@@ -1,0 +1,59 @@
+# GitLab CI skeleton for kraken-hub. Pipeline shape follows kraken/docs/09-observability-and-testing.md.
+# Placeholders: the GitLab host and registry (gitlab.damoreira.ml) are not real yet.
+
+stages:
+  - fmt
+  - clippy
+  - test
+  - docker
+
+default:
+  image: rust:1.99 # placeholder tag; pin to the exact digest once the registry mirror exists
+  cache:
+    key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry
+      - target/
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: always
+
+before_script:
+  - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler > /dev/null
+
+fmt:
+  stage: fmt
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: clippy
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+  stage: test
+  services:
+    - name: docker:28-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    TESTCONTAINERS_RYUK_DISABLED: "true"
+  script:
+    - cargo test --all-features
+
+docker:
+  stage: docker
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+      --destination "registry.gitlab.damoreira.ml/kraken/kraken-hub:$CI_COMMIT_TAG"
+      --destination "registry.gitlab.damoreira.ml/kraken/kraken-hubatest"

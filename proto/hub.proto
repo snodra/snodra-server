@@ -1,0 +1,141 @@
+// kraken hub protocol.
+//
+// A service opens one bidirectional stream per instance with Hub.Connect, announces the command
+// and query types it handles with a Register message, and then exchanges Request and Reply
+// messages over that stream for as long as it lives. The hub keeps an in-memory registry of
+// connected instances and forwards each Request to one instance that registered its type.
+//
+// The hub never inspects or persists payloads. Payloads are JSON documents produced by the
+// kraken-messaging libraries; the JSON shape of each type is defined by the owning service's
+// *-api module (JVM) or documented contract (Rust).
+//
+// This file lives in the umbrella repository (kraken/protocol/hub.proto) and is consumed by
+// kraken-hub, kraken-messaging and kraken-messaging-rs as a git submodule.
+
+syntax = "proto3";
+
+package kraken.hub.v1;
+
+option java_package = "io.damoreira.kraken.hub.v1";
+option java_multiple_files = true;
+
+// Routing and relaying of commands and queries between services.
+service Hub {
+  // One long-lived stream per service instance. The first client message must be a Register.
+  rpc Connect(stream ClientMessage) returns (stream ServerMessage);
+}
+
+// Everything a service instance can send to the hub.
+message ClientMessage {
+  oneof message {
+    Register register = 1;
+    Request request = 2;
+    Reply reply = 3;
+    Heartbeat heartbeat = 4;
+  }
+}
+
+// Everything the hub can send to a service instance.
+message ServerMessage {
+  oneof message {
+    // A command or query another service sent, forwarded to this instance because it registered
+    // the type.
+    Request request = 1;
+    // The reply to a Request this instance sent earlier (matched by Reply.request_id).
+    Reply reply = 2;
+    // A failure the hub detected for a Request this instance sent (matched by Error.request_id).
+    Error error = 3;
+    // Echo of a client Heartbeat, or an unsolicited keep-alive.
+    Heartbeat heartbeat = 4;
+  }
+}
+
+// Announces what this instance handles. Must be the first message on the stream. A later
+// Register on the same stream replaces the previous registration (used when handlers are added
+// after startup).
+message Register {
+  // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
+  string service_name = 1;
+  // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
+  string instance_id = 2;
+  // Fully qualified command type names this instance handles, for example "files.AttachFile".
+  repeated string command_types = 3;
+  // Fully qualified query type names this instance handles, for example "files.GetFileMetadata".
+  repeated string query_types = 4;
+}
+
+// Whether a Request is a command (exactly one handler, side effects) or a query (read only).
+enum RequestKind {
+  REQUEST_KIND_UNSPECIFIED = 0;
+  COMMAND = 1;
+  QUERY = 2;
+}
+
+// A command or query. Sent by the originating instance; forwarded by the hub without changes.
+message Request {
+  // Unique id chosen by the sender (UUID). Replies and errors carry it back.
+  string id = 1;
+  RequestKind kind = 2;
+  // Fully qualified type name, for example "gymnotes.LogWorkout".
+  string type = 3;
+  // Optional. When present, all requests with the same key for the same type go to the same
+  // instance of the owning service (consistent hashing). Typically the aggregate id.
+  string routing_key = 4;
+  // JSON document, UTF-8. The sender's library serialises the message class to this document.
+  bytes payload = 5;
+  // Transport metadata. Known keys: "authorization" (Bearer JWT of the acting user),
+  // "correlationId", "traceparent" (W3C trace context), "tracestate".
+  map<string, string> headers = 6;
+  // Per-request timeout hint in milliseconds. The hub uses it to emit TIMEOUT if no Reply
+  // arrives in time. Zero means use the hub default (5000 ms).
+  uint32 timeout_ms = 7;
+}
+
+// Success or application-level failure returned by the handling instance.
+message Reply {
+  // The Request.id this reply answers.
+  string request_id = 1;
+  oneof result {
+    // JSON document, UTF-8. The sender's library deserialises it to the handler's declared
+    // response type. May be an empty object for commands without a result.
+    bytes payload = 2;
+    // The handler threw or rejected the request. Forwarded as-is to the sender.
+    Error error = 3;
+  }
+}
+
+// Failure codes. The hub produces NO_HANDLER, TIMEOUT and HANDLER_DISCONNECTED itself;
+// handlers produce HANDLER_ERROR, UNAUTHENTICATED and INVALID_REQUEST inside a Reply.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // No connected instance has registered Request.type.
+  NO_HANDLER = 1;
+  // No Reply arrived within Request.timeout_ms (or the hub default).
+  TIMEOUT = 2;
+  // The instance the request was forwarded to closed its stream before replying.
+  HANDLER_DISCONNECTED = 3;
+  // The handler raised an exception. "message" carries a short description, never a stack trace.
+  HANDLER_ERROR = 4;
+  // The handling service rejected the forwarded JWT (missing, expired, wrong issuer, no role).
+  UNAUTHENTICATED = 5;
+  // The payload could not be deserialised into the handler's parameter type.
+  INVALID_REQUEST = 6;
+}
+
+message Error {
+  // The Request.id this error refers to.
+  string request_id = 1;
+  ErrorCode code = 2;
+  // Human-readable, safe to log and to surface to a developer. Not for end users.
+  string message = 3;
+  // Optional machine-readable details from the handler (for example a validation error list as
+  // JSON). Empty for hub-generated errors.
+  bytes details = 4;
+}
+
+// Keep-alive. Clients send one every 10 seconds; the hub drops an instance from the registry
+// after three missed heartbeats (30 seconds) or when the stream closes, whichever comes first.
+message Heartbeat {
+  // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
+  int64 sent_at_ms = 1;
+}
