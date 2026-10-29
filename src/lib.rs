@@ -4,6 +4,7 @@
 pub mod config;
 pub mod registry;
 pub mod service;
+pub mod session;
 pub mod telemetry;
 
 pub mod proto {
