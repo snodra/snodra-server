@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
 use crate::registry::{InstanceId, Kind, PickError, Registry};
 use crate::session::{SendError, Sessions};
-use crate::telemetry::{Metrics, Outcome};
+use crate::telemetry::{Metrics, Outcome, set_parent_from_headers};
 
 struct Pending {
     sender: InstanceId,
@@ -28,6 +28,8 @@ struct Pending {
     type_name: String,
     started: Instant,
     cancel: AbortHandle,
+    /// The `hub.route` span; closes (and exports) when the entry is dropped.
+    span: tracing::Span,
 }
 
 pub struct Router {
@@ -65,6 +67,10 @@ fn outcome_of(code: ErrorCode) -> Outcome {
     }
 }
 
+fn record_outcome(span: &tracing::Span, outcome: Outcome) {
+    span.record("kraken.outcome", outcome.as_str());
+}
+
 impl Router {
     pub fn new(
         registry: Arc<Registry>,
@@ -86,6 +92,15 @@ impl Router {
     pub fn route(self: &Arc<Self>, sender: &str, req: Request) {
         let id = req.id.clone();
         let type_name = req.r#type.clone();
+        let span = tracing::info_span!(
+            "hub.route",
+            kraken.type = %req.r#type,
+            kraken.kind = ?req.kind(),
+            kraken.sender = %sender,
+            kraken.handler = tracing::field::Empty,
+            kraken.outcome = tracing::field::Empty,
+        );
+        set_parent_from_headers(&span, &req.headers);
         let req_kind = match req.kind() {
             RequestKind::Command => Some(Kind::Command),
             RequestKind::Query => Some(Kind::Query),
@@ -96,6 +111,7 @@ impl Router {
             if let Some(kind) = req_kind {
                 self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
             }
+            record_outcome(&span, Outcome::InvalidRequest);
             self.send_to(
                 sender,
                 error_message(
@@ -119,11 +135,13 @@ impl Router {
                     }
                 };
                 self.record_rejected(req_kind, &type_name, Outcome::NoHandler);
+                record_outcome(&span, Outcome::NoHandler);
                 self.send_to(sender, error_message(&id, ErrorCode::NoHandler, message));
                 return;
             }
         };
 
+        span.record("kraken.handler", handler.as_str());
         let timeout = if req.timeout_ms == 0 {
             self.config.default_timeout
         } else {
@@ -137,6 +155,7 @@ impl Router {
             if pending.contains_key(&id) {
                 drop(pending);
                 self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
+                record_outcome(&span, Outcome::InvalidRequest);
                 self.send_to(
                     sender,
                     error_message(
@@ -162,6 +181,7 @@ impl Router {
                 type_name,
                 started: Instant::now(),
                 cancel,
+                span,
             };
             pending.insert(id.clone(), entry);
         }
@@ -212,6 +232,7 @@ impl Router {
             Some(reply::Result::Error(_)) => Outcome::HandlerError,
             _ => Outcome::Ok,
         };
+        record_outcome(&entry.span, outcome);
         self.metrics.request_finished(
             entry.kind,
             &entry.type_name,
@@ -250,6 +271,9 @@ impl Router {
         };
         for entry in dropped {
             entry.cancel.abort();
+            // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in flight.
+            self.metrics.in_flight_add(entry.kind, -1);
+            entry.span.record("kraken.outcome", "sender_disconnected");
         }
         for (id, entry) in failed {
             entry.cancel.abort();
@@ -260,6 +284,13 @@ impl Router {
                 format!("handler instance {instance_id} disconnected"),
             );
         }
+    }
+
+    /// Refreshes the `kraken_hub_sessions` and `kraken_hub_registered_types` gauges from the
+    /// current session and registry state. Call after any change to either.
+    pub fn refresh_gauges(&self) {
+        self.metrics.sessions_set(self.sessions.count_by_service());
+        self.metrics.registered_types_set(&self.registry.snapshot());
     }
 
     pub fn in_flight(&self) -> usize {
@@ -285,6 +316,7 @@ impl Router {
 
     /// `entry` must already have been removed from the map by the caller.
     fn finish_with_error(&self, id: &str, entry: Pending, code: ErrorCode, message: String) {
+        record_outcome(&entry.span, outcome_of(code));
         self.metrics.request_finished(
             entry.kind,
             &entry.type_name,

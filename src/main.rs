@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
-    kraken_hub::telemetry::init(&config);
+    let _telemetry = kraken_hub::telemetry::init(&config)?;
     let listener = TcpListener::bind(config.listen).await?;
     kraken_hub::serve(config, listener).await
 }

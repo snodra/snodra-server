@@ -31,7 +31,7 @@ pub async fn serve(config: Config, listener: TcpListener) -> anyhow::Result<()> 
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
-    let metrics = Metrics::noop();
+    let metrics = Metrics::new(opentelemetry::global::meter("kraken-hub"));
     let router = Router::new(
         Arc::clone(&registry),
         Arc::clone(&sessions),
@@ -85,5 +85,6 @@ async fn watchdog(
             service::disconnect(&registry, &sessions, &router, &id, token);
         }
         registry.sweep(now);
+        router.refresh_gauges();
     }
 }

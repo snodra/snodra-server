@@ -50,6 +50,7 @@ pub fn disconnect(
     };
     router.on_disconnect(instance_id);
     registry.unregister(instance_id, Instant::now());
+    router.refresh_gauges();
     info!(instance = %instance_id, service = %session.service, "disconnect");
     true
 }
@@ -172,6 +173,7 @@ async fn run_stream(
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
     let token = ctx.sessions.insert(&instance_id, &service, tx.clone());
+    ctx.router.refresh_gauges();
     // From here on the sessions map holds the only strong sender, so removing the session ends
     // the outbound stream; this task keeps a weak handle for its own replies.
     let out = tx.downgrade();
@@ -205,6 +207,7 @@ async fn run_stream(
                     }
                     break;
                 }
+                ctx.router.refresh_gauges();
             }
             Some(client_message::Message::Heartbeat(hb)) => {
                 ctx.sessions.touch(&instance_id, Instant::now());
