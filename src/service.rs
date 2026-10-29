@@ -32,12 +32,18 @@ use crate::proto::{
 use crate::registry::{RegisterError, Registry};
 use crate::router::Router;
 use crate::session::Sessions;
+use crate::topology::{ClockAnchor, snapshot};
 
 pub struct HubService {
     pub registry: Arc<Registry>,
     pub sessions: Arc<Sessions>,
     pub router: Arc<Router>,
     pub config: Arc<Config>,
+    /// Anchor for converting monotonic instants to wall-clock time in topology snapshots.
+    pub anchor: ClockAnchor,
+    /// When this hub started serving (monotonic).
+    pub started: Instant,
+    pub heartbeat_timeout: Duration,
 }
 
 type ServerStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send + 'static>>;
@@ -124,7 +130,17 @@ impl Hub for HubService {
         &self,
         _request: Request<TopologyRequest>,
     ) -> Result<Response<TopologyResponse>, Status> {
-        Err(Status::unimplemented("topology not implemented yet"))
+        debug!("topology requested");
+        let topology = snapshot(
+            &self.registry,
+            &self.sessions,
+            &self.router,
+            self.anchor,
+            self.started,
+            self.heartbeat_timeout,
+            Instant::now(),
+        );
+        Ok(Response::new(topology.to_proto()))
     }
 }
 

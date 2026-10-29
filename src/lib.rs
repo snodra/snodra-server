@@ -7,6 +7,7 @@ pub mod router;
 pub mod service;
 pub mod session;
 pub mod telemetry;
+pub mod topology;
 
 pub mod proto {
     tonic::include_proto!("kraken.hub.v1");
@@ -55,6 +56,7 @@ pub async fn serve_with_shutdown(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let anchor = topology::ClockAnchor::now();
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
@@ -74,6 +76,9 @@ pub async fn serve_with_shutdown(
         sessions: Arc::clone(&sessions),
         router: Arc::clone(&router),
         config: Arc::clone(&config),
+        anchor,
+        started: anchor.instant,
+        heartbeat_timeout: config.heartbeat_timeout,
     };
 
     let watchdog = tokio::spawn(watchdog(

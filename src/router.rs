@@ -36,6 +36,13 @@ struct Pending {
     span: tracing::Span,
 }
 
+/// Pending requests touching one instance, by role.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InFlight {
+    pub as_handler: u32,
+    pub as_sender: u32,
+}
+
 pub struct Router {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
@@ -371,6 +378,18 @@ impl Router {
     pub fn refresh_gauges(&self) {
         self.metrics.sessions_set(self.sessions.count_by_service());
         self.metrics.registered_types_set(&self.registry.snapshot());
+    }
+
+    /// Pending requests per instance (as handler and as sender) and the total pending count,
+    /// from one pass under the pending lock.
+    pub fn in_flight_by_instance(&self) -> (HashMap<InstanceId, InFlight>, u32) {
+        let pending = self.pending.lock().unwrap();
+        let mut by_instance: HashMap<InstanceId, InFlight> = HashMap::new();
+        for p in pending.values() {
+            by_instance.entry(p.handler.clone()).or_default().as_handler += 1;
+            by_instance.entry(p.sender.clone()).or_default().as_sender += 1;
+        }
+        (by_instance, pending.len() as u32)
     }
 
     pub fn in_flight(&self) -> usize {

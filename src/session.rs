@@ -39,11 +39,22 @@ pub struct Session {
     pub service: String,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
     pub last_heartbeat: Instant,
+    /// When the stream registered (set at `insert`).
+    pub connected_since: Instant,
     /// Unique per `insert`; lets a stream remove only its own session.
     pub token: u64,
     /// Cancelled when the session is removed or replaced; the stream task exits on it at once
     /// instead of waiting for the client to drain the response body.
     pub cancel: CancellationToken,
+}
+
+/// Read-only copy of one session's observable state, for the topology view.
+#[derive(Debug, Clone)]
+pub struct SessionDetail {
+    pub instance_id: InstanceId,
+    pub service: String,
+    pub connected_since: Instant,
+    pub last_heartbeat: Instant,
 }
 
 /// Instance id -> session. Lock order: the sessions lock may be held while the registry lock is
@@ -70,10 +81,12 @@ impl Sessions {
         cancel: CancellationToken,
     ) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
         let session = Session {
             service: service.to_string(),
             tx,
-            last_heartbeat: Instant::now(),
+            last_heartbeat: now,
+            connected_since: now,
             token,
             cancel,
         };
@@ -141,6 +154,21 @@ impl Sessions {
             .unwrap()
             .iter()
             .map(|(id, s)| (id.clone(), s.token))
+            .collect()
+    }
+
+    /// Every session's observable state, cloned out under one brief lock.
+    pub fn details(&self) -> Vec<SessionDetail> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, s)| SessionDetail {
+                instance_id: id.clone(),
+                service: s.service.clone(),
+                connected_since: s.connected_since,
+                last_heartbeat: s.last_heartbeat,
+            })
             .collect()
     }
 
