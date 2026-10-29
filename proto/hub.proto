@@ -136,6 +136,8 @@ message Error {
 
 // Keep-alive. Clients send one every 10 seconds; the hub drops an instance from the registry
 // after three missed heartbeats (30 seconds) or when the stream closes, whichever comes first.
+// The hub echoes a client Heartbeat with `sent_at_ms` unchanged; clients use the echo to confirm a
+// Register was processed.
 message Heartbeat {
   // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
   int64 sent_at_ms = 1;
