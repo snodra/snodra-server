@@ -503,6 +503,7 @@ async fn shutdown_closes_streams_and_returns_promptly() {
     let server = tokio::spawn(kraken_hub::serve_with_shutdown(
         Config::default(),
         listener,
+        None,
         async move {
             let _ = stop_rx.await;
         },

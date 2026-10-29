@@ -9,6 +9,9 @@ use anyhow::Context;
 pub struct Config {
     /// Address the gRPC server binds to. `KRAKEN_HUB_LISTEN`, default `0.0.0.0:7000`.
     pub listen: SocketAddr,
+    /// Address of the HTTP JSON mirror (`GET /topology`). `KRAKEN_HUB_HTTP_LISTEN`, default
+    /// `0.0.0.0:7001`; an explicitly empty value disables the HTTP listener.
+    pub http_listen: Option<SocketAddr>,
     /// OTLP gRPC endpoint for traces and metrics. `KRAKEN_HUB_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
     pub otlp_endpoint: Option<String>,
     /// `tracing` filter. `KRAKEN_HUB_LOG`, default `info`.
@@ -35,6 +38,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 7000)),
+            http_listen: Some(SocketAddr::from(([0, 0, 0, 0], 7001))),
             otlp_endpoint: Some("http://otel-lgtm:4317".to_string()),
             log: "info".to_string(),
             default_timeout: Duration::from_millis(5_000),
@@ -59,6 +63,14 @@ impl Config {
         let mut c = Self::default();
         if let Some(v) = var("KRAKEN_HUB_LISTEN") {
             c.listen = v.parse().context("KRAKEN_HUB_LISTEN")?;
+        }
+        // Unset keeps the default; an explicitly empty value disables the HTTP listener.
+        if let Some(v) = lookup("KRAKEN_HUB_HTTP_LISTEN") {
+            c.http_listen = if v.is_empty() {
+                None
+            } else {
+                Some(v.parse().context("KRAKEN_HUB_HTTP_LISTEN")?)
+            };
         }
         // Unset keeps the default; an explicitly empty value disables export.
         if let Some(v) = lookup("KRAKEN_HUB_OTLP_ENDPOINT") {
@@ -156,5 +168,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(c.handshake_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn http_listen_defaults_to_7001_and_empty_disables() {
+        let with = |value: Option<&str>| {
+            Config::from_lookup(|n| {
+                (n == "KRAKEN_HUB_HTTP_LISTEN")
+                    .then(|| value.map(str::to_string))
+                    .flatten()
+            })
+        };
+        let default = Some("0.0.0.0:7001".parse().unwrap());
+        assert_eq!(Config::default().http_listen, default);
+        assert_eq!(with(None).unwrap().http_listen, default);
+        assert_eq!(with(Some("")).unwrap().http_listen, None);
+        assert_eq!(
+            with(Some("127.0.0.1:9")).unwrap().http_listen,
+            Some("127.0.0.1:9".parse().unwrap())
+        );
+        assert!(with(Some("nonsense")).is_err());
     }
 }

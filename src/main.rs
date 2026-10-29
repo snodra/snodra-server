@@ -21,7 +21,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let telemetry = kraken_hub::telemetry::init(&config)?;
     let listener = TcpListener::bind(config.listen).await?;
-    kraken_hub::serve_with_shutdown(config, listener, kraken_hub::shutdown_signal()).await?;
+    let http = kraken_hub::bind_http(&config).await?;
+    kraken_hub::serve_with_shutdown(config, listener, http, kraken_hub::shutdown_signal()).await?;
     // Flushes pending spans and metrics.
     drop(telemetry);
     Ok(ExitCode::SUCCESS)

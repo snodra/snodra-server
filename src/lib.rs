@@ -18,6 +18,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+use axum::Json;
+use axum::extract::State;
 use config::Config;
 use proto::hub_server::HubServer;
 use registry::Registry;
@@ -42,18 +45,57 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// gRPC health service name the hub reports (and `--health-check` probes).
 pub const HEALTH_SERVICE: &str = "kraken.hub.v1.Hub";
 
-/// Runs the hub on `listener` until the server stops (no shutdown signal).
+/// Runs the hub on `listener` until the server stops (no shutdown signal). The HTTP mirror is
+/// bound here from `config.http_listen`; failing to bind it is fatal.
 pub async fn serve(config: Config, listener: TcpListener) -> anyhow::Result<()> {
-    serve_with_shutdown(config, listener, std::future::pending()).await
+    let http = bind_http(&config).await?;
+    serve_with_shutdown(config, listener, http, std::future::pending()).await
 }
 
-/// Runs the hub on `listener` until `shutdown` completes. Shutdown sequence: health goes
+/// Binds the HTTP mirror listener from `config.http_listen` (`None` when disabled).
+pub async fn bind_http(config: &Config) -> anyhow::Result<Option<TcpListener>> {
+    match config.http_listen {
+        Some(addr) => Ok(Some(
+            TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind HTTP listener {addr}"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Everything the `GET /topology` handler needs; the same `Arc`s the gRPC service holds.
+#[derive(Clone)]
+struct TopologyState {
+    registry: Arc<Registry>,
+    sessions: Arc<Sessions>,
+    router: Arc<Router>,
+    anchor: topology::ClockAnchor,
+    started: Instant,
+    heartbeat_timeout: Duration,
+}
+
+async fn get_topology(State(s): State<TopologyState>) -> Json<topology::Topology> {
+    Json(topology::snapshot(
+        &s.registry,
+        &s.sessions,
+        &s.router,
+        s.anchor,
+        s.started,
+        s.heartbeat_timeout,
+        Instant::now(),
+    ))
+}
+
+/// Runs the hub on `listener` until `shutdown` completes. When `http` is given, `GET /topology`
+/// is served there (JSON mirror of the `Topology` RPC) and stops on the same signal. Shutdown sequence: health goes
 /// `NOT_SERVING`, the watchdog stops, every session is closed with `UNAVAILABLE` (its pending
 /// requests fail as on any disconnect), then the server drains connections for at most
 /// [`SHUTDOWN_GRACE`] and the function returns.
 pub async fn serve_with_shutdown(
     config: Config,
     listener: TcpListener,
+    http: Option<TcpListener>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let anchor = topology::ClockAnchor::now();
@@ -67,6 +109,30 @@ pub async fn serve_with_shutdown(
         Arc::clone(&config),
         metrics,
     );
+
+    let stopping = CancellationToken::new();
+    let http_task = http.map(|listener| {
+        let state = TopologyState {
+            registry: Arc::clone(&registry),
+            sessions: Arc::clone(&sessions),
+            router: Arc::clone(&router),
+            anchor,
+            started: anchor.instant,
+            heartbeat_timeout: config.heartbeat_timeout,
+        };
+        let app = axum::Router::new()
+            .route("/topology", axum::routing::get(get_topology))
+            .with_state(state);
+        let stopping = stopping.clone();
+        info!(addr = ?listener.local_addr().ok(), "http listening");
+        tokio::spawn(async move {
+            let result = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stopping.cancelled().await })
+                .await;
+            info!("http stopped");
+            result
+        })
+    });
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_serving::<HubServer<HubService>>().await;
@@ -88,7 +154,6 @@ pub async fn serve_with_shutdown(
         config.heartbeat_timeout,
     ));
 
-    let stopping = CancellationToken::new();
     let signal = {
         let stopping = stopping.clone();
         let watchdog = watchdog.abort_handle();
@@ -136,6 +201,16 @@ pub async fn serve_with_shutdown(
         }
     };
     watchdog.abort();
+    // Also covers the gRPC server ending on its own: stop HTTP, then wait for it within the grace.
+    stopping.cancel();
+    if let Some(task) = http_task {
+        match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => warn!(error = %e, "http server failed"),
+            Ok(Err(e)) => warn!(error = %e, "http task failed"),
+            Err(_) => warn!("http connections did not drain in time"),
+        }
+    }
     result?;
     info!("hub stopped");
     Ok(())

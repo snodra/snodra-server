@@ -33,6 +33,7 @@ cargo run
 | Variable | Default | Meaning |
 |---|---|---|
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
+| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for `GET /topology`; empty disables the HTTP listener |
 | `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
 | `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
 | `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 |
@@ -41,6 +42,10 @@ cargo run
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
+
+**Topology view.** `GET /topology` on `KRAKEN_HUB_HTTP_LISTEN` returns the same snapshot as the
+`Topology` RPC as JSON (camelCase fields, `kind` as `COMMAND` or `QUERY`); every other path is 404.
+The full section is written with the topology view's documentation task.
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
   unset keeps that default; setting it to an empty string disables OTLP export, which is useful

@@ -15,14 +15,79 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 use tonic::{Status, Streaming};
 
-/// Binds `127.0.0.1:0`, spawns `serve` and returns the bound address.
+/// Binds `127.0.0.1:0` for gRPC, runs the hub without an HTTP listener and returns the
+/// bound address.
 pub async fn start_hub(config: Config) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        kraken_hub::serve(config, listener).await.unwrap();
+        kraken_hub::serve_with_shutdown(config, listener, None, std::future::pending())
+            .await
+            .unwrap();
     });
     addr
+}
+
+/// Like [`start_hub`], plus an ephemeral HTTP listener when `config.http_listen` is `Some`
+/// (the configured port is ignored). Returns `(grpc_addr, http_addr)`.
+pub async fn start_hub_with_http(config: Config) -> (SocketAddr, Option<SocketAddr>) {
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc.local_addr().unwrap();
+    let http = match config.http_listen {
+        Some(_) => Some(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()),
+        None => None,
+    };
+    let http_addr = http.as_ref().map(|l| l.local_addr().unwrap());
+    tokio::spawn(async move {
+        kraken_hub::serve_with_shutdown(config, grpc, http, std::future::pending())
+            .await
+            .unwrap();
+    });
+    (grpc_addr, http_addr)
+}
+
+/// Minimal HTTP/1.1 GET over a raw socket (bounded to 3 s). Returns `(status, body)`.
+pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fut = async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        String::from_utf8(raw).unwrap()
+    };
+    let raw = tokio::time::timeout(Duration::from_secs(3), fut)
+        .await
+        .expect("http_get timed out");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("malformed HTTP response");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("malformed status line");
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_string()
+    };
+    (status, body)
+}
+
+fn dechunk(mut rest: &str) -> String {
+    let mut out = String::new();
+    while let Some((size, tail)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).expect("bad chunk size");
+        if n == 0 {
+            break;
+        }
+        out.push_str(&tail[..n]);
+        rest = &tail[n + 2..];
+    }
+    out
 }
 
 pub struct FakeClient {
