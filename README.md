@@ -28,7 +28,7 @@ docker build -t kraken-hub .
 | Variable | Default | Meaning |
 |---|---|---|
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
-| `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
+| `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics; an empty value disables OTLP export |
 | `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
 | `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 |
 | `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` |

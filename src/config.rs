@@ -9,7 +9,7 @@ use anyhow::Context;
 pub struct Config {
     /// Address the gRPC server binds to. `KRAKEN_HUB_LISTEN`, default `0.0.0.0:7000`.
     pub listen: SocketAddr,
-    /// OTLP gRPC endpoint for traces and metrics. `KRAKEN_HUB_OTLP_ENDPOINT`, unset by default.
+    /// OTLP gRPC endpoint for traces and metrics. `KRAKEN_HUB_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
     pub otlp_endpoint: Option<String>,
     /// `tracing` filter. `KRAKEN_HUB_LOG`, default `info`.
     pub log: String,
@@ -32,7 +32,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 7000)),
-            otlp_endpoint: None,
+            otlp_endpoint: Some("http://otel-lgtm:4317".to_string()),
             log: "info".to_string(),
             default_timeout: Duration::from_millis(5_000),
             max_timeout: Duration::from_millis(60_000),
@@ -46,11 +46,20 @@ impl Default for Config {
 impl Config {
     /// Starts from [`Config::default`] and overrides from `KRAKEN_HUB_*` variables.
     pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Like [`Config::from_env`] over an arbitrary variable lookup (hermetic in tests).
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let var = |name: &str| lookup(name).filter(|s| !s.is_empty());
         let mut c = Self::default();
         if let Some(v) = var("KRAKEN_HUB_LISTEN") {
             c.listen = v.parse().context("KRAKEN_HUB_LISTEN")?;
         }
-        c.otlp_endpoint = var("KRAKEN_HUB_OTLP_ENDPOINT");
+        // Unset keeps the default; an explicitly empty value disables export.
+        if let Some(v) = lookup("KRAKEN_HUB_OTLP_ENDPOINT") {
+            c.otlp_endpoint = Some(v).filter(|s| !s.is_empty());
+        }
         if let Some(v) = var("KRAKEN_HUB_LOG") {
             c.log = v;
         }
@@ -71,11 +80,6 @@ impl Config {
         }
         Ok(c)
     }
-}
-
-/// Reads a variable, treating unset and empty the same.
-fn var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 fn millis(s: &str) -> anyhow::Result<Duration> {
@@ -100,7 +104,7 @@ mod tests {
     fn defaults_match_spec() {
         let c = Config::default();
         assert_eq!(c.listen, "0.0.0.0:7000".parse().unwrap());
-        assert_eq!(c.otlp_endpoint, None);
+        assert_eq!(c.otlp_endpoint.as_deref(), Some("http://otel-lgtm:4317"));
         assert_eq!(c.default_timeout, Duration::from_millis(5000));
         assert_eq!(c.max_timeout, Duration::from_millis(60_000));
         assert_eq!(c.heartbeat_timeout, Duration::from_secs(30));
@@ -115,5 +119,25 @@ mod tests {
         assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert!(parse_duration("abc").is_err());
+    }
+
+    fn otlp(value: Option<&str>) -> Option<String> {
+        let c = Config::from_lookup(|n| {
+            (n == "KRAKEN_HUB_OTLP_ENDPOINT")
+                .then(|| value.map(str::to_string))
+                .flatten()
+        })
+        .unwrap();
+        c.otlp_endpoint
+    }
+
+    #[test]
+    fn otlp_endpoint_unset_keeps_default_empty_disables_value_overrides() {
+        assert_eq!(otlp(None).as_deref(), Some("http://otel-lgtm:4317"));
+        assert_eq!(otlp(Some("")), None);
+        assert_eq!(
+            otlp(Some("http://x:4317")).as_deref(),
+            Some("http://x:4317")
+        );
     }
 }
