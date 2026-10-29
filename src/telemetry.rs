@@ -21,6 +21,7 @@ pub fn init(config: &Config) {
 pub enum Outcome {
     Ok,
     NoHandler,
+    InvalidRequest,
     Timeout,
     HandlerDisconnected,
     HandlerError,

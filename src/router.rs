@@ -3,12 +3,17 @@
 //! Invariant: exactly one terminal message (`Reply` or `Error`) per request id. Whoever removes
 //! the `Pending` entry from the map is the only one allowed to send it. The map lock is never
 //! held across an await (it is never held across anything but short synchronous work).
+//!
+//! Metrics outcomes: a `Reply` carrying an error from a handler is always `HandlerError`;
+//! `outcome_of` maps only errors the hub itself produces (NO_HANDLER, TIMEOUT,
+//! HANDLER_DISCONNECTED, INVALID_REQUEST, and busy as HANDLER_ERROR).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
@@ -50,12 +55,13 @@ pub fn error_message(
 
 fn outcome_of(code: ErrorCode) -> Outcome {
     match code {
-        ErrorCode::NoHandler | ErrorCode::InvalidRequest | ErrorCode::Unauthenticated => {
-            Outcome::NoHandler
-        }
+        ErrorCode::NoHandler => Outcome::NoHandler,
+        ErrorCode::InvalidRequest => Outcome::InvalidRequest,
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
-        ErrorCode::HandlerError | ErrorCode::Unspecified => Outcome::HandlerError,
+        ErrorCode::HandlerError | ErrorCode::Unauthenticated | ErrorCode::Unspecified => {
+            Outcome::HandlerError
+        }
     }
 }
 
@@ -80,17 +86,26 @@ impl Router {
     pub fn route(self: &Arc<Self>, sender: &str, req: Request) {
         let id = req.id.clone();
         let type_name = req.r#type.clone();
-        if req.kind() == RequestKind::Unspecified || type_name.is_empty() {
+        let req_kind = match req.kind() {
+            RequestKind::Command => Some(Kind::Command),
+            RequestKind::Query => Some(Kind::Query),
+            RequestKind::Unspecified => None,
+        };
+        let Some(req_kind) = req_kind.filter(|_| !type_name.is_empty()) else {
+            // Without a kind there is no metrics label, so only kind-bearing requests are counted.
+            if let Some(kind) = req_kind {
+                self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
+            }
             self.send_to(
                 sender,
                 error_message(
                     &id,
-                    ErrorCode::NoHandler,
+                    ErrorCode::InvalidRequest,
                     "invalid request: missing kind or type",
                 ),
             );
             return;
-        }
+        };
 
         let (kind, handler) = match self.registry.pick(&type_name, &req.routing_key) {
             Ok(picked) => picked,
@@ -103,13 +118,7 @@ impl Router {
                         format!("owner known, no instance for service {service}")
                     }
                 };
-                self.metrics.request_started(request_kind(&req));
-                self.metrics.request_finished(
-                    request_kind(&req),
-                    &type_name,
-                    Outcome::NoHandler,
-                    Duration::ZERO,
-                );
+                self.record_rejected(req_kind, &type_name, Outcome::NoHandler);
                 self.send_to(sender, error_message(&id, ErrorCode::NoHandler, message));
                 return;
             }
@@ -121,11 +130,24 @@ impl Router {
             Duration::from_millis(req.timeout_ms.into()).min(self.config.max_timeout)
         };
 
-        self.metrics.request_started(kind);
         // Insert before forwarding so a fast reply always finds its entry. The lock is held
         // while spawning so an immediate timeout cannot run before the entry exists.
         {
             let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(&id) {
+                drop(pending);
+                self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
+                self.send_to(
+                    sender,
+                    error_message(
+                        &id,
+                        ErrorCode::InvalidRequest,
+                        "invalid request: duplicate id",
+                    ),
+                );
+                return;
+            }
+            self.metrics.request_started(kind);
             let router = Arc::clone(self);
             let task_id = id.clone();
             let cancel = tokio::spawn(async move {
@@ -141,9 +163,7 @@ impl Router {
                 started: Instant::now(),
                 cancel,
             };
-            if let Some(old) = pending.insert(id.clone(), entry) {
-                old.cancel.abort();
-            }
+            pending.insert(id.clone(), entry);
         }
 
         let forwarded = ServerMessage {
@@ -189,7 +209,7 @@ impl Router {
         };
         entry.cancel.abort();
         let outcome = match &reply.result {
-            Some(reply::Result::Error(e)) => outcome_of(e.code()),
+            Some(reply::Result::Error(_)) => Outcome::HandlerError,
             _ => Outcome::Ok,
         };
         self.metrics.request_finished(
@@ -274,17 +294,16 @@ impl Router {
         self.send_to(&entry.sender, error_message(id, code, message));
     }
 
+    fn record_rejected(&self, kind: Kind, type_name: &str, outcome: Outcome) {
+        self.metrics.request_started(kind);
+        self.metrics
+            .request_finished(kind, type_name, outcome, Duration::ZERO);
+    }
+
     fn send_to(&self, instance: &str, msg: ServerMessage) {
         if let Err(e) = self.sessions.send(instance, msg) {
             tracing::debug!(instance, error = %e, "dropping terminal message");
         }
-    }
-}
-
-fn request_kind(req: &Request) -> Kind {
-    match req.kind() {
-        RequestKind::Query => Kind::Query,
-        _ => Kind::Command,
     }
 }
 
@@ -442,6 +461,40 @@ mod tests {
         assert!(f.sender_rx.try_recv().is_err());
         tokio::time::sleep(Duration::from_millis(2)).await;
         expect_error(&mut f.sender_rx, "r2", ErrorCode::Timeout);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_is_rejected_without_touching_pending() {
+        let mut f = fixture();
+        let mut s2_rx = fake(&f.sessions, "s2", "web", 16);
+        f.router.route("s1", request("r1", "t.Cmd", 0));
+        f.router.route("s2", request("r1", "t.Cmd", 0));
+        let msg = expect_error(&mut s2_rx, "r1", ErrorCode::InvalidRequest);
+        assert_eq!(msg, "invalid request: duplicate id");
+        assert_eq!(f.router.in_flight(), 1);
+        assert!(f.handler_rx.try_recv().is_ok());
+        assert!(f.handler_rx.try_recv().is_err());
+        f.router.on_reply("h1", payload_reply("r1"));
+        assert!(matches!(
+            f.sender_rx.try_recv().unwrap().unwrap().message,
+            Some(server_message::Message::Reply(_))
+        ));
+        assert!(s2_rx.try_recv().is_err());
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_just_before_deadline_sends_no_timeout() {
+        let mut f = fixture();
+        f.router.route("s1", request("r1", "t.Cmd", 10));
+        tokio::time::sleep(Duration::from_millis(9)).await;
+        f.router.on_reply("h1", payload_reply("r1"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(matches!(
+            f.sender_rx.try_recv().unwrap().unwrap().message,
+            Some(server_message::Message::Reply(_))
+        ));
+        assert!(f.sender_rx.try_recv().is_err());
     }
 
     #[tokio::test]
