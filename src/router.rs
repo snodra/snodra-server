@@ -70,6 +70,9 @@ fn outcome_of(code: ErrorCode) -> Outcome {
     match code {
         ErrorCode::NoHandler => Outcome::NoHandler,
         ErrorCode::InvalidRequest => Outcome::InvalidRequest,
+        // Handler-produced: the receiving service denied an authenticated caller. Counted as a
+        // handler error like every other Reply{error} relayed by the hub.
+        ErrorCode::PermissionDenied => Outcome::HandlerError,
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
         ErrorCode::HandlerError | ErrorCode::Unauthenticated | ErrorCode::Unspecified => {

@@ -110,8 +110,8 @@ message Reply {
 }
 
 // Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, and INVALID_REQUEST
-// (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED
-// and INVALID_REQUEST inside a Reply.
+// (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED,
+// PERMISSION_DENIED and INVALID_REQUEST inside a Reply.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
@@ -122,10 +122,14 @@ enum ErrorCode {
   HANDLER_DISCONNECTED = 3;
   // The handler raised an exception. "message" carries a short description, never a stack trace.
   HANDLER_ERROR = 4;
-  // The handling service rejected the forwarded JWT (missing, expired, wrong issuer, no role).
+  // The handling service required an authenticated caller and the request carried no readable
+  // identity, or the forwarded JWT failed validation (expired, wrong issuer, bad signature).
   UNAUTHENTICATED = 5;
   // The payload could not be deserialised into the handler's parameter type.
   INVALID_REQUEST = 6;
+  // The handling service evaluated the handler's @RequiresAuthentication expression as false for
+  // an authenticated caller.
+  PERMISSION_DENIED = 7;
 }
 
 message Error {
