@@ -3,6 +3,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
@@ -14,7 +15,7 @@ use crate::proto::hub_server::Hub;
 use crate::proto::{
     ClientMessage, Error, ErrorCode, Heartbeat, ServerMessage, client_message, server_message,
 };
-use crate::registry::{Instance, Registry};
+use crate::registry::Registry;
 
 pub struct HubService {
     pub registry: Arc<Registry>,
@@ -48,12 +49,14 @@ impl Hub for HubService {
                 match msg.message {
                     Some(client_message::Message::Register(reg)) => {
                         info!(service = %reg.service_name, instance = %reg.instance_id, "register");
-                        let inst = Instance {
-                            instance_id: reg.instance_id.clone(),
-                            service_name: reg.service_name.clone(),
-                        };
-                        let types = reg.command_types.into_iter().chain(reg.query_types);
-                        registry.register(inst, types);
+                        if let Err(e) = registry.register(
+                            &reg.instance_id,
+                            &reg.service_name,
+                            &reg.command_types,
+                            &reg.query_types,
+                        ) {
+                            warn!(error = %e, "register rejected");
+                        }
                         instance_id = Some(reg.instance_id);
                     }
                     Some(client_message::Message::Heartbeat(hb)) => {
@@ -93,7 +96,7 @@ impl Hub for HubService {
             }
             if let Some(id) = instance_id {
                 info!(instance = %id, "stream closed, unregistering");
-                registry.unregister(&id);
+                registry.unregister(&id, Instant::now());
             }
         });
 
