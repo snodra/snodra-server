@@ -52,7 +52,7 @@ message ServerMessage {
 
 // Announces what this instance handles. Must be the first message on the stream. A later
 // Register on the same stream replaces the previous registration (used when handlers are added
-// after startup).
+// after startup). An empty service_name or instance_id is rejected.
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -104,8 +104,9 @@ message Reply {
   }
 }
 
-// Failure codes. The hub produces NO_HANDLER, TIMEOUT and HANDLER_DISCONNECTED itself;
-// handlers produce HANDLER_ERROR, UNAUTHENTICATED and INVALID_REQUEST inside a Reply.
+// Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, and INVALID_REQUEST
+// (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED
+// and INVALID_REQUEST inside a Reply.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
