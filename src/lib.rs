@@ -1,6 +1,7 @@
 //! kraken-hub: routes commands and queries between kraken services over gRPC.
 //! See kraken/docs/05-services/hub.md.
 
+pub mod cli;
 pub mod config;
 pub mod registry;
 pub mod router;
@@ -262,6 +263,19 @@ pub async fn health_probe(addr: SocketAddr) -> anyhow::Result<bool> {
         .await?
         .into_inner();
     Ok(response.status() == PbStatus::Serving)
+}
+
+/// Calls the `Topology` RPC on `addr` and converts the response. The caller bounds the time
+/// (the `--topology` mode uses 3 s).
+pub async fn topology_probe(addr: SocketAddr) -> anyhow::Result<topology::Topology> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let response = proto::hub_client::HubClient::new(channel)
+        .topology(proto::TopologyRequest {})
+        .await?
+        .into_inner();
+    Ok(topology::Topology::from_proto(&response))
 }
 
 /// Evicts instances without a heartbeat for `timeout` and sweeps expired type owners.

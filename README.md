@@ -45,6 +45,9 @@ cargo run
 
 **Topology view.** `GET /topology` on `KRAKEN_HUB_HTTP_LISTEN` returns the same snapshot as the
 `Topology` RPC as JSON (camelCase fields, `kind` as `COMMAND` or `QUERY`); every other path is 404.
+`kraken-hub --topology` prints the local hub's topology as a table (`--topology --json` as JSON);
+it probes `127.0.0.1` on the port of `KRAKEN_HUB_LISTEN` with a 3 s timeout and exits 1 on
+failure. Unknown or conflicting flags print the usage to stderr and exit 2.
 The full section is written with the topology view's documentation task.
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
