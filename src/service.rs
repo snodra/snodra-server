@@ -26,7 +26,8 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::proto::hub_server::Hub;
 use crate::proto::{
-    ClientMessage, Heartbeat, Register, ServerMessage, client_message, server_message,
+    ClientMessage, Heartbeat, Register, ServerMessage, TopologyRequest, TopologyResponse,
+    client_message, server_message,
 };
 use crate::registry::Registry;
 use crate::router::Router;
@@ -117,6 +118,13 @@ impl Hub for HubService {
             _cancel_on_drop: cancel.drop_guard(),
         };
         Ok(Response::new(Box::pin(stream) as ServerStream))
+    }
+
+    async fn topology(
+        &self,
+        _request: Request<TopologyRequest>,
+    ) -> Result<Response<TopologyResponse>, Status> {
+        Err(Status::unimplemented("topology not implemented yet"))
     }
 }
 

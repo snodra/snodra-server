@@ -23,6 +23,9 @@ option java_multiple_files = true;
 service Hub {
   // One long-lived stream per service instance. The first client message must be a Register.
   rpc Connect(stream ClientMessage) returns (stream ServerMessage);
+  // A point-in-time snapshot of connected services, instances, type ownership and in-flight
+  // requests, for operators and tooling. Never contains payloads or headers.
+  rpc Topology(TopologyRequest) returns (TopologyResponse);
 }
 
 // Everything a service instance can send to the hub.
@@ -52,7 +55,9 @@ message ServerMessage {
 
 // Announces what this instance handles. Must be the first message on the stream. A later
 // Register on the same stream replaces the previous registration (used when handlers are added
-// after startup). An empty service_name or instance_id is rejected.
+// after startup). An empty service_name or instance_id is rejected. A type listed in both
+// command_types and query_types is rejected with INVALID_ARGUMENT. A type whose kind differs from
+// the kind its current owner registered is rejected with ALREADY_EXISTS.
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -141,4 +146,68 @@ message Error {
 message Heartbeat {
   // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
   int64 sent_at_ms = 1;
+}
+
+// Request for a topology snapshot. Carries no parameters.
+message TopologyRequest {}
+
+// One snapshot, taken at a point in time. The hub's internal maps are read one after another, so
+// a service may briefly appear in one and not another; the snapshot reconciles by instance id.
+message TopologyResponse {
+  // Wall clock (epoch milliseconds) when this hub process started.
+  int64 hub_started_at_ms = 1;
+  // Wall clock (epoch milliseconds) at snapshot time.
+  int64 now_ms = 2;
+  // The hub's heartbeat eviction threshold in milliseconds.
+  int64 heartbeat_timeout_ms = 3;
+  repeated ServiceTopology services = 4;
+  // Sorted by type name.
+  repeated TypeOwnership types = 5;
+  TopologyTotals totals = 6;
+}
+
+message ServiceTopology {
+  string service_name = 1;
+  // Sorted by instance_id.
+  repeated InstanceTopology instances = 2;
+}
+
+message InstanceTopology {
+  string instance_id = 1;
+  // Wall clock (epoch milliseconds) when the stream registered.
+  int64 connected_since_ms = 2;
+  // now_ms minus the last heartbeat (or the registration time if none yet).
+  int64 last_heartbeat_age_ms = 3;
+  // True when the last heartbeat is older than heartbeat_timeout_ms / 3.
+  bool stale = 4;
+  // Pending requests forwarded to this instance.
+  uint32 in_flight_as_handler = 5;
+  // Pending requests this instance sent.
+  uint32 in_flight_as_sender = 6;
+  // Sorted.
+  repeated string command_types = 7;
+  // Sorted.
+  repeated string query_types = 8;
+}
+
+message TypeOwnership {
+  string type = 1;
+  // Reuses RequestKind (COMMAND or QUERY).
+  RequestKind kind = 2;
+  string owner_service = 3;
+  // Instances currently listing the type.
+  uint32 live_instances = 4;
+  // No live instance; stays until the owner grace sweep removes the type.
+  bool orphaned = 5;
+  // 0 unless orphaned.
+  int64 orphaned_for_ms = 6;
+}
+
+message TopologyTotals {
+  uint32 services = 1;
+  uint32 instances = 2;
+  uint32 command_types = 3;
+  uint32 query_types = 4;
+  // Size of the pending-request map.
+  uint32 in_flight = 5;
 }
