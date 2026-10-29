@@ -29,7 +29,7 @@ use crate::proto::{
     ClientMessage, Heartbeat, Register, ServerMessage, TopologyRequest, TopologyResponse,
     client_message, server_message,
 };
-use crate::registry::Registry;
+use crate::registry::{RegisterError, Registry};
 use crate::router::Router;
 use crate::session::Sessions;
 
@@ -160,7 +160,13 @@ impl StreamCtx {
             }
             Err(e) => {
                 warn!(error = %e, service = %reg.service_name, instance = %reg.instance_id, "register rejected");
-                Err(Status::already_exists(e.to_string()))
+                Err(match e {
+                    RegisterError::DuplicateTypeAcrossKinds { .. } => {
+                        Status::invalid_argument(e.to_string())
+                    }
+                    RegisterError::TypeOwnedByOtherService { .. }
+                    | RegisterError::KindConflict { .. } => Status::already_exists(e.to_string()),
+                })
             }
         })
     }

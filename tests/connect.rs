@@ -522,3 +522,30 @@ async fn shutdown_closes_streams_and_returns_promptly() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn register_with_type_in_both_lists_is_invalid_argument() {
+    let addr = start_hub(Config::default()).await;
+    let mut c = FakeClient::register(addr, "svc", &["x.Do"], &["x.Do"]).await;
+    let status = c.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "type x.Do listed as both command and query"
+    );
+}
+
+#[tokio::test]
+async fn register_kind_conflict_is_already_exists() {
+    let addr = start_hub(Config::default()).await;
+    let mut a = FakeClient::register(addr, "svc-a", &["x.Do"], &[]).await;
+    a.tx.send(heartbeat(1)).await.unwrap();
+    a.next_within(SHORT).await.unwrap().unwrap();
+    let mut b = FakeClient::register(addr, "svc-b", &[], &["x.Do"]).await;
+    let status = b.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert_eq!(
+        status.message(),
+        "type x.Do is owned as COMMAND by service svc-a"
+    );
+}

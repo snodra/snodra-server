@@ -8,7 +8,7 @@
 //!   hashing (same key, same instance while membership is stable);
 //! - commands without a key and all queries go to one instance chosen round-robin.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,7 +27,29 @@ pub enum Kind {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisterError {
-    TypeOwnedByOtherService { type_name: String, owner: String },
+    TypeOwnedByOtherService {
+        type_name: String,
+        owner: String,
+    },
+    /// The type is already owned (by any service) under a different kind.
+    KindConflict {
+        type_name: String,
+        owner: String,
+        owner_kind: Kind,
+    },
+    /// The request lists the same type as both command and query.
+    DuplicateTypeAcrossKinds {
+        type_name: String,
+    },
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Command => "COMMAND",
+            Kind::Query => "QUERY",
+        }
+    }
 }
 
 impl fmt::Display for RegisterError {
@@ -35,6 +57,18 @@ impl fmt::Display for RegisterError {
         match self {
             Self::TypeOwnedByOtherService { type_name, owner } => {
                 write!(f, "type {type_name} is owned by service {owner}")
+            }
+            Self::KindConflict {
+                type_name,
+                owner,
+                owner_kind,
+            } => write!(
+                f,
+                "type {type_name} is owned as {} by service {owner}",
+                owner_kind.label()
+            ),
+            Self::DuplicateTypeAcrossKinds { type_name } => {
+                write!(f, "type {type_name} listed as both command and query")
             }
         }
     }
@@ -63,6 +97,31 @@ pub struct ServiceSnapshot {
     pub instances: usize,
     pub command_types: usize,
     pub query_types: usize,
+}
+
+/// Types one instance lists, sorted by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceTypes {
+    pub service: String,
+    pub command_types: Vec<String>,
+    pub query_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeInfo {
+    pub type_name: String,
+    pub kind: Kind,
+    pub owner_service: String,
+    pub live_instances: u32,
+    /// `Some(age)` while no live instance lists the type (until `sweep` drops it).
+    pub orphaned_for: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryTopology {
+    pub instances: HashMap<InstanceId, InstanceTypes>,
+    /// Sorted by type name.
+    pub types: Vec<TypeInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +175,7 @@ struct ServiceEntry {
 
 struct InstanceEntry {
     service: String,
-    types: Vec<String>,
+    types: Vec<(String, Kind)>,
 }
 
 #[derive(Default)]
@@ -130,7 +189,7 @@ impl Inner {
     /// Removes an instance, releasing its type holds. Returns the service it belonged to.
     fn remove_instance(&mut self, instance_id: &str, now: Instant) -> Option<String> {
         let entry = self.instances.remove(instance_id)?;
-        for t in &entry.types {
+        for (t, _) in &entry.types {
             if let Some(owner) = self.types.get_mut(t) {
                 owner.holders = owner.holders.saturating_sub(1);
                 if owner.holders == 0 {
@@ -173,23 +232,36 @@ impl Registry {
         let mut inner = self.inner.lock().unwrap();
 
         let mut wanted: Vec<(&String, Kind)> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen: HashMap<&String, Kind> = HashMap::new();
         let commands = command_types.iter().map(|t| (t, Kind::Command));
         let queries = query_types.iter().map(|t| (t, Kind::Query));
         for (t, kind) in commands.chain(queries) {
-            if seen.insert(t) {
-                wanted.push((t, kind));
+            match seen.insert(t, kind) {
+                None => wanted.push((t, kind)),
+                Some(prev) if prev != kind => {
+                    return Err(RegisterError::DuplicateTypeAcrossKinds {
+                        type_name: t.clone(),
+                    });
+                }
+                Some(_) => {}
             }
         }
 
-        for (t, _) in &wanted {
-            if let Some(owner) = inner.types.get(*t)
-                && owner.service != service
-            {
-                return Err(RegisterError::TypeOwnedByOtherService {
-                    type_name: (*t).clone(),
-                    owner: owner.service.clone(),
-                });
+        for (t, kind) in &wanted {
+            if let Some(owner) = inner.types.get(*t) {
+                if owner.kind != *kind {
+                    return Err(RegisterError::KindConflict {
+                        type_name: (*t).clone(),
+                        owner: owner.service.clone(),
+                        owner_kind: owner.kind,
+                    });
+                }
+                if owner.service != service {
+                    return Err(RegisterError::TypeOwnedByOtherService {
+                        type_name: (*t).clone(),
+                        owner: owner.service.clone(),
+                    });
+                }
             }
         }
 
@@ -214,7 +286,7 @@ impl Registry {
             instance_id.to_string(),
             InstanceEntry {
                 service: service.to_string(),
-                types: wanted.into_iter().map(|(t, _)| t.clone()).collect(),
+                types: wanted.into_iter().map(|(t, k)| (t.clone(), k)).collect(),
             },
         );
         Ok(())
@@ -270,6 +342,51 @@ impl Registry {
     pub fn service_of(&self, instance_id: &str) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner.instances.get(instance_id).map(|e| e.service.clone())
+    }
+
+    /// Read-only view of instances, their types by kind and type ownership state.
+    pub fn topology(&self, now: Instant) -> RegistryTopology {
+        let inner = self.inner.lock().unwrap();
+        let instances = inner
+            .instances
+            .iter()
+            .map(|(id, e)| {
+                let of_kind = |k: Kind| {
+                    let mut v: Vec<String> = e
+                        .types
+                        .iter()
+                        .filter(|(_, tk)| *tk == k)
+                        .map(|(t, _)| t.clone())
+                        .collect();
+                    v.sort();
+                    v
+                };
+                (
+                    id.clone(),
+                    InstanceTypes {
+                        service: e.service.clone(),
+                        command_types: of_kind(Kind::Command),
+                        query_types: of_kind(Kind::Query),
+                    },
+                )
+            })
+            .collect();
+        let mut types: Vec<TypeInfo> = inner
+            .types
+            .iter()
+            .map(|(name, o)| TypeInfo {
+                type_name: name.clone(),
+                kind: o.kind,
+                owner_service: o.service.clone(),
+                live_instances: o.holders as u32,
+                orphaned_for: match o.orphaned_at {
+                    Some(at) if o.holders == 0 => Some(now.saturating_duration_since(at)),
+                    _ => None,
+                },
+            })
+            .collect();
+        types.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+        RegistryTopology { instances, types }
     }
 
     /// Per-service counts for metrics, sorted by service name.
@@ -454,5 +571,92 @@ mod tests {
                 assert_ne!(now, "c");
             }
         }
+    }
+
+    #[test]
+    fn topology_lists_instance_types_by_kind_sorted() {
+        let r = reg();
+        r.register("a", "svc", &s(&["b.X", "a.Y"]), &s(&["q.Z"]))
+            .unwrap();
+        let topo = r.topology(Instant::now());
+        let it = &topo.instances["a"];
+        assert_eq!(it.service, "svc");
+        assert_eq!(it.command_types, ["a.Y", "b.X"]);
+        assert_eq!(it.query_types, ["q.Z"]);
+        let names: Vec<_> = topo.types.iter().map(|t| t.type_name.as_str()).collect();
+        assert_eq!(names, ["a.Y", "b.X", "q.Z"]);
+    }
+
+    #[test]
+    fn topology_reports_live_instances_and_orphaned_age() {
+        let r = reg();
+        two_instances(&r, &["t.X"]);
+        let t0 = Instant::now();
+        r.unregister("a", t0);
+        let info = r.topology(t0).types.remove(0);
+        assert_eq!((info.live_instances, info.orphaned_for), (1, None));
+        r.unregister("b", t0);
+        let now = t0 + Duration::from_secs(5);
+        let info = r.topology(now).types.remove(0);
+        assert_eq!(info.live_instances, 0);
+        assert_eq!(info.orphaned_for, Some(now - t0));
+        assert_eq!(info.kind, Kind::Command);
+        assert_eq!(info.owner_service, "svc");
+    }
+
+    #[test]
+    fn topology_keeps_orphaned_type_past_grace_until_sweep() {
+        let r = reg();
+        r.register("a", "svc", &s(&["t.X"]), &[]).unwrap();
+        let t0 = Instant::now();
+        r.unregister("a", t0);
+        let late = t0 + Duration::from_secs(120);
+        let types = r.topology(late).types;
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].orphaned_for, Some(Duration::from_secs(120)));
+        r.sweep(late);
+        assert!(r.topology(late).types.is_empty());
+    }
+
+    #[test]
+    fn register_same_type_under_both_kinds_is_rejected() {
+        let r = reg();
+        let err = r
+            .register("a", "A", &s(&["t.X"]), &s(&["t.X"]))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RegisterError::DuplicateTypeAcrossKinds {
+                type_name: "t.X".into()
+            }
+        );
+        assert_eq!(r.service_of("a"), None);
+        assert!(r.topology(Instant::now()).types.is_empty());
+    }
+
+    #[test]
+    fn register_kind_conflict_with_owner_is_rejected() {
+        let r = reg();
+        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
+        let err = r.register("b", "B", &[], &s(&["t.X"])).unwrap_err();
+        assert_eq!(
+            err,
+            RegisterError::KindConflict {
+                type_name: "t.X".into(),
+                owner: "A".into(),
+                owner_kind: Kind::Command
+            }
+        );
+        assert_eq!(err.to_string(), "type t.X is owned as COMMAND by service A");
+        assert_eq!(r.service_of("b"), None);
+    }
+
+    #[test]
+    fn same_service_reregister_with_other_kind_is_rejected() {
+        let r = reg();
+        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
+        let err = r.register("a2", "A", &[], &s(&["t.X"])).unwrap_err();
+        assert!(matches!(err, RegisterError::KindConflict { .. }));
+        assert_eq!(r.service_of("a2"), None);
     }
 }
