@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
 use crate::registry::{InstanceId, Kind, PickError, Registry};
 use crate::session::{SendError, Sessions};
-use crate::telemetry::{Metrics, Outcome, set_parent_from_headers};
+use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 
 struct Pending {
     sender: InstanceId,
@@ -71,6 +71,43 @@ fn record_outcome(span: &tracing::Span, outcome: Outcome) {
     span.record("kraken.outcome", outcome.as_str());
 }
 
+/// One structured line per error outcome: hub-produced errors at warn, a handler's own error
+/// reply (`relayed`) at info. Identifiers only, never the payload or error details.
+fn log_outcome(
+    request_id: &str,
+    type_name: &str,
+    kind: Option<Kind>,
+    sender: &str,
+    handler: Option<&str>,
+    outcome: Outcome,
+    relayed: bool,
+) {
+    let kind = kind.map_or("unspecified", kind_label);
+    let handler = handler.unwrap_or("");
+    let outcome_label = outcome.as_str();
+    if relayed {
+        tracing::info!(
+            request_id,
+            kraken.type = type_name,
+            kraken.kind = kind,
+            kraken.sender = sender,
+            kraken.handler = handler,
+            kraken.outcome = outcome_label,
+            "request ended with error"
+        );
+    } else {
+        tracing::warn!(
+            request_id,
+            kraken.type = type_name,
+            kraken.kind = kind,
+            kraken.sender = sender,
+            kraken.handler = handler,
+            kraken.outcome = outcome_label,
+            "request ended with error"
+        );
+    }
+}
+
 impl Router {
     pub fn new(
         registry: Arc<Registry>,
@@ -92,26 +129,35 @@ impl Router {
     pub fn route(self: &Arc<Self>, sender: &str, req: Request) {
         let id = req.id.clone();
         let type_name = req.r#type.clone();
-        let span = tracing::info_span!(
-            "hub.route",
-            kraken.type = %req.r#type,
-            kraken.kind = ?req.kind(),
-            kraken.sender = %sender,
-            kraken.handler = tracing::field::Empty,
-            kraken.outcome = tracing::field::Empty,
-        );
-        set_parent_from_headers(&span, &req.headers);
         let req_kind = match req.kind() {
             RequestKind::Command => Some(Kind::Command),
             RequestKind::Query => Some(Kind::Query),
             RequestKind::Unspecified => None,
         };
+        let span = tracing::info_span!(
+            "hub.route",
+            kraken.type = %req.r#type,
+            kraken.kind = req_kind.map_or("unspecified", kind_label),
+            kraken.sender = %sender,
+            kraken.handler = tracing::field::Empty,
+            kraken.outcome = tracing::field::Empty,
+        );
+        set_parent_from_headers(&span, &req.headers);
         let Some(req_kind) = req_kind.filter(|_| !type_name.is_empty()) else {
             // Without a kind there is no metrics label, so only kind-bearing requests are counted.
             if let Some(kind) = req_kind {
                 self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
             }
             record_outcome(&span, Outcome::InvalidRequest);
+            log_outcome(
+                &id,
+                &type_name,
+                req_kind,
+                sender,
+                None,
+                Outcome::InvalidRequest,
+                false,
+            );
             self.send_to(
                 sender,
                 error_message(
@@ -136,6 +182,15 @@ impl Router {
                 };
                 self.record_rejected(req_kind, &type_name, Outcome::NoHandler);
                 record_outcome(&span, Outcome::NoHandler);
+                log_outcome(
+                    &id,
+                    &type_name,
+                    Some(req_kind),
+                    sender,
+                    None,
+                    Outcome::NoHandler,
+                    false,
+                );
                 self.send_to(sender, error_message(&id, ErrorCode::NoHandler, message));
                 return;
             }
@@ -156,6 +211,15 @@ impl Router {
                 drop(pending);
                 self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
                 record_outcome(&span, Outcome::InvalidRequest);
+                log_outcome(
+                    &id,
+                    &type_name,
+                    Some(kind),
+                    sender,
+                    None,
+                    Outcome::InvalidRequest,
+                    false,
+                );
                 self.send_to(
                     sender,
                     error_message(
@@ -233,6 +297,17 @@ impl Router {
             _ => Outcome::Ok,
         };
         record_outcome(&entry.span, outcome);
+        if outcome == Outcome::HandlerError {
+            log_outcome(
+                &id,
+                &entry.type_name,
+                Some(entry.kind),
+                &entry.sender,
+                Some(&entry.handler),
+                outcome,
+                true,
+            );
+        }
         self.metrics.request_finished(
             entry.kind,
             &entry.type_name,
@@ -316,7 +391,17 @@ impl Router {
 
     /// `entry` must already have been removed from the map by the caller.
     fn finish_with_error(&self, id: &str, entry: Pending, code: ErrorCode, message: String) {
-        record_outcome(&entry.span, outcome_of(code));
+        let outcome = outcome_of(code);
+        record_outcome(&entry.span, outcome);
+        log_outcome(
+            id,
+            &entry.type_name,
+            Some(entry.kind),
+            &entry.sender,
+            Some(&entry.handler),
+            outcome,
+            false,
+        );
         self.metrics.request_finished(
             entry.kind,
             &entry.type_name,

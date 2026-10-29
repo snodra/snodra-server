@@ -147,7 +147,7 @@ impl Outcome {
     }
 }
 
-fn kind_label(kind: Kind) -> &'static str {
+pub fn kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::Command => "command",
         Kind::Query => "query",
@@ -183,6 +183,10 @@ impl Metrics {
             duration: meter
                 .f64_histogram("kraken_hub_request_duration_seconds")
                 .with_unit("s")
+                .with_boundaries(vec![
+                    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    30.0, 60.0,
+                ])
                 .with_description("Time from request receipt to terminal message")
                 .build(),
             in_flight: meter
@@ -233,7 +237,7 @@ impl Metrics {
             KeyValue::new("outcome", outcome.as_str()),
         ];
         self.requests.add(1, &attrs);
-        self.duration.record(duration.as_secs_f64(), &attrs);
+        self.duration.record(duration.as_secs_f64(), &attrs[..2]);
     }
 
     pub fn buffer_full(&self, service: &str) {
@@ -339,6 +343,67 @@ mod tests {
             "{attrs:?}"
         );
         assert_eq!(point.value(), 1);
+    }
+
+    fn exporter_and_metrics() -> (InMemoryMetricExporter, SdkMeterProvider, Arc<Metrics>) {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = Metrics::new(provider.meter("test"));
+        (exporter, provider, metrics)
+    }
+
+    #[test]
+    fn duration_histogram_has_kind_and_type_labels_only() {
+        let (exporter, provider, metrics) = exporter_and_metrics();
+        metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let metric = finished
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .find(|m| m.name() == "kraken_hub_request_duration_seconds")
+            .expect("histogram exported");
+        let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data() else {
+            panic!("expected f64 histogram");
+        };
+        let point = h.data_points().next().expect("one data point");
+        let mut attrs: Vec<(String, String)> = point
+            .attributes()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        attrs.sort();
+        assert_eq!(
+            attrs,
+            [
+                ("kind".to_string(), "command".to_string()),
+                ("type".to_string(), "a.B".to_string())
+            ]
+        );
+        assert_eq!(point.count(), 1);
+        assert_eq!(point.bounds().next(), Some(0.001));
+    }
+
+    #[test]
+    fn in_flight_returns_to_zero_after_finish() {
+        let (exporter, provider, metrics) = exporter_and_metrics();
+        metrics.request_started(Kind::Query);
+        metrics.request_finished(Kind::Query, "q.X", Outcome::Ok, Duration::ZERO);
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let metric = finished
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .find(|m| m.name() == "kraken_hub_in_flight")
+            .expect("up-down counter exported");
+        let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+            panic!("expected i64 sum");
+        };
+        let total: i64 = sum.data_points().map(|p| p.value()).sum();
+        assert_eq!(total, 0);
     }
 
     #[test]
