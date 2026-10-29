@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::proto::hub_server::Hub;
@@ -35,13 +35,23 @@ type ServerStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + S
 type Outbound = mpsc::Sender<Result<ServerMessage, Status>>;
 
 /// The one disconnect sequence: stream end, inbound error, rejected re-register and watchdog
-/// eviction all go through here. Removing the session drops its sender, which ends the client's
-/// inbound stream.
-pub fn disconnect(registry: &Registry, sessions: &Sessions, router: &Router, instance_id: &str) {
+/// eviction all go through here. It only acts if the session identified by `token` is still the
+/// registered one, so a late disconnect of an old stream never touches a newer stream that reused
+/// the instance id. Removing the session drops its sender, which ends the client's inbound stream.
+pub fn disconnect(
+    registry: &Registry,
+    sessions: &Sessions,
+    router: &Router,
+    instance_id: &str,
+    token: u64,
+) -> bool {
+    let Some(session) = sessions.remove_if(instance_id, token) else {
+        return false;
+    };
     router.on_disconnect(instance_id);
-    let service = sessions.remove(instance_id).map(|s| s.service);
     registry.unregister(instance_id, Instant::now());
-    info!(instance = %instance_id, service = service.as_deref().unwrap_or("unknown"), "disconnect");
+    info!(instance = %instance_id, service = %session.service, "disconnect");
+    true
 }
 
 /// Response stream that tells the stream task when it ended because every sender is gone (the
@@ -161,19 +171,16 @@ async fn run_stream(
     }
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
-    ctx.sessions.insert(&instance_id, &service, tx.clone());
+    let token = ctx.sessions.insert(&instance_id, &service, tx.clone());
     // From here on the sessions map holds the only strong sender, so removing the session ends
     // the outbound stream; this task keeps a weak handle for its own replies.
     let out = tx.downgrade();
     drop(tx);
 
-    // `evicted`: the session was removed by someone else (watchdog, or replaced by a newer
-    // stream with the same instance id); its cleanup already happened and must not run again.
-    let mut evicted = false;
     loop {
         let msg = tokio::select! {
             biased;
-            ended = &mut ended => { evicted = ended.is_ok(); break; }
+            _ = &mut ended => break,
             msg = inbound.next() => msg,
         };
         let msg = match msg {
@@ -192,28 +199,27 @@ async fn run_stream(
                     reg.service_name = service.clone();
                 }
                 if let Err(status) = ctx.register(&reg) {
-                    match out.upgrade() {
-                        Some(tx) => {
-                            let _ = tx.send(Err(status)).await;
-                        }
-                        None => evicted = true,
+                    // Best effort: a full buffer must not keep this task alive.
+                    if let Some(tx) = out.upgrade() {
+                        let _ = tx.try_send(Err(status));
                     }
                     break;
                 }
             }
             Some(client_message::Message::Heartbeat(hb)) => {
                 ctx.sessions.touch(&instance_id, Instant::now());
-                let Some(tx) = out.upgrade() else {
-                    evicted = true;
-                    break;
-                };
+                let Some(tx) = out.upgrade() else { break };
                 let echo = ServerMessage {
                     message: Some(server_message::Message::Heartbeat(Heartbeat {
                         sent_at_ms: hb.sent_at_ms,
                     })),
                 };
-                if tx.send(Ok(echo)).await.is_err() {
-                    break;
+                match tx.try_send(Ok(echo)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!(instance = %instance_id, "outbound buffer full, heartbeat echo dropped");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             Some(client_message::Message::Request(req)) => ctx.router.route(&instance_id, req),
@@ -221,7 +227,11 @@ async fn run_stream(
             None => {}
         }
     }
-    if !evicted {
-        disconnect(&ctx.registry, &ctx.sessions, &ctx.router, &instance_id);
-    }
+    disconnect(
+        &ctx.registry,
+        &ctx.sessions,
+        &ctx.router,
+        &instance_id,
+        token,
+    );
 }

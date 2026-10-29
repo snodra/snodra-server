@@ -5,8 +5,8 @@ use std::time::Duration;
 use common::{FakeClient, start_hub};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{
-    ClientMessage, ErrorCode, Heartbeat, Request, RequestKind, ServerMessage, client_message,
-    reply, server_message,
+    ClientMessage, ErrorCode, Heartbeat, Request, RequestKind, client_message, reply,
+    server_message,
 };
 use tonic::Code;
 
@@ -190,10 +190,15 @@ async fn routing_key_sticks_to_one_instance_of_two() {
     ))
     .await
     .unwrap();
-    let a1_first = tokio::select! {
-        r = a1.rx.message() => { r.unwrap().unwrap(); true }
-        r = a2.rx.message() => { r.unwrap().unwrap(); false }
-    };
+    let first = tokio::time::timeout(SHORT, async {
+        tokio::select! {
+            r = a1.rx.message() => { r.unwrap().unwrap(); true }
+            r = a2.rx.message() => { r.unwrap().unwrap(); false }
+        }
+    })
+    .await
+    .expect("no instance received the first request");
+    let a1_first = first;
     for i in 1..20 {
         b.tx.send(FakeClient::request(
             &format!("k{i}"),
@@ -360,5 +365,71 @@ async fn reregister_replaces_type_list() {
     assert_eq!(expect_request(&mut a).await.id, "r2");
 }
 
-#[allow(dead_code)]
-fn _unused(_: ServerMessage) {}
+#[tokio::test]
+async fn late_disconnect_of_old_stream_does_not_evict_reconnected_instance() {
+    let addr = start_hub(Config::default()).await;
+    let first = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
+    let mut second = FakeClient::connect(addr).await;
+    second.instance_id = first.instance_id.clone();
+    second.send_register("a", &["a.Do"], &[]).await;
+    second.tx.send(heartbeat(1)).await.unwrap();
+    second.next_within(SHORT).await.unwrap().unwrap();
+
+    // The first stream ends late; the replaced session's task must not touch the new one.
+    drop(first);
+    let mut b = FakeClient::register(addr, "b", &[], &[]).await;
+    // Give the hub a round trip on b's stream so the old stream's close is likely processed.
+    b.tx.send(heartbeat(2)).await.unwrap();
+    b.next_within(SHORT).await.unwrap().unwrap();
+
+    b.tx.send(FakeClient::request(
+        "r1",
+        RequestKind::Command,
+        "a.Do",
+        "",
+        0,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(expect_request(&mut second).await.id, "r1");
+    second
+        .tx
+        .send(FakeClient::reply_ok("r1", b"{}"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        b.next_within(SHORT).await.unwrap().unwrap().message,
+        Some(server_message::Message::Reply(_))
+    ));
+    // The second stream is still open: heartbeat still echoes.
+    second.tx.send(heartbeat(3)).await.unwrap();
+    assert!(second.next_within(SHORT).await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn rejected_reregister_closes_stream_and_unregisters() {
+    let addr = start_hub(Config::default()).await;
+    let mut other = FakeClient::register(addr, "other", &["o.Do"], &[]).await;
+    other.tx.send(heartbeat(1)).await.unwrap();
+    other.next_within(SHORT).await.unwrap().unwrap();
+
+    let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
+    a.tx.send(heartbeat(1)).await.unwrap();
+    a.next_within(SHORT).await.unwrap().unwrap();
+    a.send_register("a", &["o.Do"], &[]).await;
+    let status = a.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert!(a.next_within(SHORT).await.is_none());
+
+    let mut b = FakeClient::register(addr, "b", &[], &[]).await;
+    b.tx.send(FakeClient::request(
+        "r1",
+        RequestKind::Command,
+        "a.Do",
+        "",
+        0,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(expect_error(&mut b).await.code, ErrorCode::NoHandler as i32);
+}

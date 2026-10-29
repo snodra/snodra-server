@@ -80,9 +80,9 @@ async fn watchdog(
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        for id in sessions.stale(now, timeout) {
+        for (id, token) in sessions.stale_with_tokens(now, timeout) {
             warn!(instance = %id, "heartbeat timeout, evicting");
-            service::disconnect(&registry, &sessions, &router, &id);
+            service::disconnect(&registry, &sessions, &router, &id, token);
         }
         registry.sweep(now);
     }
