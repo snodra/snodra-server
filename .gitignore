@@ -14,3 +14,7 @@
 .idea/
 .vscode/
 *.swp
+
+# Local worktrees and SDD scratch
+.worktrees/
+.superpowers/
