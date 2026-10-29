@@ -43,12 +43,7 @@ cargo run
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
 
-**Topology view.** `GET /topology` on `KRAKEN_HUB_HTTP_LISTEN` returns the same snapshot as the
-`Topology` RPC as JSON (camelCase fields, `kind` as `COMMAND` or `QUERY`); every other path is 404.
-`kraken-hub --topology` prints the local hub's topology as a table (`--topology --json` as JSON);
-it probes `127.0.0.1` on the port of `KRAKEN_HUB_LISTEN` with a 3 s timeout and exits 1 on
-failure. Unknown or conflicting flags print the usage to stderr and exit 2.
-The full section is written with the topology view's documentation task.
+The topology view (`GET /topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view).
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
   unset keeps that default; setting it to an empty string disables OTLP export, which is useful
@@ -57,8 +52,107 @@ The full section is written with the topology view's documentation task.
   or no `Register`, within it is closed with `DEADLINE_EXCEEDED` `no Register within 10s`. A
   `Register` with an empty `instance_id` or `service_name` is closed with `INVALID_ARGUMENT`.
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
-  AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7001` (and map the compose
+  AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the topology HTTP port; map the compose
   host port accordingly).
+
+## Topology view
+
+The hub can show who is connected right now: every service with its live instances, which command
+and query types each instance handles, who owns each type, and how many requests are in flight
+(as handler and as sender). It never contains payloads or headers. The same snapshot is served
+three ways:
+
+```sh
+grpcurl -plaintext localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
+curl localhost:7001/topology                                   # HTTP JSON
+kraken-hub --topology [--json]                                 # CLI inside the container
+```
+
+```sh
+docker exec kraken-hub /app/kraken-hub --topology
+docker exec kraken-hub /app/kraken-hub --topology --json
+```
+
+- `GET /topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as `COMMAND` or
+  `QUERY`); every other path is 404. **Builder call:** the HTTP endpoint is a second port (7001),
+  because the gRPC port speaks only HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
+- `kraken-hub --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
+  port of `KRAKEN_HUB_LISTEN` with a 3 s timeout. Exit codes: 0 success, 1 failure (hub
+  unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
+  With nothing connected it prints `no services connected` and a totals line.
+- Like the rest of the port-7000 surface, the topology has no authentication.
+
+### Snapshot fields
+
+Top level:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hubStartedAtMs` | int64 | hub start, epoch milliseconds |
+| `nowMs` | int64 | snapshot time, epoch milliseconds |
+| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, in ms |
+| `services` | list | one entry per service with at least one live session |
+| `types` | list | one entry per owned type, including orphaned ones |
+| `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight` (all counts) |
+
+`services[]`: `serviceName` (string) and `instances[]`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `instanceId` | string | instance id from `Register` |
+| `connectedSinceMs` | int64 | when the session started, epoch ms |
+| `lastHeartbeatAgeMs` | int64 | time since the last heartbeat, ms |
+| `stale` | bool | `lastHeartbeatAgeMs` > `heartbeatTimeoutMs` / 3 (see below) |
+| `inFlightAsHandler` | uint32 | requests currently being handled by this instance |
+| `inFlightAsSender` | uint32 | requests this instance sent that have no terminal message yet |
+| `commandTypes` | list of string | command types this instance registered |
+| `queryTypes` | list of string | query types this instance registered |
+
+`types[]`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | string | the command or query type name |
+| `kind` | string | `COMMAND` or `QUERY` |
+| `ownerService` | string | the service that owns the type |
+| `liveInstances` | uint32 | live instances of the owner that registered it |
+| `orphaned` | bool | the owner has no live instance (ownership is held during the grace period) |
+| `orphanedForMs` | int64 | how long it has been orphaned, ms; 0 when not orphaned |
+
+`totals.inFlight` counts requests in the router, so it can differ from the per-instance sums when
+a sender or handler is already gone.
+
+### Consistency
+
+A snapshot is three sequential reads (sessions, then registry, then router), each under its own
+lock and never nested. It is not a single atomic cut: a request or a disconnect can land between
+reads. Sessions are the base set: an instance appears only if it has a live session, and its
+types and in-flight counts are attached by instance id (empty or zero when absent).
+
+### Staleness
+
+**Builder call:** an instance is `stale` when its last heartbeat is older than a third of
+`heartbeatTimeoutMs`. It is still connected and still receives requests; the flag is an early
+warning before the hub evicts it at the full timeout.
+
+### Orphaned types
+
+**Builder call:** when the last instance of a service leaves, its types stay in `types` with
+`orphaned: true` and a growing `orphanedForMs` until `KRAKEN_HUB_OWNER_GRACE` expires and the
+sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
+
+### Register rejections
+
+**Builder call:** two additions to the registry rules.
+
+- A type listed under both `command_types` and `query_types` in one `Register` is rejected with
+  `INVALID_ARGUMENT`.
+- Registering a type under a different kind than its current owner uses (for example a query
+  type that the owner holds as a command) is rejected with `ALREADY_EXISTS`.
+
+On macOS port 7000 is held by AirPlay Receiver; see the port note under
+[Running locally](#running-locally). In the container smoke test map it, for example
+`-p 7002:7000 -p 7001:7001`.
 
 ## Protocol summary
 
@@ -130,7 +224,7 @@ with `HubClient::new(channel)`.
 
 ```sh
 docker build -t kraken-hub:dev .
-docker run --rm -p 7000:7000 -e KRAKEN_HUB_OTLP_ENDPOINT= kraken-hub:dev
+docker run --rm -p 7000:7000 -p 7001:7001 -e KRAKEN_HUB_OTLP_ENDPOINT= kraken-hub:dev
 ```
 
 The image is distroless (no shell, no curl), so its `HEALTHCHECK` runs the binary's own probe:
@@ -171,6 +265,8 @@ src/session.rs    per-connection outbound buffers
 src/router.rs     request forwarding, timeouts, reply relay, one terminal message per id
 src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
-tests/            integration tests over a real gRPC connection
+src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
+src/cli.rs        --health-check and --topology client modes
+tests/            integration tests over a real gRPC connection (topology.rs, http.rs, cli.rs)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
