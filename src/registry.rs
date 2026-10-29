@@ -5,11 +5,11 @@
 //!   hashing of the key (same key, same instance while membership is stable);
 //! - commands without a key and all queries go to one instance chosen round-robin.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use dashmap::DashMap;
 
 pub type InstanceId = String;
 
@@ -22,7 +22,7 @@ pub struct Instance {
 #[derive(Default)]
 pub struct Registry {
     /// message type name -> instances that registered it
-    by_type: DashMap<String, Vec<Instance>>,
+    by_type: Mutex<HashMap<String, Vec<Instance>>>,
     rr_counter: AtomicUsize,
 }
 
@@ -35,14 +35,15 @@ impl Registry {
     /// instance replaces its previous registration.
     pub fn register(&self, instance: Instance, types: impl IntoIterator<Item = String>) {
         self.unregister(&instance.instance_id);
+        let mut by_type = self.by_type.lock().unwrap();
         for t in types {
-            self.by_type.entry(t).or_default().push(instance.clone());
+            by_type.entry(t).or_default().push(instance.clone());
         }
     }
 
     /// Removes an instance from every type. Called on stream close or missed heartbeats.
     pub fn unregister(&self, instance_id: &str) {
-        self.by_type.retain(|_, instances| {
+        self.by_type.lock().unwrap().retain(|_, instances| {
             instances.retain(|i| i.instance_id != instance_id);
             !instances.is_empty()
         });
@@ -50,7 +51,8 @@ impl Registry {
 
     /// Picks the instance that should handle `message_type`, or `None` when nobody registered it.
     pub fn pick_owner(&self, message_type: &str, routing_key: &str) -> Option<Instance> {
-        let instances = self.by_type.get(message_type)?;
+        let by_type = self.by_type.lock().unwrap();
+        let instances = by_type.get(message_type)?;
         if instances.is_empty() {
             return None;
         }
@@ -65,7 +67,7 @@ impl Registry {
     }
 
     pub fn registered_types(&self) -> Vec<String> {
-        self.by_type.iter().map(|e| e.key().clone()).collect()
+        self.by_type.lock().unwrap().keys().cloned().collect()
     }
 }
 
@@ -74,7 +76,10 @@ mod tests {
     use super::*;
 
     fn inst(id: &str) -> Instance {
-        Instance { instance_id: id.into(), service_name: "svc".into() }
+        Instance {
+            instance_id: id.into(),
+            service_name: "svc".into(),
+        }
     }
 
     #[test]

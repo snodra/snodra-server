@@ -28,23 +28,22 @@ docker build -t kraken-hub .
 | Variable | Default | Meaning |
 |---|---|---|
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
-| `KRAKEN_HUB_OTLP_ENDPOINT` | unset | OTLP gRPC endpoint for traces and metrics |
-| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `30` | seconds without a heartbeat before an instance is dropped |
-| `KRAKEN_HUB_MAX_TIMEOUT_MS` | `30000` | clamp for `Request.timeout_ms` |
+| `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
+| `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
+| `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 |
+| `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` |
+| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold (`30`, `30s` or `500ms`) |
+| `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
+| `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 
 ## Layout
 
 ```
-src/main.rs      tracing, config, tonic server
+src/lib.rs       crate root, proto module, serve()
+src/main.rs      thin binary: config, telemetry, serve
+src/telemetry.rs tracing subscriber
 src/config.rs    KRAKEN_HUB_* parsing
 src/registry.rs  type -> instances, consistent hash / round-robin owner selection (unit tested)
 src/service.rs   Hub.Connect stream handling (Register, Heartbeat, Request -> NO_HANDLER)
 proto/hub.proto  protocol, synced from the umbrella repo
 ```
-
-> **Builder call:** the skeleton was written without a local Rust toolchain and has not been
-> compiled yet. Expect small compile fixes (prost field naming such as `r#type`, tonic 0.14 stream
-> type signatures) on the first `cargo build`.
-
-> **Builder call:** no `Cargo.lock` is committed yet; the first successful build should commit it,
-> since this is a binary crate.

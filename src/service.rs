@@ -11,7 +11,9 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::proto::hub_server::Hub;
-use crate::proto::{ClientMessage, Error, ErrorCode, Heartbeat, ServerMessage, client_message, server_message};
+use crate::proto::{
+    ClientMessage, Error, ErrorCode, Heartbeat, ServerMessage, client_message, server_message,
+};
 use crate::registry::{Instance, Registry};
 
 pub struct HubService {
@@ -72,7 +74,10 @@ impl Hub for HubService {
                             message: Some(server_message::Message::Error(Error {
                                 request_id: req.id,
                                 code: ErrorCode::NoHandler as i32,
-                                message: format!("routing not implemented; no handler for {}", req.r#type),
+                                message: format!(
+                                    "routing not implemented; no handler for {}",
+                                    req.r#type
+                                ),
                                 details: Vec::new(),
                             })),
                         };
@@ -92,6 +97,8 @@ impl Hub for HubService {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as ServerStream))
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as ServerStream
+        ))
     }
 }
