@@ -56,4 +56,4 @@ docker:
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
       --destination "registry.gitlab.damoreira.ml/kraken/kraken-hub:$CI_COMMIT_TAG"
-      --destination "registry.gitlab.damoreira.ml/kraken/kraken-hubatest"
+      --destination "registry.gitlab.damoreira.ml/kraken/kraken-hub:latest"
