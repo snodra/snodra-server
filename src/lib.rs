@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod registry;
+pub mod router;
 pub mod service;
 pub mod session;
 pub mod telemetry;
