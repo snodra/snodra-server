@@ -40,9 +40,14 @@ cargo run
 | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold (`30`, `30s` or `500ms`) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
+| `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
 
-- **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Setting it to an
-  empty string disables OTLP export, which is useful for `cargo run` without a collector.
+- **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
+  unset keeps that default; setting it to an empty string disables OTLP export, which is useful
+  for `cargo run` without a collector. (For every other variable an empty value means "unset".)
+- **Builder call:** `KRAKEN_HUB_HANDSHAKE_TIMEOUT` (default `10s`): a stream that sends nothing,
+  or no `Register`, within it is closed with `DEADLINE_EXCEEDED` `no Register within 10s`. A
+  `Register` with an empty `instance_id` or `service_name` is closed with `INVALID_ARGUMENT`.
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
   AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7001` (and map the compose
   host port accordingly).
@@ -53,13 +58,14 @@ A service connects with `Hub.Connect`, sends `Register` (service name, instance 
 command and query types) and then `Heartbeat` messages. A `Request` (kind, type, id, payload,
 optional `timeout_ms`) is routed to one live instance of the service that owns the type; the
 handler answers with a `Reply` carrying the same id, which the hub relays to the sender. Each
-request id gets exactly one terminal message: a `Reply` or a hub-produced error. The hub
-propagates W3C trace headers from the `Request` to the handler.
+request id gets exactly one terminal message: a `Reply` or a hub-produced error. The hub forwards
+the `Request` (headers included) unchanged and parents its `hub.route` span on the request's
+trace headers.
 
 Error codes:
 
 - Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, and **Builder call:**
-  `INVALID_REQUEST` (malformed request: missing kind or type, or a duplicate in-flight
+  `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
   `Request.id`). When the handler's outbound buffer is full, the hub answers `HANDLER_ERROR` with
   the message `handler busy`.
 - Handler-produced codes in a `Reply{error}` are forwarded unchanged.
@@ -83,6 +89,22 @@ with `HubClient::new(channel)`.
   re-register after a reconnect.
 - No scatter-gather: every request goes to exactly one handler.
 
+## Connection lifecycle
+
+- **Builder call:** HTTP/2 keepalive PINGs every 10 s, the connection is dropped when a PING is
+  not answered within 20 s; TCP keepalive is 30 s. These are constants in `src/lib.rs`.
+- A stream that misses heartbeats for `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is evicted: its session is
+  removed, its stream task stops at once (even if the client no longer reads), its registration is
+  dropped and its in-flight requests fail with `HANDLER_DISCONNECTED`.
+- A `Register` with an instance id that already has a live stream replaces the old stream (logged
+  at `info` as `session replaced by a new stream`); the old stream is closed.
+- **Builder call:** when a sender's buffer is full, a terminal `Reply` or `Error` is retried in
+  the background for up to 5 s before it is dropped (logged at `warn`, counted in
+  `kraken_hub_session_buffer_full_total{service}`).
+- Graceful shutdown on SIGTERM or Ctrl-C: health turns `NOT_SERVING`, every stream is closed with
+  `UNAVAILABLE` `hub shutting down` (in-flight requests fail as on a disconnect), connections get
+  at most 5 s to drain, then telemetry is flushed and the process exits.
+
 ## Observability
 
 - Traces: one span `hub.route` per request, with the outcome in `kraken.outcome`; parent context
@@ -90,7 +112,10 @@ with `HubClient::new(channel)`.
 - Metrics (OTLP): `kraken_hub_requests_total`, `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight`, `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`.
-- Health: the standard `grpc.health.v1.Health` service on the same port.
+- Health: the standard `grpc.health.v1.Health` service on the same port (service
+  `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
+  `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
+  `SERVING`, 1 otherwise.
 - Logs: JSON on stdout, filtered by `KRAKEN_HUB_LOG`.
 
 ## Image
@@ -99,6 +124,30 @@ with `HubClient::new(channel)`.
 docker build -t kraken-hub:dev .
 docker run --rm -p 7000:7000 -e KRAKEN_HUB_OTLP_ENDPOINT= kraken-hub:dev
 ```
+
+The image is distroless (no shell, no curl), so its `HEALTHCHECK` runs the binary's own probe:
+`HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/kraken-hub", "--health-check"]`.
+In compose, `depends_on` can wait for it:
+
+```yaml
+services:
+  kraken-hub:
+    image: kraken-hub:dev
+    environment:
+      KRAKEN_HUB_OTLP_ENDPOINT: http://otel-lgtm:4317
+    # The image already declares this healthcheck; repeat it only to change the timings.
+    healthcheck:
+      test: ["CMD", "/app/kraken-hub", "--health-check"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+  orders:
+    depends_on:
+      kraken-hub:
+        condition: service_healthy
+```
+
+`docker stop` sends SIGTERM to the hub (PID 1), which shuts down gracefully (see above).
 
 `kraken-hub:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
 releases (`vX.Y.Z`) to `registry.gitlab.damoreira.ml/kraken/kraken-hub:<tag>` and `:latest`.

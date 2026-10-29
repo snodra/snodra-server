@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -20,6 +21,9 @@ use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply,
 use crate::registry::{InstanceId, Kind, PickError, Registry};
 use crate::session::{SendError, Sessions};
 use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
+
+/// How long a terminal message waits for room in a full sender buffer before it is given up.
+const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Pending {
     sender: InstanceId,
@@ -143,7 +147,12 @@ impl Router {
             kraken.outcome = tracing::field::Empty,
         );
         set_parent_from_headers(&span, &req.headers);
-        let Some(req_kind) = req_kind.filter(|_| !type_name.is_empty()) else {
+        let Some(req_kind) = req_kind.filter(|_| !type_name.is_empty() && !id.is_empty()) else {
+            let message = if id.is_empty() {
+                "invalid request: missing id"
+            } else {
+                "invalid request: missing kind or type"
+            };
             // Without a kind there is no metrics label, so only kind-bearing requests are counted.
             if let Some(kind) = req_kind {
                 self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
@@ -160,11 +169,7 @@ impl Router {
             );
             self.send_to(
                 sender,
-                error_message(
-                    &id,
-                    ErrorCode::InvalidRequest,
-                    "invalid request: missing kind or type",
-                ),
+                error_message(&id, ErrorCode::InvalidRequest, message),
             );
             return;
         };
@@ -417,9 +422,39 @@ impl Router {
             .request_finished(kind, type_name, outcome, Duration::ZERO);
     }
 
+    /// Sends a terminal message (`Reply` or `Error`) to `instance`. `try_send` is the fast path;
+    /// when the buffer is full the message is handed to a background delivery that waits up to
+    /// [`TERMINAL_SEND_TIMEOUT`] for room, so a terminal message is never dropped just because
+    /// the sender is momentarily slow. At most one such task exists per removed pending entry,
+    /// so their number is bounded by the in-flight requests.
     fn send_to(&self, instance: &str, msg: ServerMessage) {
-        if let Err(e) = self.sessions.send(instance, msg) {
-            tracing::debug!(instance, error = %e, "dropping terminal message");
+        let Some(tx) = self.sessions.sender(instance) else {
+            tracing::debug!(instance, "sender gone, dropping terminal message");
+            return;
+        };
+        match tx.try_send(Ok(msg)) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => {
+                tracing::debug!(instance, "sender stream closed, dropping terminal message");
+            }
+            Err(TrySendError::Full(msg)) => {
+                let service = self
+                    .registry
+                    .service_of(instance)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let metrics = Arc::clone(&self.metrics);
+                let instance = instance.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send_timeout(msg, TERMINAL_SEND_TIMEOUT).await {
+                        let reason = match e {
+                            SendTimeoutError::Timeout(_) => "buffer still full",
+                            SendTimeoutError::Closed(_) => "stream closed",
+                        };
+                        tracing::warn!(instance, service, reason, "terminal message not delivered");
+                        metrics.buffer_full(&service);
+                    }
+                });
+            }
         }
     }
 }
@@ -429,13 +464,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
     use tonic::Status;
 
     type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
 
     fn fake(sessions: &Sessions, id: &str, service: &str, cap: usize) -> Rx {
         let (tx, rx) = mpsc::channel(cap);
-        sessions.insert(id, service, tx);
+        sessions.insert(id, service, tx, CancellationToken::new());
         rx
     }
 
@@ -651,5 +687,53 @@ mod tests {
         f.router.route("s1", request("r1", "t.Cmd", 0));
         expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
         assert_eq!(f.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_request_id_is_invalid_request() {
+        let mut f = fixture();
+        f.router.route("s1", request("", "t.Cmd", 0));
+        let msg = expect_error(&mut f.sender_rx, "", ErrorCode::InvalidRequest);
+        assert_eq!(msg, "invalid request: missing id");
+        assert!(f.handler_rx.try_recv().is_err());
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn reply_to_busy_sender_is_delivered_once_there_is_room() {
+        let f = fixture();
+        let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
+        f.router.route("s2", request("r1", "t.Cmd", 0));
+        // Fill s2's only slot so the reply's try_send hits a full buffer.
+        f.sessions.send("s2", ServerMessage::default()).unwrap();
+        f.router.on_reply("h1", payload_reply("r1"));
+        assert_eq!(f.router.in_flight(), 0);
+        assert_eq!(
+            s2_rx.recv().await.unwrap().unwrap(),
+            ServerMessage::default()
+        );
+        let got = tokio::time::timeout(Duration::from_secs(1), s2_rx.recv())
+            .await
+            .expect("reply delivered after the buffer drained")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.message,
+            Some(server_message::Message::Reply(payload_reply("r1")))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn error_to_busy_sender_is_given_up_after_the_delivery_timeout() {
+        let f = fixture();
+        let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
+        f.sessions.send("s2", ServerMessage::default()).unwrap();
+        f.router.route("s2", request("r1", "t.Nope", 0));
+        tokio::time::sleep(TERMINAL_SEND_TIMEOUT + Duration::from_millis(1)).await;
+        assert_eq!(
+            s2_rx.recv().await.unwrap().unwrap(),
+            ServerMessage::default()
+        );
+        assert!(s2_rx.try_recv().is_err());
     }
 }

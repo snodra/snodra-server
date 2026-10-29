@@ -433,3 +433,92 @@ async fn rejected_reregister_closes_stream_and_unregisters() {
     .unwrap();
     assert_eq!(expect_error(&mut b).await.code, ErrorCode::NoHandler as i32);
 }
+
+#[tokio::test]
+async fn connect_without_register_times_out() {
+    let config = Config {
+        handshake_timeout: Duration::from_millis(200),
+        ..Config::default()
+    };
+    let addr = start_hub(config).await;
+    let mut c = FakeClient::connect(addr).await;
+    let status = c.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert_eq!(status.message(), "no Register within 200ms");
+    assert!(c.next_within(SHORT).await.is_none());
+}
+
+#[tokio::test]
+async fn register_with_empty_identity_is_invalid_argument() {
+    let addr = start_hub(Config::default()).await;
+    let mut no_service = FakeClient::connect(addr).await;
+    no_service.send_register("", &["a.Do"], &[]).await;
+    let status = no_service.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let mut no_instance = FakeClient::connect(addr).await;
+    no_instance.instance_id = String::new();
+    no_instance.send_register("a", &["a.Do"], &[]).await;
+    let status = no_instance.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // Neither registered anything.
+    let mut b = FakeClient::register(addr, "b", &[], &[]).await;
+    b.tx.send(FakeClient::request(
+        "r1",
+        RequestKind::Command,
+        "a.Do",
+        "",
+        0,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(expect_error(&mut b).await.code, ErrorCode::NoHandler as i32);
+}
+
+#[tokio::test]
+async fn empty_request_id_is_invalid_request() {
+    let addr = start_hub(Config::default()).await;
+    let _a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
+    let mut b = FakeClient::register(addr, "b", &[], &[]).await;
+    b.tx.send(FakeClient::request("", RequestKind::Command, "a.Do", "", 0))
+        .await
+        .unwrap();
+    let e = expect_error(&mut b).await;
+    assert_eq!(e.code, ErrorCode::InvalidRequest as i32);
+    assert_eq!(e.message, "invalid request: missing id");
+}
+
+#[tokio::test]
+async fn health_probe_reports_serving() {
+    let addr = start_hub(Config::default()).await;
+    assert!(kraken_hub::health_probe(addr).await.unwrap());
+}
+
+#[tokio::test]
+async fn shutdown_closes_streams_and_returns_promptly() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kraken_hub::serve_with_shutdown(
+        Config::default(),
+        listener,
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
+    a.tx.send(heartbeat(1)).await.unwrap();
+    a.next_within(SHORT).await.unwrap().unwrap();
+
+    stop_tx.send(()).unwrap();
+    let status = a.next_within(SHORT).await.unwrap().unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "hub shutting down");
+    // Returns well before the 5 s drain bound: the open Connect stream was closed, not waited on.
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("serve returned")
+        .unwrap()
+        .unwrap();
+}

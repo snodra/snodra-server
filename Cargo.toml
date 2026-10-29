@@ -22,15 +22,13 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 prost = "0.14.4"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1"
-tower = "0.5.3"
+tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.34.0"
 opentelemetry = "0.33.1"
 opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33.1", features = ["grpc-tonic"] }
-uuid = { version = "1", features = ["v7", "serde"] }
-thiserror = "2"
 anyhow = "1"
 
 [build-dependencies]
@@ -38,5 +36,6 @@ tonic-prost-build = "0.14.8"
 prost-build = "0.14.4"
 
 [dev-dependencies]
+uuid = { version = "1", features = ["v7"] }
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio", "testing"] }

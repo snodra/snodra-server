@@ -203,7 +203,7 @@ impl Metrics {
                 .build(),
             buffer_full: meter
                 .u64_counter("kraken_hub_session_buffer_full_total")
-                .with_description("Requests rejected because a handler session buffer was full")
+                .with_description("Messages not delivered because a session buffer was full (busy handler, or a terminal message the sender did not read in time)")
                 .build(),
             seen: Mutex::new(Seen::default()),
         })

@@ -2,16 +2,24 @@
 //!
 //! Each connected stream is driven by one task (`run_stream`). The task owns the inbound half;
 //! the outbound half is the receiver of a per-session channel whose only long-lived sender is the
-//! one stored in [`Sessions`], so removing the session (disconnect, watchdog eviction) ends the
-//! client's inbound stream and wakes the task.
+//! one stored in [`Sessions`]. Every session carries a [`CancellationToken`]: removing or
+//! replacing the session cancels it, and the task exits at once, without waiting for the client
+//! to drain the response body (a stalled client may never do that). Dropping the response body
+//! (client went away) cancels the same token.
+//!
+//! Lock order is sessions -> registry, never the reverse: registry registration and
+//! unregistration for an instance run inside [`Sessions::with_current`] /
+//! [`Sessions::remove_if_then`], so only the stream that currently owns an instance id can change
+//! its registration.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
@@ -34,10 +42,16 @@ pub struct HubService {
 type ServerStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send + 'static>>;
 type Outbound = mpsc::Sender<Result<ServerMessage, Status>>;
 
-/// The one disconnect sequence: stream end, inbound error, rejected re-register and watchdog
-/// eviction all go through here. It only acts if the session identified by `token` is still the
-/// registered one, so a late disconnect of an old stream never touches a newer stream that reused
-/// the instance id. Removing the session drops its sender, which ends the client's inbound stream.
+/// The one disconnect sequence: stream end, inbound error, rejected register, watchdog eviction
+/// and shutdown all go through here. It only acts if the session identified by `token` is still
+/// the registered one, so a late disconnect of an old stream never touches a newer stream that
+/// reused the instance id.
+///
+/// Removing the session cancels it (the stream task exits) and drops its sender (the client's
+/// inbound stream ends once drained). The registry unregister runs under the same sessions lock,
+/// so no newer stream for the id can register in between and be unregistered by this one.
+/// `router.on_disconnect` runs right after the lock is released, because it sends terminal
+/// errors through [`Sessions`] (whose mutex is not reentrant).
 pub fn disconnect(
     registry: &Registry,
     sessions: &Sessions,
@@ -45,35 +59,30 @@ pub fn disconnect(
     instance_id: &str,
     token: u64,
 ) -> bool {
-    let Some(session) = sessions.remove_if(instance_id, token) else {
+    let Some(service) = sessions.remove_if_then(instance_id, token, |session| {
+        registry.unregister(instance_id, Instant::now());
+        session.service
+    }) else {
         return false;
     };
     router.on_disconnect(instance_id);
-    registry.unregister(instance_id, Instant::now());
     router.refresh_gauges();
-    info!(instance = %instance_id, service = %session.service, "disconnect");
+    info!(instance = %instance_id, service = %service, "disconnect");
     true
 }
 
-/// Response stream that tells the stream task when it ended because every sender is gone (the
-/// session was removed by someone else). If it is merely dropped (client went away) the task sees
-/// the channel close without a value and runs the disconnect itself.
-struct EndSignal {
+/// Response stream; dropping it (the client went away, or hyper finished the body) cancels the
+/// stream task.
+struct ResponseStream {
     inner: ReceiverStream<Result<ServerMessage, Status>>,
-    signal: Option<oneshot::Sender<()>>,
+    _cancel_on_drop: DropGuard,
 }
 
-impl Stream for EndSignal {
+impl Stream for ResponseStream {
     type Item = Result<ServerMessage, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = Pin::new(&mut self.inner).poll_next(cx);
-        if matches!(poll, Poll::Ready(None))
-            && let Some(signal) = self.signal.take()
-        {
-            let _ = signal.send(());
-        }
-        poll
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -92,19 +101,20 @@ impl Hub for HubService {
             buffer = 1;
         }
         let (tx, rx) = mpsc::channel(buffer);
-        let (end_tx, end_rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
         info!("connect");
 
         let ctx = StreamCtx {
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             router: Arc::clone(&self.router),
+            handshake_timeout: self.config.handshake_timeout,
         };
-        tokio::spawn(run_stream(ctx, inbound, tx, end_rx));
+        tokio::spawn(run_stream(ctx, inbound, tx, cancel.clone()));
 
-        let stream = EndSignal {
+        let stream = ResponseStream {
             inner: ReceiverStream::new(rx),
-            signal: Some(end_tx),
+            _cancel_on_drop: cancel.drop_guard(),
         };
         Ok(Response::new(Box::pin(stream) as ServerStream))
     }
@@ -114,29 +124,47 @@ struct StreamCtx {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     router: Arc<Router>,
+    handshake_timeout: Duration,
 }
 
 impl StreamCtx {
-    fn register(&self, reg: &Register) -> Result<(), Status> {
-        self.registry
-            .register(
+    /// Registers `reg` while the session `token` is provably the current one for its instance
+    /// id. `None` means the session was removed or replaced meanwhile (nothing was changed).
+    fn register(&self, token: u64, reg: &Register) -> Option<Result<(), Status>> {
+        let result = self.sessions.with_current(&reg.instance_id, token, || {
+            self.registry.register(
                 &reg.instance_id,
                 &reg.service_name,
                 &reg.command_types,
                 &reg.query_types,
             )
-            .map_err(|e| {
+        })?;
+        Some(match result {
+            Ok(()) => {
+                info!(
+                    service = %reg.service_name,
+                    instance = %reg.instance_id,
+                    commands = reg.command_types.len(),
+                    queries = reg.query_types.len(),
+                    "register"
+                );
+                Ok(())
+            }
+            Err(e) => {
                 warn!(error = %e, service = %reg.service_name, instance = %reg.instance_id, "register rejected");
-                Status::already_exists(e.to_string())
-            })?;
-        info!(
-            service = %reg.service_name,
-            instance = %reg.instance_id,
-            commands = reg.command_types.len(),
-            queries = reg.query_types.len(),
-            "register"
-        );
-        Ok(())
+                Err(Status::already_exists(e.to_string()))
+            }
+        })
+    }
+
+    fn disconnect(&self, instance_id: &str, token: u64) -> bool {
+        disconnect(
+            &self.registry,
+            &self.sessions,
+            &self.router,
+            instance_id,
+            token,
+        )
     }
 }
 
@@ -144,15 +172,30 @@ async fn run_stream(
     ctx: StreamCtx,
     mut inbound: Streaming<ClientMessage>,
     tx: Outbound,
-    mut ended: oneshot::Receiver<()>,
+    cancel: CancellationToken,
 ) {
-    // Handshake: the first message must be a successful Register. No session state exists yet,
-    // so every failure here just reports the status and ends the stream.
-    let first = match inbound.next().await {
-        Some(Ok(ClientMessage {
+    // Handshake: the first message must be a Register, within the handshake timeout. No session
+    // state exists yet, so every failure here just reports the status and ends the stream.
+    let first = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        first = tokio::time::timeout(ctx.handshake_timeout, inbound.next()) => first,
+    };
+    let first = match first {
+        Err(_elapsed) => {
+            warn!(timeout = ?ctx.handshake_timeout, "no Register within handshake timeout");
+            let _ = tx
+                .send(Err(Status::deadline_exceeded(format!(
+                    "no Register within {:?}",
+                    ctx.handshake_timeout
+                ))))
+                .await;
+            return;
+        }
+        Ok(Some(Ok(ClientMessage {
             message: Some(client_message::Message::Register(reg)),
-        })) => reg,
-        other => {
+        }))) => reg,
+        Ok(other) => {
             if let Some(Err(status)) = &other {
                 warn!(%status, "client stream error before register");
             } else {
@@ -166,13 +209,37 @@ async fn run_stream(
             return;
         }
     };
-    if let Err(status) = ctx.register(&first) {
-        let _ = tx.send(Err(status)).await;
+    if first.instance_id.is_empty() || first.service_name.is_empty() {
+        warn!(service = %first.service_name, instance = %first.instance_id, "register with empty identity");
+        let _ = tx
+            .send(Err(Status::invalid_argument(
+                "Register.instance_id and Register.service_name must not be empty",
+            )))
+            .await;
         return;
     }
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
-    let token = ctx.sessions.insert(&instance_id, &service, tx.clone());
+    // Session first, then the registration under it: a late disconnect of an older stream with
+    // the same instance id can then never unregister this stream's registration.
+    let token = ctx
+        .sessions
+        .insert(&instance_id, &service, tx.clone(), cancel.clone());
+    match ctx.register(token, &first) {
+        Some(Ok(())) => {}
+        Some(Err(status)) => {
+            // The replaced session's registration (if any) may still be in the registry; the
+            // full disconnect removes it along with this session.
+            ctx.disconnect(&instance_id, token);
+            // Best effort: the buffer may hold requests routed to this id meanwhile.
+            let _ = tx.try_send(Err(status));
+            return;
+        }
+        None => {
+            debug!(instance = %instance_id, "session replaced during handshake");
+            return;
+        }
+    }
     ctx.router.refresh_gauges();
     // From here on the sessions map holds the only strong sender, so removing the session ends
     // the outbound stream; this task keeps a weak handle for its own replies.
@@ -182,7 +249,7 @@ async fn run_stream(
     loop {
         let msg = tokio::select! {
             biased;
-            _ = &mut ended => break,
+            _ = cancel.cancelled() => break,
             msg = inbound.next() => msg,
         };
         let msg = match msg {
@@ -200,14 +267,17 @@ async fn run_stream(
                     reg.instance_id = instance_id.clone();
                     reg.service_name = service.clone();
                 }
-                if let Err(status) = ctx.register(&reg) {
-                    // Best effort: a full buffer must not keep this task alive.
-                    if let Some(tx) = out.upgrade() {
-                        let _ = tx.try_send(Err(status));
+                match ctx.register(token, &reg) {
+                    Some(Ok(())) => ctx.router.refresh_gauges(),
+                    Some(Err(status)) => {
+                        // Best effort: a full buffer must not keep this task alive.
+                        if let Some(tx) = out.upgrade() {
+                            let _ = tx.try_send(Err(status));
+                        }
+                        break;
                     }
-                    break;
+                    None => break,
                 }
-                ctx.router.refresh_gauges();
             }
             Some(client_message::Message::Heartbeat(hb)) => {
                 ctx.sessions.touch(&instance_id, Instant::now());
@@ -230,11 +300,5 @@ async fn run_stream(
             None => {}
         }
     }
-    disconnect(
-        &ctx.registry,
-        &ctx.sessions,
-        &ctx.router,
-        &instance_id,
-        token,
-    );
+    ctx.disconnect(&instance_id, token);
 }

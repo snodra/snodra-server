@@ -14,4 +14,6 @@ COPY --from=builder /app/target/release/kraken-hub /app/kraken-hub
 ENV KRAKEN_HUB_LISTEN=0.0.0.0:7000
 EXPOSE 7000
 USER nonroot
+# Distroless has no shell or curl: the binary probes its own gRPC health service.
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/kraken-hub", "--health-check"]
 ENTRYPOINT ["/app/kraken-hub"]

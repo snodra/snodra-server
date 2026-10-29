@@ -26,6 +26,9 @@ pub struct Config {
     pub owner_grace: Duration,
     /// Per-session outbound buffer, in messages. `KRAKEN_HUB_SESSION_BUFFER`, default 1024.
     pub session_buffer: usize,
+    /// A new `Connect` stream must send `Register` within this long or it is closed with
+    /// `DEADLINE_EXCEEDED`. `KRAKEN_HUB_HANDSHAKE_TIMEOUT`, default 10 s.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             heartbeat_timeout: Duration::from_secs(30),
             owner_grace: Duration::from_secs(60),
             session_buffer: 1024,
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -78,6 +82,9 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_SESSION_BUFFER") {
             c.session_buffer = v.parse().context("KRAKEN_HUB_SESSION_BUFFER")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_HANDSHAKE_TIMEOUT") {
+            c.handshake_timeout = parse_duration(&v).context("KRAKEN_HUB_HANDSHAKE_TIMEOUT")?;
+        }
         Ok(c)
     }
 }
@@ -110,6 +117,7 @@ mod tests {
         assert_eq!(c.heartbeat_timeout, Duration::from_secs(30));
         assert_eq!(c.owner_grace, Duration::from_secs(60));
         assert_eq!(c.session_buffer, 1024);
+        assert_eq!(c.handshake_timeout, Duration::from_secs(10));
         assert_eq!(c.log, "info");
     }
 
@@ -139,5 +147,14 @@ mod tests {
             otlp(Some("http://x:4317")).as_deref(),
             Some("http://x:4317")
         );
+    }
+
+    #[test]
+    fn handshake_timeout_is_read_from_env() {
+        let c = Config::from_lookup(|n| {
+            (n == "KRAKEN_HUB_HANDSHAKE_TIMEOUT").then(|| "250ms".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.handshake_timeout, Duration::from_millis(250));
     }
 }
