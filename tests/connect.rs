@@ -495,15 +495,20 @@ async fn health_probe_reports_serving() {
     assert!(kraken_hub::health_probe(addr).await.unwrap());
 }
 
-#[tokio::test]
-async fn shutdown_closes_streams_and_returns_promptly() {
+async fn shutdown_returns_promptly(with_http: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let http = if with_http {
+        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+    } else {
+        None
+    };
+    let http_addr = http.as_ref().map(|l| l.local_addr().unwrap());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(kraken_hub::serve_with_shutdown(
         Config::default(),
         listener,
-        None,
+        http,
         async move {
             let _ = stop_rx.await;
         },
@@ -511,6 +516,10 @@ async fn shutdown_closes_streams_and_returns_promptly() {
     let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
     a.tx.send(heartbeat(1)).await.unwrap();
     a.next_within(SHORT).await.unwrap().unwrap();
+    if let Some(http_addr) = http_addr {
+        let (status, _) = common::http_get(http_addr, "/topology").await;
+        assert_eq!(status, 200);
+    }
 
     stop_tx.send(()).unwrap();
     let status = a.next_within(SHORT).await.unwrap().unwrap_err();
@@ -522,6 +531,22 @@ async fn shutdown_closes_streams_and_returns_promptly() {
         .expect("serve returned")
         .unwrap()
         .unwrap();
+    if let Some(http_addr) = http_addr {
+        assert!(
+            tokio::net::TcpStream::connect(http_addr).await.is_err(),
+            "http port still accepts connections after shutdown"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shutdown_closes_streams_and_returns_promptly() {
+    shutdown_returns_promptly(false).await;
+}
+
+#[tokio::test]
+async fn shutdown_with_http_returns_promptly_and_closes_http_port() {
+    shutdown_returns_promptly(true).await;
 }
 
 #[tokio::test]

@@ -346,20 +346,18 @@ impl Registry {
 
     /// Read-only view of instances, their types by kind and type ownership state.
     pub fn topology(&self, now: Instant) -> RegistryTopology {
+        // Collect under the lock (the routing path shares it); sort after releasing it.
         let inner = self.inner.lock().unwrap();
-        let instances = inner
+        let mut instances: HashMap<String, InstanceTypes> = inner
             .instances
             .iter()
             .map(|(id, e)| {
-                let of_kind = |k: Kind| {
-                    let mut v: Vec<String> = e
-                        .types
+                let of_kind = |k: Kind| -> Vec<String> {
+                    e.types
                         .iter()
                         .filter(|(_, tk)| *tk == k)
                         .map(|(t, _)| t.clone())
-                        .collect();
-                    v.sort();
-                    v
+                        .collect()
                 };
                 (
                     id.clone(),
@@ -385,6 +383,11 @@ impl Registry {
                 },
             })
             .collect();
+        drop(inner);
+        for it in instances.values_mut() {
+            it.command_types.sort();
+            it.query_types.sort();
+        }
         types.sort_by(|a, b| a.type_name.cmp(&b.type_name));
         RegistryTopology { instances, types }
     }

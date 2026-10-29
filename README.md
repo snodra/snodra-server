@@ -63,7 +63,7 @@ and query types each instance handles, who owns each type, and how many requests
 three ways:
 
 ```sh
-grpcurl -plaintext localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
+grpcurl -plaintext -import-path proto -proto hub.proto localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
 curl localhost:7001/topology                                   # HTTP JSON
 kraken-hub --topology [--json]                                 # CLI inside the container
 ```
@@ -81,6 +81,9 @@ docker exec kraken-hub /app/kraken-hub --topology --json
   unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
   With nothing connected it prints `no services connected` and a totals line.
 - Like the rest of the port-7000 surface, the topology has no authentication.
+- The hub has no gRPC server reflection, hence the `-proto` flags. grpcurl's proto-JSON prints
+  int64 as strings and omits default values, so its output differs textually from
+  `curl :7001/topology`.
 
 ### Snapshot fields
 
@@ -133,7 +136,8 @@ types and in-flight counts are attached by instance id (empty or zero when absen
 
 **Builder call:** an instance is `stale` when its last heartbeat is older than a third of
 `heartbeatTimeoutMs`. It is still connected and still receives requests; the flag is an early
-warning before the hub evicts it at the full timeout.
+warning before the hub evicts it at the full timeout. `stale` assumes clients heartbeat at most
+every `heartbeatTimeoutMs / 3`; a brief `stale: true` right before a heartbeat arrives is normal.
 
 ### Orphaned types
 
@@ -148,11 +152,9 @@ sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
 - A type listed under both `command_types` and `query_types` in one `Register` is rejected with
   `INVALID_ARGUMENT`.
 - Registering a type under a different kind than its current owner uses (for example a query
-  type that the owner holds as a command) is rejected with `ALREADY_EXISTS`.
-
-On macOS port 7000 is held by AirPlay Receiver; see the port note under
-[Running locally](#running-locally). In the container smoke test map it, for example
-`-p 7002:7000 -p 7001:7001`.
+  type that the owner holds as a command) is rejected with `ALREADY_EXISTS`. A type's kind cannot
+  change while it is owned; change it only after every instance of the owner has left and the
+  owner grace sweep has removed the type.
 
 ## Protocol summary
 

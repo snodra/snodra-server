@@ -112,6 +112,8 @@ pub async fn serve_with_shutdown(
     );
 
     let stopping = CancellationToken::new();
+    // Set once, when shutdown begins; the gRPC drain and the HTTP join share one deadline from it.
+    let stop_began: Arc<std::sync::OnceLock<Instant>> = Arc::default();
     let http_task = http.map(|listener| {
         let state = TopologyState {
             registry: Arc::clone(&registry),
@@ -127,9 +129,13 @@ pub async fn serve_with_shutdown(
         let stopping = stopping.clone();
         info!(addr = ?listener.local_addr().ok(), "http listening");
         tokio::spawn(async move {
+            let token = stopping.clone();
             let result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move { stopping.cancelled().await })
+                .with_graceful_shutdown(async move { token.cancelled().await })
                 .await;
+            if !stopping.is_cancelled() {
+                warn!("http server stopped before shutdown was requested");
+            }
             info!("http stopped");
             result
         })
@@ -157,6 +163,7 @@ pub async fn serve_with_shutdown(
 
     let signal = {
         let stopping = stopping.clone();
+        let stop_began = Arc::clone(&stop_began);
         let watchdog = watchdog.abort_handle();
         let (registry, sessions, router) = (
             Arc::clone(&registry),
@@ -179,6 +186,7 @@ pub async fn serve_with_shutdown(
                 }
                 service::disconnect(&registry, &sessions, &router, &id, token);
             }
+            let _ = stop_began.set(Instant::now());
             stopping.cancel();
         }
     };
@@ -195,21 +203,28 @@ pub async fn serve_with_shutdown(
         result = server => result,
         _ = async {
             stopping.cancelled().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            let began = stop_began.get().copied().unwrap_or_else(Instant::now);
+            tokio::time::sleep_until(tokio::time::Instant::from_std(began + SHUTDOWN_GRACE)).await;
         } => {
             warn!(grace = ?SHUTDOWN_GRACE, "connections did not drain in time; stopping anyway");
             Ok(())
         }
     };
     watchdog.abort();
-    // Also covers the gRPC server ending on its own: stop HTTP, then wait for it within the grace.
+    // Also covers the gRPC server ending on its own: stop HTTP, then wait for it until the same
+    // deadline the gRPC drain used (shutdown start + grace), so the total stays within one grace.
     stopping.cancel();
-    if let Some(task) = http_task {
-        match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+    if let Some(mut task) = http_task {
+        let began = stop_began.get().copied().unwrap_or_else(Instant::now);
+        let deadline = tokio::time::Instant::from_std(began + SHUTDOWN_GRACE);
+        match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => warn!(error = %e, "http server failed"),
             Ok(Err(e)) => warn!(error = %e, "http task failed"),
-            Err(_) => warn!("http connections did not drain in time"),
+            Err(_) => {
+                warn!("http connections did not drain in time; aborting");
+                task.abort();
+            }
         }
     }
     result?;
