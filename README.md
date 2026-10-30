@@ -1,4 +1,20 @@
-# kraken-hub
+<h1 align="center">kraken-hub</h1>
+
+<p align="center">
+  A stateless gRPC router for commands and queries between kraken services, in the spirit of Axon Server.
+</p>
+
+<p align="center">
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/kraken-org/kraken-hub/badges/main/pipeline.svg"></a>
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/badges/release.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
+  <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
+  <img alt="image" src="https://img.shields.io/badge/image-distroless-blue?logo=docker&logoColor=white">
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken/-/tree/main/docs"><img alt="kraken docs" src="https://img.shields.io/badge/kraken-umbrella%20docs-0B5FFF"></a>
+  <img alt="license" src="https://img.shields.io/badge/license-pending-lightgrey">
+</p>
+
+---
 
 Axon-Server-like gRPC router for kraken. Services open one bidirectional stream (`Hub.Connect`),
 register the command and query types they handle, and the hub forwards each request to a live
@@ -9,6 +25,21 @@ Design and protocol: see the umbrella docs `../kraken/docs/05-services/hub.md` a
 `../kraken/docs/02-messaging.md`. The proto in `proto/hub.proto` is a copy of
 `../kraken/protocol/hub.proto` (see `proto/README.md`). Items marked **Builder call** below are
 implementation decisions that are not yet in the umbrella spec; the spec is updated separately.
+
+## Table of contents
+
+- [Build and test](#build-and-test)
+- [Running locally](#running-locally)
+- [Topology view](#topology-view)
+- [Protocol summary](#protocol-summary)
+- [Routing and limitations](#routing-and-limitations)
+- [Connection lifecycle](#connection-lifecycle)
+- [Observability](#observability)
+- [Image](#image)
+- [Layout](#layout)
+- [CI/CD pipeline](#cicd-pipeline)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Build and test
 
@@ -272,3 +303,33 @@ src/cli.rs        --health-check and --topology client modes
 tests/            integration tests over a real gRPC connection (topology.rs, http.rs, cli.rs)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
+
+
+## CI/CD pipeline
+
+Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml); runs on every push and merge request on a Rust image
+with `protobuf-compiler` installed.
+
+```mermaid
+flowchart LR
+    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Kaniko → registry"]
+```
+
+| Stage | Job | Runs | Produces |
+|---|---|---|---|
+| fmt | `fmt` | always | formatting check |
+| clippy | `clippy` | always | lint with warnings as errors |
+| test | `test` | always | unit and in-process integration tests |
+| docker | `docker` | only on tags `vX.Y.Z` | `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:vX.Y.Z` and `:latest` |
+
+The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `kraken-hub:dev`).
+
+## Contributing
+
+Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by merge request with a
+green pipeline; conventional commit messages. Design changes go to the umbrella repo first.
+Conventions: [`../kraken/docs/04-repositories.md`](../kraken/docs/04-repositories.md).
+
+## License
+
+No license has been chosen yet; all rights reserved until a `LICENSE` file lands.
