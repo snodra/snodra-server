@@ -254,7 +254,7 @@ services:
 `docker stop` sends SIGTERM to the hub (PID 1), which shuts down gracefully (see above).
 
 `kraken-hub:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
-releases (`vX.Y.Z`) to `registry.gitlab.damoreira.ml/kraken/kraken-hub:<tag>` and `:latest`.
+releases (`vX.Y.Z`) to `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:<tag>` and `:latest`.
 
 ## Layout
 
