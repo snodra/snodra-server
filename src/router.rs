@@ -308,7 +308,6 @@ impl Router {
         for id in overflow {
             self.reject_busy(&id, "queue full");
         }
-        self.refresh_flow_gauges(service);
         true
     }
 
@@ -328,7 +327,6 @@ impl Router {
             (f.service.clone(), ready)
         };
         if !ready.is_empty() {
-            self.refresh_flow_gauges(&service);
             self.forward_ready(ctx, instance_id, token, &service, ready);
         }
     }
@@ -337,7 +335,7 @@ impl Router {
     /// offers it as a target, and the requests still waiting for it are routed again, so a
     /// stopping instance draws no new work. What it was already forwarded it still answers.
     pub fn on_stopping(&self, ctx: &ContextId, instance_id: &str, token: u64) {
-        let (service, waiting) = {
+        let waiting = {
             let mut flows = self.flows.lock().unwrap();
             let Some(f) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
                 return;
@@ -346,13 +344,10 @@ impl Router {
             for item in &waiting {
                 f.assigned.remove(&item.id);
             }
-            (f.service.clone(), waiting)
+            waiting
         };
-        if !waiting.is_empty() {
-            self.refresh_flow_gauges(&service);
-            for item in waiting {
-                self.reroute(ctx, item);
-            }
+        for item in waiting {
+            self.reroute(ctx, item);
         }
     }
 
@@ -370,7 +365,6 @@ impl Router {
             *permits = permits.saturating_add(count).min(flow.initial);
             (flow.service.clone(), drain(flow))
         };
-        self.refresh_flow_gauges(&service);
         self.forward_ready(ctx, instance_id, token, &service, ready);
     }
 
@@ -401,22 +395,6 @@ impl Router {
             .values()
             .map(|f| f.queue.len())
             .sum()
-    }
-
-    fn refresh_flow_gauges(&self, service: &str) {
-        let (depth, permits) = {
-            let flows = self.flows.lock().unwrap();
-            flows
-                .values()
-                .filter(|f| f.service == service)
-                .fold((0u64, 0u64), |(d, p), f| {
-                    (
-                        d + f.queue.len() as u64,
-                        p + u64::from(f.permits.unwrap_or(0)),
-                    )
-                })
-        };
-        self.metrics.flow_set(service, depth, permits);
     }
 
     /// Load information of `candidates` for [`choose`].
@@ -820,7 +798,6 @@ impl Router {
                 }
             }
             Next::Forward(msg, service) => {
-                self.refresh_flow_gauges(&service);
                 if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
                     self.return_permit(handler, token);
                     self.forward_failed(id, handler, &service, e);
@@ -840,7 +817,6 @@ impl Router {
                     f.queue.remove(id);
                     f.assigned.remove(id);
                 }
-                self.refresh_flow_gauges(&service);
                 self.forward_ready(ctx, handler, token, &service, ready);
             }
             Next::Rejected(reason, service) => {
@@ -913,19 +889,16 @@ impl Router {
     pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str, token: u64) {
         // The flow state goes first: a request routed concurrently then either finds no flow and
         // fails at once, or was assigned before and is among the pending entries collected below.
-        let (service, waiting) = {
+        let waiting = {
             let mut flows = self.flows.lock().unwrap();
             match flows.get(instance_id) {
-                Some(f) if f.token == token => {
-                    let mut f = flows.remove(instance_id).expect("checked above");
-                    (Some(f.service), f.queue.drain())
-                }
-                _ => (None, Vec::new()),
+                Some(f) if f.token == token => flows
+                    .remove(instance_id)
+                    .map(|mut f| f.queue.drain())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
             }
         };
-        if let Some(service) = &service {
-            self.refresh_flow_gauges(service);
-        }
         // Queued requests never reached the instance: they are routed again, not failed.
         let waiting_ids: HashSet<&str> = waiting.iter().map(|q| q.id.as_str()).collect();
         let handled_by = |p: &Pending| p.handler == instance_id && p.handler_token == token;
@@ -979,6 +952,21 @@ impl Router {
     pub fn refresh_gauges(&self) {
         self.metrics.sessions_set(self.sessions.count_by_service());
         self.metrics.registered_types_set(&self.registry.snapshot());
+        self.metrics.flows_set(self.flow_gauges());
+    }
+
+    /// Requests queued and permits left per service, over flow-controlled instances: one pass
+    /// for the whole hub, run by the watchdog every tick (at most a second) instead of per
+    /// request, so the gauges are right after timeouts, departures and returned permits too.
+    fn flow_gauges(&self) -> HashMap<String, (u64, u64)> {
+        let flows = self.flows.lock().unwrap();
+        let mut by_service: HashMap<String, (u64, u64)> = HashMap::new();
+        for f in flows.values().filter(|f| f.permits.is_some()) {
+            let entry = by_service.entry(f.service.clone()).or_default();
+            entry.0 += f.queue.len() as u64;
+            entry.1 += u64::from(f.permits.unwrap_or(0));
+        }
+        by_service
     }
 
     /// Pending requests per instance (as handler and as sender) and the total pending count,
@@ -1694,6 +1682,10 @@ mod tests {
 
     impl Cluster {
         fn new() -> Self {
+            Self::with_metrics(Metrics::noop())
+        }
+
+        fn with_metrics(metrics: Arc<Metrics>) -> Self {
             let config = Config::default();
             let registry = Arc::new(Registry::new(config.owner_grace));
             let sessions = Arc::new(Sessions::new());
@@ -1701,7 +1693,7 @@ mod tests {
                 Arc::clone(&registry),
                 Arc::clone(&sessions),
                 Arc::new(config),
-                Metrics::noop(),
+                metrics,
             );
             let (tx, sender_rx) = mpsc::channel(64);
             let token = sessions.insert(&D, "s1", "web", meta(true), tx, CancellationToken::new());
@@ -1948,6 +1940,55 @@ mod tests {
         assert!(forwarded(&mut f.handler_rx).is_empty(), "ghost not sent");
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!((view.permits_available, view.queued), (1, 0));
+    }
+
+    /// The flow gauges follow the queues even when no further request comes: they are
+    /// refreshed by the watchdog's sweep (`refresh_gauges`), not per request.
+    #[tokio::test(start_paused = true)]
+    async fn flow_gauges_are_right_after_queued_timeouts_departures_and_permits() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut c = Cluster::with_metrics(Arc::clone(&m.metrics));
+        c.join("h1", Some(1));
+        let depth = |m: &crate::telemetry::test_support::TestMetrics| {
+            (
+                m.gauge("kraken_hub_queue_depth", "orders"),
+                m.gauge("kraken_hub_permits_available", "orders"),
+            )
+        };
+        c.router.route(&D, "s1", unkeyed("busy", 0, 10_000));
+        c.router.route(&D, "s1", unkeyed("waits", 0, 100));
+        c.router.refresh_gauges();
+        assert_eq!(depth(&m), (Some(1), Some(0)));
+
+        tokio::time::sleep(Duration::from_millis(101)).await; // "waits" times out in the queue
+        c.router.refresh_gauges();
+        assert_eq!(depth(&m), (Some(0), Some(0)), "after a queued timeout");
+
+        // A sender leaves with a request still queued.
+        let (tx, _rx2) = mpsc::channel(64);
+        let s2 = c
+            .sessions
+            .insert(&D, "s2", "web", meta(true), tx, CancellationToken::new());
+        let _ = c.router.open_session(&D, "s2", s2, "web", None);
+        c.router.route(&D, "s2", unkeyed("orphan", 0, 10_000));
+        c.router.refresh_gauges();
+        assert_eq!(depth(&m), (Some(1), Some(0)));
+        c.router.on_disconnect(&D, "s2", s2);
+        c.router.refresh_gauges();
+        assert_eq!(depth(&m), (Some(0), Some(0)), "after a sender departure");
+
+        c.router.on_reply(&D, "h1", payload_reply("busy"));
+        c.permit("h1");
+        c.router.refresh_gauges();
+        assert_eq!(depth(&m), (Some(0), Some(1)), "after a returned permit");
+
+        c.leave("h1");
+        c.router.refresh_gauges();
+        assert_eq!(
+            depth(&m),
+            (Some(0), Some(0)),
+            "a service without flows reads 0"
+        );
     }
 
     fn candidate(id: &str, load_factor: u32, tags: &[(&str, &str)]) -> Candidate {

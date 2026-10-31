@@ -179,6 +179,7 @@ pub struct Metrics {
 struct Seen {
     sessions: HashSet<String>,
     types: HashSet<String>,
+    flows: HashSet<String>,
 }
 
 impl Metrics {
@@ -238,10 +239,22 @@ impl Metrics {
         })
     }
 
-    pub fn flow_set(&self, service: &str, queue_depth: u64, permits_available: u64) {
-        let attrs = [KeyValue::new("service", service.to_string())];
-        self.queue_depth.record(queue_depth, &attrs);
-        self.permits_available.record(permits_available, &attrs);
+    /// Queue depth and permits left per service (flow-controlled instances summed); services
+    /// that had flows before and have none now are written back as 0.
+    pub fn flows_set(&self, by_service: HashMap<String, (u64, u64)>) {
+        let mut seen = self.seen.lock().unwrap();
+        for gone in seen.flows.iter().filter(|s| !by_service.contains_key(*s)) {
+            let attrs = [KeyValue::new("service", gone.clone())];
+            self.queue_depth.record(0, &attrs);
+            self.permits_available.record(0, &attrs);
+        }
+        seen.flows = by_service.keys().cloned().collect();
+        drop(seen);
+        for (service, (depth, permits)) in by_service {
+            let attrs = [KeyValue::new("service", service)];
+            self.queue_depth.record(depth, &attrs);
+            self.permits_available.record(permits, &attrs);
+        }
     }
 
     pub fn queue_waited(&self, service: &str, type_name: &str, waited: Duration) {
@@ -351,6 +364,56 @@ impl Metrics {
                     ],
                 );
             }
+        }
+    }
+}
+
+/// In-memory metrics for unit tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+
+    pub(crate) struct TestMetrics {
+        pub metrics: Arc<Metrics>,
+        exporter: InMemoryMetricExporter,
+        provider: SdkMeterProvider,
+    }
+
+    pub(crate) fn test_metrics() -> TestMetrics {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        TestMetrics {
+            metrics: Metrics::new(provider.meter("test")),
+            exporter,
+            provider,
+        }
+    }
+
+    impl TestMetrics {
+        /// The last value of the u64 gauge `name` for `service`, as exported now.
+        pub(crate) fn gauge(&self, name: &str, service: &str) -> Option<u64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::U64(MetricData::Gauge(g)) = metric.data() else {
+                panic!("{name} is not a u64 gauge");
+            };
+            g.data_points()
+                .find(|p| {
+                    p.attributes()
+                        .any(|kv| kv.key.as_str() == "service" && kv.value.as_str() == service)
+                })
+                .map(|p| p.value())
         }
     }
 }
