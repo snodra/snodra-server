@@ -74,6 +74,8 @@ cargo run
 | `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to v2 clients in `RegisterAck`; `KRAKEN_HUB_HEARTBEAT_TIMEOUT` must be at least twice it |
 | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold for v2 sessions (`10`, `10s` or `500ms`) |
 | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold for v1 sessions (`Register.protocol_version` 0, clients that heartbeat every 10 s) |
+| `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one flow-controlled instance before new ones are rejected |
+| `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one flow-controlled instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
@@ -137,7 +139,7 @@ Top level:
 | `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (v2 sessions), in ms |
 | `services` | list | one entry per service with at least one live session |
 | `types` | list | one entry per owned type, including orphaned ones |
-| `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight` (all counts) |
+| `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight`, `queued` (all counts; `inFlight` includes queued requests) |
 
 `services[]`: `serviceName` (string) and `instances[]`:
 
@@ -153,6 +155,11 @@ Top level:
 | `queryTypes` | list of string | query types this instance registered |
 | `protocolVersion` | uint32 | `Register.protocol_version` of the session's first `Register` (0 = v1) |
 | `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty for v1 clients |
+| `flowControlled` | bool | the hub forwards to this instance only with permits |
+| `permitsAvailable` | uint32 | permits left (0 when not flow-controlled) |
+| `queued` | uint32 | requests waiting in the hub's queue for this instance |
+| `loadFactor` | uint32 | `Register.load_factor` as applied (0 reads as 100) |
+| `tags` | map | `Register.tags` |
 
 `types[]`:
 
@@ -212,15 +219,16 @@ trace headers.
 
 Error codes:
 
-- Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, and **Builder call:**
+- Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, **Builder call:**
   `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
-  `Request.id`). When the handler's outbound buffer is full, the hub answers `HANDLER_ERROR` with
-  the message `handler busy`.
+  `Request.id`), and `RESOURCE_EXHAUSTED` (full queue or session buffer; only to senders that
+  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`).
 - Handler-produced codes in a `Reply{error}` are forwarded unchanged.
 
-Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`
-and `invalid_request`. **Builder call:** any handler `Reply{error}` counts as `handler_error`,
-whatever its code.
+Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
+`invalid_request` and `resource_exhausted`. **Builder call:** any handler `Reply{error}` counts as
+`handler_error`, whatever its code; a capacity rejection by the hub (full queue or session
+buffer) counts as `resource_exhausted` whichever code the sender got.
 
 The generated client stubs are built with `build_transport(false)`; Rust clients create the stub
 with `HubClient::new(channel)`.
@@ -248,6 +256,35 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
 - `tests/compat.rs` is the compatibility suite: a raw v1 client gets no ack, only v1 messages and
   the legacy timeout; a v2 client gets the ack with the configured values before the echo.
 
+### Flow control
+
+Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
+
+- A v2 session that declares the `flow-control` capability and sends `Register.initial_permits > 0`
+  is **flow-controlled**: the hub forwards it a request only while it has a permit (one per
+  forward) and adds permits on every `Permits{count}` it sends. Every other session
+  (`initial_permits` 0, no capability, v1) is unlimited exactly as before P1.
+- Requests for a flow-controlled instance without a permit wait in its queue, ordered by
+  `Request.priority` (higher first) and then arrival. A queued request keeps its own deadline
+  (`TIMEOUT`) and fails with `HANDLER_DISCONNECTED` when the instance disconnects or is replaced.
+- A full queue (`KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` entries or
+  `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), like a full session buffer, answers
+  `RESOURCE_EXHAUSTED` to a sender that shares `flow-control` and `HANDLER_ERROR` `handler busy`
+  to any other sender, so no session gets a code it did not declare.
+- Permits, load factor and tags are read from the first `Register` of a stream.
+
+### Routing
+
+- **Keyed commands** go to the instance the owning service's consistent-hash ring returns for
+  the key. **Builder call:** each instance has `128 x load_factor / 100` virtual nodes (0 reads
+  as 100, clamped to 8..1024), points are `xxh64("<instance>#<i>")`, a colliding point belongs to
+  the smaller instance id, so every hub builds the same ring. Affinity wins: a full queue rejects
+  the request rather than rerouting it.
+- **Unkeyed commands and all queries** go to the instance with the best tag-match score (number
+  of `Register.tags` pairs equal to the sender's), then among those to instances that can take
+  a request now (unlimited, or a permit and an empty queue), then to the least
+  `(queued + forwarded) / load_factor`, round-robin among ties.
+
 ### Request timeouts
 
 With `override` the `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for the request's type:
@@ -269,8 +306,8 @@ without any client change; v1 clients always send a timeout, so for them an over
   library answers `NO_HANDLER` and the sender sees a transient error.
 - Single hub instance; no clustering or failover.
 - No authentication or authorization on the gRPC port.
-- Not durable: registrations, in-flight requests and sessions are in memory only. Clients
-  re-register after a reconnect.
+- Not durable: registrations, in-flight and queued requests and sessions are in memory only.
+  Clients re-register after a reconnect.
 - No scatter-gather: every request goes to exactly one handler.
 
 ## Connection lifecycle
@@ -300,7 +337,10 @@ without any client change; v1 clients always send a timeout, so for them an over
   is taken from the request's trace headers. Exported over OTLP.
 - Metrics (OTLP): `kraken_hub_requests_total`, `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight`, `kraken_hub_sessions`, `kraken_hub_registered_types`,
-  `kraken_hub_session_buffer_full_total`.
+  `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
+  `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
+  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `buffer_full`). No
+  per-instance labels.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
   `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
@@ -351,12 +391,13 @@ src/context.rs    ContextId (always "default")
 src/protocol.rs   version negotiation, RegisterAck
 src/registry.rs   service/type ownership and instance selection
 src/session.rs    per-connection outbound buffers
-src/router.rs     request forwarding, timeouts, reply relay, one terminal message per id
+src/router.rs     request forwarding, flow control, candidate choice, timeouts, reply relay, one terminal message per id
+src/queue.rs      per-instance queue (priority, then age; count and byte caps)
 src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
 src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
 src/cli.rs        --health-check and --topology client modes
-tests/            integration tests over a real gRPC connection (compat.rs, topology.rs, http.rs, cli.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, cli.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
