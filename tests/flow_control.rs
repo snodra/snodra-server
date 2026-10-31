@@ -173,8 +173,26 @@ async fn a_full_queue_is_resource_exhausted_for_flow_senders_and_busy_for_v1_sen
     }
 }
 
+/// The next request `c` gets, skipping acks and heartbeat echoes.
+async fn next_request(c: &mut FakeClient) -> Request {
+    loop {
+        if let server_message::Message::Request(r) = message(c).await {
+            return r;
+        }
+    }
+}
+
+async fn expect_error(c: &mut FakeClient) -> (String, ErrorCode) {
+    match message(c).await {
+        server_message::Message::Error(e) => (e.request_id.clone(), e.code()),
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+/// Only the forwarded request's outcome is unknown; the queued one never left the hub and,
+/// with no other instance to take it, is NO_HANDLER (retryable for commands too).
 #[tokio::test]
-async fn a_disconnecting_handler_fails_its_queued_requests() {
+async fn a_disconnecting_handler_fails_what_it_had_and_its_queue_finds_no_handler() {
     let addr = start_hub(config()).await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut handler, 1).await;
@@ -184,18 +202,82 @@ async fn a_disconnecting_handler_fails_its_queued_requests() {
     sender.tx.send(request("queued", 0)).await.unwrap();
     assert_eq!(expect_request(&mut handler).await.id, "forwarded");
     drop(handler);
-    let mut failed = Vec::new();
-    for _ in 0..2 {
-        match message(&mut sender).await {
-            server_message::Message::Error(e) => {
-                assert_eq!(e.code(), ErrorCode::HandlerDisconnected);
-                failed.push(e.request_id);
-            }
-            other => panic!("expected HANDLER_DISCONNECTED, got {other:?}"),
-        }
-    }
+    let mut failed = vec![
+        expect_error(&mut sender).await,
+        expect_error(&mut sender).await,
+    ];
     failed.sort();
-    assert_eq!(failed, ["forwarded", "queued"]);
+    assert_eq!(
+        failed,
+        [
+            ("forwarded".to_string(), ErrorCode::HandlerDisconnected),
+            ("queued".to_string(), ErrorCode::NoHandler)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn queued_commands_survive_a_reconnect_of_their_handler() {
+    let addr = start_hub(config()).await;
+    let mut old = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
+    handshake(&mut old, 1).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    handshake(&mut sender, 1).await;
+    for id in ["forwarded", "q1", "q2"] {
+        sender.tx.send(request(id, 0)).await.unwrap();
+    }
+    assert_eq!(expect_request(&mut old).await.id, "forwarded");
+    handshake(&mut sender, 2).await; // all three routed
+    // A new stream with the same instance id replaces the old one.
+    let mut new = FakeClient::register_flow_as(addr, &old.instance_id, "svc-h", &["h.Do"], 1).await;
+    assert_eq!(
+        expect_error(&mut sender).await,
+        ("forwarded".to_string(), ErrorCode::HandlerDisconnected)
+    );
+    assert_eq!(next_request(&mut new).await.id, "q1");
+    new.permits(1).await;
+    assert_eq!(next_request(&mut new).await.id, "q2");
+    nothing_within(&mut sender, Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn a_rolling_restart_hands_queued_commands_over_and_the_stopping_instance_draws_nothing() {
+    let addr = start_hub(config()).await;
+    let mut a = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
+    handshake(&mut a, 1).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    handshake(&mut sender, 1).await;
+    for id in ["on-a", "q1", "q2"] {
+        sender.tx.send(request(id, 0)).await.unwrap();
+    }
+    assert_eq!(expect_request(&mut a).await.id, "on-a");
+    handshake(&mut sender, 2).await;
+    let mut b = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
+    handshake(&mut b, 1).await;
+
+    // A stops gracefully: an empty Register, then it finishes its request.
+    a.send_register_flow("svc-h", &[], 1).await;
+    handshake(&mut a, 2).await;
+    assert_eq!(next_request(&mut b).await.id, "q1", "A's queue moves to B");
+    a.tx.send(FakeClient::reply_ok("on-a", b"{}"))
+        .await
+        .unwrap();
+    a.permits(1).await;
+    match message(&mut sender).await {
+        server_message::Message::Reply(r) => assert_eq!(r.request_id, "on-a"),
+        other => panic!("expected the reply, got {other:?}"),
+    }
+    for id in ["new-1", "new-2"] {
+        sender.tx.send(request(id, 0)).await.unwrap();
+    }
+    handshake(&mut sender, 3).await;
+    nothing_within(&mut a, Duration::from_millis(200)).await;
+    let mut on_b = Vec::new();
+    for _ in 0..3 {
+        b.permits(1).await;
+        on_b.push(next_request(&mut b).await.id);
+    }
+    assert_eq!(on_b, ["q2", "new-1", "new-2"]);
 }
 
 #[tokio::test]

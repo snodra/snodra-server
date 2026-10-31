@@ -367,6 +367,8 @@ async fn run_stream(
         }
     }
     ctx.router.refresh_gauges();
+    // Requests taken over from a replaced session go out now that the ack is queued.
+    ctx.router.start_session(&ctx.context, &instance_id, token);
     // From here on the sessions map holds the only strong sender, so removing the session ends
     // the outbound stream; this task keeps a weak handle for its own replies.
     let out = tx.downgrade();
@@ -395,6 +397,10 @@ async fn run_stream(
                 }
                 match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
+                        // No types left: a graceful stop. Its queue goes to other instances.
+                        if reg.command_types.is_empty() && reg.query_types.is_empty() {
+                            ctx.router.on_stopping(&ctx.context, &instance_id, token);
+                        }
                         ctx.router.refresh_gauges();
                         // Best effort like the heartbeat echo: a full buffer drops this ack.
                         if let (Some(ack), Some(tx)) = (&ack, out.upgrade())

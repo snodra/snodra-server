@@ -159,6 +159,15 @@ pub fn error_message(
     }
 }
 
+fn no_handler_message(type_name: &str, e: PickError) -> String {
+    match e {
+        PickError::UnknownType => format!("no handler registered for type {type_name}"),
+        PickError::NoLiveInstance { service } => {
+            format!("owner known, no instance for service {service}")
+        }
+    }
+}
+
 fn outcome_of(code: ErrorCode) -> Outcome {
     match code {
         ErrorCode::NoHandler => Outcome::NoHandler,
@@ -259,15 +268,92 @@ impl Router {
             ),
             assigned: HashSet::new(),
         };
-        {
+        let mut flow = flow;
+        let mut moved = Vec::new();
+        let mut overflow = Vec::new();
+        let replaced = {
             let mut flows = self.flows.lock().unwrap();
             if flows.get(instance_id).is_some_and(|f| f.token > token) {
                 return false;
             }
+            let replaced = flows.remove(instance_id).map(|mut old| {
+                // Requests the replaced session never got wait for this one instead of failing
+                // with it (ADR 0014): same order, same deadlines.
+                for item in old.queue.drain() {
+                    let id = item.id.clone();
+                    match flow.queue.push(item) {
+                        Ok(()) => {
+                            flow.assigned.insert(id.clone());
+                            moved.push(id);
+                        }
+                        Err(_) => overflow.push(id),
+                    }
+                }
+                old.token
+            });
             flows.insert(instance_id.to_string(), flow);
+            replaced
+        };
+        if let Some(old) = replaced {
+            let mut pending = self.pending.lock().unwrap();
+            for id in &moved {
+                if let Some(p) = pending
+                    .get_mut(id)
+                    .filter(|p| p.handler == instance_id && p.handler_token == old)
+                {
+                    p.handler_token = token;
+                }
+            }
+        }
+        for id in overflow {
+            self.reject_busy(&id, "queue full");
         }
         self.refresh_flow_gauges(service);
         true
+    }
+
+    /// Forwards what a new session can take of the queue it took over from the session it
+    /// replaced. Call once the session is current (after its ack).
+    pub fn start_session(&self, ctx: &ContextId, instance_id: &str, token: u64) {
+        let (service, ready) = {
+            let mut flows = self.flows.lock().unwrap();
+            let Some(f) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
+                return;
+            };
+            let ready = if f.permits.is_none() {
+                f.queue.drain()
+            } else {
+                drain(f)
+            };
+            (f.service.clone(), ready)
+        };
+        if !ready.is_empty() {
+            self.refresh_flow_gauges(&service);
+            self.forward_ready(ctx, instance_id, token, &service, ready);
+        }
+    }
+
+    /// The instance re-registered without types (a graceful stop): the registry no longer
+    /// offers it as a target, and the requests still waiting for it are routed again, so a
+    /// stopping instance draws no new work. What it was already forwarded it still answers.
+    pub fn on_stopping(&self, ctx: &ContextId, instance_id: &str, token: u64) {
+        let (service, waiting) = {
+            let mut flows = self.flows.lock().unwrap();
+            let Some(f) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
+                return;
+            };
+            let waiting = f.queue.drain();
+            for item in &waiting {
+                f.assigned.remove(&item.id);
+            }
+            (f.service.clone(), waiting)
+        };
+        if !waiting.is_empty() {
+            self.refresh_flow_gauges(&service);
+            for item in waiting {
+                self.reroute(ctx, item);
+            }
+        }
     }
 
     /// `Permits{count}` from session `token`: adds permits and forwards queued requests. Ignored
@@ -513,17 +599,10 @@ impl Router {
             return;
         };
 
-        let (kind, target) = match self.registry.pick_target(ctx, &type_name, &req.routing_key) {
+        let (kind, handler) = match self.pick_handler(ctx, sender, &type_name, &req.routing_key) {
             Ok(picked) => picked,
             Err(e) => {
-                let message = match e {
-                    PickError::UnknownType => {
-                        format!("no handler registered for type {type_name}")
-                    }
-                    PickError::NoLiveInstance { service } => {
-                        format!("owner known, no instance for service {service}")
-                    }
-                };
+                let message = no_handler_message(&type_name, e);
                 self.record_rejected(req_kind, &type_name, Outcome::NoHandler);
                 record_outcome(&span, Outcome::NoHandler);
                 log_outcome(
@@ -544,22 +623,6 @@ impl Router {
             }
         };
 
-        let handler = match target {
-            Target::Keyed(id) => id,
-            Target::Candidates {
-                mut candidates,
-                rotation,
-            } => {
-                let sender_tags = self
-                    .registry
-                    .placement_of(ctx, sender)
-                    .map(|p| p.tags)
-                    .unwrap_or_default();
-                let loads = self.loads(&candidates);
-                let i = choose(&candidates, &sender_tags, rotation, |id| loads[id]);
-                candidates.swap_remove(i).id
-            }
-        };
         span.record("kraken.handler", handler.as_str());
         let (sender_token, sender_flow_control) = match self.sessions.sender_info(ctx, sender) {
             Some((token, flow)) => (Some(token), flow),
@@ -622,6 +685,74 @@ impl Router {
         }
 
         self.dispatch(ctx, &id, &handler, handler_token, req);
+    }
+
+    /// The instance a request goes to: the ring owner of a keyed command, else the best of the
+    /// owner's instances for `sender` ([`choose`]).
+    fn pick_handler(
+        &self,
+        ctx: &ContextId,
+        sender: &str,
+        type_name: &str,
+        routing_key: &str,
+    ) -> Result<(Kind, InstanceId), PickError> {
+        let (kind, target) = self.registry.pick_target(ctx, type_name, routing_key)?;
+        let handler = match target {
+            Target::Keyed(id) => id,
+            Target::Candidates {
+                mut candidates,
+                rotation,
+            } => {
+                let sender_tags = self
+                    .registry
+                    .placement_of(ctx, sender)
+                    .map(|p| p.tags)
+                    .unwrap_or_default();
+                let loads = self.loads(&candidates);
+                let i = choose(&candidates, &sender_tags, rotation, |id| loads[id]);
+                candidates.swap_remove(i).id
+            }
+        };
+        Ok((kind, handler))
+    }
+
+    /// Routes a request that never left the hub again, because the instance it waited for left
+    /// or stopped: same id, same deadline (its timer keeps running), normal routing (a keyed
+    /// command goes to the new ring owner); no instance left is NO_HANDLER.
+    fn reroute(&self, ctx: &ContextId, item: Queued) {
+        let Some(server_message::Message::Request(req)) = item.msg.message else {
+            return;
+        };
+        let id = item.id;
+        let Some(sender) = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|p| p.sender.clone())
+        else {
+            return; // ended meanwhile
+        };
+        let handler = match self.pick_handler(ctx, &sender, &req.r#type, &req.routing_key) {
+            Ok((_, handler)) => handler,
+            Err(e) => {
+                let message = no_handler_message(&req.r#type, e);
+                self.fail(&id, ErrorCode::NoHandler, message);
+                return;
+            }
+        };
+        let token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(p) = pending.get_mut(&id) else {
+                return;
+            };
+            p.handler = handler.clone();
+            p.handler_token = token;
+            p.span.record("kraken.handler", handler.as_str());
+        }
+        tracing::debug!(request_id = %id, handler = %handler, "queued request routed again");
+        self.dispatch(ctx, &id, &handler, token, req);
     }
 
     /// Forwards a routed request (its pending entry exists) to `handler`'s session `token`: at
@@ -782,16 +913,21 @@ impl Router {
     pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str, token: u64) {
         // The flow state goes first: a request routed concurrently then either finds no flow and
         // fails at once, or was assigned before and is among the pending entries collected below.
-        let service = {
+        let (service, waiting) = {
             let mut flows = self.flows.lock().unwrap();
             match flows.get(instance_id) {
-                Some(f) if f.token == token => flows.remove(instance_id).map(|f| f.service),
-                _ => None,
+                Some(f) if f.token == token => {
+                    let mut f = flows.remove(instance_id).expect("checked above");
+                    (Some(f.service), f.queue.drain())
+                }
+                _ => (None, Vec::new()),
             }
         };
         if let Some(service) = &service {
             self.refresh_flow_gauges(service);
         }
+        // Queued requests never reached the instance: they are routed again, not failed.
+        let waiting_ids: HashSet<&str> = waiting.iter().map(|q| q.id.as_str()).collect();
         let handled_by = |p: &Pending| p.handler == instance_id && p.handler_token == token;
         let sent_by = |p: &Pending| p.sender == instance_id && p.sender_token == Some(token);
         let (failed, dropped) = {
@@ -804,11 +940,15 @@ impl Router {
             let mut failed = Vec::new();
             let mut dropped = Vec::new();
             for id in ids {
+                let sent = sent_by(&pending[&id]);
+                if !sent && waiting_ids.contains(id.as_str()) {
+                    continue; // stays pending, routed again below
+                }
                 let entry = pending.remove(&id).expect("id collected under same lock");
-                if handled_by(&entry) {
-                    failed.push((id, entry));
-                } else {
+                if sent {
                     dropped.push((id, entry));
+                } else {
+                    failed.push((id, entry));
                 }
             }
             (failed, dropped)
@@ -819,6 +959,9 @@ impl Router {
             // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in flight.
             self.metrics.in_flight_add(entry.kind, -1);
             entry.span.record("kraken.outcome", "sender_disconnected");
+        }
+        for item in waiting {
+            self.reroute(ctx, item); // a dropped one is no longer pending: skipped
         }
         for (id, entry) in failed {
             entry.cancel.abort();
@@ -1317,7 +1460,6 @@ mod tests {
 
     struct FlowFx {
         router: Arc<Router>,
-        sessions: Arc<Sessions>,
         sender_rx: Rx,
         handler_rx: Rx,
         handler_token: u64,
@@ -1366,7 +1508,6 @@ mod tests {
         router.open_session(&D, "h1", handler_token, "orders", permits);
         FlowFx {
             router,
-            sessions,
             sender_rx,
             handler_rx,
             handler_token,
@@ -1541,29 +1682,169 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_disconnect_fails_queued_requests_like_forwarded_ones() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
-        f.router.route(&D, "s1", unkeyed("sent", 0, 0));
-        f.router.route(&D, "s1", unkeyed("queued", 0, 0));
-        f.router.on_disconnect(&D, "h1", f.handler_token);
-        let mut codes = Vec::new();
-        while let Ok(Ok(m)) = f.sender_rx.try_recv() {
-            if let Some(server_message::Message::Error(e)) = m.message {
-                codes.push((e.request_id.clone(), e.code()));
+    /// Service "orders" (t.Cmd, t.Qry) with handler instances added by [`Cluster::join`]; sender
+    /// s1 ("web") shares flow-control.
+    struct Cluster {
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        router: Arc<Router>,
+        sender_rx: Rx,
+        handlers: HashMap<&'static str, (Rx, u64)>,
+    }
+
+    impl Cluster {
+        fn new() -> Self {
+            let config = Config::default();
+            let registry = Arc::new(Registry::new(config.owner_grace));
+            let sessions = Arc::new(Sessions::new());
+            let router = Router::new(
+                Arc::clone(&registry),
+                Arc::clone(&sessions),
+                Arc::new(config),
+                Metrics::noop(),
+            );
+            let (tx, sender_rx) = mpsc::channel(64);
+            let token = sessions.insert(&D, "s1", "web", meta(true), tx, CancellationToken::new());
+            let _ = router.open_session(&D, "s1", token, "web", None);
+            Cluster {
+                registry,
+                sessions,
+                router,
+                sender_rx,
+                handlers: HashMap::new(),
             }
         }
-        codes.sort();
+
+        /// A handler instance connects like the stream task does: flow, session, registration.
+        fn join(&mut self, id: &'static str, permits: Option<u32>) {
+            let token = self.sessions.allocate_token();
+            assert!(self.router.open_session(&D, id, token, "orders", permits));
+            let (tx, rx) = mpsc::channel(64);
+            let replaced = self
+                .sessions
+                .insert_with_token(
+                    &D,
+                    id,
+                    "orders",
+                    meta(permits.is_some()),
+                    tx,
+                    CancellationToken::new(),
+                    token,
+                )
+                .unwrap();
+            if let Some(old) = replaced {
+                self.router.on_disconnect(&D, id, old);
+            }
+            self.registry
+                .register(&D, id, "orders", &["t.Cmd".into()], &["t.Qry".into()])
+                .unwrap();
+            self.router.start_session(&D, id, token);
+            self.handlers.insert(id, (rx, token));
+        }
+
+        /// The instance's stream ends (the disconnect sequence of the stream task).
+        fn leave(&self, id: &str) {
+            let token = self.handlers[id].1;
+            crate::service::disconnect(&self.registry, &self.sessions, &self.router, &D, id, token);
+        }
+
+        fn forwarded(&mut self, id: &str) -> Vec<String> {
+            forwarded(&mut self.handlers.get_mut(id).unwrap().0)
+        }
+
+        fn permit(&self, id: &str) {
+            self.router.on_permits(&D, id, self.handlers[id].1, 1);
+        }
+
+        /// Errors the sender got so far, sorted by request id.
+        fn errors(&mut self) -> Vec<(String, ErrorCode)> {
+            let mut out = Vec::new();
+            while let Ok(Ok(m)) = self.sender_rx.try_recv() {
+                if let Some(server_message::Message::Error(e)) = m.message {
+                    out.push((e.request_id.clone(), e.code()));
+                }
+            }
+            out.sort();
+            out
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_requests_of_a_departed_instance_go_to_another_one() {
+        let mut c = Cluster::new();
+        c.join("h1", Some(1));
+        c.router.route(&D, "s1", unkeyed("sent", 0, 0));
+        c.router.route(&D, "s1", request("q-keyed", "t.Cmd", 0));
+        c.router.route(&D, "s1", unkeyed("q-unkeyed", 0, 0));
+        assert_eq!(c.forwarded("h1"), ["sent"]);
+        c.join("h2", Some(1));
+        c.leave("h1");
         assert_eq!(
-            codes,
+            c.errors(),
+            [("sent".to_string(), ErrorCode::HandlerDisconnected)],
+            "only the forwarded request's outcome is unknown"
+        );
+        assert_eq!(c.forwarded("h2"), ["q-keyed"], "same id, new ring owner");
+        c.permit("h2");
+        assert_eq!(c.forwarded("h2"), ["q-unkeyed"]);
+        assert_eq!(c.router.in_flight(), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_requests_without_another_instance_end_with_no_handler() {
+        let mut c = Cluster::new();
+        c.join("h1", Some(1));
+        c.router.route(&D, "s1", unkeyed("sent", 0, 0));
+        c.router.route(&D, "s1", unkeyed("queued", 0, 0));
+        c.leave("h1");
+        assert_eq!(
+            c.errors(),
             [
-                ("queued".to_string(), ErrorCode::HandlerDisconnected),
+                ("queued".to_string(), ErrorCode::NoHandler),
                 ("sent".to_string(), ErrorCode::HandlerDisconnected)
             ]
         );
-        assert_eq!(f.router.queued_total(), 0);
-        assert!(f.router.flow_by_instance().is_empty());
-        let _ = f.sessions;
+        assert_eq!(c.router.queued_total(), 0);
+        assert!(c.router.flow_by_instance().keys().all(|id| id != "h1"));
+    }
+
+    #[tokio::test]
+    async fn a_replacement_takes_over_the_queue_of_the_session_it_replaced() {
+        let mut c = Cluster::new();
+        c.join("h1", Some(1));
+        c.router.route(&D, "s1", unkeyed("sent", 0, 0));
+        c.router.route(&D, "s1", unkeyed("q1", 0, 0));
+        c.router.route(&D, "s1", unkeyed("q2", 0, 0));
+        assert_eq!(c.forwarded("h1"), ["sent"]);
+        c.join("h1", Some(1)); // reconnect: a new stream with the same instance id
+        assert_eq!(
+            c.errors(),
+            [("sent".to_string(), ErrorCode::HandlerDisconnected)]
+        );
+        assert_eq!(c.forwarded("h1"), ["q1"], "the new stream's permit");
+        c.permit("h1");
+        assert_eq!(c.forwarded("h1"), ["q2"]);
+    }
+
+    #[tokio::test]
+    async fn a_stopping_instance_hands_its_queue_over_and_draws_nothing_new() {
+        let mut c = Cluster::new();
+        c.join("h1", Some(1));
+        c.router.route(&D, "s1", unkeyed("sent", 0, 0));
+        c.router.route(&D, "s1", unkeyed("queued", 0, 0));
+        c.join("h2", Some(1));
+        // h1 stops gracefully: an empty Register, then it finishes what it has.
+        let h1 = c.handlers["h1"].1;
+        c.registry.register(&D, "h1", "orders", &[], &[]).unwrap();
+        c.router.on_stopping(&D, "h1", h1);
+        assert_eq!(c.forwarded("h2"), ["queued"]);
+        c.router.on_reply(&D, "h1", payload_reply("sent"));
+        c.permit("h1");
+        for i in 0..4 {
+            c.router.route(&D, "s1", unkeyed(&format!("new-{i}"), 0, 0));
+        }
+        assert_eq!(c.forwarded("h1"), ["sent"], "nothing new for h1");
+        assert!(c.errors().is_empty());
     }
 
     #[tokio::test]

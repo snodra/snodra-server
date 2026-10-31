@@ -198,6 +198,35 @@ impl FakeClient {
         client
     }
 
+    /// Like [`FakeClient::register_flow`] for a given instance id: a reconnect of that instance.
+    pub async fn register_flow_as(
+        addr: SocketAddr,
+        instance_id: &str,
+        service: &str,
+        commands: &[&str],
+        initial_permits: u32,
+    ) -> Self {
+        let mut client = Self::connect(addr).await;
+        client.instance_id = instance_id.to_string();
+        client
+            .send_register_flow(service, commands, initial_permits)
+            .await;
+        client
+    }
+
+    /// A v2 `Register` sharing flow-control (first or re-register; an empty `commands` list is
+    /// what a client sends when it stops gracefully).
+    pub async fn send_register_flow(&self, service: &str, commands: &[&str], initial_permits: u32) {
+        let reg = Register {
+            protocol_version: 2,
+            capabilities: vec!["flow-control".to_string()],
+            client_version: "fake-client/1.0".to_string(),
+            initial_permits,
+            ..self.register_message(service, commands, &[])
+        };
+        self.send_raw_register(reg).await;
+    }
+
     pub async fn permits(&self, count: u32) {
         let msg = ClientMessage {
             message: Some(client_message::Message::Permits(Permits { count })),

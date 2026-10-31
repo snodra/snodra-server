@@ -391,7 +391,11 @@ impl Registry {
 
         let svc = inner.services.entry(service.to_string()).or_default();
         svc.instances.insert(instance_id.to_string());
-        svc.ring.add(instance_id, vnodes_for(placement.load_factor));
+        // An instance without types (a sender only, or one stopping gracefully: its last
+        // Register is empty) is no routing target: not on the ring, not a candidate.
+        if !wanted.is_empty() {
+            svc.ring.add(instance_id, vnodes_for(placement.load_factor));
+        }
         inner.instances.insert(
             instance_id.to_string(),
             InstanceEntry {
@@ -461,23 +465,23 @@ impl Registry {
             let id = svc.ring.lookup(hash).cloned().ok_or_else(no_live)?;
             return Ok((kind, Target::Keyed(id)));
         }
-        let rotation = svc.rr;
-        svc.rr = svc.rr.wrapping_add(1);
-        let candidates = svc
+        let candidates: Vec<Candidate> = svc
             .instances
             .iter()
-            .map(|id| {
-                let placement = instances
-                    .get(id)
-                    .map(|e| e.placement.clone())
-                    .unwrap_or_default();
-                Candidate {
+            .filter_map(|id| {
+                let entry = instances.get(id).filter(|e| !e.types.is_empty())?;
+                Some(Candidate {
                     id: id.clone(),
-                    load_factor: placement.load_factor,
-                    tags: placement.tags,
-                }
+                    load_factor: entry.placement.load_factor,
+                    tags: entry.placement.tags.clone(),
+                })
             })
             .collect();
+        if candidates.is_empty() {
+            return Err(no_live());
+        }
+        let rotation = svc.rr;
+        svc.rr = svc.rr.wrapping_add(1);
         Ok((
             kind,
             Target::Candidates {
@@ -733,6 +737,32 @@ mod tests {
         let topo = r.topology(Instant::now());
         assert_eq!(topo.instances["a"].load_factor, 100);
         assert_eq!(topo.instances["a"].tags["zone"], "z1");
+    }
+
+    /// A graceful stop re-registers without types: the instance stops drawing new work.
+    #[test]
+    fn an_instance_registered_without_types_is_no_routing_target() {
+        let r = reg();
+        two_instances(&r, &["t.Cmd"]);
+        r.register(&D, "b", "svc", &[], &[]).unwrap();
+        for key in 0..200 {
+            let (_, id) = r.pick(&D, "t.Cmd", &format!("key-{key}")).unwrap();
+            assert_eq!(
+                id, "a",
+                "keyed command {key} went to the stopping instance b"
+            );
+        }
+        let (_, target) = r.pick_target(&D, "t.Cmd", "").unwrap();
+        let Target::Candidates { candidates, .. } = target else {
+            panic!("expected candidates");
+        };
+        let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a"]);
+        r.register(&D, "a", "svc", &[], &[]).unwrap();
+        assert!(
+            r.pick(&D, "t.Cmd", "").is_err(),
+            "no instance left to route to"
+        );
     }
 
     #[test]
