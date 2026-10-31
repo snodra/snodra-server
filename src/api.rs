@@ -110,7 +110,8 @@ pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
         started_at_ms: t.hub_started_at_ms,
         now_ms: t.now_ms,
         build_id: build_id.to_string(),
-        grafana_url: config.grafana_url.clone(),
+        // The config check rejects user info; dropped here too, as this route is unauthenticated.
+        grafana_url: config.grafana_url.as_deref().map(without_userinfo),
         window_ms: ms(config.edge_stats_window),
     }
 }
@@ -469,7 +470,19 @@ pub fn fmt_size(bytes: usize) -> String {
     format!("{bytes}B")
 }
 
-/// A URL without the `user:password@` part, if it has one.
+/// A URL with its `user:password@` part removed entirely (for links).
+pub fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// A URL with its `user:password@` part masked as `***@`, if it has one.
 pub fn strip_userinfo(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
@@ -985,6 +998,30 @@ mod tests {
             assert_eq!(parse_size(&fmt_size(n)).unwrap(), n);
         }
         assert_eq!(fmt_size(1536), "1536B");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn version_never_carries_url_user_info() {
+        for url in [
+            "https://admin:hunter2@grafana.example/d/hub",
+            "https://admin@grafana.example/d/hub",
+        ] {
+            let c = Config {
+                grafana_url: Some(url.into()),
+                ..Config::default()
+            };
+            let v = version(&c, &topology(), "b1");
+            assert_eq!(
+                v.grafana_url.as_deref(),
+                Some("https://grafana.example/d/hub")
+            );
+            let json = serde_json::to_string(&v).unwrap();
+            assert!(!json.contains('@'), "{json}");
+            assert!(
+                !json.contains("hunter2") && !json.contains("admin"),
+                "{json}"
+            );
+        }
     }
 
     #[test]

@@ -274,9 +274,20 @@ const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
 
-/// A URL the dashboard may put in a link: `http://` or `https://` with a host, no whitespace or
-/// control characters (so it can never be a `javascript:` link or break out of an attribute).
+/// A URL the dashboard may put in a link: `http://` or `https://` with a host, no user info, no
+/// whitespace or control characters (so it can never be a `javascript:` link or break out of an attribute).
 fn check_link_url(url: &str) -> anyhow::Result<()> {
+    // Checked first, and without echoing the URL: the value may hold a password. The link is
+    // served unauthenticated (`/api/v1/version`), so credentials do not belong in it.
+    if let Some((_, rest)) = url.split_once("://") {
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if rest[..authority_end].contains('@') {
+            bail!(
+                "the URL carries user info (user:password@); the dashboard serves this link \
+                 unauthenticated, so put no credentials in it (Grafana asks for its own login)"
+            );
+        }
+    }
     let lower = url.to_ascii_lowercase();
     let rest = ["http://", "https://"]
         .iter()
@@ -653,6 +664,33 @@ mod tests {
             assert!(
                 with_env(&[("KRAKEN_HUB_GRAFANA_URL", bad)]).is_err(),
                 "{bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn grafana_url_must_not_carry_user_info() {
+        for bad in [
+            "https://user:pass@grafana.example",
+            "https://user@grafana.example",
+            "http://admin:hunter2@grafana.example:3000/d/hub",
+        ] {
+            let err =
+                with_env(&[("KRAKEN_HUB_GRAFANA_URL", bad)]).expect_err(&format!("{bad} accepted"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("KRAKEN_HUB_GRAFANA_URL"), "{msg}");
+            assert!(msg.contains("user info"), "{msg}");
+            assert!(!msg.contains(bad) && !msg.contains("hunter2"), "{msg}");
+        }
+        // An `@` after the host (path, query, fragment) is not user info.
+        for good in [
+            "https://grafana.example/d/x@y",
+            "https://grafana.example/d/x?by=a@b",
+            "https://grafana.example/#a@b",
+        ] {
+            assert!(
+                with_env(&[("KRAKEN_HUB_GRAFANA_URL", good)]).is_ok(),
+                "{good} rejected"
             );
         }
     }
