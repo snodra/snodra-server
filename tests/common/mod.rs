@@ -48,6 +48,29 @@ pub async fn start_hub_with_http(config: Config) -> (SocketAddr, Option<SocketAd
 
 /// Minimal HTTP/1.1 GET over a raw socket (bounded to 3 s). Returns `(status, body)`.
 pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    let r = http_get_full(addr, path).await;
+    (r.status, r.body)
+}
+
+/// Status, headers (names lowercased) and body of an HTTP response.
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl HttpResponse {
+    /// The first header named `name` (lowercase), if any.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Like [`http_get`], with the response headers.
+pub async fn http_get_full(addr: SocketAddr, path: &str) -> HttpResponse {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let fut = async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -61,20 +84,29 @@ pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
         .await
         .expect("http_get timed out");
     let (head, body) = raw.split_once("\r\n\r\n").expect("malformed HTTP response");
-    let status = head
-        .split_whitespace()
-        .nth(1)
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .expect("malformed status line");
-    let body = if head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let chunked = headers
+        .iter()
+        .any(|(n, v)| n == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    let body = if chunked {
         dechunk(body)
     } else {
         body.to_string()
     };
-    (status, body)
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 fn dechunk(mut rest: &str) -> String {

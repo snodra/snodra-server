@@ -1,10 +1,12 @@
 //! kraken-hub: routes commands and queries between kraken services over gRPC.
 //! See kraken/docs/05-services/hub.md.
 
+pub mod api;
 pub mod cli;
 pub mod config;
 pub mod context;
 pub mod edges;
+pub mod http;
 pub mod protocol;
 pub mod queue;
 pub mod registry;
@@ -24,8 +26,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use axum::Json;
-use axum::extract::State;
 use config::Config;
 use proto::hub_server::HubServer;
 use registry::Registry;
@@ -69,33 +69,9 @@ pub async fn bind_http(config: &Config) -> anyhow::Result<Option<TcpListener>> {
     }
 }
 
-/// Everything the `GET /topology` handler needs; the same `Arc`s the gRPC service holds.
-#[derive(Clone)]
-struct TopologyState {
-    registry: Arc<Registry>,
-    sessions: Arc<Sessions>,
-    router: Arc<Router>,
-    anchor: topology::ClockAnchor,
-    started: Instant,
-    hub_id: String,
-    heartbeat_timeout: Duration,
-}
-
-async fn get_topology(State(s): State<TopologyState>) -> Json<topology::Topology> {
-    Json(topology::snapshot(
-        &s.registry,
-        &s.sessions,
-        &s.router,
-        s.anchor,
-        s.started,
-        &s.hub_id,
-        s.heartbeat_timeout,
-        Instant::now(),
-    ))
-}
-
-/// Runs the hub on `listener` until `shutdown` completes. When `http` is given, `GET /topology`
-/// is served there (JSON mirror of the `Topology` RPC) and stops on the same signal. Shutdown sequence: health goes
+/// Runs the hub on `listener` until `shutdown` completes. When `http` is given, the HTTP routes
+/// ([`http::app`]: `GET /topology`, and the dashboard unless disabled) are served there and stop
+/// on the same signal. Shutdown sequence: health goes
 /// `NOT_SERVING`, the watchdog stops, every session is closed with `UNAVAILABLE` (its pending
 /// requests fail as on any disconnect), then the server drains connections for at most
 /// [`SHUTDOWN_GRACE`] and the function returns.
@@ -121,18 +97,17 @@ pub async fn serve_with_shutdown(
     // Set once, when shutdown begins; the gRPC drain and the HTTP join share one deadline from it.
     let stop_began: Arc<std::sync::OnceLock<Instant>> = Arc::default();
     let http_task = http.map(|listener| {
-        let state = TopologyState {
+        let app = http::app(http::HttpState {
             registry: Arc::clone(&registry),
             sessions: Arc::clone(&sessions),
             router: Arc::clone(&router),
+            config: Arc::clone(&config),
             anchor,
             started: anchor.instant,
-            hub_id: config.hub_id.clone(),
-            heartbeat_timeout: config.heartbeat_timeout,
-        };
-        let app = axum::Router::new()
-            .route("/topology", axum::routing::get(get_topology))
-            .with_state(state);
+            build_id: env!("CARGO_PKG_VERSION").to_string(),
+            stopping: stopping.clone(),
+            streams: Arc::default(),
+        });
         let stopping = stopping.clone();
         info!(addr = ?listener.local_addr().ok(), "http listening");
         tokio::spawn(async move {
