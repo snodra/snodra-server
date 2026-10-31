@@ -137,6 +137,7 @@ impl FakeClient {
                 instance_id: self.instance_id.clone(),
                 command_types: commands.iter().map(|s| s.to_string()).collect(),
                 query_types: queries.iter().map(|s| s.to_string()).collect(),
+                ..Register::default()
             })),
         };
         self.tx.send(msg).await.unwrap();

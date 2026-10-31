@@ -27,6 +27,17 @@ fmt:
   script:
     - cargo fmt --all -- --check
 
+# proto/hub.proto must stay byte-identical to the umbrella's kraken/protocol/hub.proto.
+proto-sync:
+  stage: fmt
+  before_script: []
+  variables:
+    KRAKEN_PROTO_SYNC_REQUIRED: "true"
+    KRAKEN_PROTO_SOURCE: "$CI_PROJECT_DIR/../kraken/protocol/hub.proto"
+  script:
+    - git clone --depth 1 "${KRAKEN_UMBRELLA_REPO:-https://gitlab.damoreira.ml/kraken-org/kraken.git}" ../kraken
+    - bash scripts/check-proto-sync.sh
+
 clippy:
   stage: clippy
   script:

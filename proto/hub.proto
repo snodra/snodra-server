@@ -50,6 +50,9 @@ message ServerMessage {
     Error error = 3;
     // Echo of a client Heartbeat, or an unsolicited keep-alive.
     Heartbeat heartbeat = 4;
+    // Protocol v2 only: answers every accepted Register of a session that declared
+    // Register.protocol_version >= 2. Never sent to a v1 session (protocol_version 0).
+    RegisterAck register_ack = 5;
   }
 }
 
@@ -58,6 +61,12 @@ message ServerMessage {
 // after startup). An empty service_name or instance_id is rejected. A type listed in both
 // command_types and query_types is rejected with INVALID_ARGUMENT. A type whose kind differs from
 // the kind its current owner registered is rejected with ALREADY_EXISTS.
+//
+// Version negotiation (ADR 0013): protocol_version, capabilities and client_version are read from
+// the first Register of a stream only; later Registers cannot change them. A v2 session
+// (protocol_version >= 2) gets a RegisterAck for every accepted Register, written before the echo
+// of any Heartbeat that follows it, so a new client tells a new hub (ack first) from an old one
+// (echo first, no ack). Fields 8-11 and 13 are allocated to later roadmap phases.
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -67,6 +76,52 @@ message Register {
   repeated string command_types = 3;
   // Fully qualified query type names this instance handles, for example "files.GetFileMetadata".
   repeated string query_types = 4;
+  // 0 (unset) is protocol v1: no RegisterAck, legacy heartbeat timeout. 2 is the version this
+  // file defines; 1 is never sent and reads as v1; anything above 2 is answered as 2.
+  uint32 protocol_version = 5;
+  // Optional protocol features this client supports. None are defined yet; unknown names are
+  // ignored by the hub.
+  repeated string capabilities = 6;
+  // Accepted and ignored until hub access control ships (roadmap P5). Never logged.
+  Credentials credentials = 7;
+  // Free text naming the client library and its version, for example "kraken-messaging/0.1.0".
+  // Shown in the topology view; never used for routing decisions.
+  string client_version = 12;
+}
+
+// How a client authenticates itself to the hub. Carried on Register; ignored until P5.
+message Credentials {
+  oneof kind {
+    // Static pre-shared token.
+    string token = 1;
+    // Client-credentials access token (JWT) issued by Keycloak.
+    string jwt = 2;
+  }
+}
+
+// The hub's answer to an accepted Register of a v2 session. Carries the values the client needs
+// to align with this hub: heartbeat cadence, the eviction threshold applied to this session and
+// the request timeout rules.
+message RegisterAck {
+  // Identifies this hub process (KRAKEN_HUB_ID, default hostname plus a random suffix).
+  string hub_id = 1;
+  // The negotiated protocol version: min(Register.protocol_version, hub's version), currently 2.
+  uint32 protocol_version = 2;
+  // Capabilities both sides support (the intersection). None are defined yet.
+  repeated string capabilities = 3;
+  // How often the client should send a Heartbeat.
+  uint32 heartbeat_interval_ms = 4;
+  // The hub evicts this session after this long without a Heartbeat.
+  uint32 heartbeat_timeout_ms = 5;
+  // Timeout applied to a Request with timeout_ms == 0 and no per-type override.
+  uint32 default_timeout_ms = 6;
+  // Upper clamp for Request.timeout_ms on types without a per-type override.
+  uint32 max_timeout_ms = 7;
+  // The context this session belongs to; always "default" until contexts ship.
+  string context = 8;
+  // Per-type timeout overrides (type name -> ms). For these types the override replaces both the
+  // default and the clamp; see Request.timeout_ms.
+  map<string, uint32> type_timeouts_ms = 9;
 }
 
 // Whether a Request is a command (exactly one handler, side effects) or a query (read only).
@@ -92,7 +147,11 @@ message Request {
   // "correlationId", "traceparent" (W3C trace context), "tracestate".
   map<string, string> headers = 6;
   // Per-request timeout hint in milliseconds. The hub uses it to emit TIMEOUT if no Reply
-  // arrives in time. Zero means use the hub default (5000 ms).
+  // arrives in time. The effective timeout is, with override = the hub's per-type override for
+  // `type` (RegisterAck.type_timeouts_ms):
+  //   timeout_ms > 0:  min(timeout_ms, override or max_timeout_ms)
+  //   timeout_ms == 0: override or default_timeout_ms (5000 ms unless configured)
+  // v2 clients send 0 unless their caller chose a timeout, so per-type overrides apply.
   uint32 timeout_ms = 7;
 }
 
@@ -111,7 +170,8 @@ message Reply {
 
 // Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, and INVALID_REQUEST
 // (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED,
-// PERMISSION_DENIED and INVALID_REQUEST inside a Reply.
+// PERMISSION_DENIED and INVALID_REQUEST inside a Reply. The hub never sends a code above 7 to a
+// v1 session. Codes 8 and 9 are allocated to later roadmap phases.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
@@ -130,6 +190,9 @@ enum ErrorCode {
   // The handling service evaluated the handler's @RequiresAuthentication expression as false for
   // an authenticated caller.
   PERMISSION_DENIED = 7;
+  // The request needs a feature the sender, the hub or the target did not declare. Declared in
+  // protocol v2; not produced yet.
+  UNSUPPORTED = 10;
 }
 
 message Error {
@@ -143,10 +206,11 @@ message Error {
   bytes details = 4;
 }
 
-// Keep-alive. Clients send one every 10 seconds; the hub drops an instance from the registry
-// after three missed heartbeats (30 seconds) or when the stream closes, whichever comes first.
-// The hub echoes a client Heartbeat with `sent_at_ms` unchanged; clients use the echo to confirm a
-// Register was processed.
+// Keep-alive. A v2 client sends one every RegisterAck.heartbeat_interval_ms (3 s by default) and
+// is evicted after RegisterAck.heartbeat_timeout_ms (10 s by default) without one. A v1 client
+// sends one every 10 seconds and is evicted after the legacy timeout (30 s by default). The stream
+// closing evicts at once. The hub echoes a client Heartbeat with `sent_at_ms` unchanged; clients
+// use the echo to confirm a Register was processed.
 message Heartbeat {
   // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
   int64 sent_at_ms = 1;
@@ -162,12 +226,15 @@ message TopologyResponse {
   int64 hub_started_at_ms = 1;
   // Wall clock (epoch milliseconds) at snapshot time.
   int64 now_ms = 2;
-  // The hub's heartbeat eviction threshold in milliseconds.
+  // The hub's heartbeat eviction threshold for v2 sessions in milliseconds (v1 sessions use the
+  // legacy threshold).
   int64 heartbeat_timeout_ms = 3;
   repeated ServiceTopology services = 4;
   // Sorted by type name.
   repeated TypeOwnership types = 5;
   TopologyTotals totals = 6;
+  // Same value as RegisterAck.hub_id.
+  string hub_id = 7;
 }
 
 message ServiceTopology {
@@ -182,7 +249,7 @@ message InstanceTopology {
   int64 connected_since_ms = 2;
   // now_ms minus the last heartbeat (or the registration time if none yet).
   int64 last_heartbeat_age_ms = 3;
-  // True when the last heartbeat is older than heartbeat_timeout_ms / 3.
+  // True when the last heartbeat is older than a third of this session's eviction threshold.
   bool stale = 4;
   // Pending requests forwarded to this instance.
   uint32 in_flight_as_handler = 5;
@@ -192,6 +259,10 @@ message InstanceTopology {
   repeated string command_types = 7;
   // Sorted.
   repeated string query_types = 8;
+  // Register.protocol_version of the session's first Register (0 = v1).
+  uint32 protocol_version = 9;
+  // Register.client_version, empty when the client did not send one.
+  string client_version = 10;
 }
 
 message TypeOwnership {

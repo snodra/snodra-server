@@ -225,6 +225,8 @@ impl Topology {
                             in_flight_as_sender: i.in_flight_as_sender,
                             command_types: i.command_types.clone(),
                             query_types: i.query_types.clone(),
+                            protocol_version: 0,
+                            client_version: String::new(),
                         })
                         .collect(),
                 })
@@ -251,6 +253,7 @@ impl Topology {
                 query_types: self.totals.query_types,
                 in_flight: self.totals.in_flight,
             }),
+            hub_id: String::new(),
         }
     }
 

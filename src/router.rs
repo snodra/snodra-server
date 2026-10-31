@@ -75,9 +75,11 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::PermissionDenied => Outcome::HandlerError,
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
-        ErrorCode::HandlerError | ErrorCode::Unauthenticated | ErrorCode::Unspecified => {
-            Outcome::HandlerError
-        }
+        // UNSUPPORTED is declared by protocol v2 but not produced by this hub yet.
+        ErrorCode::HandlerError
+        | ErrorCode::Unauthenticated
+        | ErrorCode::Unsupported
+        | ErrorCode::Unspecified => Outcome::HandlerError,
     }
 }
 
