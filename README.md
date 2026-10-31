@@ -238,6 +238,15 @@ calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
 `KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana.
 
+- **Builder call:** any client can create thousands of types and edges by sending type names
+  nobody owns (`NO_HANDLER`), so the pages draw a bounded amount. The graph draws at most 60
+  type nodes (registered types first, then by requests) plus up to 40 more with a problem (no
+  owner, orphaned, 1 % errors or more), and says how many more are hidden; the filter and the
+  Types page reach the rest. The edges table and the Types table show at most 200 rows (the
+  busiest edges; the first types) with a "showing 200 of N" note; filters search every row. A
+  refresh redraws the graph only when its nodes or edges change, otherwise it updates edge
+  widths, colours and labels in place.
+
 ### JSON API
 
 All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:

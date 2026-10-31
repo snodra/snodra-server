@@ -82,6 +82,18 @@ export function table(caption, headers, rows, kind) {
       h('tbody', null, body)));
 }
 
+/**
+ * Rows a table draws at most: thousands of DOM rows per refresh freeze the tab. Filters still
+ * search every row; `capNote` says how many are shown.
+ */
+export const MAX_ROWS = 200;
+
+/** The note under a capped table, or null when every row is shown. */
+export function capNote(shown, total, which, noun) {
+  if (shown >= total) return null;
+  return h('p', { class: 'note' }, `Showing the ${which} ${shown} of ${total} ${noun}; use the filter to narrow.`);
+}
+
 /** A numeric cell. */
 export function num(content, title) {
   return { class: 'num', content, title };

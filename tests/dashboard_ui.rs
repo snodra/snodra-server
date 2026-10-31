@@ -204,6 +204,16 @@ fn browser() -> Option<PathBuf> {
 
 /// The DOM after load and the console lines of one headless load of `url`.
 async fn load(browser: &Path, url: &str, profile: &Path) -> (String, Vec<String>) {
+    load_with(browser, url, profile, &[]).await
+}
+
+/// [`load`] with extra browser arguments.
+async fn load_with(
+    browser: &Path,
+    url: &str,
+    profile: &Path,
+    extra: &[&str],
+) -> (String, Vec<String>) {
     let run = tokio::process::Command::new(browser)
         .args([
             "--headless=new",
@@ -215,6 +225,7 @@ async fn load(browser: &Path, url: &str, profile: &Path) -> (String, Vec<String>
             "--v=0",
             "--dump-dom",
         ])
+        .args(extra)
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg(url)
         .kill_on_drop(true)
@@ -309,6 +320,120 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
     }
     let _ = std::fs::remove_dir_all(&profiles);
     drop((a, b));
+}
+
+/// Opens every `/api/v1/stream` slot (each answered `200`), so the next stream gets `503`.
+async fn take_stream_slots(http: SocketAddr) -> Vec<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut open = Vec::new();
+    for _ in 0..kraken_hub::http::MAX_STREAMS {
+        let mut stream = tokio::net::TcpStream::connect(http).await.unwrap();
+        let request = format!("GET /api/v1/stream HTTP/1.1\r\nHost: {http}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut head = [0u8; 12];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        open.push(stream);
+    }
+    let (status, _) = http_get(http, "/api/v1/stream").await;
+    assert_eq!(status, 503);
+    open
+}
+
+/// Loads `page` until it says it rendered; returns the DOM and how long the rendered load took.
+async fn rendered(
+    browser: &Path,
+    http: SocketAddr,
+    page: &str,
+    profile: &Path,
+) -> (String, Duration) {
+    let url = format!("http://{http}/ui/#/{page}");
+    for _ in 0..8 {
+        let started = std::time::Instant::now();
+        // The large graph takes longer to fetch than the load event: give the page virtual
+        // time (fetches complete, timers fast-forward) before the DOM is dumped.
+        let (dom, console) =
+            load_with(browser, &url, profile, &["--virtual-time-budget=5000"]).await;
+        assert!(console.is_empty(), "{page}: console messages: {console:#?}");
+        if dom.contains("data-ready=\"true\"") {
+            return (dom, started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("{page} never rendered");
+}
+
+/// Any client can create thousands of edges and type nodes by sending distinct type names that
+/// get `NO_HANDLER`. The overview must stay responsive: it draws a bounded number of type nodes
+/// with a note about the rest, and the tables show a bounded number of rows.
+#[tokio::test]
+async fn a_flood_of_types_and_edges_renders_bounded_and_in_time() {
+    const FLOOD: usize = 4000;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let _owner = FakeClient::register(grpc, "service-b", &[], &["examples.CountGreetings"]).await;
+    let mut flood = FakeClient::register(grpc, "flood", &[], &[]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tx = flood.tx.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..FLOOD {
+            tx.send(FakeClient::request(
+                &format!("f{i}"),
+                RequestKind::Query,
+                &format!("flood.Type{i:05}"),
+                "",
+                0,
+            ))
+            .await
+            .unwrap();
+        }
+    });
+    let mut answered = 0;
+    while answered < FLOOD {
+        if let server_message::Message::Error(_) = next_message(&mut flood).await {
+            answered += 1;
+        }
+    }
+    sender.await.unwrap();
+    let (status, body) = http_get(http, "/api/v1/graph").await;
+    assert_eq!(status, 200);
+    let graph: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        graph["edges"].as_array().unwrap().len() > FLOOD,
+        "flood not recorded"
+    );
+
+    // The page's live stream is an endless fetch, which stops Chrome's virtual time; with every
+    // stream slot taken the page falls back to polling (also covered here), so a virtual-time
+    // budget lets the large first fetch finish before the DOM is dumped.
+    let _slots = take_stream_slots(http).await;
+    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-flood-{}", std::process::id()));
+    let (dom, took) = rendered(&browser, http, "overview", &profiles.join("overview")).await;
+    assert!(took < Duration::from_secs(15), "overview took {took:?}");
+    assert!(
+        dom.contains("more types hidden"),
+        "no note about hidden types"
+    );
+    let type_nodes = dom.matches("class=\"g-node").count();
+    assert!(type_nodes <= 120, "{type_nodes} graph nodes drawn");
+    assert!(
+        dom.contains("Showing the busiest 200 of"),
+        "edges table not capped"
+    );
+    assert!(dom.matches("<tr>").count() < 260, "too many table rows");
+
+    let (dom, took) = rendered(&browser, http, "types", &profiles.join("types")).await;
+    assert!(took < Duration::from_secs(15), "types took {took:?}");
+    assert!(
+        dom.contains("Showing the first 200 of"),
+        "types table not capped"
+    );
+    assert!(dom.matches("<tr>").count() < 260, "too many table rows");
+    let _ = std::fs::remove_dir_all(&profiles);
 }
 
 #[test]

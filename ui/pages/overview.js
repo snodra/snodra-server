@@ -1,8 +1,8 @@
 // Overview: totals, the traffic graph (senders -> types -> owners) and the same edges as a table.
 
-import { badge, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
+import { MAX_ROWS, badge, capNote, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
 import * as fmt from '../format.js';
-import { buildModel, hideTip, renderGraph } from '../graph.js';
+import { buildModel, hideTip, renderGraph, structureKey } from '../graph.js';
 
 function tile(label, value, sub) {
   return h('div', { class: 'tile' },
@@ -33,7 +33,9 @@ function errorCell(e) {
 
 function renderEdges(el, model, windowMs) {
   const owner = (type) => model.types.get(type)?.owners.join(', ') || '';
-  const edges = [...model.sends].sort((a, b) => b.count - a.count || a.sender.localeCompare(b.sender));
+  // Every edge the filter keeps (not only the drawn ones), busiest first, at most MAX_ROWS.
+  const edges = [...model.tableSends].sort((a, b) => b.count - a.count
+    || a.sender.localeCompare(b.sender) || a.type.localeCompare(b.type));
   if (!edges.length) {
     fill(el, h('p', { class: 'empty' }, `No requests in the last ${fmt.windowLabel(windowMs)}.`));
     return;
@@ -41,7 +43,7 @@ function renderEdges(el, model, windowMs) {
   fill(el, table('Requests by sender service and type',
     ['Sender', 'Type', 'Owner', { label: 'Requests', class: 'num' }, { label: 'Errors', class: 'num' },
       { label: 'p50', class: 'num' }, { label: 'p99', class: 'num' }],
-    edges.map((e) => [
+    edges.slice(0, MAX_ROWS).map((e) => [
       e.sender,
       { class: 'mono', content: e.type },
       owner(e.type) || badge('crit', 'no owner'),
@@ -49,7 +51,7 @@ function renderEdges(el, model, windowMs) {
       errorCell(e),
       num(fmt.latency(e.p50Ms)),
       num(fmt.latency(e.p99Ms)),
-    ])));
+    ])), capNote(Math.min(edges.length, MAX_ROWS), edges.length, 'busiest', 'edges'));
 }
 
 export default {
@@ -95,21 +97,26 @@ export default {
         h('div', { class: 'card-head' }, h('h2', null, 'Requests by sender and type'), edgesMeta),
         edgesBox));
 
+    // The SVG is rebuilt only when its structure (nodes, their states, edges, width) changes;
+    // otherwise a refresh updates widths, levels and labels in place.
     const draw = (force) => {
       if (!data) return;
       const width = graphBox.clientWidth;
-      const signature = JSON.stringify([data.nodes, data.edges, query, hideIdle, width]);
-      if (!force && signature === drawn) return;
-      drawn = signature;
       const model = buildModel(data, { query, hideIdle });
-      const focusedKey = graphBox.contains(document.activeElement) ? document.activeElement.dataset.key : null;
-      hideTip();
+      const structure = structureKey(model, width);
       if (!model.left.length && !model.middle.length && !model.right.length) {
+        hideTip();
         current = null;
+        drawn = structure;
         fill(graphBox, h('p', { class: 'empty' }, data.nodes.length
           ? 'Nothing matches the filter.'
           : 'No services are connected and nothing was sent in the window.'));
+      } else if (!force && current && structure === drawn) {
+        current.update(model);
       } else {
+        drawn = structure;
+        const focusedKey = graphBox.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+        hideTip();
         current = renderGraph(model, width, data.windowMs);
         fill(graphBox, current.svg);
         const again = focusedKey && current.svg.querySelector(`[data-key="${CSS.escape(focusedKey)}"]`);
@@ -117,6 +124,10 @@ export default {
         else if (hovered) current.highlight(hovered);
       }
       const extra = [];
+      if (model.capped) {
+        extra.push(h('p', { class: 'note' }, badge('warn', 'not all drawn'),
+          ` ${fmt.int(model.capped)} more types hidden: the graph draws the registered and busiest ones and those with problems. Use the filter or the Types page.`));
+      }
       if (model.hidden) extra.push(h('p', { class: 'note' }, `${model.hidden} types hidden by the filter.`));
       if (data.evictedEdges) {
         extra.push(h('p', { class: 'note' }, badge('warn', 'edge cap'),
@@ -124,7 +135,7 @@ export default {
       }
       fill(notes, extra);
       renderEdges(edgesBox, model, data.windowMs);
-      edgesMeta.textContent = `last ${fmt.windowLabel(data.windowMs)}, ${model.sends.length} edges`;
+      edgesMeta.textContent = `last ${fmt.windowLabel(data.windowMs)}, ${model.tableSends.length} edges`;
     };
 
     graphBox.addEventListener('pointerover', (ev) => {

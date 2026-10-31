@@ -21,36 +21,87 @@ function mean(values) {
   return values.length ? values.reduce((a, b) => a + b, 0) / values.length : Infinity;
 }
 
+/** Type nodes drawn at most, ranked registered first, then by requests in the window... */
+export const MAX_TYPE_NODES = 60;
+/** ...plus at most this many more that have a problem (no owner, orphaned, 1 % errors). */
+export const MAX_PROBLEM_NODES = 40;
+
+/** Requests and errors of a list of edges, with the list. */
+function aggregate(map, key, e) {
+  let a = map.get(key);
+  if (!a) {
+    a = { edges: [], req: 0, err: 0 };
+    map.set(key, a);
+  }
+  a.edges.push(e);
+  a.req += e.count;
+  a.err += e.errors;
+}
+
+const NONE = { edges: [], req: 0, err: 0 };
+
 /**
  * Which nodes and edges the graph shows, in which order. `query` keeps types whose name, owner
- * or senders contain it; `hideIdle` drops types without requests in the window.
+ * or senders contain it; `hideIdle` drops types without requests in the window. Per-type,
+ * per-sender and per-owner aggregates are built once here (Maps), so rendering is linear in the
+ * edges. At most `maxTypes` type nodes (plus `maxProblems` with a problem) are kept: any client
+ * can create thousands of types by sending names nobody owns. `tableSends` are the edges of
+ * every type the filter keeps, for the table; `sends` and `handles` only those drawn.
  */
-export function buildModel(graph, { query = '', hideIdle = false } = {}) {
+export function buildModel(graph, {
+  query = '', hideIdle = false, maxTypes = MAX_TYPE_NODES, maxProblems = MAX_PROBLEM_NODES,
+} = {}) {
   const services = new Map();
   const types = new Map();
   for (const n of graph.nodes) (n.kind === 'service' ? services : types).set(n.name, n);
-  const sends = graph.edges
-    .filter((e) => e.role === 'send')
-    .map((e) => ({ ...e, sender: strip(e.from, 'service:'), type: strip(e.to, 'type:') }));
-  const handles = graph.edges
-    .filter((e) => e.role === 'handle')
-    .map((e) => ({ ...e, type: strip(e.from, 'type:'), owner: strip(e.to, 'service:') }));
-
-  const sendsTo = new Map();
-  for (const e of sends) {
-    if (!sendsTo.has(e.type)) sendsTo.set(e.type, []);
-    sendsTo.get(e.type).push(e);
+  const sends = [];
+  const handles = [];
+  for (const e of graph.edges) {
+    if (e.role === 'send') sends.push({ ...e, sender: strip(e.from, 'service:'), type: strip(e.to, 'type:') });
+    else if (e.role === 'handle') handles.push({ ...e, type: strip(e.from, 'type:'), owner: strip(e.to, 'service:') });
   }
+
+  const intoType = new Map();
+  const fromSender = new Map();
+  const byOwner = new Map();
+  const handlesOf = new Map();
+  for (const e of sends) {
+    aggregate(intoType, e.type, e);
+    aggregate(fromSender, e.sender, e);
+  }
+  for (const e of handles) {
+    aggregate(byOwner, e.owner, e);
+    aggregate(handlesOf, e.type, e);
+  }
+  const into = (name) => intoType.get(name) || NONE;
+
   const q = query.trim().toLowerCase();
   const matches = (name) => name.toLowerCase().includes(q);
   const keepType = (t) => {
-    const into = sendsTo.get(t.name) || [];
-    if (hideIdle && !into.some((e) => e.count > 0)) return false;
-    return !q || matches(t.name) || t.owners.some(matches) || into.some((e) => matches(e.sender));
+    const edges = into(t.name).edges;
+    if (hideIdle && !edges.some((e) => e.count > 0)) return false;
+    return !q || matches(t.name) || t.owners.some(matches) || edges.some((e) => matches(e.sender));
   };
-  const kept = [...types.values()].filter(keepType);
+  const matched = [...types.values()].filter(keepType);
+
+  // The cap: registered types first (services bound how many exist), then by traffic; then
+  // the busiest of the remaining types with a problem.
+  let kept = matched;
+  if (matched.length > maxTypes) {
+    const ranked = [...matched].sort((a, b) => (b.registered - a.registered)
+      || into(b.name).req - into(a.name).req || a.name.localeCompare(b.name));
+    const problem = (t) => {
+      const level = fmt.errorLevel(into(t.name).err, into(t.name).req);
+      return !t.registered || t.orphaned || level === 'warn' || level === 'crit';
+    };
+    const rest = ranked.slice(maxTypes).filter(problem)
+      .sort((a, b) => into(b.name).req - into(a.name).req || a.name.localeCompare(b.name));
+    kept = [...ranked.slice(0, maxTypes), ...rest.slice(0, maxProblems)];
+  }
+  const matchedNames = new Set(matched.map((t) => t.name));
   const keptNames = new Set(kept.map((t) => t.name));
-  const vSends = sends.filter((e) => keptNames.has(e.type));
+  const tableSends = sends.filter((e) => matchedNames.has(e.type));
+  const vSends = tableSends.filter((e) => keptNames.has(e.type));
   const vHandles = handles.filter((e) => keptNames.has(e.type));
 
   // Owners by name; types grouped by owner (types nobody owns last); senders by the mean
@@ -60,29 +111,61 @@ export function buildModel(graph, { query = '', hideIdle = false } = {}) {
   const groupOf = (t) => (t.owners.length ? ownerIndex.get(t.owners[0]) ?? right.length : right.length);
   let middle = kept.sort((a, b) => groupOf(a) - groupOf(b) || a.name.localeCompare(b.name));
 
-  const senderNames = new Set(vSends.map((e) => e.sender));
+  const vFrom = new Map();
+  const vInto = new Map();
+  for (const e of vSends) {
+    aggregate(vFrom, e.sender, e);
+    aggregate(vInto, e.type, e);
+  }
+  const senderNames = new Set(vFrom.keys());
   if (!hideIdle) {
     // Connected services that own nothing and sent nothing in the window (an idle gateway).
-    const busy = new Set([...sends.map((e) => e.sender), ...handles.map((e) => e.owner)]);
     for (const svc of services.values()) {
-      if (!busy.has(svc.name) && (!q || matches(svc.name))) senderNames.add(svc.name);
+      const busy = fromSender.has(svc.name) || byOwner.has(svc.name);
+      if (!busy && (!q || matches(svc.name))) senderNames.add(svc.name);
     }
   }
   const midIndex = () => new Map(middle.map((t, i) => [t.name, i]));
   let mi = midIndex();
   const bary = new Map([...senderNames].map((name) => [
-    name, mean(vSends.filter((e) => e.sender === name).map((e) => mi.get(e.type))),
+    name, mean((vFrom.get(name) || NONE).edges.map((e) => mi.get(e.type))),
   ]));
   const left = [...senderNames].sort((a, b) => bary.get(a) - bary.get(b) || a.localeCompare(b));
   const leftIndex = new Map(left.map((name, i) => [name, i]));
   const typeBary = new Map(middle.map((t) => [
-    t.name, mean((sendsTo.get(t.name) || []).filter((e) => leftIndex.has(e.sender)).map((e) => leftIndex.get(e.sender))),
+    t.name, mean((vInto.get(t.name) || NONE).edges.filter((e) => leftIndex.has(e.sender)).map((e) => leftIndex.get(e.sender))),
   ]));
   middle = middle.sort((a, b) => groupOf(a) - groupOf(b)
     || typeBary.get(a.name) - typeBary.get(b.name) || a.name.localeCompare(b.name));
   mi = midIndex();
 
-  return { services, types, left, middle, right, sends: vSends, handles: vHandles, hidden: types.size - kept.length };
+  return {
+    services, types, left, middle, right, sends: vSends, handles: vHandles, tableSends,
+    hidden: types.size - matched.length,
+    capped: matched.length - kept.length,
+    sender: (name) => fromSender.get(name) || NONE,
+    into,
+    owner: (name) => byOwner.get(name) || NONE,
+  };
+}
+
+/**
+ * What the drawn SVG depends on besides counters: the nodes, their states and the edges. While
+ * it stays the same, a refresh updates the drawn graph in place (`update`).
+ */
+export function structureKey(model, width) {
+  const svc = (name) => {
+    const n = model.services.get(name);
+    return n ? [n.instances, n.staleInstances] : null;
+  };
+  return JSON.stringify([
+    Math.floor(width),
+    model.left.map((name) => [name, svc(name)]),
+    model.middle.map((t) => [t.name, t.typeKind, t.registered, t.orphaned, t.owners]),
+    model.right.map((name) => [name, svc(name)]),
+    model.sends.map((e) => `${e.from}>${e.to}`),
+    model.handles.map((e) => `${e.from}>${e.to}`),
+  ]);
 }
 
 // ---- tooltip -----------------------------------------------------------------------------
@@ -138,9 +221,73 @@ function clip(text, max, fromStart) {
 const warnMark = (cx, cy) => s('path', { class: 'mark-warn', d: `M${cx} ${cy - 5}L${cx + 5.5} ${cy + 4.5}L${cx - 5.5} ${cy + 4.5}Z` });
 const critMark = (cx, cy) => s('path', { class: 'mark-crit', d: `M${cx} ${cy - 5.5}L${cx + 5.5} ${cy}L${cx} ${cy + 5.5}L${cx - 5.5} ${cy}Z` });
 
+const RANK = { idle: 0, ok: 1, warn: 2, crit: 3 };
+
+/** The drawn edges of `model` with their level and width (log scale against the busiest). */
+function edgeVisuals(model) {
+  const all = [
+    ...model.sends.map((e) => ({ e, from: `L:${e.sender}`, to: `M:${e.type}`, title: `${e.sender} → ${e.type}` })),
+    ...model.handles.map((e) => ({ e, from: `M:${e.type}`, to: `R:${e.owner}`, title: `${e.type} → ${e.owner} (owner)` })),
+  ];
+  let max = 1;
+  for (const d of all) max = Math.max(max, d.e.count);
+  for (const d of all) {
+    d.key = `${d.from}>${d.to}`;
+    d.level = fmt.errorLevel(d.e.errors, d.e.count);
+    d.width = d.e.count ? 1.5 + (6.5 * Math.log1p(d.e.count)) / Math.log1p(max) : 1;
+  }
+  return all;
+}
+
+/** Aria label and tooltip of every node, from the model's aggregates. */
+function nodeInfo(model, windowText) {
+  const out = new Map();
+  for (const name of model.left) {
+    const svc = model.services.get(name) || { instances: 0, staleInstances: 0 };
+    const sent = model.sender(name);
+    out.set(`L:${name}`, {
+      aria: `Sender ${name}, ${svc.instances} instances, sent ${sent.req} requests to ${sent.edges.length} types, ${windowText}`,
+      tip: [h('strong', null, name), rows([
+        ['Instances', svc.instances === 0 ? 'none (left)' : `${svc.instances}${svc.staleInstances ? `, ${svc.staleInstances} stale` : ''}`],
+        ['Sends', `${sent.edges.length} types`],
+        ['Requests', fmt.int(sent.req)],
+        ['Errors', `${fmt.int(sent.err)} (${fmt.errorRate(sent.err, sent.req)})`],
+      ])],
+    });
+  }
+  for (const t of model.middle) {
+    const into = model.into(t.name);
+    const state = !t.registered ? 'no owner' : t.orphaned ? 'orphaned (owner has no instance)' : 'owned';
+    out.set(`M:${t.name}`, {
+      aria: `${t.typeKind === 'QUERY' ? 'Query' : 'Command'} ${t.name}, ${state}, ${into.req} requests from ${into.edges.length} senders, ${windowText}`,
+      tip: [h('strong', null, t.name), rows([
+        ['Kind', t.typeKind === 'QUERY' ? 'query' : 'command'],
+        ['Owner', t.owners.join(', ') || 'none: requests get NO_HANDLER'],
+        ['State', state],
+        ['Senders', String(into.edges.length)],
+        ...trafficRows({ count: into.req, errors: into.err, p50Ms: null, p99Ms: null }).slice(0, 2),
+      ])],
+    });
+  }
+  for (const name of model.right) {
+    const svc = model.services.get(name) || { instances: 0, staleInstances: 0 };
+    const owned = model.owner(name);
+    out.set(`R:${name}`, {
+      aria: `Owner ${name}, ${svc.instances} instances, owns ${owned.edges.length} types`,
+      tip: [h('strong', null, name), rows([
+        ['Instances', svc.instances === 0 ? 'none: its types are orphaned' : `${svc.instances}${svc.staleInstances ? `, ${svc.staleInstances} stale` : ''}`],
+        ['Owns', `${owned.edges.length} types`],
+        ['Requests', fmt.int(owned.req)],
+      ])],
+    });
+  }
+  return out;
+}
+
 /**
  * The graph as an SVG element `width` wide. `windowMs` labels the tooltips. Returns
- * { svg, highlight(key|null) } so the caller can keep a highlight across refreshes.
+ * { svg, highlight(key|null), update(model) }: `update` takes a model with the same
+ * [`structureKey`] and changes widths, levels, labels and tooltips in place.
  */
 export function renderGraph(model, width, windowMs) {
   const W = Math.max(MIN_WIDTH, Math.floor(width));
@@ -164,19 +311,11 @@ export function renderGraph(model, width, windowMs) {
   });
 
   // Edges first (under the nodes). Thick ones first so thin ones stay visible on top.
-  const all = [
-    ...model.sends.map((e) => ({ e, from: `L:${e.sender}`, to: `M:${e.type}`, title: `${e.sender} → ${e.type}` })),
-    ...model.handles.map((e) => ({ e, from: `M:${e.type}`, to: `R:${e.owner}`, title: `${e.type} → ${e.owner} (owner)` })),
-  ].filter((d) => pos.has(d.from) && pos.has(d.to));
-  const max = Math.max(1, ...all.map((d) => d.e.count));
-  const rank = { idle: 0, ok: 1, warn: 2, crit: 3 };
-  for (const d of all) {
-    d.level = fmt.errorLevel(d.e.errors, d.e.count);
-    d.width = d.e.count ? 1.5 + (6.5 * Math.log1p(d.e.count)) / Math.log1p(max) : 1;
-  }
-  all.sort((a, b) => rank[a.level] - rank[b.level] || b.width - a.width);
+  const all = edgeVisuals(model).filter((d) => pos.has(d.from) && pos.has(d.to));
+  all.sort((a, b) => RANK[a.level] - RANK[b.level] || b.width - a.width);
 
   const edgesByNode = new Map();
+  const edgeEls = new Map();
   const link = (key, el) => {
     if (!edgesByNode.has(key)) edgesByNode.set(key, []);
     edgesByNode.get(key).push(el);
@@ -193,11 +332,12 @@ export function renderGraph(model, width, windowMs) {
     const path = `M${x0} ${y0}C${x0 + dx} ${y0} ${x1 - dx} ${y1} ${x1} ${y1}`;
     const line = s('path', { class: ['g-edge', d.level], d: path, 'stroke-width': d.width.toFixed(2) });
     const hit = s('path', { class: 'g-hit', d: path, 'stroke-width': Math.max(12, d.width + 6) });
-    const content = [h('strong', null, d.title), rows(trafficRows(d.e))];
-    hit.addEventListener('pointermove', (ev) => showTip(content, ev.clientX, ev.clientY));
-    hit.addEventListener('pointerleave', hideTip);
     const g = s('g', { dataset: { from: d.from, to: d.to } }, line, hit);
     g.edgeData = d;
+    const tip = () => [h('strong', null, g.edgeData.title), rows(trafficRows(g.edgeData.e))];
+    hit.addEventListener('pointermove', (ev) => showTip(tip(), ev.clientX, ev.clientY));
+    hit.addEventListener('pointerleave', hideTip);
+    edgeEls.set(d.key, { g, line, hit });
     link(d.from, g);
     link(d.to, g);
     edgeLayer.append(g);
@@ -205,14 +345,16 @@ export function renderGraph(model, width, windowMs) {
   svg.append(edgeLayer);
 
   // Nodes.
+  const info = nodeInfo(model, windowText);
   const nodeLayer = s('g');
   const nodeEls = new Map();
   const addNode = (key, label, opts) => {
     const p = pos.get(key);
+    const { aria, tip } = info.get(key);
     const g = s('g', {
       class: ['g-node', opts.level, opts.gone && 'gone'],
       transform: `translate(${p.x} ${p.y})`,
-      tabindex: 0, role: 'img', 'aria-label': opts.aria, dataset: { key },
+      tabindex: 0, role: 'img', 'aria-label': aria, dataset: { key },
     });
     g.append(s('rect', { class: 'box', width: nodeW, height: ROW, rx: 6 }));
     let textX = 10;
@@ -228,68 +370,34 @@ export function renderGraph(model, width, windowMs) {
     if (opts.sub) g.append(s('text', { class: 'sub', x: nodeW - 8 - markW, y: 18, 'text-anchor': 'end' }, opts.sub));
     if (opts.mark === 'warn') g.append(warnMark(nodeW - 12, ROW / 2));
     if (opts.mark === 'crit') g.append(critMark(nodeW - 12, ROW / 2));
-    g.tipContent = opts.tip;
+    g.tipContent = tip;
     nodeEls.set(key, g);
     nodeLayer.append(g);
   };
 
-  const sendSummary = (name) => {
-    const out = model.sends.filter((e) => e.sender === name);
-    const req = out.reduce((n, e) => n + e.count, 0);
-    const err = out.reduce((n, e) => n + e.errors, 0);
-    return { types: out.length, req, err };
-  };
   for (const name of model.left) {
     const svc = model.services.get(name) || { instances: 0, staleInstances: 0 };
-    const sent = sendSummary(name);
-    const inst = `${svc.instances} inst`;
     addNode(`L:${name}`, name, {
-      sub: inst,
+      sub: `${svc.instances} inst`,
       gone: svc.instances === 0,
       mark: svc.staleInstances ? 'warn' : null,
-      aria: `Sender ${name}, ${svc.instances} instances, sent ${sent.req} requests to ${sent.types} types, ${windowText}`,
-      tip: [h('strong', null, name), rows([
-        ['Instances', svc.instances === 0 ? 'none (left)' : `${svc.instances}${svc.staleInstances ? `, ${svc.staleInstances} stale` : ''}`],
-        ['Sends', `${sent.types} types`],
-        ['Requests', fmt.int(sent.req)],
-        ['Errors', `${fmt.int(sent.err)} (${fmt.errorRate(sent.err, sent.req)})`],
-      ])],
     });
   }
   for (const t of model.middle) {
-    const into = model.sends.filter((e) => e.type === t.name);
-    const req = into.reduce((n, e) => n + e.count, 0);
-    const err = into.reduce((n, e) => n + e.errors, 0);
-    const state = !t.registered ? 'no owner' : t.orphaned ? 'orphaned (owner has no instance)' : 'owned';
     addNode(`M:${t.name}`, t.name, {
       kindLetter: t.typeKind === 'QUERY' ? 'Q' : 'C',
       clipStart: true,
       level: !t.registered ? 'crit' : t.orphaned ? 'warn' : null,
       mark: !t.registered ? 'crit' : t.orphaned ? 'warn' : null,
-      aria: `${t.typeKind === 'QUERY' ? 'Query' : 'Command'} ${t.name}, ${state}, ${req} requests from ${into.length} senders, ${windowText}`,
-      tip: [h('strong', null, t.name), rows([
-        ['Kind', t.typeKind === 'QUERY' ? 'query' : 'command'],
-        ['Owner', t.owners.join(', ') || 'none: requests get NO_HANDLER'],
-        ['State', state],
-        ['Senders', String(into.length)],
-        ...trafficRows({ count: req, errors: err, p50Ms: null, p99Ms: null }).slice(0, 2),
-      ])],
     });
   }
   for (const name of model.right) {
     const svc = model.services.get(name) || { instances: 0, staleInstances: 0 };
-    const owned = model.handles.filter((e) => e.owner === name);
     addNode(`R:${name}`, name, {
       sub: `${svc.instances} inst`,
       level: svc.instances === 0 ? 'warn' : null,
       gone: svc.instances === 0,
       mark: svc.instances === 0 || svc.staleInstances ? 'warn' : null,
-      aria: `Owner ${name}, ${svc.instances} instances, owns ${owned.length} types`,
-      tip: [h('strong', null, name), rows([
-        ['Instances', svc.instances === 0 ? 'none: its types are orphaned' : `${svc.instances}${svc.staleInstances ? `, ${svc.staleInstances} stale` : ''}`],
-        ['Owns', `${owned.length} types`],
-        ['Requests', fmt.int(owned.reduce((n, e) => n + e.count, 0))],
-      ])],
     });
   }
   svg.append(nodeLayer);
@@ -311,12 +419,15 @@ export function renderGraph(model, width, windowMs) {
     if (!key.startsWith('L:')) follow(key, 'in');
     return { edges, nodes };
   };
+  let highlighted = null;
   const highlight = (key) => {
     for (const el of svg.querySelectorAll('.related')) el.classList.remove('related');
     if (!key || !nodeEls.has(key)) {
+      highlighted = null;
       svg.classList.remove('focus-mode');
       return;
     }
+    highlighted = key;
     const r = related(key);
     svg.classList.add('focus-mode');
     for (const g of r.edges) g.querySelector('.g-edge').classList.add('related');
@@ -337,5 +448,24 @@ export function renderGraph(model, width, windowMs) {
     });
   }
   svg.addEventListener('pointerleave', hideTip);
-  return { svg, highlight };
+
+  // Counters changed, structure did not: widths, levels, labels and tooltips in place.
+  const update = (next) => {
+    for (const d of edgeVisuals(next)) {
+      const el = edgeEls.get(d.key);
+      if (!el) continue;
+      el.g.edgeData = d;
+      el.line.setAttribute('class', `g-edge ${d.level}`);
+      el.line.setAttribute('stroke-width', d.width.toFixed(2));
+      el.hit.setAttribute('stroke-width', String(Math.max(12, d.width + 6)));
+    }
+    for (const [key, { aria, tip }] of nodeInfo(next, windowText)) {
+      const g = nodeEls.get(key);
+      if (!g) continue;
+      g.setAttribute('aria-label', aria);
+      g.tipContent = tip;
+    }
+    if (highlighted) highlight(highlighted);
+  };
+  return { svg, highlight, update };
 }

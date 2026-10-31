@@ -1,6 +1,6 @@
 // Command and query types: owners, instances, state and traffic in the window.
 
-import { badge, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
+import { MAX_ROWS, badge, capNote, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
 import * as fmt from '../format.js';
 
 function state(t) {
@@ -71,7 +71,7 @@ export default {
         'State', 'Senders',
         { label: 'Requests', class: 'num' }, { label: 'Errors', class: 'num' },
         { label: 'p50', class: 'num' }, { label: 'p99', class: 'num' },
-      ], shown.map((t) => [
+      ], shown.slice(0, MAX_ROWS).map((t) => [
         { class: 'mono', content: t.type },
         h('span', { class: 'kind', title: t.kind === 'QUERY' ? 'query' : 'command' }, t.kind === 'QUERY' ? 'Q' : 'C'),
         t.owners.length ? t.owners.join(', ') : { class: 'dim', content: 'none' },
@@ -82,7 +82,7 @@ export default {
         errors(t),
         num(fmt.latency(t.traffic.p50Ms)),
         num(fmt.latency(t.traffic.p99Ms)),
-      ])));
+      ])), capNote(Math.min(shown.length, MAX_ROWS), shown.length, 'first', 'types'));
     };
 
     const draw = () => {
