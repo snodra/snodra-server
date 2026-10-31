@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod protocol;
+pub mod queue;
 pub mod registry;
 pub mod router;
 pub mod service;
