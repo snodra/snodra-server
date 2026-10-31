@@ -31,6 +31,7 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 - [Build and test](#build-and-test)
 - [Running locally](#running-locally)
 - [Topology view](#topology-view)
+- [Dashboard](#dashboard)
 - [Protocol summary](#protocol-summary)
 - [Routing and limitations](#routing-and-limitations)
 - [Connection lifecycle](#connection-lifecycle)
@@ -65,7 +66,7 @@ cargo run
 |---|---|---|
 | `KRAKEN_HUB_ID` | hostname + `-` + 8 random hex digits | identifies this hub process in `RegisterAck.hub_id` and the topology (`hubId`) |
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
-| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for `GET /topology`; empty disables the HTTP listener |
+| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for `GET /topology`, the dashboard and its API; empty disables the HTTP listener |
 | `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
 | `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
 | `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
@@ -80,8 +81,15 @@ cargo run
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
+| `KRAKEN_HUB_DASHBOARD_ENABLED` | `true` | serve the read-only dashboard (`/ui/`) and its API (`/api/v1/`) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `KRAKEN_HUB_GRAFANA_URL` | none | Grafana base URL the dashboard links to; must be `http://` or `https://` (checked at startup) |
+| `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` | `10000` | cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least recently used go first |
+| `KRAKEN_HUB_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
 
-The topology view (`GET /topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view).
+Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
+
+The topology view (`GET /topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view),
+the dashboard in [Dashboard](#dashboard).
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
   unset keeps that default; setting it to an empty string disables OTLP export, which is useful
@@ -117,8 +125,10 @@ docker exec kraken-hub /app/kraken-hub --topology --json
 ```
 
 - `GET /topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as `COMMAND` or
-  `QUERY`); every other path is 404. **Builder call:** the HTTP endpoint is a second port (7001),
-  because the gRPC port speaks only HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
+  `QUERY`), unchanged by the dashboard and served even when the dashboard is disabled. Besides
+  the dashboard paths (`/`, `/ui`, `/ui/...`, `/api/v1/...`) every other path is 404.
+  **Builder call:** the HTTP endpoint is a second port (7001), because the gRPC port speaks only
+  HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
 - `kraken-hub --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
   port of `KRAKEN_HUB_LISTEN` with a 3 s timeout. Exit codes: 0 success, 1 failure (hub
   unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
@@ -206,6 +216,94 @@ sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
   type that the owner holds as a command) is rejected with `ALREADY_EXISTS`. A type's kind cannot
   change while it is owned; change it only after every instance of the owner has left and the
   owner grace sweep has removed the type.
+
+## Dashboard
+
+A read-only web dashboard is compiled into the binary and served on the HTTP port: open
+`http://localhost:7001/` (it redirects to `/ui/`). It shows what the topology view shows, plus who
+calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
+
+> **No authentication in this phase.** The dashboard and `/api/v1/` are read-only and open to
+> anyone who reaches port 7001, like `GET /topology`. Keep the port on the private network; the
+> page footer says the same. A dashboard token arrives with hub access control (roadmap P5a).
+
+| Page | Shows |
+|---|---|
+| Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
+| Services | every service with its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since; the types each service handles |
+| Types | every type: kind, owner, live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
+| Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
+| Processors, Dead letters, Events | placeholders: available from phase 6 (processors, dead letters) and phase 7 (events) |
+
+Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
+`KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana.
+
+### JSON API
+
+All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
+
+| Path | Body |
+|---|---|
+| `topology` | the topology snapshot, as `GET /topology` |
+| `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
+| `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
+| `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
+| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl`, `windowMs` |
+| `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
+
+- **Builder call:** at most 64 streams are open at once; the 65th gets `503` and its page polls.
+  Streams end at shutdown.
+- **Builder call:** `revision` hashes services, instances, their registrations and flow-control
+  and stale flags, type ownership and the set of edges, not counters or ages, so a page can
+  refresh at once on a structural change.
+
+### Edge statistics
+
+The router counts every request that reaches a terminal state on its `(sender service, type)`
+edge: requests, errors (any outcome but `ok`) and its latency. In memory only, like everything
+in the hub.
+
+- Window: `KRAKEN_HUB_EDGE_STATS_WINDOW` (5 min) in ten slots (30 s each), so a view covers
+  between 4.5 and 5 minutes. Expired edges are swept once per slot.
+- Latency: a sparse log-scale histogram per slot, 8 bins per power of two; p50 and p99 are off by
+  at most about 4.4 %.
+- **Builder call:** requests the hub answers without routing them (`NO_HANDLER`,
+  `INVALID_REQUEST`, a duplicate id) count as errors but have no latency, so they do not drag
+  the percentiles to zero. Requests whose sender disconnected are not counted (as in
+  `kraken_hub_requests_total`). The `handle` edge of a type merges all its requests, including
+  `NO_HANDLER` answers while the owner had no instance.
+- **Builder call:** cap `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` (10 000). At the cap a new edge drops
+  the least recently used edges, 1 % of the cap at a time (at least one), counted in
+  `evictedEdges` and shown on the overview. Names longer than 200 bytes are cut (with `…`), so
+  a client cannot grow the map with huge type names.
+- **Builder call:** error colours start at 1 % (warning) and 5 % (critical) of the window's
+  requests; below 1 % the edge keeps the neutral colour and the table still shows its errors.
+- `KRAKEN_HUB_DASHBOARD_ENABLED=false` also stops collecting the statistics.
+
+### Assets, caching and headers
+
+`ui/` holds `index.html`, `app.css`, `favicon.svg` and plain ES modules (`app.js`, `api.js`,
+`live.js`, `graph.js`, `dom.js`, `format.js`, `pages/*.js`). There is no third-party code, no
+package manager and no build step; the files are compiled into the binary with `rust-embed`.
+
+- `/ui/` is served `no-cache` and references every asset under `/ui/v/<build>/`, where `<build>`
+  is a hash of all embedded files. Those URLs are `immutable`, so a new hub version is picked up
+  at once and nothing stale is cached. **Builder call:** a request for another build id is
+  answered with the current file, `no-cache` (a tab open across an upgrade keeps working; it
+  also shows a "reload" banner).
+- Every dashboard and API response carries `Content-Security-Policy: default-src 'self';
+  script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self';
+  object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
+  Names registered by clients only ever reach the page as text.
+- **Builder call:** `/` and `/ui` redirect to `/ui/` with `307` and a relative `Location`
+  (`ui/`), so the redirect works behind a proxy that mounts the hub under a path and is not
+  cached past a `KRAKEN_HUB_DASHBOARD_ENABLED=false`.
+
+Developing the page: edit `ui/`, `cargo run` (assets are embedded in debug builds too) and
+reload. `tests/dashboard_ui.rs` checks that every referenced asset and every import resolves,
+and loads each page in headless Chrome when one is installed (`KRAKEN_HUB_TEST_BROWSER=<path>`
+picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Protocol summary
 
@@ -354,6 +452,8 @@ without any client change; v1 clients always send a timeout, so for them an over
 
 - Traces: one span `hub.route` per request, with the outcome in `kraken.outcome`; parent context
   is taken from the request's trace headers. Exported over OTLP.
+- Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
+  [Dashboard](#dashboard)); Grafana for history.
 - Metrics (OTLP): `kraken_hub_requests_total`, `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
@@ -417,7 +517,12 @@ src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
 src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
 src/cli.rs        --health-check and --topology client modes
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, cli.rs, proto_sync.rs)
+src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
+src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream), security headers
+src/api.rs        dashboard API views (types, graph, settings, version, summary)
+src/assets.rs     embedded ui/ assets, build id, caching
+ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
