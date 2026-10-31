@@ -367,6 +367,20 @@ impl Router {
         }
     }
 
+    /// A forward that was not written gives its permit back.
+    fn return_permit(&self, handler: &str, token: u64) {
+        if let Some(f) = self
+            .flows
+            .lock()
+            .unwrap()
+            .get_mut(handler)
+            .filter(|f| f.token == token)
+            && let Some(p) = f.permits.as_mut()
+        {
+            *p = (*p + 1).min(f.initial);
+        }
+    }
+
     /// The request `id` is still pending and assigned to `handler`'s session `token`.
     fn is_pending_for(&self, id: &str, handler: &str, token: u64) -> bool {
         self.pending
@@ -398,16 +412,7 @@ impl Router {
                 self.metrics
                     .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
                 if let Err(e) = self.sessions.send_if_current(ctx, handler, token, item.msg) {
-                    if let Some(f) = self
-                        .flows
-                        .lock()
-                        .unwrap()
-                        .get_mut(handler)
-                        .filter(|f| f.token == token)
-                        && let Some(p) = f.permits.as_mut()
-                    {
-                        *p = (*p + 1).min(f.initial);
-                    }
+                    self.return_permit(handler, token);
                     self.forward_failed(&item.id, handler, service, e);
                 }
             }
@@ -635,6 +640,8 @@ impl Router {
         };
         enum Next {
             Send(ServerMessage, String),
+            /// With one of the session's permits.
+            Forward(ServerMessage, String),
             Drained(Vec<Queued>, String),
             Rejected(&'static str, String),
             Closed,
@@ -650,6 +657,13 @@ impl Router {
                     let service = flow.service.clone();
                     if flow.permits.is_none() {
                         Next::Send(msg, service)
+                    } else if flow.queue.is_empty()
+                        && let Some(p) = flow.permits.as_mut().filter(|p| **p > 0)
+                    {
+                        // A permit and nobody waiting: forward at once. The queue caps bound
+                        // what waits, so a request that can go now is not measured against them.
+                        *p -= 1;
+                        Next::Forward(msg, service)
                     } else {
                         let bytes = prost::Message::encoded_len(&msg);
                         let item = Queued {
@@ -671,6 +685,13 @@ impl Router {
         match next {
             Next::Send(msg, service) => {
                 if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
+                    self.forward_failed(id, handler, &service, e);
+                }
+            }
+            Next::Forward(msg, service) => {
+                self.refresh_flow_gauges(&service);
+                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
+                    self.return_permit(handler, token);
                     self.forward_failed(id, handler, &service, e);
                 }
             }
@@ -1481,6 +1502,23 @@ mod tests {
         let msg = expect_error(&mut f.sender_rx, "big", ErrorCode::ResourceExhausted);
         assert!(msg.contains("queue full"), "{msg}");
         assert_eq!(f.router.queued_total(), 1);
+    }
+
+    /// The caps bound what waits; a request that can go at once is never measured against them.
+    #[tokio::test]
+    async fn an_idle_instance_with_a_permit_takes_a_request_larger_than_its_queue_cap() {
+        let config = Config {
+            queue_bytes_per_instance: 200,
+            ..Config::default()
+        };
+        let mut f = flow_fixture(config, Some(1), true);
+        let mut big = unkeyed("big", 0, 0);
+        big.payload = vec![b'x'; 300];
+        f.router.route(&D, "s1", big);
+        assert_eq!(forwarded(&mut f.handler_rx), ["big"]);
+        assert!(f.sender_rx.try_recv().is_err(), "not rejected");
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!((view.permits_available, view.queued), (0, 0));
     }
 
     #[tokio::test]
