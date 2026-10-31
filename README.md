@@ -248,11 +248,14 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
-| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl`, `windowMs` |
+| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs` |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
 
 - **Builder call:** at most 64 streams are open at once; the 65th gets `503` and its page polls.
   Streams end at shutdown.
+- **Builder call:** all streams read one shared summary, recomputed every 0.5 s only while at
+  least one stream is open (edge totals are kept as requests arrive, so this does not walk the
+  edges); without a stream nothing is computed.
 - **Builder call:** `revision` hashes services, instances, their registrations and flow-control
   and stale flags, type ownership and the set of edges, not counters or ages, so a page can
   refresh at once on a structural change.

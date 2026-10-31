@@ -6,7 +6,8 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -16,8 +17,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::IntervalStream;
+use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -28,7 +30,8 @@ use crate::session::Sessions;
 use crate::topology::{self, ClockAnchor, Topology};
 use crate::{api, assets};
 
-/// The live stream recomputes its summary this often and sends it when it changed...
+/// The shared live summary is recomputed this often while a stream is open; each stream sends
+/// it when it changed...
 pub const STREAM_CHECK: Duration = Duration::from_millis(500);
 /// ...and at least this often.
 pub const STREAM_EVERY: Duration = Duration::from_secs(2);
@@ -53,10 +56,12 @@ pub struct HttpState {
     pub started: Instant,
     /// Content hash of the dashboard assets, reported by `version` and the stream.
     pub build_id: String,
-    /// Cancelled at shutdown: open streams end within [`STREAM_CHECK`].
+    /// Cancelled at shutdown: open streams end at once.
     pub stopping: CancellationToken,
     /// Open `/api/v1/stream` connections.
     pub streams: Arc<AtomicUsize>,
+    /// The summary every open stream reads (computed once per tick for all of them).
+    pub summaries: Arc<SummaryFeed>,
 }
 
 impl HttpState {
@@ -165,6 +170,63 @@ async fn api_version(State(s): State<HttpState>) -> Response {
     fresh_json(api::version(&s.config, &s.topology(), &s.build_id))
 }
 
+type SharedSummary = Option<Arc<api::Summary>>;
+
+/// The one producer of the live summary, shared by every open `/api/v1/stream`. While at least
+/// one stream is subscribed, a task recomputes the summary every [`STREAM_CHECK`] (topology and
+/// O(1) edge totals) and publishes it; with no subscriber the task ends and nothing is computed.
+/// So the work under the registry, session and edge locks is per tick, not per stream.
+#[derive(Default)]
+pub struct SummaryFeed {
+    tx: watch::Sender<SharedSummary>,
+    /// Whether the producer task runs; taken together with the subscriber check, so a
+    /// subscriber either keeps the running task alive or starts a new one.
+    running: Mutex<bool>,
+    computed: AtomicU64,
+}
+
+impl SummaryFeed {
+    /// Summaries computed since the hub started.
+    pub fn computed(&self) -> u64 {
+        self.computed.load(Ordering::Relaxed)
+    }
+
+    /// A receiver of the shared summary; starts the producer if it is not running.
+    fn subscribe(self: &Arc<Self>, s: &HttpState) -> watch::Receiver<SharedSummary> {
+        let rx = self.tx.subscribe();
+        let mut running = self.running.lock().unwrap();
+        if !*running {
+            *running = true;
+            tokio::spawn(produce(Arc::clone(self), s.clone()));
+        }
+        rx
+    }
+}
+
+async fn produce(feed: Arc<SummaryFeed>, s: HttpState) {
+    let mut ticker = tokio::time::interval(STREAM_CHECK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = s.stopping.cancelled() => {}
+        }
+        {
+            let mut running = feed.running.lock().unwrap();
+            if s.stopping.is_cancelled() || feed.tx.receiver_count() == 0 {
+                // A later subscriber waits for a fresh summary instead of reading this one,
+                // however old it gets. Sending also wakes open streams to see the shutdown.
+                feed.tx.send_replace(None);
+                *running = false;
+                return;
+            }
+        }
+        feed.computed.fetch_add(1, Ordering::Relaxed);
+        let summary = api::summary(&s.topology(), &s.window_totals(), &s.build_id);
+        feed.tx.send_replace(Some(Arc::new(summary)));
+    }
+}
+
 /// Holds one of the [`MAX_STREAMS`] stream slots until dropped.
 struct StreamSlot(Arc<AtomicUsize>);
 
@@ -186,7 +248,7 @@ impl Drop for StreamSlot {
 
 /// Server-sent events: a `summary` event (totals, window counts, a structural `revision`) at
 /// once, then whenever it changed (checked every [`STREAM_CHECK`]) and at least every
-/// [`STREAM_EVERY`]. Ends at shutdown.
+/// [`STREAM_EVERY`]. Ends at shutdown. Every stream reads the one [`SummaryFeed`].
 async fn api_stream(State(s): State<HttpState>) -> Response {
     let Some(slot) = StreamSlot::acquire(&s.streams) else {
         return (
@@ -195,16 +257,18 @@ async fn api_stream(State(s): State<HttpState>) -> Response {
         )
             .into_response();
     };
-    let mut ticker = tokio::time::interval(STREAM_CHECK);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last: Option<(api::Summary, Instant)> = None;
-    let events = IntervalStream::new(ticker)
-        .map_while(move |_| {
+    let rx = s.summaries.subscribe(&s);
+    let stopping = s.stopping.clone();
+    let mut last: Option<(Arc<api::Summary>, Instant)> = None;
+    let events = WatchStream::new(rx)
+        .map_while(move |summary| {
             let _slot = &slot;
-            if s.stopping.is_cancelled() {
+            if stopping.is_cancelled() {
                 return None;
             }
-            let summary = api::summary(&s.topology(), &s.window_totals(), &s.build_id);
+            let Some(summary) = summary else {
+                return Some(None);
+            };
             let due = last.as_ref().is_none_or(|(prev, sent)| {
                 sent.elapsed() >= STREAM_EVERY
                     || prev.revision != summary.revision
@@ -214,7 +278,7 @@ async fn api_stream(State(s): State<HttpState>) -> Response {
             if !due {
                 return Some(None);
             }
-            let event = Event::default().event("summary").json_data(&summary).ok();
+            let event = Event::default().event("summary").json_data(&*summary).ok();
             last = Some((summary, Instant::now()));
             Some(event)
         })
@@ -233,6 +297,95 @@ async fn api_stream(State(s): State<HttpState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::Registry;
+    use crate::telemetry::Metrics;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn state() -> HttpState {
+        let config = Arc::new(Config {
+            otlp_endpoint: None,
+            ..Config::default()
+        });
+        let registry = Arc::new(Registry::new(config.owner_grace));
+        let sessions = Arc::new(Sessions::new());
+        let router = Router::new(
+            Arc::clone(&registry),
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+            Metrics::new(opentelemetry::global::meter("test")),
+        );
+        let anchor = ClockAnchor::now();
+        HttpState {
+            registry,
+            sessions,
+            router,
+            config,
+            anchor,
+            started: anchor.instant,
+            build_id: "test".into(),
+            stopping: CancellationToken::new(),
+            streams: Arc::default(),
+            summaries: Arc::default(),
+        }
+    }
+
+    fn computed(s: &HttpState) -> u64 {
+        s.summaries.computed()
+    }
+
+    /// Opens `/api/v1/stream` and waits for its first `summary` event.
+    async fn open_stream(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET /api/v1/stream HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut seen = String::new();
+        let mut chunk = [0u8; 4096];
+        while !seen.contains("event: summary") {
+            let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk))
+                .await
+                .expect("no summary in time")
+                .unwrap();
+            assert!(n > 0, "stream closed: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+        stream
+    }
+
+    #[tokio::test]
+    async fn many_streams_share_one_summary_per_tick_and_idle_streams_cost_nothing() {
+        let s = state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app(s.clone())).into_future());
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            streams.push(open_stream(addr).await);
+        }
+        let before = computed(&s);
+        tokio::time::sleep(STREAM_CHECK * 6).await;
+        let during = computed(&s) - before;
+        // One computation per tick for all eight streams (six ticks, with slack for timing);
+        // a computation per stream would be about 48.
+        assert!((4..=8).contains(&during), "{during} summaries in six ticks");
+
+        // Without subscribers the producer stops: hyper notices the closed connections at the
+        // next write (at most STREAM_EVERY), the producer at its next tick.
+        drop(streams);
+        tokio::time::sleep(STREAM_EVERY + STREAM_CHECK * 3).await;
+        let idle = computed(&s);
+        tokio::time::sleep(STREAM_CHECK * 4).await;
+        assert_eq!(
+            computed(&s),
+            idle,
+            "summaries computed without a subscriber"
+        );
+
+        // A new subscriber starts it again.
+        let again = open_stream(addr).await;
+        assert!(computed(&s) > idle);
+        drop(again);
+        server.abort();
+    }
 
     #[test]
     fn stream_slots_are_bounded_and_given_back() {

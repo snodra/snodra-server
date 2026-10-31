@@ -15,9 +15,12 @@
 //! [`EdgeSnapshot::evicted`]. Sender and type names longer than [`MAX_NAME_BYTES`] are cut.
 //!
 //! Everything sits behind one mutex that is taken for short synchronous work only, never
-//! together with the router's other locks. Time is `tokio::time::Instant`, like the router's,
+//! together with the router's other locks. Readers keep their share small: [`EdgeStats::totals`]
+//! reads request, error and key-hash totals kept as edges change (O(1)), and
+//! [`EdgeStats::snapshot`] copies counts and sketch bins and merges them after the lock. Time is `tokio::time::Instant`, like the router's,
 //! so tests run on paused time.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -82,8 +85,8 @@ pub struct Latency {
 }
 
 impl Latency {
-    fn add_sketch(&mut self, s: &Sketch) {
-        for &(bin, n) in &s.bins {
+    fn add_bins(&mut self, bins: &[(u16, u32)]) {
+        for &(bin, n) in bins {
             *self.bins.entry(bin).or_default() += u64::from(n);
             self.samples += u64::from(n);
         }
@@ -143,6 +146,14 @@ mod probe {
 
     thread_local! {
         pub static KEY_CLONES: Cell<u64> = const { Cell::new(0) };
+        pub static KEY_HASHES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// `f`'s result and the key hashes it computed.
+    pub fn key_hashes<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = KEY_HASHES.with(Cell::get);
+        let out = f();
+        (out, KEY_HASHES.with(Cell::get) - before)
     }
 
     /// `f`'s result and the key clones it made.
@@ -165,6 +176,8 @@ struct Edge {
     /// Kind of the latest request on the edge.
     kind: Kind,
     last_seen: Instant,
+    /// [`key_hash`] of the edge's key, computed once when the edge is created.
+    hash: u64,
     /// Oldest first; only slots with requests.
     slots: VecDeque<Slot>,
 }
@@ -179,17 +192,66 @@ impl Edge {
     }
 }
 
+/// Requests and errors of one slot over all edges.
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotTotals {
+    index: u64,
+    count: u64,
+    errors: u64,
+}
+
 #[derive(Default)]
 struct Inner {
     edges: HashMap<EdgeKey, Edge>,
     /// The slot of the last full sweep (one sweep per slot at most).
     swept_at: u64,
     evicted: u64,
+    /// XOR of the held edges' hashes, kept on insert and removal.
+    keys_hash: u64,
+    /// Totals per slot over all edges, at `index % SLOTS`, kept on record and eviction, so
+    /// [`EdgeStats::totals`] reads ten numbers instead of walking the map.
+    slot_totals: [SlotTotals; SLOTS as usize],
+}
+
+impl SlotTotals {
+    /// The entry of slot `index` in `ring`, reset when it still holds an older slot; `None` when
+    /// it already holds a newer one (`index` is then out of every window).
+    fn of(ring: &mut [SlotTotals; SLOTS as usize], index: u64) -> Option<&mut SlotTotals> {
+        let t = &mut ring[(index % SLOTS) as usize];
+        if t.index < index {
+            *t = SlotTotals {
+                index,
+                ..SlotTotals::default()
+            };
+        }
+        (t.index == index).then_some(t)
+    }
 }
 
 impl Inner {
+    /// Drops expired slots and the edges left without any. Their counts are older than every
+    /// window from here on, so only the key hash changes.
     fn sweep(&mut self, oldest: u64) {
-        self.edges.retain(|_, e| e.trim(oldest));
+        let keys_hash = &mut self.keys_hash;
+        self.edges.retain(|_, e| {
+            let live = e.trim(oldest);
+            if !live {
+                *keys_hash ^= e.hash;
+            }
+            live
+        });
+    }
+
+    /// Takes a removed live edge out of the totals.
+    fn forget(keys_hash: &mut u64, ring: &mut [SlotTotals; SLOTS as usize], e: &Edge) {
+        *keys_hash ^= e.hash;
+        for s in &e.slots {
+            let t = &mut ring[(s.index % SLOTS) as usize];
+            if t.index == s.index {
+                t.count = t.count.saturating_sub(s.count);
+                t.errors = t.errors.saturating_sub(s.errors);
+            }
+        }
     }
 
     /// Drops the `n` least recently used edges. Only the last-seen instants are copied (no
@@ -204,15 +266,21 @@ impl Inner {
         let cutoff = *ages.select_nth_unstable(n - 1).1;
         let older = ages.iter().filter(|&&t| t < cutoff).count();
         let mut ties = n - older;
-        self.edges.retain(|_, e| {
-            if e.last_seen < cutoff {
-                return false;
+        let Inner {
+            edges,
+            keys_hash,
+            slot_totals,
+            ..
+        } = self;
+        edges.retain(|_, e| {
+            let drop = e.last_seen < cutoff || (e.last_seen == cutoff && ties > 0);
+            if drop {
+                if e.last_seen == cutoff {
+                    ties -= 1;
+                }
+                Self::forget(keys_hash, slot_totals, e);
             }
-            if e.last_seen == cutoff && ties > 0 {
-                ties -= 1;
-                return false;
-            }
-            true
+            !drop
         });
         self.evicted += n as u64;
     }
@@ -255,6 +323,17 @@ pub struct EdgeStats {
     max_edges: usize,
     origin: Instant,
     inner: Mutex<Inner>,
+}
+
+/// Hash of one edge key; the XOR over the live keys is [`WindowTotals::keys_hash`].
+fn key_hash(key: &EdgeKey) -> u64 {
+    #[cfg(test)]
+    probe::KEY_HASHES.with(|n| n.set(n.get() + 1));
+    let mut bytes = Vec::with_capacity(key.sender.len() + key.type_name.len() + 1);
+    bytes.extend_from_slice(key.sender.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(key.type_name.as_bytes());
+    xxh64(&bytes, 0)
 }
 
 /// Cuts `name` to at most [`MAX_NAME_BYTES`] bytes (plus the ellipsis).
@@ -314,8 +393,9 @@ impl EdgeStats {
             sender: clip(sender),
             type_name: clip(type_name),
         };
-        let mut inner = self.inner.lock().unwrap();
-        if inner.swept_at != current {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if current > inner.swept_at {
             inner.sweep(oldest);
             inner.swept_at = current;
         }
@@ -325,11 +405,19 @@ impl EdgeStats {
             let batch = (self.max_edges / 100).max(1);
             inner.evict(batch);
         }
-        let edge = inner.edges.entry(key).or_insert_with(|| Edge {
-            kind,
-            last_seen: now,
-            slots: VecDeque::new(),
-        });
+        let edge = match inner.edges.entry(key) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let hash = key_hash(v.key());
+                inner.keys_hash ^= hash;
+                v.insert(Edge {
+                    kind,
+                    last_seen: now,
+                    hash,
+                    slots: VecDeque::new(),
+                })
+            }
+        };
         edge.kind = kind;
         edge.last_seen = edge.last_seen.max(now);
         // A caller that read the clock just before another one took the lock lands in the
@@ -351,42 +439,61 @@ impl EdgeStats {
         if let Some(latency) = latency {
             slot.sketch.record(latency);
         }
+        if let Some(t) = SlotTotals::of(&mut inner.slot_totals, slot.index) {
+            t.count += 1;
+            if error {
+                t.errors += 1;
+            }
+        }
     }
 
-    /// Every edge with a request in the window at `now`. The slots are copied under the lock
-    /// and merged after it is released.
+    /// Every edge with a request in the window at `now`. Under the lock only the key, the
+    /// summed counts and the live slots' sketch bins (into one shared buffer) are copied; the
+    /// latency merge and the sort happen after it is released.
     pub fn snapshot(&self, now: Instant) -> EdgeSnapshot {
+        struct Raw {
+            key: EdgeKey,
+            kind: Kind,
+            count: u64,
+            errors: u64,
+            bins: std::ops::Range<usize>,
+        }
         let oldest = Self::oldest_live(self.slot_index(now));
+        let mut bins: Vec<(u16, u32)> = Vec::new();
         let (raw, evicted) = {
             let inner = self.inner.lock().unwrap();
-            let raw: Vec<(EdgeKey, Kind, Vec<Slot>)> = inner
-                .edges
-                .iter()
-                .filter_map(|(k, e)| {
-                    let live: Vec<Slot> = e
-                        .slots
-                        .iter()
-                        .filter(|s| s.index >= oldest)
-                        .cloned()
-                        .collect();
-                    (!live.is_empty()).then(|| (k.clone(), e.kind, live))
-                })
-                .collect();
+            let mut raw = Vec::with_capacity(inner.edges.len());
+            for (k, e) in &inner.edges {
+                let start = bins.len();
+                let (mut count, mut errors) = (0, 0);
+                for s in e.slots.iter().filter(|s| s.index >= oldest) {
+                    count += s.count;
+                    errors += s.errors;
+                    bins.extend_from_slice(&s.sketch.bins);
+                }
+                if count > 0 {
+                    raw.push(Raw {
+                        key: k.clone(),
+                        kind: e.kind,
+                        count,
+                        errors,
+                        bins: start..bins.len(),
+                    });
+                }
+            }
             (raw, inner.evicted)
         };
         let mut edges: Vec<EdgeWindow> = raw
             .into_iter()
-            .map(|(key, kind, slots)| {
+            .map(|r| {
                 let mut latency = Latency::default();
-                for s in &slots {
-                    latency.add_sketch(&s.sketch);
-                }
+                latency.add_bins(&bins[r.bins]);
                 EdgeWindow {
-                    sender: key.sender,
-                    type_name: key.type_name,
-                    kind,
-                    count: slots.iter().map(|s| s.count).sum(),
-                    errors: slots.iter().map(|s| s.errors).sum(),
+                    sender: r.key.sender,
+                    type_name: r.key.type_name,
+                    kind: r.kind,
+                    count: r.count,
+                    errors: r.errors,
                     latency,
                 }
             })
@@ -403,26 +510,25 @@ impl EdgeStats {
         }
     }
 
-    /// Requests and errors over the window, and a hash of the live edge keys.
+    /// Requests and errors over the window, and a hash of the live edge keys. O(1): the totals
+    /// are kept as edges change; at most once per slot this sweeps expired edges first, as the
+    /// next record would.
     pub fn totals(&self, now: Instant) -> WindowTotals {
-        let oldest = Self::oldest_live(self.slot_index(now));
-        let inner = self.inner.lock().unwrap();
-        let mut t = WindowTotals::default();
-        for (key, edge) in &inner.edges {
-            let mut live = edge.slots.iter().filter(|s| s.index >= oldest).peekable();
-            if live.peek().is_none() {
-                continue;
-            }
-            for s in live {
-                t.requests += s.count;
-                t.errors += s.errors;
-            }
-            t.edges += 1;
-            let mut bytes = Vec::with_capacity(key.sender.len() + key.type_name.len() + 1);
-            bytes.extend_from_slice(key.sender.as_bytes());
-            bytes.push(0);
-            bytes.extend_from_slice(key.type_name.as_bytes());
-            t.keys_hash ^= xxh64(&bytes, 0);
+        let current = self.slot_index(now);
+        let oldest = Self::oldest_live(current);
+        let mut inner = self.inner.lock().unwrap();
+        if current > inner.swept_at {
+            inner.sweep(oldest);
+            inner.swept_at = current;
+        }
+        let mut t = WindowTotals {
+            edges: inner.edges.len(),
+            keys_hash: inner.keys_hash,
+            ..WindowTotals::default()
+        };
+        for s in inner.slot_totals.iter().filter(|s| s.index >= oldest) {
+            t.requests += s.count;
+            t.errors += s.errors;
         }
         t
     }
@@ -721,6 +827,62 @@ mod tests {
         assert!((p99 - 10.0).abs() < 0.5, "{p99}");
         let max = merged.quantile(1.0).unwrap().as_secs_f64() * 1000.0;
         assert!((max - 1000.0).abs() < 45.0, "{max}");
+    }
+
+    /// The totals recomputed from a snapshot: what `totals` must equal.
+    fn recomputed(stats: &EdgeStats) -> WindowTotals {
+        let snap = stats.snapshot(Instant::now());
+        let mut t = WindowTotals::default();
+        for e in &snap.edges {
+            t.requests += e.count;
+            t.errors += e.errors;
+            t.edges += 1;
+            t.keys_hash ^= key_hash(&EdgeKey {
+                sender: e.sender.clone(),
+                type_name: e.type_name.clone(),
+            });
+        }
+        t
+    }
+
+    fn check_totals(stats: &EdgeStats, at: &str) {
+        let (got, hashes) = probe::key_hashes(|| stats.totals(Instant::now()));
+        assert_eq!(got, recomputed(stats), "{at}");
+        assert_eq!(
+            hashes, 0,
+            "{at}: totals hashed keys instead of keeping the hash"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn totals_are_kept_incrementally_through_records_evictions_and_expiry() {
+        let stats = EdgeStats::new(WINDOW, 4);
+        check_totals(&stats, "empty");
+        rec(&stats, "a", "t.A", false, Some(1));
+        rec(&stats, "a", "t.A", true, Some(1));
+        rec(&stats, "b", "t.A", true, None);
+        check_totals(&stats, "records");
+        tokio::time::advance(Duration::from_secs(40)).await;
+        for t in ["t.B", "t.C"] {
+            rec(&stats, "a", t, false, Some(1));
+        }
+        rec(&stats, "a", "t.A", false, Some(1));
+        check_totals(&stats, "second slot");
+        // At the cap (4): a new edge evicts the least recently used one (b -> t.A).
+        tokio::time::advance(ms(10)).await;
+        rec(&stats, "a", "t.D", true, Some(1));
+        assert_eq!(stats.snapshot(Instant::now()).evicted, 1);
+        check_totals(&stats, "eviction");
+        // The first slot (0-30 s) leaves the window at 300 s, without any record.
+        tokio::time::advance(Duration::from_secs(265)).await;
+        check_totals(&stats, "first slot expired");
+        assert_eq!(stats.totals(Instant::now()).requests, 4);
+        // Everything expires.
+        tokio::time::advance(WINDOW).await;
+        check_totals(&stats, "all expired");
+        assert_eq!(stats.totals(Instant::now()), WindowTotals::default());
+        rec(&stats, "c", "t.E", false, None);
+        check_totals(&stats, "fresh");
     }
 
     #[tokio::test(start_paused = true)]

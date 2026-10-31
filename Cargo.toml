@@ -21,7 +21,7 @@ tonic-health = "0.14"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 prost = "0.14.4"
 tokio = { version = "1.54.1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

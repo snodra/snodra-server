@@ -108,6 +108,7 @@ pub async fn serve_with_shutdown(
             build_id: assets::build_id().to_string(),
             stopping: stopping.clone(),
             streams: Arc::default(),
+            summaries: Arc::default(),
         });
         let stopping = stopping.clone();
         info!(addr = ?listener.local_addr().ok(), "http listening");
