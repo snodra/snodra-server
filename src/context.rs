@@ -1,13 +1,14 @@
-//! Contexts: the unit the hub will one day partition its registry by (roadmap P8, "contexts").
+//! Contexts: the unit the hub would partition its registry by. The owner deferred contexts
+//! indefinitely (no tenant use case); P0 keeps the door open.
 //!
-//! Until then every session lives in the `default` context. The registry, session and router APIs
+//! Every session lives in the `default` context. The registry, session and router APIs
 //! already take a [`ContextId`] so adding contexts later changes their implementation, not their
 //! callers.
 
 use std::fmt;
 use std::sync::Arc;
 
-/// Name of the one context that exists today; `Register` has no context field yet.
+/// Name of the one context that exists; `Register` has no context field.
 pub const DEFAULT_CONTEXT: &str = "default";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

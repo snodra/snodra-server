@@ -30,9 +30,10 @@ use crate::proto::{
     ClientMessage, Heartbeat, Register, ServerMessage, TopologyRequest, TopologyResponse,
     client_message, server_message,
 };
+use crate::protocol;
 use crate::registry::{RegisterError, Registry};
 use crate::router::Router;
-use crate::session::Sessions;
+use crate::session::{SessionMeta, Sessions};
 use crate::topology::{ClockAnchor, snapshot};
 
 pub struct HubService {
@@ -117,7 +118,7 @@ impl Hub for HubService {
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             router: Arc::clone(&self.router),
-            handshake_timeout: self.config.handshake_timeout,
+            config: Arc::clone(&self.config),
             context: ContextId::default(),
         };
         tokio::spawn(run_stream(ctx, inbound, tx, cancel.clone()));
@@ -140,6 +141,7 @@ impl Hub for HubService {
             &self.router,
             self.anchor,
             self.started,
+            &self.config.hub_id,
             self.heartbeat_timeout,
             Instant::now(),
         );
@@ -151,8 +153,8 @@ struct StreamCtx {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     router: Arc<Router>,
-    handshake_timeout: Duration,
-    /// Every stream lives in the default context until `Register` carries one (roadmap P8).
+    config: Arc<Config>,
+    /// Every stream lives in the default context (contexts are deferred; the API keeps the door open).
     context: ContextId,
 }
 
@@ -173,11 +175,14 @@ impl StreamCtx {
             })?;
         Some(match result {
             Ok(()) => {
+                // Never log `reg` itself: it may carry credentials.
                 info!(
                     service = %reg.service_name,
                     instance = %reg.instance_id,
                     commands = reg.command_types.len(),
                     queries = reg.query_types.len(),
+                    protocol_version = reg.protocol_version,
+                    client_version = %reg.client_version,
                     "register"
                 );
                 Ok(())
@@ -215,18 +220,19 @@ async fn run_stream(
 ) {
     // Handshake: the first message must be a Register, within the handshake timeout. No session
     // state exists yet, so every failure here just reports the status and ends the stream.
+    let handshake_timeout = ctx.config.handshake_timeout;
     let first = tokio::select! {
         biased;
         _ = cancel.cancelled() => return,
-        first = tokio::time::timeout(ctx.handshake_timeout, inbound.next()) => first,
+        first = tokio::time::timeout(handshake_timeout, inbound.next()) => first,
     };
     let first = match first {
         Err(_elapsed) => {
-            warn!(timeout = ?ctx.handshake_timeout, "no Register within handshake timeout");
+            warn!(timeout = ?handshake_timeout, "no Register within handshake timeout");
             let _ = tx
                 .send(Err(Status::deadline_exceeded(format!(
                     "no Register within {:?}",
-                    ctx.handshake_timeout
+                    handshake_timeout
                 ))))
                 .await;
             return;
@@ -259,12 +265,29 @@ async fn run_stream(
     }
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
+    // Version, capabilities and client version are fixed by the first Register (ADR 0013).
+    let v2 = protocol::is_v2(first.protocol_version);
+    let ack = v2.then(|| {
+        protocol::register_ack(
+            &ctx.config,
+            &ctx.context,
+            first.protocol_version,
+            &first.capabilities,
+        )
+    });
+    let meta = SessionMeta {
+        protocol_version: first.protocol_version,
+        capabilities: first.capabilities.clone(),
+        client_version: first.client_version.clone(),
+        heartbeat_timeout: ctx.config.heartbeat_timeout_for(first.protocol_version),
+    };
     // Session first, then the registration under it: a late disconnect of an older stream with
     // the same instance id can then never unregister this stream's registration.
     let token = ctx.sessions.insert(
         &ctx.context,
         &instance_id,
         &service,
+        meta,
         tx.clone(),
         cancel.clone(),
     );
@@ -280,6 +303,20 @@ async fn run_stream(
         }
         None => {
             debug!(instance = %instance_id, "session replaced during handshake");
+            return;
+        }
+    }
+    // The ack is queued before this task reads the next inbound message, so it precedes the echo
+    // of the heartbeat that follows the Register (the stream's messages are handled in order).
+    // Requests routed to this instance meanwhile may come first; clients handle them anyway.
+    if let Some(ack) = &ack {
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            sent = tx.send(Ok(ack.clone())) => sent.is_ok(),
+        };
+        if !sent {
+            ctx.disconnect(&instance_id, token);
             return;
         }
     }
@@ -311,7 +348,16 @@ async fn run_stream(
                     reg.service_name = service.clone();
                 }
                 match ctx.register(token, &reg) {
-                    Some(Ok(())) => ctx.router.refresh_gauges(),
+                    Some(Ok(())) => {
+                        ctx.router.refresh_gauges();
+                        // Best effort like the heartbeat echo: a full buffer drops this ack.
+                        if let (Some(ack), Some(tx)) = (&ack, out.upgrade())
+                            && let Err(mpsc::error::TrySendError::Full(_)) =
+                                tx.try_send(Ok(ack.clone()))
+                        {
+                            debug!(instance = %instance_id, "outbound buffer full, re-register ack dropped");
+                        }
+                    }
                     Some(Err(status)) => {
                         // Best effort: a full buffer must not keep this task alive.
                         if let Some(tx) = out.upgrade() {

@@ -97,7 +97,9 @@ async fn topology_lists_two_services_with_instances_and_types() {
         (2, 3, 1, 1)
     );
     assert_eq!(totals.in_flight, 0);
-    assert_eq!(t.heartbeat_timeout_ms, 30_000);
+    // The v2 threshold (KRAKEN_HUB_HEARTBEAT_TIMEOUT); v1 sessions are held to the legacy one.
+    assert_eq!(t.heartbeat_timeout_ms, 10_000);
+    assert!(!t.hub_id.is_empty());
     assert!(t.now_ms >= t.hub_started_at_ms && t.hub_started_at_ms > 0);
     for s in &t.services {
         for i in &s.instances {
@@ -192,7 +194,9 @@ async fn topology_counts_in_flight_for_handler_and_sender() {
 #[tokio::test]
 async fn topology_reflects_eviction() {
     let addr = start_hub(Config {
+        heartbeat_interval: Duration::from_millis(300),
         heartbeat_timeout: Duration::from_secs(1),
+        legacy_heartbeat_timeout: Duration::from_secs(1), // the fake client speaks v1
         ..config()
     })
     .await;

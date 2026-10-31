@@ -56,6 +56,7 @@ pub enum KindName {
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Topology {
+    pub hub_id: String,
     pub hub_started_at_ms: i64,
     pub now_ms: i64,
     pub heartbeat_timeout_ms: i64,
@@ -82,6 +83,10 @@ pub struct InstanceTopology {
     pub in_flight_as_sender: u32,
     pub command_types: Vec<String>,
     pub query_types: Vec<String>,
+    /// `Register.protocol_version` of the session (0 = v1).
+    pub protocol_version: u32,
+    /// `Register.client_version`, empty for v1 clients.
+    pub client_version: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -112,12 +117,14 @@ fn ms(d: Duration) -> i64 {
 
 /// Builds the snapshot. Sessions are the base set; registry types and in-flight counts are
 /// attached by instance id (empty / zero when absent).
+#[allow(clippy::too_many_arguments)] // plain inputs of one snapshot; a struct would only rename them
 pub fn snapshot(
     registry: &Registry,
     sessions: &Sessions,
     router: &Router,
     anchor: ClockAnchor,
     started: Instant,
+    hub_id: &str,
     heartbeat_timeout: Duration,
     now: Instant,
 ) -> Topology {
@@ -125,7 +132,6 @@ pub fn snapshot(
     let reg = registry.topology(now);
     let (in_flight, in_flight_total) = router.in_flight_by_instance();
 
-    let stale_after = heartbeat_timeout / 3;
     let mut by_service: BTreeMap<String, Vec<InstanceTopology>> = BTreeMap::new();
     for d in details {
         let age = now.saturating_duration_since(d.last_heartbeat);
@@ -141,11 +147,14 @@ pub fn snapshot(
             .push(InstanceTopology {
                 connected_since_ms: anchor.to_epoch_ms(d.connected_since),
                 last_heartbeat_age_ms: ms(age),
-                stale: age > stale_after,
+                // Each session against its own threshold (v2 and v1 sessions differ).
+                stale: age > d.heartbeat_timeout / 3,
                 in_flight_as_handler: flight.as_handler,
                 in_flight_as_sender: flight.as_sender,
                 command_types: commands,
                 query_types: queries,
+                protocol_version: d.protocol_version,
+                client_version: d.client_version,
                 instance_id: d.instance_id,
             });
     }
@@ -193,6 +202,7 @@ pub fn snapshot(
     };
 
     Topology {
+        hub_id: hub_id.to_string(),
         hub_started_at_ms: anchor.to_epoch_ms(started),
         now_ms: anchor.to_epoch_ms(now),
         heartbeat_timeout_ms: ms(heartbeat_timeout),
@@ -225,8 +235,8 @@ impl Topology {
                             in_flight_as_sender: i.in_flight_as_sender,
                             command_types: i.command_types.clone(),
                             query_types: i.query_types.clone(),
-                            protocol_version: 0,
-                            client_version: String::new(),
+                            protocol_version: i.protocol_version,
+                            client_version: i.client_version.clone(),
                         })
                         .collect(),
                 })
@@ -253,7 +263,7 @@ impl Topology {
                 query_types: self.totals.query_types,
                 in_flight: self.totals.in_flight,
             }),
-            hub_id: String::new(),
+            hub_id: self.hub_id.clone(),
         }
     }
 
@@ -262,6 +272,7 @@ impl Topology {
     pub fn from_proto(p: &proto::TopologyResponse) -> Topology {
         let totals = p.totals.unwrap_or_default();
         Topology {
+            hub_id: p.hub_id.clone(),
             hub_started_at_ms: p.hub_started_at_ms,
             now_ms: p.now_ms,
             heartbeat_timeout_ms: p.heartbeat_timeout_ms,
@@ -282,6 +293,8 @@ impl Topology {
                             in_flight_as_sender: i.in_flight_as_sender,
                             command_types: i.command_types.clone(),
                             query_types: i.query_types.clone(),
+                            protocol_version: i.protocol_version,
+                            client_version: i.client_version.clone(),
                         })
                         .collect(),
                 })
@@ -320,6 +333,7 @@ impl Topology {
 mod tests {
     use super::*;
     use crate::context::ContextId;
+    use crate::session::SessionMeta;
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
     use crate::config::Config;
@@ -354,10 +368,14 @@ mod tests {
     }
 
     fn connect(f: &Fx, id: &str, service: &str) {
+        connect_with(f, id, service, SessionMeta::v1(Duration::from_secs(30)));
+    }
+
+    fn connect_with(f: &Fx, id: &str, service: &str, meta: SessionMeta) {
         let (tx, rx) = mpsc::channel(4);
         std::mem::forget(rx);
         f.sessions
-            .insert(&D, id, service, tx, CancellationToken::new());
+            .insert(&D, id, service, meta, tx, CancellationToken::new());
     }
 
     fn snap(f: &Fx, started: Instant, timeout: Duration, now: Instant) -> Topology {
@@ -367,6 +385,7 @@ mod tests {
             &f.router,
             f.anchor,
             started,
+            "hub-x",
             timeout,
             now,
         )
@@ -421,13 +440,72 @@ mod tests {
         assert_eq!(t.heartbeat_timeout_ms, 30000);
     }
 
+    #[tokio::test]
+    async fn stale_uses_each_session_own_timeout() {
+        let f = fx();
+        connect(&f, "v1", "svc");
+        connect_with(
+            &f,
+            "v2",
+            "svc",
+            SessionMeta {
+                protocol_version: 2,
+                client_version: "lib/1".into(),
+                ..SessionMeta::v1(Duration::from_secs(10))
+            },
+        );
+        let base = Instant::now();
+        f.sessions.touch(&D, "v1", base);
+        f.sessions.touch(&D, "v2", base);
+        // 5 s of silence: more than 10 s / 3, less than 30 s / 3.
+        let t = snap(
+            &f,
+            f.anchor.instant,
+            Duration::from_secs(10),
+            base + Duration::from_secs(5),
+        );
+        let by_id = |id: &str| {
+            t.services[0]
+                .instances
+                .iter()
+                .find(|i| i.instance_id == id)
+                .unwrap()
+        };
+        assert!(by_id("v2").stale);
+        assert!(!by_id("v1").stale);
+        assert_eq!(
+            (
+                by_id("v2").protocol_version,
+                by_id("v2").client_version.as_str()
+            ),
+            (2, "lib/1")
+        );
+        assert_eq!(
+            (
+                by_id("v1").protocol_version,
+                by_id("v1").client_version.as_str()
+            ),
+            (0, "")
+        );
+        assert_eq!(t.hub_id, "hub-x");
+    }
+
     fn sample() -> Topology {
         let f = fx();
         f.registry
             .register(&D, "i1", "a", &["a.Do".into()], &["a.Get".into()])
             .unwrap();
         connect(&f, "i1", "a");
-        connect(&f, "i2", "b");
+        connect_with(
+            &f,
+            "i2",
+            "b",
+            SessionMeta {
+                protocol_version: 2,
+                client_version: "lib/1".into(),
+                ..SessionMeta::v1(Duration::from_secs(10))
+            },
+        );
         f.registry.register(&D, "i2", "b", &[], &[]).unwrap();
         snap(
             &f,
@@ -453,6 +531,9 @@ mod tests {
         assert!(json.contains("connectedSinceMs"), "{json}");
         assert!(json.contains("lastHeartbeatAgeMs"), "{json}");
         assert!(json.contains("heartbeatTimeoutMs"), "{json}");
+        assert!(json.contains("\"hubId\":\"hub-x\""), "{json}");
+        assert!(json.contains("\"protocolVersion\":2"), "{json}");
+        assert!(json.contains("\"clientVersion\":\"lib/1\""), "{json}");
         assert_eq!(serde_json::from_str::<Topology>(&json).unwrap(), t);
     }
 }

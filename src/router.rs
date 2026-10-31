@@ -510,7 +510,14 @@ mod tests {
 
     fn fake(sessions: &Sessions, id: &str, service: &str, cap: usize) -> Rx {
         let (tx, rx) = mpsc::channel(cap);
-        sessions.insert(&D, id, service, tx, CancellationToken::new());
+        sessions.insert(
+            &D,
+            id,
+            service,
+            crate::session::SessionMeta::v1(Duration::from_secs(30)),
+            tx,
+            CancellationToken::new(),
+        );
         rx
     }
 

@@ -241,11 +241,14 @@ mod tests {
             in_flight_as_sender: flight.1,
             command_types: commands.iter().map(|s| s.to_string()).collect(),
             query_types: queries.iter().map(|s| s.to_string()).collect(),
+            protocol_version: 2,
+            client_version: "kraken-messaging/0.1.0".into(),
         }
     }
 
     fn fixture() -> Topology {
         Topology {
+            hub_id: "hub-1".into(),
             hub_started_at_ms: 0,
             now_ms: 200_000_000,
             heartbeat_timeout_ms: 30_000,
@@ -329,6 +332,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
     #[test]
     fn render_table_empty_topology() {
         let t = Topology {
+            hub_id: "hub-1".into(),
             hub_started_at_ms: 0,
             now_ms: 1,
             heartbeat_timeout_ms: 30_000,

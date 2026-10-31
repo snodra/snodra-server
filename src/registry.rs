@@ -211,8 +211,8 @@ impl Inner {
 }
 
 /// One registry partition. Every method that routes or (un)registers takes the [`ContextId`] of
-/// the session; until contexts ship (roadmap P8) the only context is `default` and the registry
-/// has a single partition.
+/// the session; contexts are deferred, so the only context is `default` and the registry has a
+/// single partition.
 pub struct Registry {
     owner_grace: Duration,
     inner: Mutex<Inner>,

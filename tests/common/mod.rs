@@ -7,8 +7,8 @@ use std::time::Duration;
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
 use kraken_hub::proto::{
-    ClientMessage, Error, ErrorCode, Register, Reply, Request, RequestKind, ServerMessage,
-    client_message, reply,
+    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, Register, Reply, Request, RequestKind,
+    ServerMessage, client_message, credentials, reply,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -129,16 +129,60 @@ impl FakeClient {
         client
     }
 
-    /// Sends a `Register` for this client's instance id (first or re-register).
+    /// Like [`FakeClient::register`] for a protocol v2 client: `protocol_version` 2, a client
+    /// version and (ignored) credentials.
+    pub async fn register_v2(
+        addr: SocketAddr,
+        service: &str,
+        commands: &[&str],
+        queries: &[&str],
+    ) -> Self {
+        let client = Self::connect(addr).await;
+        client.send_register_v2(service, commands, queries).await;
+        client
+    }
+
+    fn register_message(&self, service: &str, commands: &[&str], queries: &[&str]) -> Register {
+        Register {
+            service_name: service.to_string(),
+            instance_id: self.instance_id.clone(),
+            command_types: commands.iter().map(|s| s.to_string()).collect(),
+            query_types: queries.iter().map(|s| s.to_string()).collect(),
+            ..Register::default()
+        }
+    }
+
+    /// Sends a v1 `Register` (no version fields) for this client's instance id (first or
+    /// re-register).
     pub async fn send_register(&self, service: &str, commands: &[&str], queries: &[&str]) {
+        let reg = self.register_message(service, commands, queries);
+        self.send_raw_register(reg).await;
+    }
+
+    /// Sends a v2 `Register` for this client's instance id.
+    pub async fn send_register_v2(&self, service: &str, commands: &[&str], queries: &[&str]) {
+        let reg = Register {
+            protocol_version: 2,
+            capabilities: vec!["not-a-real-capability".to_string()],
+            client_version: "fake-client/1.0".to_string(),
+            credentials: Some(Credentials {
+                kind: Some(credentials::Kind::Token("s3cret".to_string())),
+            }),
+            ..self.register_message(service, commands, queries)
+        };
+        self.send_raw_register(reg).await;
+    }
+
+    pub async fn send_raw_register(&self, reg: Register) {
         let msg = ClientMessage {
-            message: Some(client_message::Message::Register(Register {
-                service_name: service.to_string(),
-                instance_id: self.instance_id.clone(),
-                command_types: commands.iter().map(|s| s.to_string()).collect(),
-                query_types: queries.iter().map(|s| s.to_string()).collect(),
-                ..Register::default()
-            })),
+            message: Some(client_message::Message::Register(reg)),
+        };
+        self.tx.send(msg).await.unwrap();
+    }
+
+    pub async fn heartbeat(&self, sent_at_ms: i64) {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::Heartbeat(Heartbeat { sent_at_ms })),
         };
         self.tx.send(msg).await.unwrap();
     }

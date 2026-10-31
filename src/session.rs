@@ -36,10 +36,36 @@ impl fmt::Display for SendError {
     }
 }
 
+/// What a session negotiated in the first `Register` of its stream; fixed for the stream's life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// `Register.protocol_version` as sent (0 = v1).
+    pub protocol_version: u32,
+    /// `Register.capabilities` as sent.
+    pub capabilities: Vec<String>,
+    /// `Register.client_version` as sent (empty for v1 clients).
+    pub client_version: String,
+    /// The session is evicted after this long without a heartbeat (v2 or legacy timeout).
+    pub heartbeat_timeout: Duration,
+}
+
+impl SessionMeta {
+    /// A v1 session (protocol_version 0) with the given eviction threshold.
+    pub fn v1(heartbeat_timeout: Duration) -> Self {
+        Self {
+            protocol_version: 0,
+            capabilities: Vec::new(),
+            client_version: String::new(),
+            heartbeat_timeout,
+        }
+    }
+}
+
 pub struct Session {
-    /// The context the session registered in (always `default` until contexts ship).
+    /// The context the session registered in (always `default`; contexts are deferred).
     pub context: ContextId,
     pub service: String,
+    pub meta: SessionMeta,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
     pub last_heartbeat: Instant,
     /// When the stream registered (set at `insert`).
@@ -57,6 +83,9 @@ pub struct SessionDetail {
     pub context: ContextId,
     pub instance_id: InstanceId,
     pub service: String,
+    pub protocol_version: u32,
+    pub client_version: String,
+    pub heartbeat_timeout: Duration,
     pub connected_since: Instant,
     pub last_heartbeat: Instant,
 }
@@ -83,6 +112,7 @@ impl Sessions {
         ctx: &ContextId,
         instance_id: &str,
         service: &str,
+        meta: SessionMeta,
         tx: mpsc::Sender<Result<ServerMessage, Status>>,
         cancel: CancellationToken,
     ) -> u64 {
@@ -91,6 +121,7 @@ impl Sessions {
         let session = Session {
             context: ctx.clone(),
             service: service.to_string(),
+            meta,
             tx,
             last_heartbeat: now,
             connected_since: now,
@@ -182,6 +213,9 @@ impl Sessions {
                 context: s.context.clone(),
                 instance_id: id.clone(),
                 service: s.service.clone(),
+                protocol_version: s.meta.protocol_version,
+                client_version: s.meta.client_version.clone(),
+                heartbeat_timeout: s.meta.heartbeat_timeout,
                 connected_since: s.connected_since,
                 last_heartbeat: s.last_heartbeat,
             })
@@ -228,28 +262,24 @@ impl Sessions {
         }
     }
 
-    /// Instances whose last heartbeat is strictly older than `now - timeout`.
-    pub fn stale(&self, now: Instant, timeout: Duration) -> Vec<InstanceId> {
-        self.inner
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, s)| s.last_heartbeat + timeout < now)
-            .map(|(id, _)| id.clone())
-            .collect()
+    /// Instances whose last heartbeat is strictly older than their own heartbeat timeout.
+    pub fn stale(&self, now: Instant) -> Vec<InstanceId> {
+        let mut ids: Vec<InstanceId> = self
+            .stale_with_tokens(now)
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Like [`Sessions::stale`], with each session's context and token for [`Sessions::remove_if`].
-    pub fn stale_with_tokens(
-        &self,
-        now: Instant,
-        timeout: Duration,
-    ) -> Vec<(ContextId, InstanceId, u64)> {
+    pub fn stale_with_tokens(&self, now: Instant) -> Vec<(ContextId, InstanceId, u64)> {
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.last_heartbeat + timeout < now)
+            .filter(|(_, s)| s.last_heartbeat + s.meta.heartbeat_timeout < now)
             .map(|(id, s)| (s.context.clone(), id.clone(), s.token))
             .collect()
     }
@@ -268,6 +298,10 @@ mod tests {
     use super::*;
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
+
+    fn v1() -> SessionMeta {
+        SessionMeta::v1(Duration::from_secs(30))
+    }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
@@ -284,7 +318,7 @@ mod tests {
     async fn send_with_full_buffer_is_busy() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        sessions.insert(&D, "a", "svc", tx, CancellationToken::new());
+        sessions.insert(&D, "a", "svc", v1(), tx, CancellationToken::new());
         assert_eq!(sessions.send(&D, "a", ServerMessage::default()), Ok(()));
         assert_eq!(
             sessions.send(&D, "a", ServerMessage::default()),
@@ -296,7 +330,7 @@ mod tests {
     async fn send_to_dropped_receiver_is_gone() {
         let sessions = Sessions::new();
         let (tx, rx) = mpsc::channel(1);
-        sessions.insert(&D, "a", "svc", tx, CancellationToken::new());
+        sessions.insert(&D, "a", "svc", v1(), tx, CancellationToken::new());
         drop(rx);
         assert_eq!(
             sessions.send(&D, "a", ServerMessage::default()),
@@ -305,18 +339,35 @@ mod tests {
     }
 
     #[test]
-    fn stale_returns_only_instances_past_timeout() {
+    fn stale_returns_only_instances_past_their_own_timeout() {
         let sessions = Sessions::new();
         let now = Instant::now();
-        let (tx_a, _rx_a) = mpsc::channel(1);
-        let (tx_b, _rx_b) = mpsc::channel(1);
-        sessions.insert(&D, "a", "svc", tx_a, CancellationToken::new());
-        sessions.insert(&D, "b", "svc", tx_b, CancellationToken::new());
-        sessions.touch(&D, "a", now);
-        sessions.touch(&D, "b", now - Duration::from_secs(31));
+        let mut senders = Vec::new();
+        for (id, timeout) in [
+            ("v1-ok", 30),
+            ("v1-late", 30),
+            ("v2-ok", 10),
+            ("v2-late", 10),
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            senders.push(rx);
+            let meta = SessionMeta {
+                protocol_version: if timeout == 10 { 2 } else { 0 },
+                ..SessionMeta::v1(Duration::from_secs(timeout))
+            };
+            sessions.insert(&D, id, "svc", meta, tx, CancellationToken::new());
+        }
+        // 12 s of silence: past the v2 timeout (10 s), inside the legacy one (30 s).
+        sessions.touch(&D, "v1-ok", now - Duration::from_secs(12));
+        sessions.touch(&D, "v2-late", now - Duration::from_secs(12));
+        sessions.touch(&D, "v2-ok", now - Duration::from_secs(9));
+        sessions.touch(&D, "v1-late", now - Duration::from_secs(31));
+        assert_eq!(sessions.stale(now), ["v1-late", "v2-late"]);
+        let details = sessions.details();
+        let v2 = details.iter().find(|d| d.instance_id == "v2-ok").unwrap();
         assert_eq!(
-            sessions.stale(now, Duration::from_secs(30)),
-            vec!["b".to_string()]
+            (v2.protocol_version, v2.heartbeat_timeout),
+            (2, Duration::from_secs(10))
         );
     }
 
@@ -325,8 +376,8 @@ mod tests {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert(&D, "a", "svc", tx1, CancellationToken::new());
-        let new = sessions.insert(&D, "a", "svc", tx2, CancellationToken::new());
+        let old = sessions.insert(&D, "a", "svc", v1(), tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", v1(), tx2, CancellationToken::new());
         assert_ne!(old, new);
         assert!(sessions.remove_if(&D, "a", old).is_none());
         assert!(sessions.remove_if(&D, "a", new).is_some());
@@ -340,8 +391,8 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let c1 = CancellationToken::new();
         let c2 = CancellationToken::new();
-        sessions.insert(&D, "a", "svc", tx1, c1.clone());
-        let new = sessions.insert(&D, "a", "svc", tx2, c2.clone());
+        sessions.insert(&D, "a", "svc", v1(), tx1, c1.clone());
+        let new = sessions.insert(&D, "a", "svc", v1(), tx2, c2.clone());
         assert!(c1.is_cancelled());
         assert!(!c2.is_cancelled());
         sessions.remove_if(&D, "a", new).unwrap();
@@ -353,8 +404,8 @@ mod tests {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert(&D, "a", "svc", tx1, CancellationToken::new());
-        let new = sessions.insert(&D, "a", "svc", tx2, CancellationToken::new());
+        let old = sessions.insert(&D, "a", "svc", v1(), tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", v1(), tx2, CancellationToken::new());
         assert_eq!(sessions.with_current(&D, "a", old, || 1), None);
         assert_eq!(sessions.with_current(&D, "a", new, || 2), Some(2));
         assert_eq!(sessions.with_current(&D, "b", new, || 3), None);

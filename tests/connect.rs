@@ -309,8 +309,9 @@ async fn health_service_reports_serving() {
 
 #[tokio::test]
 async fn stale_instance_is_evicted_by_watchdog() {
+    // A v1 client (no protocol_version) is held to the legacy timeout.
     let config = Config {
-        heartbeat_timeout: Duration::from_millis(300),
+        legacy_heartbeat_timeout: Duration::from_millis(300),
         ..Config::default()
     };
     let addr = start_hub(config).await;

@@ -75,6 +75,7 @@ struct TopologyState {
     router: Arc<Router>,
     anchor: topology::ClockAnchor,
     started: Instant,
+    hub_id: String,
     heartbeat_timeout: Duration,
 }
 
@@ -85,6 +86,7 @@ async fn get_topology(State(s): State<TopologyState>) -> Json<topology::Topology
         &s.router,
         s.anchor,
         s.started,
+        &s.hub_id,
         s.heartbeat_timeout,
         Instant::now(),
     ))
@@ -123,6 +125,7 @@ pub async fn serve_with_shutdown(
             router: Arc::clone(&router),
             anchor,
             started: anchor.instant,
+            hub_id: config.hub_id.clone(),
             heartbeat_timeout: config.heartbeat_timeout,
         };
         let app = axum::Router::new()
@@ -160,7 +163,7 @@ pub async fn serve_with_shutdown(
         Arc::clone(&registry),
         Arc::clone(&sessions),
         Arc::clone(&router),
-        config.heartbeat_timeout,
+        watchdog_period(&config),
     ));
 
     let signal = {
@@ -295,20 +298,30 @@ pub async fn topology_probe(addr: SocketAddr) -> anyhow::Result<topology::Topolo
     Ok(topology::Topology::from_proto(&response))
 }
 
-/// Evicts instances without a heartbeat for `timeout` and sweeps expired type owners.
+/// How often the watchdog looks for silent sessions: a tenth of the shorter heartbeat timeout,
+/// between 10 ms and 1 s, so an eviction lands at most about a second after the timeout.
+fn watchdog_period(config: &Config) -> Duration {
+    (config
+        .heartbeat_timeout
+        .min(config.legacy_heartbeat_timeout)
+        / 10)
+        .clamp(Duration::from_millis(10), Duration::from_secs(1))
+}
+
+/// Evicts instances silent for longer than their own heartbeat timeout and sweeps expired type
+/// owners.
 async fn watchdog(
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     router: Arc<Router>,
-    timeout: Duration,
+    period: Duration,
 ) {
-    let period = (timeout / 3).max(Duration::from_millis(10));
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        for (ctx, id, token) in sessions.stale_with_tokens(now, timeout) {
+        for (ctx, id, token) in sessions.stale_with_tokens(now) {
             warn!(instance = %id, "heartbeat timeout, evicting");
             service::disconnect(&registry, &sessions, &router, &ctx, &id, token);
         }
