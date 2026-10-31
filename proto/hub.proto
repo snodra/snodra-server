@@ -103,8 +103,10 @@ message Register {
   string client_version = 12;
 }
 
-// Flow control: the sender may receive `count` more forwarded requests. Clients send it once per
-// handled request (batched). Ignored for sessions without flow control.
+// Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
+// per handled request, batched (16, or 50 ms after the first unsent one), and at once when the
+// permits still held by the hub are down to min(16, initial_permits / 2). The hub never lets a
+// session hold more than its initial_permits. Ignored for sessions without flow control.
 message Permits {
   uint32 count = 1;
 }
@@ -215,8 +217,10 @@ enum ErrorCode {
   // The handling service evaluated the handler's @RequiresAuthentication expression as false for
   // an authenticated caller.
   PERMISSION_DENIED = 7;
-  // The target instance's queue is full (count or bytes). Sent only to senders that share the
-  // "flow-control" capability; other senders get HANDLER_ERROR "handler busy" instead.
+  // The target instance cannot take the request now: its queue at the hub is full (entries, its
+  // bytes, or the bytes queued over the whole hub) or its session buffer is full. The handler
+  // never saw the request. Sent only to senders that share the "flow-control" capability; other
+  // senders get HANDLER_ERROR "handler busy" instead.
   RESOURCE_EXHAUSTED = 8;
   // The request needs a feature the sender, the hub or the target did not declare. Declared in
   // protocol v2; not produced yet.
