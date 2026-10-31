@@ -5,8 +5,11 @@
 //! - when the last instance listing a type goes away the service keeps ownership for `owner_grace`
 //!   so a restarting service does not lose its types; `sweep` then drops it;
 //! - commands with a routing key go to one instance of the owning service chosen by consistent
-//!   hashing (same key, same instance while membership is stable);
-//! - commands without a key and all queries go to one instance chosen round-robin.
+//!   hashing over a ring weighted by each instance's load factor (same key, same instance while
+//!   membership is stable; identical on every hub);
+//! - commands without a key and all queries return every live instance of the owning service
+//!   ([`Target::Candidates`]); the router picks one by tag match and load (ADR 0014). [`Registry::pick`]
+//!   keeps the plain round-robin choice for callers without load information.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -19,7 +22,66 @@ use crate::context::ContextId;
 
 pub type InstanceId = String;
 
+/// Virtual nodes of an instance with load factor 100.
 const VNODES_PER_INSTANCE: usize = 128;
+const MIN_VNODES: usize = 8;
+const MAX_VNODES: usize = 1024;
+/// `Register.load_factor` 0 reads as this.
+pub const DEFAULT_LOAD_FACTOR: u32 = 100;
+
+/// The load factor as applied: 0 reads as [`DEFAULT_LOAD_FACTOR`].
+pub fn effective_load_factor(load_factor: u32) -> u32 {
+    if load_factor == 0 {
+        DEFAULT_LOAD_FACTOR
+    } else {
+        load_factor
+    }
+}
+
+/// `128 * load_factor / 100` virtual nodes, clamped to 8..=1024.
+pub fn vnodes_for(load_factor: u32) -> usize {
+    (VNODES_PER_INSTANCE as u64 * effective_load_factor(load_factor) as u64 / 100)
+        .clamp(MIN_VNODES as u64, MAX_VNODES as u64) as usize
+}
+
+/// Where an instance sits for routing: its relative capacity and its labels. Fixed by the first
+/// `Register` of the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    /// As applied (never 0).
+    pub load_factor: u32,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self {
+            load_factor: DEFAULT_LOAD_FACTOR,
+            tags: BTreeMap::new(),
+        }
+    }
+}
+
+/// One live instance a request may go to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub id: InstanceId,
+    pub load_factor: u32,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// What the registry decided for a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A keyed command: the ring's instance (affinity, never rerouted).
+    Keyed(InstanceId),
+    /// Every live instance of the owner, sorted by id, and a per-service rotation counter for
+    /// round-robin tie-breaks (it advances on every pick).
+    Candidates {
+        candidates: Vec<Candidate>,
+        rotation: usize,
+    },
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -101,12 +163,14 @@ pub struct ServiceSnapshot {
     pub query_types: usize,
 }
 
-/// Types one instance lists, sorted by name.
+/// Types one instance lists, sorted by name, and its placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceTypes {
     pub service: String,
     pub command_types: Vec<String>,
     pub query_types: Vec<String>,
+    pub load_factor: u32,
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,10 +202,19 @@ struct Ring {
 }
 
 impl Ring {
-    fn add(&mut self, instance_id: &str) {
-        for i in 0..VNODES_PER_INSTANCE {
+    /// Adds `vnodes` points. On the (64-bit, so rare) collision of two instances' points the
+    /// smaller instance id keeps it, so the ring does not depend on the registration order.
+    fn add(&mut self, instance_id: &str, vnodes: usize) {
+        for i in 0..vnodes {
             let point = xxh64(format!("{instance_id}#{i}").as_bytes(), 0);
-            self.points.insert(point, instance_id.to_string());
+            self.points
+                .entry(point)
+                .and_modify(|held| {
+                    if instance_id < held.as_str() {
+                        *held = instance_id.to_string();
+                    }
+                })
+                .or_insert_with(|| instance_id.to_string());
         }
     }
 
@@ -178,6 +251,7 @@ struct ServiceEntry {
 struct InstanceEntry {
     service: String,
     types: Vec<(String, Kind)>,
+    placement: Placement,
 }
 
 #[derive(Default)]
@@ -233,7 +307,7 @@ impl Registry {
         }
     }
 
-    /// Atomic: on error nothing changes. Replaces a previous registration of the same instance.
+    /// [`Registry::register_with`] with the default placement (load factor 100, no tags).
     pub fn register(
         &self,
         ctx: &ContextId,
@@ -242,7 +316,29 @@ impl Registry {
         command_types: &[String],
         query_types: &[String],
     ) -> Result<(), RegisterError> {
+        self.register_with(
+            ctx,
+            instance_id,
+            service,
+            command_types,
+            query_types,
+            Placement::default(),
+        )
+    }
+
+    /// Atomic: on error nothing changes. Replaces a previous registration of the same instance.
+    /// A load factor of 0 in `placement` reads as 100.
+    pub fn register_with(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        command_types: &[String],
+        query_types: &[String],
+        mut placement: Placement,
+    ) -> Result<(), RegisterError> {
         check_context(ctx);
+        placement.load_factor = effective_load_factor(placement.load_factor);
         let mut inner = self.inner.lock().unwrap();
 
         let mut wanted: Vec<(&String, Kind)> = Vec::new();
@@ -295,12 +391,13 @@ impl Registry {
 
         let svc = inner.services.entry(service.to_string()).or_default();
         svc.instances.insert(instance_id.to_string());
-        svc.ring.add(instance_id);
+        svc.ring.add(instance_id, vnodes_for(placement.load_factor));
         inner.instances.insert(
             instance_id.to_string(),
             InstanceEntry {
                 service: service.to_string(),
                 types: wanted.into_iter().map(|(t, k)| (t.clone(), k)).collect(),
+                placement,
             },
         );
         Ok(())
@@ -312,12 +409,34 @@ impl Registry {
         self.inner.lock().unwrap().remove_instance(instance_id, now)
     }
 
+    /// The plain choice: the ring for keyed commands, else round-robin over the candidates.
     pub fn pick(
         &self,
         ctx: &ContextId,
         type_name: &str,
         routing_key: &str,
     ) -> Result<(Kind, InstanceId), PickError> {
+        let (kind, target) = self.pick_target(ctx, type_name, routing_key)?;
+        let id = match target {
+            Target::Keyed(id) => id,
+            Target::Candidates {
+                mut candidates,
+                rotation,
+            } => {
+                let i = rotation % candidates.len();
+                candidates.swap_remove(i).id
+            }
+        };
+        Ok((kind, id))
+    }
+
+    /// The ring target of a keyed command, or every live instance of the owner.
+    pub fn pick_target(
+        &self,
+        ctx: &ContextId,
+        type_name: &str,
+        routing_key: &str,
+    ) -> Result<(Kind, Target), PickError> {
         check_context(ctx);
         let mut inner = self.inner.lock().unwrap();
         let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
@@ -328,19 +447,54 @@ impl Registry {
         if holders == 0 {
             return Err(no_live());
         }
-        let svc = inner.services.get_mut(&service).ok_or_else(no_live)?;
+        let Inner {
+            services,
+            instances,
+            ..
+        } = &mut *inner;
+        let svc = services.get_mut(&service).ok_or_else(no_live)?;
         if svc.instances.is_empty() {
             return Err(no_live());
         }
-        let id = if kind == Kind::Command && !routing_key.is_empty() {
+        if kind == Kind::Command && !routing_key.is_empty() {
             let hash = xxh64(format!("{service}:{routing_key}").as_bytes(), 0);
-            svc.ring.lookup(hash).cloned().ok_or_else(no_live)?
-        } else {
-            let idx = svc.rr % svc.instances.len();
-            svc.rr = svc.rr.wrapping_add(1);
-            svc.instances.iter().nth(idx).cloned().ok_or_else(no_live)?
-        };
-        Ok((kind, id))
+            let id = svc.ring.lookup(hash).cloned().ok_or_else(no_live)?;
+            return Ok((kind, Target::Keyed(id)));
+        }
+        let rotation = svc.rr;
+        svc.rr = svc.rr.wrapping_add(1);
+        let candidates = svc
+            .instances
+            .iter()
+            .map(|id| {
+                let placement = instances
+                    .get(id)
+                    .map(|e| e.placement.clone())
+                    .unwrap_or_default();
+                Candidate {
+                    id: id.clone(),
+                    load_factor: placement.load_factor,
+                    tags: placement.tags,
+                }
+            })
+            .collect();
+        Ok((
+            kind,
+            Target::Candidates {
+                candidates,
+                rotation,
+            },
+        ))
+    }
+
+    /// The placement an instance registered with (the sender's tags, for tag matching).
+    pub fn placement_of(&self, ctx: &ContextId, instance_id: &str) -> Option<Placement> {
+        check_context(ctx);
+        let inner = self.inner.lock().unwrap();
+        inner
+            .instances
+            .get(instance_id)
+            .map(|e| e.placement.clone())
     }
 
     /// Drops ownership of types that have had no live instance for longer than `owner_grace`.
@@ -383,6 +537,8 @@ impl Registry {
                         service: e.service.clone(),
                         command_types: of_kind(Kind::Command),
                         query_types: of_kind(Kind::Query),
+                        load_factor: e.placement.load_factor,
+                        tags: e.placement.tags.clone(),
                     },
                 )
             })
@@ -456,6 +612,127 @@ mod tests {
     fn two_instances(r: &Registry, types: &[&str]) {
         r.register(&D, "a", "svc", &s(types), &[]).unwrap();
         r.register(&D, "b", "svc", &s(types), &[]).unwrap();
+    }
+
+    fn placed(load_factor: u32, tags: &[(&str, &str)]) -> Placement {
+        Placement {
+            load_factor,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn vnodes_scale_with_the_load_factor_and_are_clamped() {
+        assert_eq!(vnodes_for(0), 128); // 0 reads as 100
+        assert_eq!(vnodes_for(100), 128);
+        assert_eq!(vnodes_for(50), 64);
+        assert_eq!(vnodes_for(300), 384);
+        assert_eq!(vnodes_for(1), 8);
+        assert_eq!(vnodes_for(5_000), 1024);
+    }
+
+    #[test]
+    fn weighted_ring_distributes_keys_by_load_factor_within_five_percent() {
+        let r = reg();
+        r.register_with(&D, "a", "svc", &s(&["t.X"]), &[], placed(100, &[]))
+            .unwrap();
+        r.register_with(&D, "b", "svc", &s(&["t.X"]), &[], placed(300, &[]))
+            .unwrap();
+        let n = 20_000;
+        let b = (0..n)
+            .filter(|i| r.pick(&D, "t.X", &format!("order-{i}")).unwrap().1 == "b")
+            .count();
+        let share = b as f64 / n as f64;
+        assert!(
+            (share - 0.75).abs() <= 0.05,
+            "b got {share:.3} of the keys, want 0.75"
+        );
+    }
+
+    #[test]
+    fn ring_is_deterministic_whatever_the_registration_order() {
+        let one = reg();
+        let two = reg();
+        for (id, lf) in [("a", 100), ("b", 250), ("c", 40)] {
+            one.register_with(&D, id, "svc", &s(&["t.X"]), &[], placed(lf, &[]))
+                .unwrap();
+        }
+        for (id, lf) in [("c", 40), ("a", 100), ("b", 250)] {
+            two.register_with(&D, id, "svc", &s(&["t.X"]), &[], placed(lf, &[]))
+                .unwrap();
+        }
+        for i in 0..2_000 {
+            let key = format!("k{i}");
+            assert_eq!(
+                one.pick(&D, "t.X", &key).unwrap(),
+                two.pick(&D, "t.X", &key).unwrap(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn unkeyed_pick_returns_sorted_candidates_with_placement_and_a_rotation() {
+        let r = reg();
+        r.register_with(
+            &D,
+            "b",
+            "svc",
+            &s(&["t.X"]),
+            &[],
+            placed(200, &[("zone", "z1")]),
+        )
+        .unwrap();
+        r.register_with(&D, "a", "svc", &s(&["t.X"]), &[], placed(0, &[]))
+            .unwrap();
+        let (
+            kind,
+            Target::Candidates {
+                candidates,
+                rotation,
+            },
+        ) = r.pick_target(&D, "t.X", "").unwrap()
+        else {
+            panic!("expected candidates");
+        };
+        assert_eq!(kind, Kind::Command);
+        let ids: Vec<_> = candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(candidates[0].load_factor, 100);
+        assert_eq!(candidates[1].tags["zone"], "z1");
+        let (_, Target::Candidates { rotation: next, .. }) = r.pick_target(&D, "t.X", "").unwrap()
+        else {
+            panic!("expected candidates");
+        };
+        assert_eq!(next, rotation.wrapping_add(1));
+        // Keyed commands get one ring target; queries ignore the key.
+        assert!(matches!(
+            r.pick_target(&D, "t.X", "k").unwrap().1,
+            Target::Keyed(_)
+        ));
+        r.register_with(&D, "q", "svc2", &[], &s(&["q.Y"]), placed(100, &[]))
+            .unwrap();
+        assert!(matches!(
+            r.pick_target(&D, "q.Y", "k").unwrap().1,
+            Target::Candidates { .. }
+        ));
+        assert_eq!(
+            r.placement_of(&D, "b").unwrap(),
+            placed(200, &[("zone", "z1")])
+        );
+    }
+
+    #[test]
+    fn topology_reports_load_factor_and_tags() {
+        let r = reg();
+        r.register_with(&D, "a", "svc", &[], &[], placed(0, &[("zone", "z1")]))
+            .unwrap();
+        let topo = r.topology(Instant::now());
+        assert_eq!(topo.instances["a"].load_factor, 100);
+        assert_eq!(topo.instances["a"].tags["zone"], "z1");
     }
 
     #[test]
