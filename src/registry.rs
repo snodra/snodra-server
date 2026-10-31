@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use xxhash_rust::xxh64::xxh64;
 
+use crate::context::ContextId;
+
 pub type InstanceId = String;
 
 const VNODES_PER_INSTANCE: usize = 128;
@@ -208,9 +210,19 @@ impl Inner {
     }
 }
 
+/// One registry partition. Every method that routes or (un)registers takes the [`ContextId`] of
+/// the session; until contexts ship (roadmap P8) the only context is `default` and the registry
+/// has a single partition.
 pub struct Registry {
     owner_grace: Duration,
     inner: Mutex<Inner>,
+}
+
+fn check_context(ctx: &ContextId) {
+    debug_assert!(
+        ctx.is_default(),
+        "context {ctx} used before contexts are supported"
+    );
 }
 
 impl Registry {
@@ -224,11 +236,13 @@ impl Registry {
     /// Atomic: on error nothing changes. Replaces a previous registration of the same instance.
     pub fn register(
         &self,
+        ctx: &ContextId,
         instance_id: &str,
         service: &str,
         command_types: &[String],
         query_types: &[String],
     ) -> Result<(), RegisterError> {
+        check_context(ctx);
         let mut inner = self.inner.lock().unwrap();
 
         let mut wanted: Vec<(&String, Kind)> = Vec::new();
@@ -293,15 +307,18 @@ impl Registry {
     }
 
     /// Returns the service name the instance belonged to, if it was registered.
-    pub fn unregister(&self, instance_id: &str, now: Instant) -> Option<String> {
+    pub fn unregister(&self, ctx: &ContextId, instance_id: &str, now: Instant) -> Option<String> {
+        check_context(ctx);
         self.inner.lock().unwrap().remove_instance(instance_id, now)
     }
 
     pub fn pick(
         &self,
+        ctx: &ContextId,
         type_name: &str,
         routing_key: &str,
     ) -> Result<(Kind, InstanceId), PickError> {
+        check_context(ctx);
         let mut inner = self.inner.lock().unwrap();
         let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
         let (kind, holders, service) = (owner.kind, owner.holders, owner.service.clone());
@@ -339,7 +356,8 @@ impl Registry {
         before - inner.types.len()
     }
 
-    pub fn service_of(&self, instance_id: &str) -> Option<String> {
+    pub fn service_of(&self, ctx: &ContextId, instance_id: &str) -> Option<String> {
+        check_context(ctx);
         let inner = self.inner.lock().unwrap();
         inner.instances.get(instance_id).map(|e| e.service.clone())
     }
@@ -425,6 +443,8 @@ impl Registry {
 mod tests {
     use super::*;
 
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
+
     fn reg() -> Registry {
         Registry::new(Duration::from_secs(60))
     }
@@ -434,23 +454,23 @@ mod tests {
     }
 
     fn two_instances(r: &Registry, types: &[&str]) {
-        r.register("a", "svc", &s(types), &[]).unwrap();
-        r.register("b", "svc", &s(types), &[]).unwrap();
+        r.register(&D, "a", "svc", &s(types), &[]).unwrap();
+        r.register(&D, "b", "svc", &s(types), &[]).unwrap();
     }
 
     #[test]
     fn pick_unknown_type_is_unknown_type() {
-        assert_eq!(reg().pick("nope", ""), Err(PickError::UnknownType));
+        assert_eq!(reg().pick(&D, "nope", ""), Err(PickError::UnknownType));
     }
 
     #[test]
     fn command_with_key_is_sticky_across_many_picks() {
         let r = reg();
         two_instances(&r, &["t.X"]);
-        let first = r.pick("t.X", "k1").unwrap();
+        let first = r.pick(&D, "t.X", "k1").unwrap();
         assert_eq!(first.0, Kind::Command);
         for _ in 0..50 {
-            assert_eq!(r.pick("t.X", "k1").unwrap(), first);
+            assert_eq!(r.pick(&D, "t.X", "k1").unwrap(), first);
         }
     }
 
@@ -461,7 +481,7 @@ mod tests {
         let mut a = 0;
         let mut b = 0;
         for i in 0..1000 {
-            match r.pick("t.X", &format!("key-{i}")).unwrap().1.as_str() {
+            match r.pick(&D, "t.X", &format!("key-{i}")).unwrap().1.as_str() {
                 "a" => a += 1,
                 _ => b += 1,
             }
@@ -473,17 +493,17 @@ mod tests {
     fn command_without_key_round_robins() {
         let r = reg();
         two_instances(&r, &["t.X"]);
-        let ids: Vec<_> = (0..4).map(|_| r.pick("t.X", "").unwrap().1).collect();
+        let ids: Vec<_> = (0..4).map(|_| r.pick(&D, "t.X", "").unwrap().1).collect();
         assert_eq!(ids, ["a", "b", "a", "b"]);
     }
 
     #[test]
     fn query_ignores_routing_key_and_round_robins() {
         let r = reg();
-        r.register("a", "svc", &[], &s(&["q.X"])).unwrap();
-        r.register("b", "svc", &[], &s(&["q.X"])).unwrap();
-        let first = r.pick("q.X", "same").unwrap();
-        let second = r.pick("q.X", "same").unwrap();
+        r.register(&D, "a", "svc", &[], &s(&["q.X"])).unwrap();
+        r.register(&D, "b", "svc", &[], &s(&["q.X"])).unwrap();
+        let first = r.pick(&D, "q.X", "same").unwrap();
+        let second = r.pick(&D, "q.X", "same").unwrap();
         assert_eq!(first, (Kind::Query, "a".to_string()));
         assert_eq!(second, (Kind::Query, "b".to_string()));
     }
@@ -491,8 +511,10 @@ mod tests {
     #[test]
     fn second_service_registering_owned_type_is_rejected_atomically() {
         let r = reg();
-        r.register("a1", "A", &s(&["t.X"]), &[]).unwrap();
-        let err = r.register("b1", "B", &s(&["t.X", "t.Y"]), &[]).unwrap_err();
+        r.register(&D, "a1", "A", &s(&["t.X"]), &[]).unwrap();
+        let err = r
+            .register(&D, "b1", "B", &s(&["t.X", "t.Y"]), &[])
+            .unwrap_err();
         assert_eq!(
             err,
             RegisterError::TypeOwnedByOtherService {
@@ -500,15 +522,15 @@ mod tests {
                 owner: "A".into()
             }
         );
-        assert_eq!(r.pick("t.Y", ""), Err(PickError::UnknownType));
-        assert_eq!(r.service_of("b1"), None);
+        assert_eq!(r.pick(&D, "t.Y", ""), Err(PickError::UnknownType));
+        assert_eq!(r.service_of(&D, "b1"), None);
     }
 
     #[test]
     fn same_service_second_instance_is_allowed() {
         let r = reg();
-        r.register("a1", "A", &s(&["t.X"]), &[]).unwrap();
-        r.register("a2", "A", &s(&["t.X"]), &[]).unwrap();
+        r.register(&D, "a1", "A", &s(&["t.X"]), &[]).unwrap();
+        r.register(&D, "a2", "A", &s(&["t.X"]), &[]).unwrap();
         assert_eq!(r.snapshot().services[0].instances, 2);
     }
 
@@ -516,58 +538,61 @@ mod tests {
     fn reregister_with_smaller_list_removes_type() {
         let r = reg();
         let now = Instant::now();
-        r.register("a", "A", &s(&["t.X", "t.Y"]), &[]).unwrap();
-        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
-        assert!(r.pick("t.X", "").is_ok());
+        r.register(&D, "a", "A", &s(&["t.X", "t.Y"]), &[]).unwrap();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
+        assert!(r.pick(&D, "t.X", "").is_ok());
         assert_eq!(
-            r.pick("t.Y", ""),
+            r.pick(&D, "t.Y", ""),
             Err(PickError::NoLiveInstance {
                 service: "A".into()
             })
         );
         r.sweep(now + Duration::from_secs(61));
-        assert_eq!(r.pick("t.Y", ""), Err(PickError::UnknownType));
-        assert!(r.pick("t.X", "").is_ok());
+        assert_eq!(r.pick(&D, "t.Y", ""), Err(PickError::UnknownType));
+        assert!(r.pick(&D, "t.X", "").is_ok());
     }
 
     #[test]
     fn last_instance_leaving_keeps_ownership_during_grace() {
         let r = reg();
-        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
         let t0 = Instant::now();
-        assert_eq!(r.unregister("a", t0), Some("A".to_string()));
+        assert_eq!(r.unregister(&D, "a", t0), Some("A".to_string()));
         let no_live = Err(PickError::NoLiveInstance {
             service: "A".into(),
         });
-        assert_eq!(r.pick("t.X", ""), no_live);
+        assert_eq!(r.pick(&D, "t.X", ""), no_live);
         assert_eq!(r.sweep(t0 + Duration::from_secs(59)), 0);
-        assert_eq!(r.pick("t.X", ""), no_live);
+        assert_eq!(r.pick(&D, "t.X", ""), no_live);
         assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 1);
-        assert_eq!(r.pick("t.X", ""), Err(PickError::UnknownType));
+        assert_eq!(r.pick(&D, "t.X", ""), Err(PickError::UnknownType));
     }
 
     #[test]
     fn instance_rejoining_within_grace_restores_routing() {
         let r = reg();
-        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
         let t0 = Instant::now();
-        r.unregister("a", t0);
-        r.register("a2", "A", &s(&["t.X"]), &[]).unwrap();
+        r.unregister(&D, "a", t0);
+        r.register(&D, "a2", "A", &s(&["t.X"]), &[]).unwrap();
         assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 0);
-        assert_eq!(r.pick("t.X", "").unwrap().1, "a2");
+        assert_eq!(r.pick(&D, "t.X", "").unwrap().1, "a2");
     }
 
     #[test]
     fn removing_one_instance_moves_only_its_keys() {
         let r = reg();
         for id in ["a", "b", "c"] {
-            r.register(id, "svc", &s(&["t.X"]), &[]).unwrap();
+            r.register(&D, id, "svc", &s(&["t.X"]), &[]).unwrap();
         }
         let keys: Vec<String> = (0..1000).map(|i| format!("k{i}")).collect();
-        let before: Vec<_> = keys.iter().map(|k| r.pick("t.X", k).unwrap().1).collect();
-        r.unregister("c", Instant::now());
+        let before: Vec<_> = keys
+            .iter()
+            .map(|k| r.pick(&D, "t.X", k).unwrap().1)
+            .collect();
+        r.unregister(&D, "c", Instant::now());
         for (k, was) in keys.iter().zip(before) {
-            let now = r.pick("t.X", k).unwrap().1;
+            let now = r.pick(&D, "t.X", k).unwrap().1;
             if was != "c" {
                 assert_eq!(now, was, "key {k} moved");
             } else {
@@ -579,7 +604,7 @@ mod tests {
     #[test]
     fn topology_lists_instance_types_by_kind_sorted() {
         let r = reg();
-        r.register("a", "svc", &s(&["b.X", "a.Y"]), &s(&["q.Z"]))
+        r.register(&D, "a", "svc", &s(&["b.X", "a.Y"]), &s(&["q.Z"]))
             .unwrap();
         let topo = r.topology(Instant::now());
         let it = &topo.instances["a"];
@@ -595,10 +620,10 @@ mod tests {
         let r = reg();
         two_instances(&r, &["t.X"]);
         let t0 = Instant::now();
-        r.unregister("a", t0);
+        r.unregister(&D, "a", t0);
         let info = r.topology(t0).types.remove(0);
         assert_eq!((info.live_instances, info.orphaned_for), (1, None));
-        r.unregister("b", t0);
+        r.unregister(&D, "b", t0);
         let now = t0 + Duration::from_secs(5);
         let info = r.topology(now).types.remove(0);
         assert_eq!(info.live_instances, 0);
@@ -610,9 +635,9 @@ mod tests {
     #[test]
     fn topology_keeps_orphaned_type_past_grace_until_sweep() {
         let r = reg();
-        r.register("a", "svc", &s(&["t.X"]), &[]).unwrap();
+        r.register(&D, "a", "svc", &s(&["t.X"]), &[]).unwrap();
         let t0 = Instant::now();
-        r.unregister("a", t0);
+        r.unregister(&D, "a", t0);
         let late = t0 + Duration::from_secs(120);
         let types = r.topology(late).types;
         assert_eq!(types.len(), 1);
@@ -625,7 +650,7 @@ mod tests {
     fn register_same_type_under_both_kinds_is_rejected() {
         let r = reg();
         let err = r
-            .register("a", "A", &s(&["t.X"]), &s(&["t.X"]))
+            .register(&D, "a", "A", &s(&["t.X"]), &s(&["t.X"]))
             .unwrap_err();
         assert_eq!(
             err,
@@ -633,15 +658,15 @@ mod tests {
                 type_name: "t.X".into()
             }
         );
-        assert_eq!(r.service_of("a"), None);
+        assert_eq!(r.service_of(&D, "a"), None);
         assert!(r.topology(Instant::now()).types.is_empty());
     }
 
     #[test]
     fn register_kind_conflict_with_owner_is_rejected() {
         let r = reg();
-        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
-        let err = r.register("b", "B", &[], &s(&["t.X"])).unwrap_err();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
+        let err = r.register(&D, "b", "B", &[], &s(&["t.X"])).unwrap_err();
         assert_eq!(
             err,
             RegisterError::KindConflict {
@@ -651,15 +676,15 @@ mod tests {
             }
         );
         assert_eq!(err.to_string(), "type t.X is owned as COMMAND by service A");
-        assert_eq!(r.service_of("b"), None);
+        assert_eq!(r.service_of(&D, "b"), None);
     }
 
     #[test]
     fn same_service_reregister_with_other_kind_is_rejected() {
         let r = reg();
-        r.register("a", "A", &s(&["t.X"]), &[]).unwrap();
-        let err = r.register("a2", "A", &[], &s(&["t.X"])).unwrap_err();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
+        let err = r.register(&D, "a2", "A", &[], &s(&["t.X"])).unwrap_err();
         assert!(matches!(err, RegisterError::KindConflict { .. }));
-        assert_eq!(r.service_of("a2"), None);
+        assert_eq!(r.service_of(&D, "a2"), None);
     }
 }

@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod registry;
 pub mod router;
 pub mod service;
@@ -180,11 +181,11 @@ pub async fn serve_with_shutdown(
                 .set_service_status("", ServingStatus::NotServing)
                 .await;
             watchdog.abort();
-            for (id, token) in sessions.all_with_tokens() {
-                if let Some(tx) = sessions.sender(&id) {
+            for (ctx, id, token) in sessions.all_with_tokens() {
+                if let Some(tx) = sessions.sender(&ctx, &id) {
                     let _ = tx.try_send(Err(tonic::Status::unavailable("hub shutting down")));
                 }
-                service::disconnect(&registry, &sessions, &router, &id, token);
+                service::disconnect(&registry, &sessions, &router, &ctx, &id, token);
             }
             let _ = stop_began.set(Instant::now());
             stopping.cancel();
@@ -306,9 +307,9 @@ async fn watchdog(
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        for (id, token) in sessions.stale_with_tokens(now, timeout) {
+        for (ctx, id, token) in sessions.stale_with_tokens(now, timeout) {
             warn!(instance = %id, "heartbeat timeout, evicting");
-            service::disconnect(&registry, &sessions, &router, &id, token);
+            service::disconnect(&registry, &sessions, &router, &ctx, &id, token);
         }
         registry.sweep(now);
         router.refresh_gauges();

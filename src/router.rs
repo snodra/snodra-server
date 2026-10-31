@@ -17,6 +17,7 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::config::Config;
+use crate::context::ContextId;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
 use crate::registry::{InstanceId, Kind, PickError, Registry};
 use crate::session::{SendError, Sessions};
@@ -26,6 +27,8 @@ use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Pending {
+    /// Context of both sender and handler (requests never cross contexts).
+    context: ContextId,
     sender: InstanceId,
     handler: InstanceId,
     kind: Kind,
@@ -142,7 +145,7 @@ impl Router {
 
     /// Called for every Request a sender wrote. Never returns an error to the caller: every
     /// failure becomes a `ServerMessage::Error` sent to `sender`.
-    pub fn route(self: &Arc<Self>, sender: &str, req: Request) {
+    pub fn route(self: &Arc<Self>, ctx: &ContextId, sender: &str, req: Request) {
         let id = req.id.clone();
         let type_name = req.r#type.clone();
         let req_kind = match req.kind() {
@@ -180,13 +183,14 @@ impl Router {
                 false,
             );
             self.send_to(
+                ctx,
                 sender,
                 error_message(&id, ErrorCode::InvalidRequest, message),
             );
             return;
         };
 
-        let (kind, handler) = match self.registry.pick(&type_name, &req.routing_key) {
+        let (kind, handler) = match self.registry.pick(ctx, &type_name, &req.routing_key) {
             Ok(picked) => picked,
             Err(e) => {
                 let message = match e {
@@ -208,7 +212,11 @@ impl Router {
                     Outcome::NoHandler,
                     false,
                 );
-                self.send_to(sender, error_message(&id, ErrorCode::NoHandler, message));
+                self.send_to(
+                    ctx,
+                    sender,
+                    error_message(&id, ErrorCode::NoHandler, message),
+                );
                 return;
             }
         };
@@ -238,6 +246,7 @@ impl Router {
                     false,
                 );
                 self.send_to(
+                    ctx,
                     sender,
                     error_message(
                         &id,
@@ -256,6 +265,7 @@ impl Router {
             })
             .abort_handle();
             let entry = Pending {
+                context: ctx.clone(),
                 sender: sender.to_string(),
                 handler: handler.clone(),
                 kind,
@@ -270,12 +280,12 @@ impl Router {
         let forwarded = ServerMessage {
             message: Some(server_message::Message::Request(req)),
         };
-        match self.sessions.send(&handler, forwarded) {
+        match self.sessions.send(ctx, &handler, forwarded) {
             Ok(()) => {}
             Err(SendError::Busy) => {
                 let service = self
                     .registry
-                    .service_of(&handler)
+                    .service_of(ctx, &handler)
                     .unwrap_or_else(|| "unknown".to_string());
                 self.metrics.buffer_full(&service);
                 self.fail(&id, ErrorCode::HandlerError, "handler busy".to_string());
@@ -292,7 +302,7 @@ impl Router {
 
     /// Reply from a handler; relays to the recorded sender if the id is pending and `from` is
     /// the recorded handler. Unknown or mismatched ids are ignored.
-    pub fn on_reply(&self, from: &str, reply: Reply) {
+    pub fn on_reply(&self, ctx: &ContextId, from: &str, reply: Reply) {
         let id = reply.request_id.clone();
         let entry = {
             let mut pending = self.pending.lock().unwrap();
@@ -301,7 +311,7 @@ impl Router {
                     tracing::debug!(request_id = %id, "reply for unknown request ignored");
                     return;
                 }
-                Some(p) if p.handler != from => {
+                Some(p) if p.handler != from || p.context != *ctx => {
                     tracing::debug!(request_id = %id, from, "reply from non-handler ignored");
                     return;
                 }
@@ -332,6 +342,7 @@ impl Router {
             entry.started.elapsed(),
         );
         self.send_to(
+            &entry.context,
             &entry.sender,
             ServerMessage {
                 message: Some(server_message::Message::Reply(reply)),
@@ -341,12 +352,14 @@ impl Router {
 
     /// Fails pending requests handled by this instance with HANDLER_DISCONNECTED; drops pending
     /// requests it sent.
-    pub fn on_disconnect(&self, instance_id: &str) {
+    pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str) {
         let (failed, dropped) = {
             let mut pending = self.pending.lock().unwrap();
             let ids: Vec<String> = pending
                 .iter()
-                .filter(|(_, p)| p.handler == instance_id || p.sender == instance_id)
+                .filter(|(_, p)| {
+                    p.context == *ctx && (p.handler == instance_id || p.sender == instance_id)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             let mut failed = Vec::new();
@@ -437,7 +450,11 @@ impl Router {
             outcome_of(code),
             entry.started.elapsed(),
         );
-        self.send_to(&entry.sender, error_message(id, code, message));
+        self.send_to(
+            &entry.context,
+            &entry.sender,
+            error_message(id, code, message),
+        );
     }
 
     fn record_rejected(&self, kind: Kind, type_name: &str, outcome: Outcome) {
@@ -451,8 +468,8 @@ impl Router {
     /// [`TERMINAL_SEND_TIMEOUT`] for room, so a terminal message is never dropped just because
     /// the sender is momentarily slow. At most one such task exists per removed pending entry,
     /// so their number is bounded by the in-flight requests.
-    fn send_to(&self, instance: &str, msg: ServerMessage) {
-        let Some(tx) = self.sessions.sender(instance) else {
+    fn send_to(&self, ctx: &ContextId, instance: &str, msg: ServerMessage) {
+        let Some(tx) = self.sessions.sender(ctx, instance) else {
             tracing::debug!(instance, "sender gone, dropping terminal message");
             return;
         };
@@ -464,7 +481,7 @@ impl Router {
             Err(TrySendError::Full(msg)) => {
                 let service = self
                     .registry
-                    .service_of(instance)
+                    .service_of(ctx, instance)
                     .unwrap_or_else(|| "unknown".to_string());
                 let metrics = Arc::clone(&self.metrics);
                 let instance = instance.to_string();
@@ -486,6 +503,8 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -495,7 +514,7 @@ mod tests {
 
     fn fake(sessions: &Sessions, id: &str, service: &str, cap: usize) -> Rx {
         let (tx, rx) = mpsc::channel(cap);
-        sessions.insert(id, service, tx, CancellationToken::new());
+        sessions.insert(&D, id, service, tx, CancellationToken::new());
         rx
     }
 
@@ -510,7 +529,7 @@ mod tests {
         let registry = Arc::new(Registry::new(config.owner_grace));
         let sessions = Arc::new(Sessions::new());
         registry
-            .register("h1", "orders", &["t.Cmd".into()], &["t.Qry".into()])
+            .register(&D, "h1", "orders", &["t.Cmd".into()], &["t.Qry".into()])
             .unwrap();
         let handler_rx = fake(&sessions, "h1", "orders", handler_cap);
         let sender_rx = fake(&sessions, "s1", "web", 16);
@@ -565,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_type_sends_no_handler_to_sender() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Nope", 0));
+        f.router.route(&D, "s1", request("r1", "t.Nope", 0));
         let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::NoHandler);
         assert_eq!(msg, "no handler registered for type t.Nope");
         assert_eq!(f.router.in_flight(), 0);
@@ -575,7 +594,7 @@ mod tests {
     async fn forwards_request_unchanged_to_picked_handler() {
         let mut f = fixture();
         let req = request("r1", "t.Cmd", 0);
-        f.router.route("s1", req.clone());
+        f.router.route(&D, "s1", req.clone());
         let got = f.handler_rx.try_recv().unwrap().unwrap();
         assert_eq!(got.message, Some(server_message::Message::Request(req)));
         assert_eq!(f.router.in_flight(), 1);
@@ -584,8 +603,8 @@ mod tests {
     #[tokio::test]
     async fn relays_reply_to_sender_and_clears_pending() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         let got = f.sender_rx.try_recv().unwrap().unwrap();
         assert_eq!(
             got.message,
@@ -597,8 +616,8 @@ mod tests {
     #[tokio::test]
     async fn reply_from_wrong_instance_is_ignored() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
-        f.router.on_reply("intruder", payload_reply("r1"));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.on_reply(&D, "intruder", payload_reply("r1"));
         assert!(f.sender_rx.try_recv().is_err());
         assert_eq!(f.router.in_flight(), 1);
     }
@@ -606,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_reply_id_is_ignored() {
         let mut f = fixture();
-        f.router.on_reply("h1", payload_reply("ghost"));
+        f.router.on_reply(&D, "h1", payload_reply("ghost"));
         assert!(f.sender_rx.try_recv().is_err());
         assert_eq!(f.router.in_flight(), 0);
     }
@@ -614,12 +633,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn timeout_sends_timeout_once_and_drops_late_reply() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 10));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 10));
         tokio::time::sleep(Duration::from_millis(11)).await;
         let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::Timeout);
         assert_eq!(msg, "no reply within 10 ms");
         assert!(f.sender_rx.try_recv().is_err());
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         assert!(f.sender_rx.try_recv().is_err());
         assert_eq!(f.router.in_flight(), 0);
     }
@@ -627,13 +646,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_timeout_uses_default_and_large_is_clamped() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
         tokio::time::sleep(Duration::from_millis(4999)).await;
         assert!(f.sender_rx.try_recv().is_err());
         tokio::time::sleep(Duration::from_millis(2)).await;
         expect_error(&mut f.sender_rx, "r1", ErrorCode::Timeout);
 
-        f.router.route("s1", request("r2", "t.Cmd", 999_999));
+        f.router.route(&D, "s1", request("r2", "t.Cmd", 999_999));
         tokio::time::sleep(Duration::from_millis(60_000 - 1)).await;
         assert!(f.sender_rx.try_recv().is_err());
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -644,14 +663,14 @@ mod tests {
     async fn duplicate_request_id_is_rejected_without_touching_pending() {
         let mut f = fixture();
         let mut s2_rx = fake(&f.sessions, "s2", "web", 16);
-        f.router.route("s1", request("r1", "t.Cmd", 0));
-        f.router.route("s2", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s2", request("r1", "t.Cmd", 0));
         let msg = expect_error(&mut s2_rx, "r1", ErrorCode::InvalidRequest);
         assert_eq!(msg, "invalid request: duplicate id");
         assert_eq!(f.router.in_flight(), 1);
         assert!(f.handler_rx.try_recv().is_ok());
         assert!(f.handler_rx.try_recv().is_err());
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         assert!(matches!(
             f.sender_rx.try_recv().unwrap().unwrap().message,
             Some(server_message::Message::Reply(_))
@@ -663,9 +682,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reply_just_before_deadline_sends_no_timeout() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 10));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 10));
         tokio::time::sleep(Duration::from_millis(9)).await;
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(matches!(
             f.sender_rx.try_recv().unwrap().unwrap().message,
@@ -677,8 +696,8 @@ mod tests {
     #[tokio::test]
     async fn handler_disconnect_fails_its_pending_requests() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
-        f.router.on_disconnect("h1");
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.on_disconnect(&D, "h1");
         let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
         assert_eq!(msg, "handler instance h1 disconnected");
         assert_eq!(f.router.in_flight(), 0);
@@ -687,18 +706,18 @@ mod tests {
     #[tokio::test]
     async fn sender_disconnect_drops_its_pending_requests() {
         let mut f = fixture();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
-        f.router.on_disconnect("s1");
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.on_disconnect(&D, "s1");
         assert_eq!(f.router.in_flight(), 0);
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         assert!(f.sender_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn full_handler_buffer_yields_handler_error_busy() {
         let mut f = fixture_with(Config::default(), 1);
-        f.sessions.send("h1", ServerMessage::default()).unwrap();
-        f.router.route("s1", request("r1", "t.Cmd", 0));
+        f.sessions.send(&D, "h1", ServerMessage::default()).unwrap();
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
         let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerError);
         assert_eq!(msg, "handler busy");
         assert_eq!(f.router.in_flight(), 0);
@@ -708,7 +727,7 @@ mod tests {
     async fn gone_handler_yields_handler_disconnected() {
         let mut f = fixture();
         drop(f.handler_rx);
-        f.router.route("s1", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
         expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
         assert_eq!(f.router.in_flight(), 0);
     }
@@ -716,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn empty_request_id_is_invalid_request() {
         let mut f = fixture();
-        f.router.route("s1", request("", "t.Cmd", 0));
+        f.router.route(&D, "s1", request("", "t.Cmd", 0));
         let msg = expect_error(&mut f.sender_rx, "", ErrorCode::InvalidRequest);
         assert_eq!(msg, "invalid request: missing id");
         assert!(f.handler_rx.try_recv().is_err());
@@ -727,10 +746,10 @@ mod tests {
     async fn reply_to_busy_sender_is_delivered_once_there_is_room() {
         let f = fixture();
         let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
-        f.router.route("s2", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s2", request("r1", "t.Cmd", 0));
         // Fill s2's only slot so the reply's try_send hits a full buffer.
-        f.sessions.send("s2", ServerMessage::default()).unwrap();
-        f.router.on_reply("h1", payload_reply("r1"));
+        f.sessions.send(&D, "s2", ServerMessage::default()).unwrap();
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
         assert_eq!(f.router.in_flight(), 0);
         assert_eq!(
             s2_rx.recv().await.unwrap().unwrap(),
@@ -751,8 +770,8 @@ mod tests {
     async fn error_to_busy_sender_is_given_up_after_the_delivery_timeout() {
         let f = fixture();
         let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
-        f.sessions.send("s2", ServerMessage::default()).unwrap();
-        f.router.route("s2", request("r1", "t.Nope", 0));
+        f.sessions.send(&D, "s2", ServerMessage::default()).unwrap();
+        f.router.route(&D, "s2", request("r1", "t.Nope", 0));
         tokio::time::sleep(TERMINAL_SEND_TIMEOUT + Duration::from_millis(1)).await;
         assert_eq!(
             s2_rx.recv().await.unwrap().unwrap(),

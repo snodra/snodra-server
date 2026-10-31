@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tracing::info;
 
+use crate::context::ContextId;
 use crate::proto::ServerMessage;
 use crate::registry::InstanceId;
 
@@ -36,6 +37,8 @@ impl fmt::Display for SendError {
 }
 
 pub struct Session {
+    /// The context the session registered in (always `default` until contexts ship).
+    pub context: ContextId,
     pub service: String,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
     pub last_heartbeat: Instant,
@@ -51,13 +54,15 @@ pub struct Session {
 /// Read-only copy of one session's observable state, for the topology view.
 #[derive(Debug, Clone)]
 pub struct SessionDetail {
+    pub context: ContextId,
     pub instance_id: InstanceId,
     pub service: String,
     pub connected_since: Instant,
     pub last_heartbeat: Instant,
 }
 
-/// Instance id -> session. Lock order: the sessions lock may be held while the registry lock is
+/// Instance id -> session. Every lookup also matches the session's [`ContextId`], so a session is
+/// only ever found in the context it registered in. Lock order: the sessions lock may be held while the registry lock is
 /// taken (inside [`Sessions::with_current`] and [`Sessions::remove_if_then`] closures), never
 /// the reverse. Closures must not call back into `Sessions` (the mutex is not reentrant).
 #[derive(Default)]
@@ -75,6 +80,7 @@ impl Sessions {
     /// session's token.
     pub fn insert(
         &self,
+        ctx: &ContextId,
         instance_id: &str,
         service: &str,
         tx: mpsc::Sender<Result<ServerMessage, Status>>,
@@ -83,6 +89,7 @@ impl Sessions {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let session = Session {
+            context: ctx.clone(),
             service: service.to_string(),
             tx,
             last_heartbeat: now,
@@ -112,12 +119,16 @@ impl Sessions {
     /// stream can only register while it provably owns the instance id.
     pub fn with_current<R>(
         &self,
+        ctx: &ContextId,
         instance_id: &str,
         token: u64,
         f: impl FnOnce() -> R,
     ) -> Option<R> {
         let inner = self.inner.lock().unwrap();
-        if inner.get(instance_id).is_some_and(|s| s.token == token) {
+        if inner
+            .get(instance_id)
+            .is_some_and(|s| s.token == token && s.context == *ctx)
+        {
             Some(f())
         } else {
             None
@@ -129,12 +140,16 @@ impl Sessions {
     /// id can be inserted before `f`, typically the registry unregister, has run).
     pub fn remove_if_then<R>(
         &self,
+        ctx: &ContextId,
         instance_id: &str,
         token: u64,
         f: impl FnOnce(Session) -> R,
     ) -> Option<R> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.get(instance_id).is_some_and(|s| s.token == token) {
+        if !inner
+            .get(instance_id)
+            .is_some_and(|s| s.token == token && s.context == *ctx)
+        {
             return None;
         }
         let session = inner.remove(instance_id).expect("checked above");
@@ -143,17 +158,17 @@ impl Sessions {
     }
 
     /// Removes the session only if it is still the one identified by `token`.
-    pub fn remove_if(&self, instance_id: &str, token: u64) -> Option<Session> {
-        self.remove_if_then(instance_id, token, |s| s)
+    pub fn remove_if(&self, ctx: &ContextId, instance_id: &str, token: u64) -> Option<Session> {
+        self.remove_if_then(ctx, instance_id, token, |s| s)
     }
 
-    /// Every current session as `(instance id, token)`, for a disconnect sweep (shutdown).
-    pub fn all_with_tokens(&self) -> Vec<(InstanceId, u64)> {
+    /// Every current session as `(context, instance id, token)`, for a disconnect sweep (shutdown).
+    pub fn all_with_tokens(&self) -> Vec<(ContextId, InstanceId, u64)> {
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, s)| (id.clone(), s.token))
+            .map(|(id, s)| (s.context.clone(), id.clone(), s.token))
             .collect()
     }
 
@@ -164,6 +179,7 @@ impl Sessions {
             .unwrap()
             .iter()
             .map(|(id, s)| SessionDetail {
+                context: s.context.clone(),
                 instance_id: id.clone(),
                 service: s.service.clone(),
                 connected_since: s.connected_since,
@@ -173,25 +189,41 @@ impl Sessions {
     }
 
     /// A clone of the instance's outbound sender, for a delivery that must outlive `try_send`.
-    pub fn sender(&self, instance_id: &str) -> Option<mpsc::Sender<Result<ServerMessage, Status>>> {
+    pub fn sender(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+    ) -> Option<mpsc::Sender<Result<ServerMessage, Status>>> {
         self.inner
             .lock()
             .unwrap()
             .get(instance_id)
+            .filter(|s| s.context == *ctx)
             .map(|s| s.tx.clone())
     }
 
     /// try_send: full buffer -> Busy, closed or unknown -> Gone.
-    pub fn send(&self, instance_id: &str, msg: ServerMessage) -> Result<(), SendError> {
-        let tx = self.sender(instance_id).ok_or(SendError::Gone)?;
+    pub fn send(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        msg: ServerMessage,
+    ) -> Result<(), SendError> {
+        let tx = self.sender(ctx, instance_id).ok_or(SendError::Gone)?;
         tx.try_send(Ok(msg)).map_err(|e| match e {
             TrySendError::Full(_) => SendError::Busy,
             TrySendError::Closed(_) => SendError::Gone,
         })
     }
 
-    pub fn touch(&self, instance_id: &str, now: Instant) {
-        if let Some(s) = self.inner.lock().unwrap().get_mut(instance_id) {
+    pub fn touch(&self, ctx: &ContextId, instance_id: &str, now: Instant) {
+        if let Some(s) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(instance_id)
+            .filter(|s| s.context == *ctx)
+        {
             s.last_heartbeat = now;
         }
     }
@@ -207,14 +239,18 @@ impl Sessions {
             .collect()
     }
 
-    /// Like [`Sessions::stale`], with each session's token for [`Sessions::remove_if`].
-    pub fn stale_with_tokens(&self, now: Instant, timeout: Duration) -> Vec<(InstanceId, u64)> {
+    /// Like [`Sessions::stale`], with each session's context and token for [`Sessions::remove_if`].
+    pub fn stale_with_tokens(
+        &self,
+        now: Instant,
+        timeout: Duration,
+    ) -> Vec<(ContextId, InstanceId, u64)> {
         self.inner
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, s)| s.last_heartbeat + timeout < now)
-            .map(|(id, s)| (id.clone(), s.token))
+            .map(|(id, s)| (s.context.clone(), id.clone(), s.token))
             .collect()
     }
 
@@ -230,6 +266,8 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
@@ -237,7 +275,7 @@ mod tests {
     async fn send_to_unknown_instance_is_gone() {
         let sessions = Sessions::new();
         assert_eq!(
-            sessions.send("nope", ServerMessage::default()),
+            sessions.send(&D, "nope", ServerMessage::default()),
             Err(SendError::Gone)
         );
     }
@@ -246,10 +284,10 @@ mod tests {
     async fn send_with_full_buffer_is_busy() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        sessions.insert("a", "svc", tx, CancellationToken::new());
-        assert_eq!(sessions.send("a", ServerMessage::default()), Ok(()));
+        sessions.insert(&D, "a", "svc", tx, CancellationToken::new());
+        assert_eq!(sessions.send(&D, "a", ServerMessage::default()), Ok(()));
         assert_eq!(
-            sessions.send("a", ServerMessage::default()),
+            sessions.send(&D, "a", ServerMessage::default()),
             Err(SendError::Busy)
         );
     }
@@ -258,10 +296,10 @@ mod tests {
     async fn send_to_dropped_receiver_is_gone() {
         let sessions = Sessions::new();
         let (tx, rx) = mpsc::channel(1);
-        sessions.insert("a", "svc", tx, CancellationToken::new());
+        sessions.insert(&D, "a", "svc", tx, CancellationToken::new());
         drop(rx);
         assert_eq!(
-            sessions.send("a", ServerMessage::default()),
+            sessions.send(&D, "a", ServerMessage::default()),
             Err(SendError::Gone)
         );
     }
@@ -272,10 +310,10 @@ mod tests {
         let now = Instant::now();
         let (tx_a, _rx_a) = mpsc::channel(1);
         let (tx_b, _rx_b) = mpsc::channel(1);
-        sessions.insert("a", "svc", tx_a, CancellationToken::new());
-        sessions.insert("b", "svc", tx_b, CancellationToken::new());
-        sessions.touch("a", now);
-        sessions.touch("b", now - Duration::from_secs(31));
+        sessions.insert(&D, "a", "svc", tx_a, CancellationToken::new());
+        sessions.insert(&D, "b", "svc", tx_b, CancellationToken::new());
+        sessions.touch(&D, "a", now);
+        sessions.touch(&D, "b", now - Duration::from_secs(31));
         assert_eq!(
             sessions.stale(now, Duration::from_secs(30)),
             vec!["b".to_string()]
@@ -287,12 +325,12 @@ mod tests {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert("a", "svc", tx1, CancellationToken::new());
-        let new = sessions.insert("a", "svc", tx2, CancellationToken::new());
+        let old = sessions.insert(&D, "a", "svc", tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", tx2, CancellationToken::new());
         assert_ne!(old, new);
-        assert!(sessions.remove_if("a", old).is_none());
-        assert!(sessions.remove_if("a", new).is_some());
-        assert!(sessions.remove_if("a", new).is_none());
+        assert!(sessions.remove_if(&D, "a", old).is_none());
+        assert!(sessions.remove_if(&D, "a", new).is_some());
+        assert!(sessions.remove_if(&D, "a", new).is_none());
     }
 
     #[test]
@@ -302,11 +340,11 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let c1 = CancellationToken::new();
         let c2 = CancellationToken::new();
-        sessions.insert("a", "svc", tx1, c1.clone());
-        let new = sessions.insert("a", "svc", tx2, c2.clone());
+        sessions.insert(&D, "a", "svc", tx1, c1.clone());
+        let new = sessions.insert(&D, "a", "svc", tx2, c2.clone());
         assert!(c1.is_cancelled());
         assert!(!c2.is_cancelled());
-        sessions.remove_if("a", new).unwrap();
+        sessions.remove_if(&D, "a", new).unwrap();
         assert!(c2.is_cancelled());
     }
 
@@ -315,13 +353,16 @@ mod tests {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert("a", "svc", tx1, CancellationToken::new());
-        let new = sessions.insert("a", "svc", tx2, CancellationToken::new());
-        assert_eq!(sessions.with_current("a", old, || 1), None);
-        assert_eq!(sessions.with_current("a", new, || 2), Some(2));
-        assert_eq!(sessions.with_current("b", new, || 3), None);
-        assert_eq!(sessions.remove_if_then("a", old, |_| 4), None);
-        assert_eq!(sessions.remove_if_then("a", new, |s| s.token), Some(new));
-        assert_eq!(sessions.with_current("a", new, || 5), None);
+        let old = sessions.insert(&D, "a", "svc", tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", tx2, CancellationToken::new());
+        assert_eq!(sessions.with_current(&D, "a", old, || 1), None);
+        assert_eq!(sessions.with_current(&D, "a", new, || 2), Some(2));
+        assert_eq!(sessions.with_current(&D, "b", new, || 3), None);
+        assert_eq!(sessions.remove_if_then(&D, "a", old, |_| 4), None);
+        assert_eq!(
+            sessions.remove_if_then(&D, "a", new, |s| s.token),
+            Some(new)
+        );
+        assert_eq!(sessions.with_current(&D, "a", new, || 5), None);
     }
 }

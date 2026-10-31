@@ -24,6 +24,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::context::ContextId;
 use crate::proto::hub_server::Hub;
 use crate::proto::{
     ClientMessage, Heartbeat, Register, ServerMessage, TopologyRequest, TopologyResponse,
@@ -63,16 +64,17 @@ pub fn disconnect(
     registry: &Registry,
     sessions: &Sessions,
     router: &Router,
+    ctx: &ContextId,
     instance_id: &str,
     token: u64,
 ) -> bool {
-    let Some(service) = sessions.remove_if_then(instance_id, token, |session| {
-        registry.unregister(instance_id, Instant::now());
+    let Some(service) = sessions.remove_if_then(ctx, instance_id, token, |session| {
+        registry.unregister(ctx, instance_id, Instant::now());
         session.service
     }) else {
         return false;
     };
-    router.on_disconnect(instance_id);
+    router.on_disconnect(ctx, instance_id);
     router.refresh_gauges();
     info!(instance = %instance_id, service = %service, "disconnect");
     true
@@ -116,6 +118,7 @@ impl Hub for HubService {
             sessions: Arc::clone(&self.sessions),
             router: Arc::clone(&self.router),
             handshake_timeout: self.config.handshake_timeout,
+            context: ContextId::default(),
         };
         tokio::spawn(run_stream(ctx, inbound, tx, cancel.clone()));
 
@@ -149,20 +152,25 @@ struct StreamCtx {
     sessions: Arc<Sessions>,
     router: Arc<Router>,
     handshake_timeout: Duration,
+    /// Every stream lives in the default context until `Register` carries one (roadmap P8).
+    context: ContextId,
 }
 
 impl StreamCtx {
     /// Registers `reg` while the session `token` is provably the current one for its instance
     /// id. `None` means the session was removed or replaced meanwhile (nothing was changed).
     fn register(&self, token: u64, reg: &Register) -> Option<Result<(), Status>> {
-        let result = self.sessions.with_current(&reg.instance_id, token, || {
-            self.registry.register(
-                &reg.instance_id,
-                &reg.service_name,
-                &reg.command_types,
-                &reg.query_types,
-            )
-        })?;
+        let result = self
+            .sessions
+            .with_current(&self.context, &reg.instance_id, token, || {
+                self.registry.register(
+                    &self.context,
+                    &reg.instance_id,
+                    &reg.service_name,
+                    &reg.command_types,
+                    &reg.query_types,
+                )
+            })?;
         Some(match result {
             Ok(()) => {
                 info!(
@@ -192,6 +200,7 @@ impl StreamCtx {
             &self.registry,
             &self.sessions,
             &self.router,
+            &self.context,
             instance_id,
             token,
         )
@@ -252,9 +261,13 @@ async fn run_stream(
     let service = first.service_name.clone();
     // Session first, then the registration under it: a late disconnect of an older stream with
     // the same instance id can then never unregister this stream's registration.
-    let token = ctx
-        .sessions
-        .insert(&instance_id, &service, tx.clone(), cancel.clone());
+    let token = ctx.sessions.insert(
+        &ctx.context,
+        &instance_id,
+        &service,
+        tx.clone(),
+        cancel.clone(),
+    );
     match ctx.register(token, &first) {
         Some(Ok(())) => {}
         Some(Err(status)) => {
@@ -310,7 +323,8 @@ async fn run_stream(
                 }
             }
             Some(client_message::Message::Heartbeat(hb)) => {
-                ctx.sessions.touch(&instance_id, Instant::now());
+                ctx.sessions
+                    .touch(&ctx.context, &instance_id, Instant::now());
                 let Some(tx) = out.upgrade() else { break };
                 let echo = ServerMessage {
                     message: Some(server_message::Message::Heartbeat(Heartbeat {
@@ -325,8 +339,12 @@ async fn run_stream(
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
-            Some(client_message::Message::Request(req)) => ctx.router.route(&instance_id, req),
-            Some(client_message::Message::Reply(reply)) => ctx.router.on_reply(&instance_id, reply),
+            Some(client_message::Message::Request(req)) => {
+                ctx.router.route(&ctx.context, &instance_id, req)
+            }
+            Some(client_message::Message::Reply(reply)) => {
+                ctx.router.on_reply(&ctx.context, &instance_id, reply)
+            }
             None => {}
         }
     }

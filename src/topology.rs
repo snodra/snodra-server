@@ -319,6 +319,9 @@ impl Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextId;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
     use crate::config::Config;
     use crate::telemetry::Metrics;
     use std::sync::Arc;
@@ -353,7 +356,8 @@ mod tests {
     fn connect(f: &Fx, id: &str, service: &str) {
         let (tx, rx) = mpsc::channel(4);
         std::mem::forget(rx);
-        f.sessions.insert(id, service, tx, CancellationToken::new());
+        f.sessions
+            .insert(&D, id, service, tx, CancellationToken::new());
     }
 
     fn snap(f: &Fx, started: Instant, timeout: Duration, now: Instant) -> Topology {
@@ -394,8 +398,8 @@ mod tests {
         connect(&f, "fresh", "svc");
         connect(&f, "old", "svc");
         let base = Instant::now();
-        f.sessions.touch("fresh", base + Duration::from_secs(9));
-        f.sessions.touch("old", base);
+        f.sessions.touch(&D, "fresh", base + Duration::from_secs(9));
+        f.sessions.touch(&D, "old", base);
         let t = snap(
             &f,
             f.anchor.instant,
@@ -420,11 +424,11 @@ mod tests {
     fn sample() -> Topology {
         let f = fx();
         f.registry
-            .register("i1", "a", &["a.Do".into()], &["a.Get".into()])
+            .register(&D, "i1", "a", &["a.Do".into()], &["a.Get".into()])
             .unwrap();
         connect(&f, "i1", "a");
         connect(&f, "i2", "b");
-        f.registry.register("i2", "b", &[], &[]).unwrap();
+        f.registry.register(&D, "i2", "b", &[], &[]).unwrap();
         snap(
             &f,
             f.anchor.instant,
