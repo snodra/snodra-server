@@ -119,10 +119,38 @@ impl Latency {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EdgeKey {
     pub sender: String,
     pub type_name: String,
+}
+
+impl Clone for EdgeKey {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        probe::KEY_CLONES.with(|n| n.set(n.get() + 1));
+        Self {
+            sender: self.sender.clone(),
+            type_name: self.type_name.clone(),
+        }
+    }
+}
+
+/// Test-only counters of the work done under the lock (per thread: tests run on one).
+#[cfg(test)]
+mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static KEY_CLONES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// `f`'s result and the key clones it made.
+    pub fn key_clones<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = KEY_CLONES.with(Cell::get);
+        let out = f();
+        (out, KEY_CLONES.with(Cell::get) - before)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,21 +192,28 @@ impl Inner {
         self.edges.retain(|_, e| e.trim(oldest));
     }
 
-    /// Drops the `n` least recently used edges.
+    /// Drops the `n` least recently used edges. Only the last-seen instants are copied (no
+    /// key): the `n`-th oldest is found with a linear select, then one pass drops every edge
+    /// older than it and as many as needed of those seen at exactly that instant.
     fn evict(&mut self, n: usize) {
         let n = n.min(self.edges.len());
         if n == 0 {
             return;
         }
-        let mut by_age: Vec<(Instant, EdgeKey)> = self
-            .edges
-            .iter()
-            .map(|(k, e)| (e.last_seen, k.clone()))
-            .collect();
-        by_age.select_nth_unstable_by(n - 1, |a, b| a.cmp(b));
-        for (_, key) in by_age.into_iter().take(n) {
-            self.edges.remove(&key);
-        }
+        let mut ages: Vec<Instant> = self.edges.values().map(|e| e.last_seen).collect();
+        let cutoff = *ages.select_nth_unstable(n - 1).1;
+        let older = ages.iter().filter(|&&t| t < cutoff).count();
+        let mut ties = n - older;
+        self.edges.retain(|_, e| {
+            if e.last_seen < cutoff {
+                return false;
+            }
+            if e.last_seen == cutoff && ties > 0 {
+                ties -= 1;
+                return false;
+            }
+            true
+        });
         self.evicted += n as u64;
     }
 }
@@ -613,6 +648,45 @@ mod tests {
                 .iter()
                 .all(|e| e.type_name != "t.000" && e.type_name != "t.001")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_at_a_large_cap_keeps_lru_order_and_clones_no_key() {
+        let stats = EdgeStats::new(WINDOW, 1000);
+        for i in 0..1000 {
+            rec(&stats, "web", &format!("t.{i:04}"), false, None);
+            tokio::time::advance(ms(1)).await;
+        }
+        // t.0000 .. t.0004 are used again: t.0005 .. t.0014 are now the ten oldest.
+        for i in 0..5 {
+            rec(&stats, "web", &format!("t.{i:04}"), false, None);
+        }
+        tokio::time::advance(ms(1)).await;
+        let ((), clones) = probe::key_clones(|| rec(&stats, "web", "t.new", false, None));
+        assert_eq!(clones, 0, "victim selection must not copy keys");
+        let snap = stats.snapshot(Instant::now());
+        assert_eq!(snap.evicted, 10);
+        assert_eq!(snap.edges.len(), 991);
+        let gone: Vec<String> = (0..1000)
+            .map(|i| format!("t.{i:04}"))
+            .filter(|t| !snap.edges.iter().any(|e| &e.type_name == t))
+            .collect();
+        let want: Vec<String> = (5..15).map(|i| format!("t.{i:04}")).collect();
+        assert_eq!(gone, want);
+        assert!(snap.edges.iter().any(|e| e.type_name == "t.new"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_with_equal_ages_drops_exactly_the_batch() {
+        // Paused time: every edge has the same last-seen instant.
+        let stats = EdgeStats::new(WINDOW, 200);
+        for i in 0..200 {
+            rec(&stats, "web", &format!("t.{i:03}"), false, None);
+        }
+        rec(&stats, "web", "t.new", false, None);
+        let snap = stats.snapshot(Instant::now());
+        assert_eq!((snap.evicted, snap.edges.len()), (2, 199));
+        assert!(snap.edges.iter().any(|e| e.type_name == "t.new"));
     }
 
     #[tokio::test(start_paused = true)]
