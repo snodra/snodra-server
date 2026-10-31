@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::proto;
-use crate::registry::{Kind, Registry};
+use crate::registry::{DEFAULT_LOAD_FACTOR, Kind, Registry};
 use crate::router::Router;
 use crate::session::Sessions;
 
@@ -87,6 +87,15 @@ pub struct InstanceTopology {
     pub protocol_version: u32,
     /// `Register.client_version`, empty for v1 clients.
     pub client_version: String,
+    /// The hub forwards to this instance only with permits.
+    pub flow_controlled: bool,
+    /// Permits left (0 when not flow-controlled).
+    pub permits_available: u32,
+    /// Requests waiting in the hub's queue for this instance.
+    pub queued: u32,
+    /// As applied (0 in `Register` reads as 100).
+    pub load_factor: u32,
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -109,6 +118,8 @@ pub struct Totals {
     pub command_types: u32,
     pub query_types: u32,
     pub in_flight: u32,
+    /// Requests waiting in per-instance queues (counted in `in_flight` too).
+    pub queued: u32,
 }
 
 fn ms(d: Duration) -> i64 {
@@ -131,15 +142,24 @@ pub fn snapshot(
     let details = sessions.details();
     let reg = registry.topology(now);
     let (in_flight, in_flight_total) = router.in_flight_by_instance();
+    let flows = router.flow_by_instance();
 
     let mut by_service: BTreeMap<String, Vec<InstanceTopology>> = BTreeMap::new();
     for d in details {
         let age = now.saturating_duration_since(d.last_heartbeat);
-        let (commands, queries) = reg
+        let (commands, queries, load_factor, tags) = reg
             .instances
             .get(&d.instance_id)
-            .map(|i| (i.command_types.clone(), i.query_types.clone()))
-            .unwrap_or_default();
+            .map(|i| {
+                (
+                    i.command_types.clone(),
+                    i.query_types.clone(),
+                    i.load_factor,
+                    i.tags.clone(),
+                )
+            })
+            .unwrap_or_else(|| (vec![], vec![], DEFAULT_LOAD_FACTOR, BTreeMap::new()));
+        let flow = flows.get(&d.instance_id).copied().unwrap_or_default();
         let flight = in_flight.get(&d.instance_id).copied().unwrap_or_default();
         by_service
             .entry(d.service)
@@ -155,6 +175,11 @@ pub fn snapshot(
                 query_types: queries,
                 protocol_version: d.protocol_version,
                 client_version: d.client_version,
+                flow_controlled: flow.flow_controlled,
+                permits_available: flow.permits_available,
+                queued: flow.queued,
+                load_factor,
+                tags,
                 instance_id: d.instance_id,
             });
     }
@@ -199,6 +224,7 @@ pub fn snapshot(
         command_types: distinct(KindName::Command),
         query_types: distinct(KindName::Query),
         in_flight: in_flight_total,
+        queued: flows.values().map(|f| f.queued).sum(),
     };
 
     Topology {
@@ -237,7 +263,11 @@ impl Topology {
                             query_types: i.query_types.clone(),
                             protocol_version: i.protocol_version,
                             client_version: i.client_version.clone(),
-                            ..Default::default()
+                            permits_available: i.permits_available,
+                            queued: i.queued,
+                            load_factor: i.load_factor,
+                            tags: i.tags.clone().into_iter().collect(),
+                            flow_controlled: i.flow_controlled,
                         })
                         .collect(),
                 })
@@ -263,7 +293,7 @@ impl Topology {
                 command_types: self.totals.command_types,
                 query_types: self.totals.query_types,
                 in_flight: self.totals.in_flight,
-                queued: 0,
+                queued: self.totals.queued,
             }),
             hub_id: self.hub_id.clone(),
         }
@@ -297,6 +327,11 @@ impl Topology {
                             query_types: i.query_types.clone(),
                             protocol_version: i.protocol_version,
                             client_version: i.client_version.clone(),
+                            flow_controlled: i.flow_controlled,
+                            permits_available: i.permits_available,
+                            queued: i.queued,
+                            load_factor: i.load_factor,
+                            tags: i.tags.clone().into_iter().collect(),
                         })
                         .collect(),
                 })
@@ -326,6 +361,7 @@ impl Topology {
                 command_types: totals.command_types,
                 query_types: totals.query_types,
                 in_flight: totals.in_flight,
+                queued: totals.queued,
             },
         }
     }
@@ -490,6 +526,51 @@ mod tests {
             (0, "")
         );
         assert_eq!(t.hub_id, "hub-x");
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_flow_state_load_factor_and_tags() {
+        let f = fx();
+        let placement = crate::registry::Placement {
+            load_factor: 250,
+            tags: [("zone".to_string(), "z1".to_string())].into(),
+        };
+        f.registry
+            .register_with(&D, "i1", "a", &["a.Do".into()], &[], placement)
+            .unwrap();
+        connect(&f, "i1", "a");
+        let token = f.sessions.token_of(&D, "i1").unwrap();
+        f.router.open_session(&D, "i1", token, "a", Some(4));
+        connect(&f, "i2", "b");
+        let t2 = f.sessions.token_of(&D, "i2").unwrap();
+        f.router.open_session(&D, "i2", t2, "b", None);
+        let t = snap(
+            &f,
+            f.anchor.instant,
+            Duration::from_secs(10),
+            Instant::now(),
+        );
+        let i1 = &t.services[0].instances[0];
+        assert!(i1.flow_controlled);
+        assert_eq!(
+            (i1.permits_available, i1.queued, i1.load_factor),
+            (4, 0, 250)
+        );
+        assert_eq!(i1.tags["zone"], "z1");
+        let i2 = &t.services[1].instances[0];
+        assert!(!i2.flow_controlled);
+        assert_eq!((i2.permits_available, i2.load_factor), (0, 100));
+        assert_eq!(t.totals.queued, 0);
+        let json = serde_json::to_string(&t).unwrap();
+        for field in [
+            "permitsAvailable",
+            "flowControlled",
+            "loadFactor",
+            "\"tags\":{\"zone\":\"z1\"}",
+        ] {
+            assert!(json.contains(field), "{field} missing: {json}");
+        }
+        assert_eq!(Topology::from_proto(&t.to_proto()), t);
     }
 
     fn sample() -> Topology {

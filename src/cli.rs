@@ -243,6 +243,11 @@ mod tests {
             query_types: queries.iter().map(|s| s.to_string()).collect(),
             protocol_version: 2,
             client_version: "kraken-messaging/0.1.0".into(),
+            flow_controlled: false,
+            permits_available: 0,
+            queued: 0,
+            load_factor: 100,
+            tags: Default::default(),
         }
     }
 
@@ -304,6 +309,7 @@ mod tests {
                 instances: 3,
                 command_types: 3,
                 query_types: 2,
+                queued: 0,
                 in_flight: 3,
             },
         }
@@ -343,6 +349,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
                 instances: 0,
                 command_types: 0,
                 query_types: 0,
+                queued: 0,
                 in_flight: 0,
             },
         };
