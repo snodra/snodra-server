@@ -7,8 +7,8 @@ use std::time::Duration;
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
 use kraken_hub::proto::{
-    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, Register, Reply, Request, RequestKind,
-    ServerMessage, client_message, credentials, reply,
+    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, Permits, Register, Reply, Request,
+    RequestKind, ServerMessage, client_message, credentials, reply,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -171,6 +171,38 @@ impl FakeClient {
             ..self.register_message(service, commands, queries)
         };
         self.send_raw_register(reg).await;
+    }
+
+    /// A v2 client that shares flow-control and starts with `initial_permits` (0 = unlimited),
+    /// with the given load factor and tags.
+    pub async fn register_flow(
+        addr: SocketAddr,
+        service: &str,
+        commands: &[&str],
+        initial_permits: u32,
+        tags: &[(&str, &str)],
+    ) -> Self {
+        let client = Self::connect(addr).await;
+        let reg = Register {
+            protocol_version: 2,
+            capabilities: vec!["flow-control".to_string()],
+            client_version: "fake-client/1.0".to_string(),
+            initial_permits,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..client.register_message(service, commands, &[])
+        };
+        client.send_raw_register(reg).await;
+        client
+    }
+
+    pub async fn permits(&self, count: u32) {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::Permits(Permits { count })),
+        };
+        self.tx.send(msg).await.unwrap();
     }
 
     pub async fn send_raw_register(&self, reg: Register) {

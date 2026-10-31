@@ -299,3 +299,62 @@ async fn zero_timeout_from_a_v2_sender_gets_the_per_type_override() {
         started.elapsed()
     );
 }
+
+/// P1 (ADR 0014): a sender that did not declare flow-control (v1, or v2 without the capability)
+/// never gets RESOURCE_EXHAUSTED: a full queue answers HANDLER_ERROR "handler busy" as before, and
+/// the ack of such a v2 client lists no capability.
+#[tokio::test]
+async fn senders_without_flow_control_never_get_resource_exhausted() {
+    let addr = start_hub(Config {
+        queue_capacity_per_instance: 1,
+        ..config()
+    })
+    .await;
+    let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
+    expect_ack(&mut handler).await;
+    handler.heartbeat(1).await;
+    expect_echo(&mut handler, 1).await;
+    let mut v2 = FakeClient::register_v2(addr, "svc-v2", &[], &[]).await;
+    v2.heartbeat(1).await;
+    assert!(expect_ack(&mut v2).await.capabilities.is_empty());
+    expect_echo(&mut v2, 1).await;
+    let mut v1 = FakeClient::register(addr, "svc-v1", &[], &[]).await;
+    v1.heartbeat(1).await;
+    expect_echo(&mut v1, 1).await;
+
+    for id in ["forwarded", "queued"] {
+        v2.tx
+            .send(FakeClient::request(
+                id,
+                RequestKind::Command,
+                "h.Do",
+                "",
+                10_000,
+            ))
+            .await
+            .unwrap();
+    }
+    v2.heartbeat(2).await;
+    expect_echo(&mut v2, 2).await;
+    for (c, id) in [(&mut v2, "v2-full"), (&mut v1, "v1-full")] {
+        c.tx.send(FakeClient::request(
+            id,
+            RequestKind::Command,
+            "h.Do",
+            "",
+            10_000,
+        ))
+        .await
+        .unwrap();
+        match next_message(c).await {
+            server_message::Message::Error(e) => {
+                assert_eq!(e.request_id, id);
+                assert_eq!(e.code(), ErrorCode::HandlerError);
+                assert_eq!(e.message, "handler busy");
+            }
+            other => panic!("expected the busy HANDLER_ERROR, got {other:?}"),
+        }
+    }
+    let seen = assert_only_v1_messages(&mut v1, Duration::from_millis(200)).await;
+    assert!(seen.is_empty(), "{seen:?}");
+}
