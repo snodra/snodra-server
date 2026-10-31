@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         Mode::Serve => {}
     }
     let telemetry = kraken_hub::telemetry::init(&config)?;
+    for warning in config.warnings() {
+        tracing::warn!("{warning}");
+    }
     let listener = TcpListener::bind(config.listen).await?;
     let http = kraken_hub::bind_http(&config).await?;
     kraken_hub::serve_with_shutdown(config, listener, http, kraken_hub::shutdown_signal()).await?;

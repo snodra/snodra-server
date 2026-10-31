@@ -29,7 +29,7 @@ pub struct Config {
     /// `KRAKEN_HUB_MAX_TIMEOUT_MS`, default 60000.
     pub max_timeout: Duration,
     /// Heartbeat period announced to v2 sessions in `RegisterAck`.
-    /// `KRAKEN_HUB_HEARTBEAT_INTERVAL`, default 3 s. Must be shorter than `heartbeat_timeout`.
+    /// `KRAKEN_HUB_HEARTBEAT_INTERVAL`, default 3 s. `heartbeat_timeout` must be at least twice it.
     pub heartbeat_interval: Duration,
     /// A v2 session (`Register.protocol_version >= 2`) is dropped after this long without a
     /// heartbeat. `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, default 10 s.
@@ -142,14 +142,27 @@ impl Config {
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
         }
-        if self.heartbeat_interval >= self.heartbeat_timeout {
+        // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
+        if self.heartbeat_interval * 2 > self.heartbeat_timeout {
             bail!(
-                "KRAKEN_HUB_HEARTBEAT_INTERVAL ({:?}) must be shorter than KRAKEN_HUB_HEARTBEAT_TIMEOUT ({:?})",
-                self.heartbeat_interval,
-                self.heartbeat_timeout
+                "KRAKEN_HUB_HEARTBEAT_TIMEOUT ({:?}) must be at least twice KRAKEN_HUB_HEARTBEAT_INTERVAL ({:?})",
+                self.heartbeat_timeout,
+                self.heartbeat_interval
             );
         }
         Ok(())
+    }
+
+    /// Settings that are valid but probably wrong; `main` logs them once telemetry is up.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.legacy_heartbeat_timeout < LEGACY_TIMEOUT_WARN_BELOW {
+            out.push(format!(
+                "KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT is {:?}: v1 clients heartbeat every 10 s, so below {:?} one late heartbeat evicts them",
+                self.legacy_heartbeat_timeout, LEGACY_TIMEOUT_WARN_BELOW
+            ));
+        }
+        out
     }
 
     /// The deadline the hub applies to a request of `type_name` that asked for `requested_ms`
@@ -175,6 +188,9 @@ impl Config {
         }
     }
 }
+
+/// v1 clients heartbeat every 10 s; a legacy timeout below two of their intervals is suspicious.
+const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
 
 /// `HOSTNAME` (set by Docker and Kubernetes), else `/etc/hostname`.
 fn hostname() -> Option<String> {
@@ -299,9 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_interval_must_be_shorter_than_the_timeout() {
+    fn heartbeat_timeout_must_allow_at_least_two_intervals() {
         assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "10s")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "0")]).is_err());
+        // 6 s interval, 10 s timeout: a single late heartbeat would evict.
+        let err = with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "6s")]).unwrap_err();
+        assert!(err.to_string().contains("at least twice"), "{err:#}");
+        assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "5s")]).is_ok());
+    }
+
+    #[test]
+    fn short_legacy_timeout_is_a_warning_not_an_error() {
+        assert!(Config::default().warnings().is_empty());
+        let c = with_env(&[("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT", "15s")]).unwrap();
+        let warnings = c.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT"),
+            "{warnings:?}"
+        );
+        assert!(
+            with_env(&[("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT", "20s")])
+                .unwrap()
+                .warnings()
+                .is_empty()
+        );
     }
 
     #[test]

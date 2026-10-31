@@ -71,7 +71,7 @@ cargo run
 | `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
 | `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` on types without an override |
 | `KRAKEN_HUB_TIMEOUT_OVERRIDES` | none | per-type timeouts, `type=ms,type=ms` (for example `files.Upload=120000`); see [Request timeouts](#request-timeouts) |
-| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to v2 clients in `RegisterAck`; must be shorter than `KRAKEN_HUB_HEARTBEAT_TIMEOUT` |
+| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to v2 clients in `RegisterAck`; `KRAKEN_HUB_HEARTBEAT_TIMEOUT` must be at least twice it |
 | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold for v2 sessions (`10`, `10s` or `500ms`) |
 | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold for v1 sessions (`Register.protocol_version` 0, clients that heartbeat every 10 s) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
@@ -88,7 +88,9 @@ The topology view (`GET /topology`, `kraken-hub --topology`) is described in [To
   `Register` with an empty `instance_id` or `service_name` is closed with `INVALID_ARGUMENT`.
 - Startup fails on a malformed `KRAKEN_HUB_TIMEOUT_OVERRIDES` (entry without `=`, empty type,
   non-numeric, zero or above `u32::MAX` milliseconds, a type listed twice) and when
-  `KRAKEN_HUB_HEARTBEAT_INTERVAL` is not shorter than `KRAKEN_HUB_HEARTBEAT_TIMEOUT`.
+  `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is less than twice `KRAKEN_HUB_HEARTBEAT_INTERVAL` (one late
+  heartbeat would evict). A `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` below 20 s is accepted with a
+  startup warning: v1 clients heartbeat every 10 s.
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
   AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the topology HTTP port; map the compose
   host port accordingly).
