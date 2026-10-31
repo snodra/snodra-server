@@ -15,7 +15,7 @@
 //! their own deadline passes. Lock order: the pending lock and the flows lock are never held
 //! together.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,8 +71,9 @@ struct Flow {
     /// `Register.initial_permits`: permits never exceed it, whatever a client sends back.
     initial: u32,
     queue: InstanceQueue,
-    /// Requests assigned to this session and not ended yet: queued plus forwarded.
-    assigned: u32,
+    /// Ids of the requests assigned to this session and not ended yet: queued plus forwarded.
+    /// A set, so ending a request twice (or before it was assigned) cannot skew the count.
+    assigned: HashSet<String>,
 }
 
 /// One session's flow state, for the topology view.
@@ -256,7 +257,7 @@ impl Router {
                 self.config.queue_capacity_per_instance,
                 self.config.queue_bytes_per_instance,
             ),
-            assigned: 0,
+            assigned: HashSet::new(),
         };
         {
             let mut flows = self.flows.lock().unwrap();
@@ -284,9 +285,7 @@ impl Router {
             (flow.service.clone(), drain(flow))
         };
         self.refresh_flow_gauges(&service);
-        for item in ready {
-            self.forward_queued(ctx, instance_id, token, &service, item);
-        }
+        self.forward_ready(ctx, instance_id, token, &service, ready);
     }
 
     /// Flow state per instance (current sessions only).
@@ -343,7 +342,7 @@ impl Router {
                 let load = match flows.get(&c.id) {
                     Some(f) => Load {
                         can_take: f.permits.is_none_or(|p| p > 0) && f.queue.is_empty(),
-                        assigned: f.assigned,
+                        assigned: f.assigned.len() as u32,
                     },
                     None => Load {
                         can_take: true,
@@ -364,36 +363,70 @@ impl Router {
             .filter(|f| f.token == entry.handler_token)
         {
             f.queue.remove(id);
-            f.assigned = f.assigned.saturating_sub(1);
+            f.assigned.remove(id);
         }
     }
 
-    /// Sends a request popped from a queue; a failed write returns the permit.
-    fn forward_queued(
+    /// The request `id` is still pending and assigned to `handler`'s session `token`.
+    fn is_pending_for(&self, id: &str, handler: &str, token: u64) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|p| p.handler == handler && p.handler_token == token)
+    }
+
+    /// Sends requests popped from `handler`'s queue (one permit each). An entry whose request
+    /// already ended (a race with its timeout, or a queue taken over from a replaced session)
+    /// is not sent: its permit goes to the next queued request. A failed write returns the
+    /// permit and fails the request.
+    fn forward_ready(
         &self,
         ctx: &ContextId,
         handler: &str,
         token: u64,
         service: &str,
-        item: Queued,
+        mut ready: Vec<Queued>,
     ) {
-        self.metrics
-            .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
-        match self.sessions.send_if_current(ctx, handler, token, item.msg) {
-            Ok(()) => {}
-            Err(e) => {
-                if let Some(f) = self
-                    .flows
-                    .lock()
-                    .unwrap()
-                    .get_mut(handler)
-                    .filter(|f| f.token == token)
-                    && let Some(p) = f.permits.as_mut()
-                {
-                    *p = (*p + 1).min(f.initial);
+        while !ready.is_empty() {
+            let mut ended = Vec::new();
+            for item in ready {
+                if !self.is_pending_for(&item.id, handler, token) {
+                    ended.push(item.id);
+                    continue;
                 }
-                self.forward_failed(&item.id, handler, service, e);
+                self.metrics
+                    .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
+                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, item.msg) {
+                    if let Some(f) = self
+                        .flows
+                        .lock()
+                        .unwrap()
+                        .get_mut(handler)
+                        .filter(|f| f.token == token)
+                        && let Some(p) = f.permits.as_mut()
+                    {
+                        *p = (*p + 1).min(f.initial);
+                    }
+                    self.forward_failed(&item.id, handler, service, e);
+                }
             }
+            if ended.is_empty() {
+                break;
+            }
+            ready = {
+                let mut flows = self.flows.lock().unwrap();
+                let Some(f) = flows.get_mut(handler).filter(|f| f.token == token) else {
+                    break;
+                };
+                for id in &ended {
+                    f.assigned.remove(id);
+                }
+                if let Some(p) = f.permits.as_mut() {
+                    *p = p.saturating_add(ended.len() as u32).min(f.initial);
+                }
+                drain(f)
+            };
         }
     }
 
@@ -591,6 +624,10 @@ impl Router {
     /// session the entry names: if it was replaced meanwhile the request fails (Gone) instead of
     /// reaching a stream whose requests the replacement already failed.
     fn dispatch(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, req: Request) {
+        // The request may have ended (timeout) between its pending insert and this dispatch.
+        if !self.is_pending_for(id, handler, token) {
+            return;
+        }
         let priority = req.priority;
         let type_name = req.r#type.clone();
         let msg = ServerMessage {
@@ -609,7 +646,7 @@ impl Router {
                 // current). Sending would bypass its permits, so the request fails instead.
                 None => Next::Closed,
                 Some(flow) => {
-                    flow.assigned += 1;
+                    flow.assigned.insert(id.to_string());
                     let service = flow.service.clone();
                     if flow.permits.is_none() {
                         Next::Send(msg, service)
@@ -638,10 +675,21 @@ impl Router {
                 }
             }
             Next::Drained(ready, service) => {
-                self.refresh_flow_gauges(&service);
-                for item in ready {
-                    self.forward_queued(ctx, handler, token, &service, item);
+                // Ended meanwhile: take it back out, so no orphan entry or assignment remains.
+                // (If it was already drained, `forward_ready` skips it.)
+                if !self.is_pending_for(id, handler, token)
+                    && let Some(f) = self
+                        .flows
+                        .lock()
+                        .unwrap()
+                        .get_mut(handler)
+                        .filter(|f| f.token == token)
+                {
+                    f.queue.remove(id);
+                    f.assigned.remove(id);
                 }
+                self.refresh_flow_gauges(&service);
+                self.forward_ready(ctx, handler, token, &service, ready);
             }
             Next::Rejected(reason, service) => {
                 self.metrics.rejected(&service, reason);
@@ -1528,6 +1576,59 @@ mod tests {
         f.router.on_permits(&D, "h1", f.handler_token, 5);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(view.permits_available, 2);
+    }
+
+    fn assigned_to(router: &Router, id: &str) -> u32 {
+        router.loads(&[candidate(id, 100, &[])])[id].assigned
+    }
+
+    fn queued_item(id: &str) -> Queued {
+        Queued {
+            id: id.to_string(),
+            type_name: "t.Cmd".into(),
+            priority: 0,
+            bytes: 10,
+            enqueued_at: Instant::now().into_std(),
+            msg: ServerMessage {
+                message: Some(server_message::Message::Request(unkeyed(id, 0, 0))),
+            },
+        }
+    }
+
+    /// The request ended (its timeout fired) between the pending insert and the dispatch.
+    #[tokio::test]
+    async fn a_request_that_ended_before_its_dispatch_leaves_no_queue_entry_or_assignment() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("busy", 0, 0));
+        f.router
+            .dispatch(&D, "ghost", "h1", f.handler_token, unkeyed("ghost", 0, 0));
+        assert_eq!(f.router.queued_total(), 0, "no orphan queue entry");
+        f.router.route(&D, "s1", unkeyed("real", 0, 0));
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        assert_eq!(forwarded(&mut f.handler_rx), ["busy", "real"]);
+        assert_eq!(assigned_to(&f.router, "h1"), 2, "busy and real only");
+    }
+
+    /// An entry still queued after its request ended (a race with the timeout, or a queue
+    /// moved to a new session) is dropped when it comes up, and its permit stays.
+    #[tokio::test]
+    async fn a_dequeued_entry_whose_request_ended_is_not_sent() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("busy", 0, 0));
+        assert_eq!(forwarded(&mut f.handler_rx), ["busy"]);
+        f.router
+            .flows
+            .lock()
+            .unwrap()
+            .get_mut("h1")
+            .unwrap()
+            .queue
+            .push(queued_item("ghost"))
+            .unwrap();
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        assert!(forwarded(&mut f.handler_rx).is_empty(), "ghost not sent");
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!((view.permits_available, view.queued), (1, 0));
     }
 
     fn candidate(id: &str, load_factor: u32, tags: &[(&str, &str)]) -> Candidate {
