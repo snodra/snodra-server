@@ -233,7 +233,7 @@ impl Metrics {
                 .build(),
             rejected: meter
                 .u64_counter("kraken_hub_rejected_total")
-                .with_description("Requests rejected for capacity (queue_full, queue_bytes, buffer_full)")
+                .with_description("Requests rejected for capacity (queue_full, queue_bytes, queue_bytes_total, buffer_full)")
                 .build(),
             seen: Mutex::new(Seen::default()),
         })
@@ -395,6 +395,30 @@ pub(crate) mod test_support {
     }
 
     impl TestMetrics {
+        /// The sum of the u64 counter `name` over the points whose attribute `key` is `value`.
+        pub(crate) fn counter(&self, name: &str, key: &str, value: &str) -> Option<u64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                panic!("{name} is not a u64 counter");
+            };
+            let points: Vec<u64> = sum
+                .data_points()
+                .filter(|p| {
+                    p.attributes()
+                        .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                })
+                .map(|p| p.value())
+                .collect();
+            (!points.is_empty()).then(|| points.iter().sum())
+        }
+
         /// The last value of the u64 gauge `name` for `service`, as exported now.
         pub(crate) fn gauge(&self, name: &str, service: &str) -> Option<u64> {
             self.exporter.reset();

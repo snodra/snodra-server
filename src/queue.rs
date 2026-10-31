@@ -1,11 +1,14 @@
 //! Per-instance request queue for flow-controlled instances (roadmap P1, ADR 0014).
 //!
 //! Ordered by priority (higher first), then arrival (FIFO within a priority). Bounded by a
-//! number of entries and a number of bytes; entries can be removed by request id (a queued
-//! request that times out, or whose sender left).
+//! number of entries and a number of bytes per instance, and by the bytes queued over all
+//! instances of the hub ([`TotalBytes`]); entries can be removed by request id (a queued request
+//! that times out, or whose sender left).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::proto::ServerMessage;
@@ -28,6 +31,8 @@ pub struct Queued {
 pub enum Full {
     Count,
     Bytes,
+    /// The hub-wide cap (`KRAKEN_HUB_QUEUE_BYTES_TOTAL`).
+    TotalBytes,
 }
 
 impl Full {
@@ -36,7 +41,41 @@ impl Full {
         match self {
             Full::Count => "queue_full",
             Full::Bytes => "queue_bytes",
+            Full::TotalBytes => "queue_bytes_total",
         }
+    }
+}
+
+/// Bytes queued over every instance queue of the hub, bounded by one cap, so many busy
+/// instances cannot together take more memory than the hub is given.
+#[derive(Debug)]
+pub struct TotalBytes {
+    used: AtomicUsize,
+    max: usize,
+}
+
+impl TotalBytes {
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            max,
+        })
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::SeqCst)
+    }
+
+    fn try_add(&self, n: usize) -> bool {
+        self.used
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
+                u.checked_add(n).filter(|t| *t <= self.max)
+            })
+            .is_ok()
+    }
+
+    fn sub(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::SeqCst);
     }
 }
 
@@ -51,10 +90,17 @@ pub struct InstanceQueue {
     next_seq: u64,
     max_len: usize,
     max_bytes: usize,
+    total: Arc<TotalBytes>,
 }
 
 impl InstanceQueue {
+    /// A queue that only has its own caps.
     pub fn new(max_len: usize, max_bytes: usize) -> Self {
+        Self::with_total(max_len, max_bytes, TotalBytes::new(usize::MAX))
+    }
+
+    /// A queue that also counts against (and is bounded by) the hub-wide `total`.
+    pub fn with_total(max_len: usize, max_bytes: usize, total: Arc<TotalBytes>) -> Self {
         Self {
             entries: BTreeMap::new(),
             keys: HashMap::new(),
@@ -62,6 +108,7 @@ impl InstanceQueue {
             next_seq: 0,
             max_len,
             max_bytes,
+            total,
         }
     }
 
@@ -86,6 +133,9 @@ impl InstanceQueue {
         if self.bytes.saturating_add(entry.bytes) > self.max_bytes {
             return Err((Full::Bytes, Box::new(entry)));
         }
+        if !self.total.try_add(entry.bytes) {
+            return Err((Full::TotalBytes, Box::new(entry)));
+        }
         let key = (Reverse(entry.priority), self.next_seq);
         self.next_seq += 1;
         self.bytes += entry.bytes;
@@ -99,6 +149,7 @@ impl InstanceQueue {
         let (_, entry) = self.entries.pop_first()?;
         self.keys.remove(&entry.id);
         self.bytes -= entry.bytes;
+        self.total.sub(entry.bytes);
         Some(entry)
     }
 
@@ -106,12 +157,20 @@ impl InstanceQueue {
         let key = self.keys.remove(id)?;
         let entry = self.entries.remove(&key)?;
         self.bytes -= entry.bytes;
+        self.total.sub(entry.bytes);
         Some(entry)
     }
 
     /// Empties the queue, in dequeue order.
     pub fn drain(&mut self) -> Vec<Queued> {
         std::iter::from_fn(|| self.pop()).collect()
+    }
+}
+
+impl Drop for InstanceQueue {
+    /// A queue dropped with entries (its session's flow state went) gives their bytes back.
+    fn drop(&mut self) {
+        self.total.sub(self.bytes);
     }
 }
 
@@ -184,6 +243,24 @@ mod tests {
         // A single entry larger than the whole cap is rejected even on an empty queue.
         let mut empty = InstanceQueue::new(100, 100);
         assert_eq!(empty.push(item("big", 0, 101)).unwrap_err().0, Full::Bytes);
+    }
+
+    #[test]
+    fn the_total_byte_cap_spans_all_queues_and_is_released_by_pop_remove_and_drop() {
+        let total = TotalBytes::new(100);
+        let mut a = InstanceQueue::with_total(100, 1 << 20, Arc::clone(&total));
+        let mut b = InstanceQueue::with_total(100, 1 << 20, Arc::clone(&total));
+        a.push(item("a1", 0, 60)).unwrap();
+        assert_eq!(b.push(item("b1", 0, 41)).unwrap_err().0, Full::TotalBytes);
+        b.push(item("b2", 0, 40)).unwrap();
+        assert_eq!(total.used(), 100);
+        a.pop().unwrap();
+        b.remove("b2").unwrap();
+        assert_eq!(total.used(), 0);
+        b.push(item("b3", 0, 70)).unwrap();
+        drop(b);
+        assert_eq!(total.used(), 0, "a dropped queue releases its bytes");
+        assert_eq!(Full::TotalBytes.reason(), "queue_bytes_total");
     }
 
     #[test]

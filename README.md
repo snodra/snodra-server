@@ -76,6 +76,7 @@ cargo run
 | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold for v1 sessions (`Register.protocol_version` 0, clients that heartbeat every 10 s) |
 | `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one flow-controlled instance before new ones are rejected |
 | `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one flow-controlled instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
+| `KRAKEN_HUB_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all flow-controlled instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
@@ -268,7 +269,8 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
   `Request.priority` (higher first) and then arrival. A queued request keeps its own deadline
   (`TIMEOUT`) and fails with `HANDLER_DISCONNECTED` when the instance disconnects or is replaced.
 - A full queue (`KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` entries or
-  `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), like a full session buffer, answers
+  `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), a hub whose queues together hold
+  `KRAKEN_HUB_QUEUE_BYTES_TOTAL` bytes, like a full session buffer, answers
   `RESOURCE_EXHAUSTED` to a sender that shares `flow-control` and `HANDLER_ERROR` `handler busy`
   to any other sender, so no session gets a code it did not declare.
 - Permits, load factor and tags are read from the first `Register` of a stream.
@@ -339,7 +341,7 @@ without any client change; v1 clients always send a timeout, so for them an over
   `kraken_hub_in_flight`, `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
-  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `buffer_full`). No
+  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`, `buffer_full`). No
   per-instance labels.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on

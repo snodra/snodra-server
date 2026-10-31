@@ -47,6 +47,10 @@ pub struct Config {
     /// Encoded bytes the hub queues for one flow-controlled instance before rejecting new
     /// requests. `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
     pub queue_bytes_per_instance: usize,
+    /// Encoded bytes the hub queues over all flow-controlled instances together before
+    /// rejecting new requests (reason `queue_bytes_total`). `KRAKEN_HUB_QUEUE_BYTES_TOTAL`,
+    /// default 512 MiB.
+    pub queue_bytes_total: usize,
     /// Type ownership is kept this long after the last instance leaves.
     /// `KRAKEN_HUB_OWNER_GRACE`, default 60 s.
     pub owner_grace: Duration,
@@ -73,6 +77,7 @@ impl Default for Config {
             timeout_overrides: BTreeMap::new(),
             queue_capacity_per_instance: 10_000,
             queue_bytes_per_instance: 64 * 1024 * 1024,
+            queue_bytes_total: 512 * 1024 * 1024,
             owner_grace: Duration::from_secs(60),
             session_buffer: 1024,
             handshake_timeout: Duration::from_secs(10),
@@ -140,6 +145,9 @@ impl Config {
             c.queue_bytes_per_instance =
                 parse_size(&v).context("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_QUEUE_BYTES_TOTAL") {
+            c.queue_bytes_total = parse_size(&v).context("KRAKEN_HUB_QUEUE_BYTES_TOTAL")?;
+        }
         if let Some(v) = var("KRAKEN_HUB_OWNER_GRACE") {
             c.owner_grace = parse_duration(&v).context("KRAKEN_HUB_OWNER_GRACE")?;
         }
@@ -162,6 +170,9 @@ impl Config {
         }
         if self.queue_bytes_per_instance == 0 {
             bail!("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE must be positive");
+        }
+        if self.queue_bytes_total == 0 {
+            bail!("KRAKEN_HUB_QUEUE_BYTES_TOTAL must be positive");
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
@@ -441,6 +452,15 @@ mod tests {
         }
         assert!(with_env(&[("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "0")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE", "0")]).is_err());
+    }
+
+    #[test]
+    fn total_queue_bytes_default_parse_and_validation() {
+        assert_eq!(Config::default().queue_bytes_total, 512 * 1024 * 1024);
+        let c = with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "1GiB")]).unwrap();
+        assert_eq!(c.queue_bytes_total, 1 << 30);
+        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "0")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "lots")]).is_err());
     }
 
     /// The effective-timeout table from the design (P0, F4).

@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
-use crate::queue::{InstanceQueue, Queued};
+use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, Sessions};
 use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
@@ -140,6 +140,8 @@ pub struct Router {
     sessions: Arc<Sessions>,
     pending: Mutex<HashMap<String, Pending>>,
     flows: Mutex<HashMap<InstanceId, Flow>>,
+    /// Bytes queued over all flows (`KRAKEN_HUB_QUEUE_BYTES_TOTAL`).
+    queued_bytes: Arc<TotalBytes>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
 }
@@ -239,6 +241,7 @@ impl Router {
             sessions,
             pending: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
+            queued_bytes: TotalBytes::new(config.queue_bytes_total),
             config,
             metrics,
         })
@@ -262,9 +265,10 @@ impl Router {
             service: service.to_string(),
             permits,
             initial: permits.unwrap_or(0),
-            queue: InstanceQueue::new(
+            queue: InstanceQueue::with_total(
                 self.config.queue_capacity_per_instance,
                 self.config.queue_bytes_per_instance,
+                Arc::clone(&self.queued_bytes),
             ),
             assigned: HashSet::new(),
         };
@@ -1686,7 +1690,10 @@ mod tests {
         }
 
         fn with_metrics(metrics: Arc<Metrics>) -> Self {
-            let config = Config::default();
+            Self::with(Config::default(), metrics)
+        }
+
+        fn with(config: Config, metrics: Arc<Metrics>) -> Self {
             let registry = Arc::new(Registry::new(config.owner_grace));
             let sessions = Arc::new(Sessions::new());
             let router = Router::new(
@@ -1988,6 +1995,41 @@ mod tests {
             depth(&m),
             (Some(0), Some(0)),
             "a service without flows reads 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_total_queue_cap_rejects_across_instances_with_its_own_reason() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let big = |id: &str| {
+            let mut r = unkeyed(id, 0, 0);
+            r.payload = vec![b'x'; 100];
+            r
+        };
+        let size = prost::Message::encoded_len(&ServerMessage {
+            message: Some(server_message::Message::Request(big("q1"))),
+        });
+        // Room for one queued request, not two.
+        let config = Config {
+            queue_bytes_total: size * 3 / 2,
+            ..Config::default()
+        };
+        let mut c = Cluster::with(config, Arc::clone(&m.metrics));
+        c.join("h1", Some(1));
+        c.join("h2", Some(1));
+        for id in ["busy-1", "busy-2", "q1", "q2"] {
+            c.router.route(&D, "s1", big(id));
+        }
+        // The busy ones take both permits; q1 waits on one instance; q2 goes to the other,
+        // whose own queue is empty, but the hub-wide cap is reached.
+        assert_eq!(
+            c.errors(),
+            [("q2".to_string(), ErrorCode::ResourceExhausted)]
+        );
+        assert_eq!(c.router.queued_total(), 1);
+        assert_eq!(
+            m.counter("kraken_hub_rejected_total", "reason", "queue_bytes_total"),
+            Some(1)
         );
     }
 
