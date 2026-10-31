@@ -116,6 +116,21 @@ impl Sessions {
         tx: mpsc::Sender<Result<ServerMessage, Status>>,
         cancel: CancellationToken,
     ) -> u64 {
+        self.insert_replacing(ctx, instance_id, service, meta, tx, cancel)
+            .0
+    }
+
+    /// Like [`Sessions::insert`], also returning the token of the session it replaced, so the
+    /// caller can end that session's requests (its stream task finds itself replaced and does not).
+    pub fn insert_replacing(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        meta: SessionMeta,
+        tx: mpsc::Sender<Result<ServerMessage, Status>>,
+        cancel: CancellationToken,
+    ) -> (u64, Option<u64>) {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let session = Session {
@@ -133,7 +148,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .insert(instance_id.to_string(), session);
-        if let Some(old) = old {
+        let replaced = old.map(|old| {
             old.cancel.cancel();
             info!(
                 instance = %instance_id,
@@ -141,8 +156,42 @@ impl Sessions {
                 old_service = %old.service,
                 "session replaced by a new stream"
             );
-        }
-        token
+            old.token
+        });
+        (token, replaced)
+    }
+
+    /// The token of the current session of `instance_id`, if any.
+    pub fn token_of(&self, ctx: &ContextId, instance_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .filter(|s| s.context == *ctx)
+            .map(|s| s.token)
+    }
+
+    /// Like [`Sessions::send`], but only to the session identified by `token`: a replaced (or
+    /// removed) session is `Gone` even if a newer one uses the same instance id.
+    pub fn send_if_current(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        msg: ServerMessage,
+    ) -> Result<(), SendError> {
+        let tx = self
+            .inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .filter(|s| s.context == *ctx && s.token == token)
+            .map(|s| s.tx.clone())
+            .ok_or(SendError::Gone)?;
+        tx.try_send(Ok(msg)).map_err(|e| match e {
+            TrySendError::Full(_) => SendError::Busy,
+            TrySendError::Closed(_) => SendError::Gone,
+        })
     }
 
     /// Runs `f` under the sessions lock if the session `token` is still the current one for

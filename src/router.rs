@@ -30,7 +30,12 @@ struct Pending {
     /// Context of both sender and handler (requests never cross contexts).
     context: ContextId,
     sender: InstanceId,
+    /// The sender's session when the request was routed (`None` if it was already gone).
+    sender_token: Option<u64>,
     handler: InstanceId,
+    /// The handler session the request was forwarded to. A reconnect with the same instance id
+    /// is a different session: it cannot answer requests forwarded to the old stream.
+    handler_token: u64,
     kind: Kind,
     type_name: String,
     started: Instant,
@@ -222,6 +227,9 @@ impl Router {
         };
 
         span.record("kraken.handler", handler.as_str());
+        let sender_token = self.sessions.token_of(ctx, sender);
+        // `None`: the handler's session vanished since the pick; the send below reports it Gone.
+        let handler_token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
         let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
 
         // Insert before forwarding so a fast reply always finds its entry. The lock is held
@@ -263,7 +271,9 @@ impl Router {
             let entry = Pending {
                 context: ctx.clone(),
                 sender: sender.to_string(),
+                sender_token,
                 handler: handler.clone(),
+                handler_token,
                 kind,
                 type_name,
                 started: Instant::now(),
@@ -276,7 +286,12 @@ impl Router {
         let forwarded = ServerMessage {
             message: Some(server_message::Message::Request(req)),
         };
-        match self.sessions.send(ctx, &handler, forwarded) {
+        // Only to the session the entry names: if it was replaced meanwhile the request fails now
+        // (Gone) instead of reaching a stream whose requests the replacement already failed.
+        match self
+            .sessions
+            .send_if_current(ctx, &handler, handler_token, forwarded)
+        {
             Ok(()) => {}
             Err(SendError::Busy) => {
                 let service = self
@@ -346,23 +361,25 @@ impl Router {
         );
     }
 
-    /// Fails pending requests handled by this instance with HANDLER_DISCONNECTED; drops pending
-    /// requests it sent.
-    pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str) {
+    /// Ends the session `token` of `instance_id` (stream closed, evicted or replaced by a
+    /// reconnect): fails the pending requests forwarded to that session with
+    /// HANDLER_DISCONNECTED and drops the pending requests it sent. Entries of a newer session
+    /// with the same instance id are untouched.
+    pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str, token: u64) {
+        let handled_by = |p: &Pending| p.handler == instance_id && p.handler_token == token;
+        let sent_by = |p: &Pending| p.sender == instance_id && p.sender_token == Some(token);
         let (failed, dropped) = {
             let mut pending = self.pending.lock().unwrap();
             let ids: Vec<String> = pending
                 .iter()
-                .filter(|(_, p)| {
-                    p.context == *ctx && (p.handler == instance_id || p.sender == instance_id)
-                })
+                .filter(|(_, p)| p.context == *ctx && (handled_by(p) || sent_by(p)))
                 .map(|(id, _)| id.clone())
                 .collect();
             let mut failed = Vec::new();
             let mut dropped = Vec::new();
             for id in ids {
                 let entry = pending.remove(&id).expect("id collected under same lock");
-                if entry.handler == instance_id {
+                if handled_by(&entry) {
                     failed.push((id, entry));
                 } else {
                     dropped.push(entry);
@@ -717,17 +734,41 @@ mod tests {
     async fn handler_disconnect_fails_its_pending_requests() {
         let mut f = fixture();
         f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
-        f.router.on_disconnect(&D, "h1");
+        let token = f.sessions.token_of(&D, "h1").unwrap();
+        f.router.on_disconnect(&D, "h1", token);
         let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
         assert_eq!(msg, "handler instance h1 disconnected");
         assert_eq!(f.router.in_flight(), 0);
     }
 
     #[tokio::test]
+    async fn ending_an_old_session_leaves_the_newer_session_of_the_same_id_alone() {
+        let mut f = fixture();
+        let old = f.sessions.token_of(&D, "h1").unwrap();
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        // h1 reconnects: a new session with the same instance id.
+        let mut new_rx = fake(&f.sessions, "h1", "orders", 16);
+        f.router.route(&D, "s1", request("r2", "t.Cmd", 0));
+        assert!(new_rx.try_recv().is_ok(), "r2 goes to the new session");
+        f.router.on_disconnect(&D, "h1", old);
+        let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
+        assert_eq!(msg, "handler instance h1 disconnected");
+        assert!(f.sender_rx.try_recv().is_err(), "r2 must stay pending");
+        assert_eq!(f.router.in_flight(), 1);
+        f.router.on_reply(&D, "h1", payload_reply("r2"));
+        assert!(matches!(
+            f.sender_rx.try_recv().unwrap().unwrap().message,
+            Some(server_message::Message::Reply(_))
+        ));
+        drop(f.handler_rx);
+    }
+
+    #[tokio::test]
     async fn sender_disconnect_drops_its_pending_requests() {
         let mut f = fixture();
         f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
-        f.router.on_disconnect(&D, "s1");
+        let token = f.sessions.token_of(&D, "s1").unwrap();
+        f.router.on_disconnect(&D, "s1", token);
         assert_eq!(f.router.in_flight(), 0);
         f.router.on_reply(&D, "h1", payload_reply("r1"));
         assert!(f.sender_rx.try_recv().is_err());

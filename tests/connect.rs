@@ -576,3 +576,51 @@ async fn register_kind_conflict_is_already_exists() {
         "type x.Do is owned as COMMAND by service svc-a"
     );
 }
+
+/// Review fix 2: a reconnect with the same instance id replaces the old session. Requests already
+/// forwarded to the old stream can no longer be answered (clients reply only on the arrival
+/// stream), so they must fail at once with HANDLER_DISCONNECTED instead of waiting for their
+/// deadline.
+#[tokio::test]
+async fn replaced_session_fails_requests_forwarded_to_it() {
+    let addr = start_hub(Config::default()).await;
+    let mut old = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
+    old.tx.send(heartbeat(1)).await.unwrap();
+    old.next_within(SHORT).await.unwrap().unwrap();
+    let mut b = FakeClient::register(addr, "b", &[], &[]).await;
+
+    b.tx.send(FakeClient::request(
+        "r1",
+        RequestKind::Command,
+        "a.Do",
+        "",
+        10_000,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(expect_request(&mut old).await.id, "r1");
+
+    // Same instance id on a new stream while the old one is still open.
+    let mut new = FakeClient::connect(addr).await;
+    new.instance_id = old.instance_id.clone();
+    new.send_register("a", &["a.Do"], &[]).await;
+    new.tx.send(heartbeat(2)).await.unwrap();
+    new.next_within(SHORT).await.unwrap().unwrap();
+
+    let e = expect_error(&mut b).await;
+    assert_eq!(e.request_id, "r1");
+    assert_eq!(e.code(), ErrorCode::HandlerDisconnected);
+
+    // The new session works normally.
+    b.tx.send(FakeClient::request(
+        "r2",
+        RequestKind::Command,
+        "a.Do",
+        "",
+        10_000,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(expect_request(&mut new).await.id, "r2");
+    drop(old);
+}

@@ -75,7 +75,7 @@ pub fn disconnect(
     }) else {
         return false;
     };
-    router.on_disconnect(ctx, instance_id);
+    router.on_disconnect(ctx, instance_id, token);
     router.refresh_gauges();
     info!(instance = %instance_id, service = %service, "disconnect");
     true
@@ -283,7 +283,7 @@ async fn run_stream(
     };
     // Session first, then the registration under it: a late disconnect of an older stream with
     // the same instance id can then never unregister this stream's registration.
-    let token = ctx.sessions.insert(
+    let (token, replaced) = ctx.sessions.insert_replacing(
         &ctx.context,
         &instance_id,
         &service,
@@ -291,6 +291,11 @@ async fn run_stream(
         tx.clone(),
         cancel.clone(),
     );
+    // The replaced stream's task sees itself replaced and skips the disconnect sequence, so its
+    // requests are ended here: nobody can answer requests forwarded to the old stream.
+    if let Some(old) = replaced {
+        ctx.router.on_disconnect(&ctx.context, &instance_id, old);
+    }
     match ctx.register(token, &first) {
         Some(Ok(())) => {}
         Some(Err(status)) => {
