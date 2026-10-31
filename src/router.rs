@@ -87,6 +87,7 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::HandlerError
         | ErrorCode::Unauthenticated
         | ErrorCode::Unsupported
+        | ErrorCode::ResourceExhausted
         | ErrorCode::Unspecified => Outcome::HandlerError,
     }
 }
@@ -580,6 +581,7 @@ mod tests {
             payload: vec![1, 2, 3],
             headers: HashMap::from([("h".to_string(), "v".to_string())]),
             timeout_ms,
+            priority: 0,
         }
     }
 

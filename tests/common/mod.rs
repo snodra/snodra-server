@@ -214,6 +214,7 @@ impl FakeClient {
                 payload: Vec::new(),
                 headers: Default::default(),
                 timeout_ms,
+                ..Request::default()
             })),
         }
     }

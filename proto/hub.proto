@@ -35,6 +35,8 @@ message ClientMessage {
     Request request = 2;
     Reply reply = 3;
     Heartbeat heartbeat = 4;
+    // Flow control (capability "flow-control"): more requests this instance can take now.
+    Permits permits = 5;
   }
 }
 
@@ -66,7 +68,8 @@ message ServerMessage {
 // the first Register of a stream only; later Registers cannot change them. A v2 session
 // (protocol_version >= 2) gets a RegisterAck for every accepted Register, written before the echo
 // of any Heartbeat that follows it, so a new client tells a new hub (ack first) from an old one
-// (echo first, no ack). Fields 8-11 and 13 are allocated to later roadmap phases.
+// (echo first, no ack). Fields initial_permits, load_factor and tags (8-10) are read from the
+// first Register of a stream too. Fields 11 and 13 are allocated to later roadmap phases.
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -79,14 +82,31 @@ message Register {
   // 0 (unset) is protocol v1: no RegisterAck, legacy heartbeat timeout. 2 is the version this
   // file defines; 1 is never sent and reads as v1; anything above 2 is answered as 2.
   uint32 protocol_version = 5;
-  // Optional protocol features this client supports. None are defined yet; unknown names are
-  // ignored by the hub.
+  // Optional protocol features this client supports; unknown names are ignored by the hub.
+  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED).
   repeated string capabilities = 6;
   // Accepted and ignored until hub access control ships (roadmap P5). Never logged.
   Credentials credentials = 7;
+  // Flow control: requests the hub may forward before the next Permits message. Honoured only
+  // when the session shares the "flow-control" capability; 0 (or no flow-control) means
+  // unlimited, the v1 behaviour. With permits the hub queues further requests per instance
+  // (ordered by Request.priority, then age) until Permits arrive.
+  uint32 initial_permits = 8;
+  // Relative capacity of this instance; 0 reads as 100. Weights its share of the
+  // consistent-hash ring (128 * load_factor / 100 virtual nodes, 8..1024) and its load score.
+  uint32 load_factor = 9;
+  // Free-form labels (for example "zone" -> "eu-1"). Unkeyed requests prefer instances whose tags
+  // match more of the sender's tags.
+  map<string, string> tags = 10;
   // Free text naming the client library and its version, for example "kraken-messaging/0.1.0".
   // Shown in the topology view; never used for routing decisions.
   string client_version = 12;
+}
+
+// Flow control: the sender may receive `count` more forwarded requests. Clients send it once per
+// handled request (batched). Ignored for sessions without flow control.
+message Permits {
+  uint32 count = 1;
 }
 
 // How a client authenticates itself to the hub. Carried on Register; ignored until P5.
@@ -107,7 +127,7 @@ message RegisterAck {
   string hub_id = 1;
   // The negotiated protocol version: min(Register.protocol_version, hub's version), currently 2.
   uint32 protocol_version = 2;
-  // Capabilities both sides support (the intersection). None are defined yet.
+  // Capabilities both sides support (the intersection), for example "flow-control".
   repeated string capabilities = 3;
   // How often the client should send a Heartbeat.
   uint32 heartbeat_interval_ms = 4;
@@ -153,6 +173,10 @@ message Request {
   //   timeout_ms == 0: override or default_timeout_ms (5000 ms unless configured)
   // v2 clients send 0 unless their caller chose a timeout, so per-type overrides apply.
   uint32 timeout_ms = 7;
+  // Field 8 is allocated to a later roadmap phase (request mode).
+  // Higher first when the hub queues requests for a flow-controlled instance; equal priorities
+  // keep arrival order. 0 is the default. Queued requests keep their own deadline.
+  int32 priority = 9;
 }
 
 // Success or application-level failure returned by the handling instance.
@@ -171,7 +195,8 @@ message Reply {
 // Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, and INVALID_REQUEST
 // (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED,
 // PERMISSION_DENIED and INVALID_REQUEST inside a Reply. The hub never sends a code above 7 to a
-// v1 session. Codes 8 and 9 are allocated to later roadmap phases.
+// v1 session, and RESOURCE_EXHAUSTED only to a session that shares the "flow-control"
+// capability. Code 9 is allocated to a later roadmap phase.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
@@ -190,6 +215,9 @@ enum ErrorCode {
   // The handling service evaluated the handler's @RequiresAuthentication expression as false for
   // an authenticated caller.
   PERMISSION_DENIED = 7;
+  // The target instance's queue is full (count or bytes). Sent only to senders that share the
+  // "flow-control" capability; other senders get HANDLER_ERROR "handler busy" instead.
+  RESOURCE_EXHAUSTED = 8;
   // The request needs a feature the sender, the hub or the target did not declare. Declared in
   // protocol v2; not produced yet.
   UNSUPPORTED = 10;
@@ -263,6 +291,16 @@ message InstanceTopology {
   uint32 protocol_version = 9;
   // Register.client_version, empty when the client did not send one.
   string client_version = 10;
+  // Requests the hub may still forward before the next Permits (0 when not flow-controlled).
+  uint32 permits_available = 11;
+  // Requests waiting in the hub's queue for this instance.
+  uint32 queued = 12;
+  // Register.load_factor as applied (0 reads as 100).
+  uint32 load_factor = 13;
+  // Register.tags.
+  map<string, string> tags = 14;
+  // True when the hub forwards to this instance only with permits.
+  bool flow_controlled = 15;
 }
 
 message TypeOwnership {
@@ -283,6 +321,8 @@ message TopologyTotals {
   uint32 instances = 2;
   uint32 command_types = 3;
   uint32 query_types = 4;
-  // Size of the pending-request map.
+  // Size of the pending-request map (queued requests included).
   uint32 in_flight = 5;
+  // Requests waiting in per-instance queues, all instances.
+  uint32 queued = 6;
 }

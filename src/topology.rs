@@ -237,6 +237,7 @@ impl Topology {
                             query_types: i.query_types.clone(),
                             protocol_version: i.protocol_version,
                             client_version: i.client_version.clone(),
+                            ..Default::default()
                         })
                         .collect(),
                 })
@@ -262,6 +263,7 @@ impl Topology {
                 command_types: self.totals.command_types,
                 query_types: self.totals.query_types,
                 in_flight: self.totals.in_flight,
+                queued: 0,
             }),
             hub_id: self.hub_id.clone(),
         }

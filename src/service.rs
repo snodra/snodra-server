@@ -396,6 +396,8 @@ async fn run_stream(
             Some(client_message::Message::Reply(reply)) => {
                 ctx.router.on_reply(&ctx.context, &instance_id, reply)
             }
+            // Flow control is not implemented yet: permits are ignored.
+            Some(client_message::Message::Permits(_)) => {}
             None => {}
         }
     }
