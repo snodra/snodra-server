@@ -41,6 +41,12 @@ pub struct Config {
     /// with `timeout_ms == 0`) and the clamp (`max_timeout`). `KRAKEN_HUB_TIMEOUT_OVERRIDES`,
     /// `type=ms,type=ms`, default none.
     pub timeout_overrides: BTreeMap<String, Duration>,
+    /// Requests the hub queues for one flow-controlled instance before rejecting new ones.
+    /// `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE`, default 10 000.
+    pub queue_capacity_per_instance: usize,
+    /// Encoded bytes the hub queues for one flow-controlled instance before rejecting new
+    /// requests. `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
+    pub queue_bytes_per_instance: usize,
     /// Type ownership is kept this long after the last instance leaves.
     /// `KRAKEN_HUB_OWNER_GRACE`, default 60 s.
     pub owner_grace: Duration,
@@ -65,6 +71,8 @@ impl Default for Config {
             heartbeat_timeout: Duration::from_secs(10),
             legacy_heartbeat_timeout: Duration::from_secs(30),
             timeout_overrides: BTreeMap::new(),
+            queue_capacity_per_instance: 10_000,
+            queue_bytes_per_instance: 64 * 1024 * 1024,
             owner_grace: Duration::from_secs(60),
             session_buffer: 1024,
             handshake_timeout: Duration::from_secs(10),
@@ -122,6 +130,16 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_TIMEOUT_OVERRIDES") {
             c.timeout_overrides = parse_overrides(&v).context("KRAKEN_HUB_TIMEOUT_OVERRIDES")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE") {
+            c.queue_capacity_per_instance = v
+                .trim()
+                .parse()
+                .context("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE") {
+            c.queue_bytes_per_instance =
+                parse_size(&v).context("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE")?;
+        }
         if let Some(v) = var("KRAKEN_HUB_OWNER_GRACE") {
             c.owner_grace = parse_duration(&v).context("KRAKEN_HUB_OWNER_GRACE")?;
         }
@@ -138,6 +156,12 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         if self.hub_id.is_empty() {
             bail!("KRAKEN_HUB_ID must not be empty");
+        }
+        if self.queue_capacity_per_instance == 0 {
+            bail!("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE must be positive");
+        }
+        if self.queue_bytes_per_instance == 0 {
+            bail!("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE must be positive");
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
@@ -246,6 +270,25 @@ fn parse_overrides(s: &str) -> anyhow::Result<BTreeMap<String, Duration>> {
 
 fn millis(s: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_millis(s.trim().parse()?))
+}
+
+/// Parses a byte size: a plain number of bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.
+pub fn parse_size(s: &str) -> anyhow::Result<usize> {
+    let s = s.trim();
+    let (digits, unit) = [
+        ("GiB", 1usize << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+        ("B", 1),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit)| s.strip_suffix(suffix).map(|d| (d.trim(), unit)))
+    .unwrap_or((s, 1));
+    let n: usize = digits.parse().with_context(|| {
+        format!("{s:?} is not a size (bytes, or a number with B, KiB, MiB, GiB)")
+    })?;
+    n.checked_mul(unit)
+        .with_context(|| format!("{s:?} is too large"))
 }
 
 /// Parses `"30"` (seconds), `"30s"` or `"500ms"`.
@@ -369,6 +412,35 @@ mod tests {
                 "{bad} accepted"
             );
         }
+    }
+
+    #[test]
+    fn queue_caps_default_and_parse_sizes() {
+        let c = Config::default();
+        assert_eq!(c.queue_capacity_per_instance, 10_000);
+        assert_eq!(c.queue_bytes_per_instance, 64 * 1024 * 1024);
+        let c = with_env(&[
+            ("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "3"),
+            ("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE", "512KiB"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (c.queue_capacity_per_instance, c.queue_bytes_per_instance),
+            (3, 512 * 1024)
+        );
+        for (v, want) in [
+            ("1048576", 1 << 20),
+            ("2MiB", 2 << 20),
+            ("1GiB", 1 << 30),
+            ("10B", 10),
+        ] {
+            assert_eq!(parse_size(v).unwrap(), want, "{v}");
+        }
+        for bad in ["", "MiB", "1.5MiB", "-1", "1TB"] {
+            assert!(parse_size(bad).is_err(), "{bad} accepted");
+        }
+        assert!(with_env(&[("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "0")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE", "0")]).is_err());
     }
 
     /// The effective-timeout table from the design (P0, F4).
