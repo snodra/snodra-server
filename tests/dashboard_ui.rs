@@ -1,0 +1,328 @@
+//! The dashboard page as a browser loads it: every asset `index.html` references is served,
+//! every `import` in every module resolves to a served module, no module is unreachable, and
+//! no module uses HTML-string sinks or third-party code. When a Chrome or Chromium binary is
+//! available, each page is also loaded headless and must render without a console message
+//! (`KRAKEN_HUB_TEST_BROWSER` points at a binary, or `none` to skip).
+
+mod common;
+
+use std::collections::{BTreeSet, VecDeque};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use common::{FakeClient, http_get, http_get_full};
+use kraken_hub::config::Config;
+use kraken_hub::proto::{RequestKind, ServerMessage, server_message};
+
+fn config() -> Config {
+    Config {
+        otlp_endpoint: None,
+        ..Config::default()
+    }
+}
+
+/// `rel` against the directory `base` (which ends with `/`), with `.` and `..` segments.
+fn resolve(base: &str, rel: &str) -> String {
+    let joined = if rel.starts_with('/') {
+        rel.to_string()
+    } else {
+        format!("{base}{rel}")
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for seg in joined.split('/') {
+        match seg {
+            "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let path = out.join("/");
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn dir_of(path: &str) -> &str {
+    &path[..=path.rfind('/').unwrap()]
+}
+
+/// Values of `attr="..."` attributes in `html`.
+fn attribute_values<'a>(html: &'a str, attr: &str) -> Vec<&'a str> {
+    let needle = format!(" {attr}=\"");
+    html.match_indices(&needle)
+        .map(|(i, _)| {
+            let rest = &html[i + needle.len()..];
+            &rest[..rest.find('"').unwrap()]
+        })
+        .collect()
+}
+
+/// Module specifiers of static and dynamic imports and re-exports in `source`.
+fn import_specifiers(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in [
+        "from '",
+        "from \"",
+        "import '",
+        "import \"",
+        "import('",
+        "import(\"",
+    ] {
+        let quote = marker.chars().last().unwrap();
+        for (i, _) in source.match_indices(marker) {
+            let rest = &source[i + marker.len()..];
+            out.push(rest[..rest.find(quote).unwrap()].to_string());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn every_referenced_asset_and_import_is_served() {
+    let (_grpc, http) = common::start_hub_with_http(config()).await;
+    let http = http.unwrap();
+    let page = http_get_full(http, "/ui/").await;
+    assert_eq!(page.status, 200);
+
+    let mut references: Vec<String> = attribute_values(&page.body, "src")
+        .into_iter()
+        .chain(attribute_values(&page.body, "href"))
+        .filter(|v| !v.starts_with('#'))
+        .map(|v| {
+            assert!(
+                !v.contains("://") && !v.starts_with("//"),
+                "page loads {v} from elsewhere"
+            );
+            resolve("/ui/", v)
+        })
+        .collect();
+    references.sort();
+    references.dedup();
+    assert!(
+        references.iter().any(|r| r.ends_with("/app.js")),
+        "{references:?}"
+    );
+
+    let mut modules: VecDeque<String> = VecDeque::new();
+    for path in &references {
+        let r = http_get_full(http, path).await;
+        assert_eq!(r.status, 200, "{path}");
+        let content_type = r.header("content-type").unwrap_or_default().to_string();
+        if path.ends_with(".js") {
+            assert_eq!(content_type, "text/javascript; charset=utf-8", "{path}");
+            modules.push_back(path.clone());
+        } else if path.ends_with(".css") {
+            assert_eq!(content_type, "text/css; charset=utf-8", "{path}");
+            assert!(!r.body.contains("@import"), "{path} imports a stylesheet");
+            for (i, _) in r.body.match_indices("url(") {
+                let rest = &r.body[i + 4..];
+                let url = rest[..rest.find(')').unwrap()].trim_matches(['"', '\'']);
+                assert!(!url.contains("://"), "{path} loads {url} from elsewhere");
+                let target = resolve(dir_of(path), url);
+                assert_eq!(http_get(http, &target).await.0, 200, "{target}");
+            }
+        }
+    }
+
+    // Walk the module graph from the entry point.
+    let mut reached = BTreeSet::new();
+    while let Some(path) = modules.pop_front() {
+        if !reached.insert(path.clone()) {
+            continue;
+        }
+        let r = http_get_full(http, &path).await;
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(
+            r.header("content-type"),
+            Some("text/javascript; charset=utf-8"),
+            "{path}"
+        );
+        for sink in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+        ] {
+            assert!(!r.body.contains(sink), "{path} uses {sink}");
+        }
+        for spec in import_specifiers(&r.body) {
+            assert!(
+                spec.starts_with("./") || spec.starts_with("../"),
+                "{path} imports {spec:?}: only relative imports of the hub's own modules"
+            );
+            modules.push_back(resolve(dir_of(&path), &spec));
+        }
+    }
+
+    // Every embedded module is reachable (no dead or forgotten file), and only those exist.
+    let build = kraken_hub::assets::build_id();
+    let prefix = format!("/ui/v/{build}/");
+    let reached: BTreeSet<String> = reached
+        .iter()
+        .map(|p| p.strip_prefix(&prefix).unwrap_or(p).to_string())
+        .collect();
+    let embedded: BTreeSet<String> = kraken_hub::assets::names()
+        .into_iter()
+        .filter(|n| n.ends_with(".js"))
+        .collect();
+    assert_eq!(reached, embedded);
+}
+
+// ---- headless browser --------------------------------------------------------------------
+
+fn browser() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("KRAKEN_HUB_TEST_BROWSER") {
+        return (!path.is_empty() && path != "none").then(|| path.into());
+    }
+    let mac = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    if mac.exists() {
+        return Some(mac.into());
+    }
+    let paths = std::env::var_os("PATH")?;
+    for name in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ] {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The DOM after load and the console lines of one headless load of `url`.
+async fn load(browser: &Path, url: &str, profile: &Path) -> (String, Vec<String>) {
+    let run = tokio::process::Command::new(browser)
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--enable-logging=stderr",
+            "--v=0",
+            "--dump-dom",
+        ])
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(url)
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("browser timed out")
+        .expect("browser did not start");
+    let console = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|l| l.contains(":CONSOLE"))
+        .map(str::to_string)
+        .collect();
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        console,
+    )
+}
+
+/// The next message that is neither an ack nor a heartbeat echo.
+async fn next_message(client: &mut FakeClient) -> server_message::Message {
+    loop {
+        match client.next().await {
+            Some(Ok(ServerMessage {
+                message: Some(server_message::Message::RegisterAck(_)),
+            })) => continue,
+            Some(Ok(ServerMessage { message: Some(m) })) => return m,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_page_renders_in_a_headless_browser_without_console_messages() {
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped (static checks still run)");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let mut b = FakeClient::register(grpc, "service-b", &[], &["examples.CountGreetings"]).await;
+    let mut a = FakeClient::register(grpc, "service-a", &[], &[]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.tx.send(FakeClient::request(
+        "r1",
+        RequestKind::Query,
+        "examples.CountGreetings",
+        "",
+        0,
+    ))
+    .await
+    .unwrap();
+    let server_message::Message::Request(_) = next_message(&mut b).await else {
+        panic!("expected the request");
+    };
+    b.tx.send(FakeClient::reply_ok("r1", b"1")).await.unwrap();
+    assert!(matches!(
+        next_message(&mut a).await,
+        server_message::Message::Reply(_)
+    ));
+
+    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-test-{}", std::process::id()));
+    let pages = [
+        ("overview", "aria-label=\"Traffic graph"),
+        ("services", "Instances of service-b"),
+        ("types", "examples.CountGreetings"),
+        ("settings", "KRAKEN_HUB_EDGE_STATS_WINDOW"),
+        ("processors", "Available from phase 6."),
+    ];
+    let mut checks = Vec::new();
+    for (page, marker) in pages {
+        let browser = browser.clone();
+        let profile = profiles.join(page);
+        checks.push(tokio::spawn(async move {
+            let url = format!("http://{http}/ui/#/{page}");
+            // --dump-dom prints the DOM after the load event, which may come before the page's
+            // first fetch has answered: retry until the page says it rendered.
+            for _ in 0..8 {
+                let (dom, console) = load(&browser, &url, &profile).await;
+                assert!(console.is_empty(), "{page}: console messages: {console:#?}");
+                if dom.contains("data-ready=\"true\"") {
+                    assert!(dom.contains(marker), "{page}: {marker} missing in {dom}");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            panic!("{page} never rendered");
+        }));
+    }
+    for check in checks {
+        check.await.unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop((a, b));
+}
+
+#[test]
+fn path_resolution_handles_dot_segments() {
+    assert_eq!(resolve("/ui/", "v/abc/app.js"), "/ui/v/abc/app.js");
+    assert_eq!(resolve("/ui/v/abc/pages/", "../dom.js"), "/ui/v/abc/dom.js");
+    assert_eq!(
+        resolve("/ui/v/abc/", "./pages/x.js"),
+        "/ui/v/abc/pages/x.js"
+    );
+    assert_eq!(
+        import_specifiers(
+            "import a from './a.js';\nimport { b } from \"../b.js\";\nimport('./c.js')"
+        ),
+        ["./a.js", "../b.js", "./c.js"]
+    );
+}

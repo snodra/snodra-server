@@ -2,6 +2,7 @@
 //! See kraken/docs/05-services/hub.md.
 
 pub mod api;
+pub mod assets;
 pub mod cli;
 pub mod config;
 pub mod context;
@@ -104,7 +105,7 @@ pub async fn serve_with_shutdown(
             config: Arc::clone(&config),
             anchor,
             started: anchor.instant,
-            build_id: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: assets::build_id().to_string(),
             stopping: stopping.clone(),
             streams: Arc::default(),
         });

@@ -6,6 +6,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
+COPY ui ./ui
 RUN cargo build --release --locked
 
 FROM gcr.io/distroless/cc-debian12:nonroot

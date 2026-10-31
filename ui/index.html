@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>kraken-hub</title>
+  <link rel="icon" type="image/svg+xml" href="v/{{build}}/favicon.svg">
+  <link rel="stylesheet" href="v/{{build}}/app.css">
+  <script type="module" src="v/{{build}}/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main" id="skip">Skip to content</a>
+  <header class="top">
+    <a class="brand" href="#/overview" aria-label="kraken-hub overview">
+      <img src="v/{{build}}/favicon.svg" alt="" width="28" height="28">
+      <span class="brand-name">kraken-hub</span>
+    </a>
+    <dl class="hub-meta" id="hub-meta" aria-label="Hub"></dl>
+    <div class="top-actions">
+      <span class="live" id="live" role="status" data-state="connecting">Connecting</span>
+      <a class="ext" id="grafana" hidden target="_blank" rel="noopener noreferrer">Grafana</a>
+    </div>
+  </header>
+  <nav class="tabs" aria-label="Dashboard pages">
+    <ul id="nav"></ul>
+  </nav>
+  <div class="banner" id="banner" role="alert" hidden></div>
+  <main id="main" tabindex="-1">
+    <p class="empty">Loading</p>
+  </main>
+  <footer class="foot">
+    Read-only dashboard. It has no authentication in this phase: keep the hub's HTTP port on the
+    private network. A dashboard token arrives with phase 5a.
+  </footer>
+  <noscript><p class="empty">The dashboard needs JavaScript. The same data is at <code>/api/v1/topology</code>.</p></noscript>
+</body>
+</html>

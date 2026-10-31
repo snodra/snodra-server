@@ -1,7 +1,8 @@
 //! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): `GET /topology` for the CLI and the
-//! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the read-only dashboard API
-//! under `/api/v1/` (roadmap P2). Every route is read-only and unauthenticated in this phase;
-//! the port belongs on the private network (P5a adds a dashboard token).
+//! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the read-only dashboard
+//! (`/ui/`, see [`crate::assets`]) and its API under `/api/v1/` (roadmap P2). Every route is
+//! read-only and unauthenticated in this phase; the port belongs on the private network (P5a
+//! adds a dashboard token).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,13 +20,13 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::api;
 use crate::config::Config;
 use crate::edges::{EdgeSnapshot, WindowTotals};
 use crate::registry::Registry;
 use crate::router::Router;
 use crate::session::Sessions;
 use crate::topology::{self, ClockAnchor, Topology};
+use crate::{api, assets};
 
 /// The live stream recomputes its summary this often and sends it when it changed...
 pub const STREAM_CHECK: Duration = Duration::from_millis(500);
@@ -93,11 +94,16 @@ impl HttpState {
     }
 }
 
-/// The HTTP routes: `/topology` always, the dashboard API when enabled. Unknown paths are 404.
+/// The HTTP routes: `/topology` always; the dashboard (`/`, `/ui` redirect to `/ui/`) and its
+/// API when enabled. Unknown paths are 404.
 pub fn app(state: HttpState) -> axum::Router {
     let mut app = axum::Router::new().route("/topology", get(get_topology));
     if state.config.dashboard_enabled {
         let api = axum::Router::new()
+            .route("/", get(assets::to_index))
+            .route("/ui", get(assets::to_index))
+            .route("/ui/", get(assets::index))
+            .route("/ui/v/{build}/{*path}", get(assets::asset))
             .route("/api/v1/topology", get(api_topology))
             .route("/api/v1/types", get(api_types))
             .route("/api/v1/graph", get(api_graph))

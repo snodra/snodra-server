@@ -422,3 +422,122 @@ async fn a_disabled_dashboard_is_404_and_topology_stays() {
     }
     topology_until(http, |t| t.totals.instances == 1).await;
 }
+
+// ---- assets ------------------------------------------------------------------------------
+
+const CSP_PARTS: &[&str] = &[
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+];
+
+fn assert_strict_csp(r: &common::HttpResponse, what: &str) {
+    let csp = r
+        .header("content-security-policy")
+        .unwrap_or_else(|| panic!("{what}: no CSP"));
+    for part in CSP_PARTS {
+        assert!(csp.contains(part), "{what}: CSP lacks {part}: {csp}");
+    }
+    assert!(
+        !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+        "{csp}"
+    );
+    assert_eq!(
+        r.header("x-content-type-options"),
+        Some("nosniff"),
+        "{what}"
+    );
+}
+
+#[tokio::test]
+async fn ui_redirects_to_the_page_and_the_page_is_not_cached() {
+    let (_grpc, http) = start(config()).await;
+    for path in ["/ui", "/"] {
+        let r = http_get_full(http, path).await;
+        assert_eq!(r.status, 307, "{path}");
+        assert_eq!(r.header("location"), Some("ui/"), "{path}");
+    }
+    let page = http_get_full(http, "/ui/").await;
+    assert_eq!(page.status, 200);
+    assert_eq!(
+        page.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(page.header("cache-control"), Some("no-cache"));
+    assert_eq!(page.header("x-frame-options"), Some("DENY"));
+    assert_strict_csp(&page, "/ui/");
+
+    // Assets are referenced under this build's prefix; no inline script, style or handlers.
+    let build = json(http, "/api/v1/version").await["buildId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(build, kraken_hub::assets::build_id());
+    assert!(
+        page.body
+            .contains(&format!(r#"<script type="module" src="v/{build}/app.js">"#)),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(&format!(r#"href="v/{build}/app.css""#)));
+    assert!(!page.body.contains("{{build}}"));
+    assert!(!page.body.contains("<style"), "inline style");
+    assert!(!page.body.contains(" style="), "inline style attribute");
+    assert!(
+        page.body.matches("<script").count()
+            == page.body.matches("<script type=\"module\" src=").count(),
+        "inline script in the page"
+    );
+    assert!(!page.body.contains(" onclick=") && !page.body.contains(" onload="));
+}
+
+#[tokio::test]
+async fn assets_have_their_content_types_and_are_immutable_per_build() {
+    let (_grpc, http) = start(config()).await;
+    let build = kraken_hub::assets::build_id();
+    for (path, content_type) in [
+        ("app.js", "text/javascript; charset=utf-8"),
+        ("pages/overview.js", "text/javascript; charset=utf-8"),
+        ("app.css", "text/css; charset=utf-8"),
+        ("favicon.svg", "image/svg+xml"),
+    ] {
+        let r = http_get_full(http, &format!("/ui/v/{build}/{path}")).await;
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(r.header("content-type"), Some(content_type), "{path}");
+        assert_eq!(
+            r.header("cache-control"),
+            Some("public, max-age=31536000, immutable"),
+            "{path}"
+        );
+        assert_strict_csp(&r, path);
+        assert!(!r.body.is_empty(), "{path}");
+    }
+    // Another build's URL still answers (a stale tab), but is not cached.
+    let stale = http_get_full(http, "/ui/v/000000000000/app.js").await;
+    assert_eq!(stale.status, 200);
+    assert_eq!(stale.header("cache-control"), Some("no-cache"));
+    // The page only at /ui/; unknown assets are 404.
+    for path in [
+        format!("/ui/v/{build}/index.html"),
+        format!("/ui/v/{build}/nope.js"),
+        format!("/ui/v/{build}/../Cargo.toml"),
+        "/ui/app.js".to_string(),
+    ] {
+        assert_eq!(http_get(http, &path).await.0, 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_dashboard_serves_no_page() {
+    let (_grpc, http) = start(Config {
+        dashboard_enabled: false,
+        ..config()
+    })
+    .await;
+    let build = kraken_hub::assets::build_id();
+    for path in ["/", "/ui", "/ui/", &format!("/ui/v/{build}/app.js")] {
+        assert_eq!(http_get(http, path).await.0, 404, "{path}");
+    }
+}

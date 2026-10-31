@@ -447,10 +447,10 @@ fn setting(
     }
 }
 
-/// `5m`, `10s` or `500ms`: the shortest exact form `parse_duration` reads back.
+/// `5m`, `60s` or `500ms`: an exact form `parse_duration` reads back, minutes from two on.
 pub fn fmt_duration(d: Duration) -> String {
     let ms = d.as_millis();
-    if ms >= 60_000 && ms.is_multiple_of(60_000) {
+    if ms >= 120_000 && ms.is_multiple_of(60_000) {
         format!("{}m", ms / 60_000)
     } else if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
@@ -979,6 +979,8 @@ mod tests {
             assert_eq!(parse_duration(&fmt_duration(d)).unwrap(), d);
         }
         assert_eq!(fmt_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(fmt_duration(Duration::from_secs(60)), "60s");
+        assert_eq!(fmt_duration(Duration::from_secs(120)), "2m");
         for n in [10usize, 1536, 512 << 10, 64 << 20, 1 << 30] {
             assert_eq!(parse_size(&fmt_size(n)).unwrap(), n);
         }
