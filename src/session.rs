@@ -97,6 +97,14 @@ pub struct Session {
     pub cancel: CancellationToken,
 }
 
+/// What the router needs to know about the sender of a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderInfo {
+    pub token: u64,
+    pub flow_control: bool,
+    pub service: String,
+}
+
 /// Read-only copy of one session's observable state, for the topology view.
 #[derive(Debug, Clone)]
 pub struct SessionDetail {
@@ -208,14 +216,19 @@ impl Sessions {
         (token, replaced)
     }
 
-    /// The current session's token and whether it shares the "flow-control" capability.
-    pub fn sender_info(&self, ctx: &ContextId, instance_id: &str) -> Option<(u64, bool)> {
+    /// The current session's token, whether it shares the "flow-control" capability, and its
+    /// service.
+    pub fn sender_info(&self, ctx: &ContextId, instance_id: &str) -> Option<SenderInfo> {
         self.inner
             .lock()
             .unwrap()
             .get(instance_id)
             .filter(|s| s.context == *ctx)
-            .map(|s| (s.token, s.meta.flow_control))
+            .map(|s| SenderInfo {
+                token: s.token,
+                flow_control: s.meta.flow_control,
+                service: s.service.clone(),
+            })
     }
 
     /// The token of the current session of `instance_id`, if any.

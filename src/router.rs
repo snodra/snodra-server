@@ -25,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::context::ContextId;
+use crate::edges::EdgeStats;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
@@ -40,6 +41,8 @@ struct Pending {
     sender: InstanceId,
     /// The sender's session when the request was routed (`None` if it was already gone).
     sender_token: Option<u64>,
+    /// The sender's service, for the edge statistics (`None` if its session was already gone).
+    sender_service: Option<String>,
     handler: InstanceId,
     /// The handler session the request was forwarded to. A reconnect with the same instance id
     /// is a different session: it cannot answer requests forwarded to the old stream.
@@ -144,6 +147,8 @@ pub struct Router {
     queued_bytes: Arc<TotalBytes>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
+    /// `(sender service, type)` statistics for the dashboard; `None` with the dashboard off.
+    edges: Option<EdgeStats>,
 }
 
 pub fn error_message(
@@ -242,9 +247,41 @@ impl Router {
             pending: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             queued_bytes: TotalBytes::new(config.queue_bytes_total),
+            edges: config
+                .dashboard_enabled
+                .then(|| EdgeStats::new(config.edge_stats_window, config.edge_stats_max_edges)),
             config,
             metrics,
         })
+    }
+
+    /// The edge statistics, `None` when the dashboard is disabled.
+    pub fn edges(&self) -> Option<&EdgeStats> {
+        self.edges.as_ref()
+    }
+
+    /// Counts a request that reached its terminal state on its `(sender service, type)` edge.
+    /// `latency` is `None` for a request answered without being routed.
+    fn record_edge(
+        &self,
+        sender_service: Option<&str>,
+        type_name: &str,
+        kind: Kind,
+        outcome: Outcome,
+        latency: Option<Duration>,
+    ) {
+        if let (Some(edges), Some(sender)) = (&self.edges, sender_service)
+            && !type_name.is_empty()
+        {
+            edges.record(
+                sender,
+                type_name,
+                kind,
+                outcome != Outcome::Ok,
+                latency,
+                Instant::now(),
+            );
+        }
     }
 
     /// Starts the flow state of a session (replacing an older session's): `permits` `Some` makes
@@ -553,6 +590,8 @@ impl Router {
             kraken.outcome = tracing::field::Empty,
         );
         set_parent_from_headers(&span, &req.headers);
+        let sender_info = self.sessions.sender_info(ctx, sender);
+        let sender_service = sender_info.as_ref().map(|s| s.service.as_str());
         let Some(req_kind) = req_kind.filter(|_| !type_name.is_empty() && !id.is_empty()) else {
             let message = if id.is_empty() {
                 "invalid request: missing id"
@@ -561,7 +600,7 @@ impl Router {
             };
             // Without a kind there is no metrics label, so only kind-bearing requests are counted.
             if let Some(kind) = req_kind {
-                self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
+                self.record_rejected(sender_service, kind, &type_name, Outcome::InvalidRequest);
             }
             record_outcome(&span, Outcome::InvalidRequest);
             log_outcome(
@@ -585,7 +624,7 @@ impl Router {
             Ok(picked) => picked,
             Err(e) => {
                 let message = no_handler_message(&type_name, e);
-                self.record_rejected(req_kind, &type_name, Outcome::NoHandler);
+                self.record_rejected(sender_service, req_kind, &type_name, Outcome::NoHandler);
                 record_outcome(&span, Outcome::NoHandler);
                 log_outcome(
                     &id,
@@ -606,8 +645,8 @@ impl Router {
         };
 
         span.record("kraken.handler", handler.as_str());
-        let (sender_token, sender_flow_control) = match self.sessions.sender_info(ctx, sender) {
-            Some((token, flow)) => (Some(token), flow),
+        let (sender_token, sender_flow_control) = match &sender_info {
+            Some(info) => (Some(info.token), info.flow_control),
             None => (None, false),
         };
         // `None`: the handler's session vanished since the pick; the send below reports it Gone.
@@ -620,7 +659,7 @@ impl Router {
             let mut pending = self.pending.lock().unwrap();
             if pending.contains_key(&id) {
                 drop(pending);
-                self.record_rejected(kind, &type_name, Outcome::InvalidRequest);
+                self.record_rejected(sender_service, kind, &type_name, Outcome::InvalidRequest);
                 record_outcome(&span, Outcome::InvalidRequest);
                 log_outcome(
                     &id,
@@ -654,6 +693,7 @@ impl Router {
                 context: ctx.clone(),
                 sender: sender.to_string(),
                 sender_token,
+                sender_service: sender_info.map(|s| s.service),
                 handler: handler.clone(),
                 handler_token,
                 sender_flow_control,
@@ -871,11 +911,15 @@ impl Router {
                 true,
             );
         }
-        self.metrics.request_finished(
-            entry.kind,
+        let elapsed = entry.started.elapsed();
+        self.metrics
+            .request_finished(entry.kind, &entry.type_name, outcome, elapsed);
+        self.record_edge(
+            entry.sender_service.as_deref(),
             &entry.type_name,
+            entry.kind,
             outcome,
-            entry.started.elapsed(),
+            Some(elapsed),
         );
         self.send_to(
             &entry.context,
@@ -1030,11 +1074,15 @@ impl Router {
             outcome,
             false,
         );
-        self.metrics.request_finished(
-            entry.kind,
+        let elapsed = entry.started.elapsed();
+        self.metrics
+            .request_finished(entry.kind, &entry.type_name, outcome, elapsed);
+        self.record_edge(
+            entry.sender_service.as_deref(),
             &entry.type_name,
+            entry.kind,
             outcome,
-            entry.started.elapsed(),
+            Some(elapsed),
         );
         self.send_to(
             &entry.context,
@@ -1043,10 +1091,19 @@ impl Router {
         );
     }
 
-    fn record_rejected(&self, kind: Kind, type_name: &str, outcome: Outcome) {
+    /// A request answered before it was routed (no pending entry): counted in the metrics and
+    /// on its edge, without a latency.
+    fn record_rejected(
+        &self,
+        sender_service: Option<&str>,
+        kind: Kind,
+        type_name: &str,
+        outcome: Outcome,
+    ) {
         self.metrics.request_started(kind);
         self.metrics
             .request_finished(kind, type_name, outcome, Duration::ZERO);
+        self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
     /// Sends a terminal message (`Reply` or `Error`) to `instance`. `try_send` is the fast path;
@@ -1206,6 +1263,77 @@ mod tests {
             }
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    /// The `(sender service, type)` edge of a request, from the router's statistics.
+    fn edge_of(router: &Router, sender: &str, type_name: &str) -> crate::edges::EdgeWindow {
+        let snap = router
+            .edges()
+            .expect("dashboard on")
+            .snapshot(Instant::now());
+        snap.edges
+            .into_iter()
+            .find(|e| e.sender == sender && e.type_name == type_name)
+            .unwrap_or_else(|| panic!("no edge {sender} -> {type_name}"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_requests_are_counted_on_their_sender_service_edge() {
+        let mut f = fixture();
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        tokio::time::advance(Duration::from_millis(40)).await;
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
+        let e = edge_of(&f.router, "web", "t.Cmd");
+        assert_eq!((e.count, e.errors, e.kind), (1, 0, Kind::Command));
+        let p50 = e.latency.quantile(0.5).unwrap().as_secs_f64() * 1000.0;
+        assert!((p50 - 40.0).abs() <= 2.0, "{p50}");
+
+        // A handler error counts as an error, with its latency.
+        f.router.route(&D, "s1", request("r2", "t.Cmd", 0));
+        f.router.on_reply(
+            &D,
+            "h1",
+            Reply {
+                request_id: "r2".into(),
+                result: Some(reply::Result::Error(crate::proto::Error {
+                    request_id: "r2".into(),
+                    code: ErrorCode::HandlerError as i32,
+                    message: "boom".into(),
+                    details: vec![],
+                })),
+            },
+        );
+        let e = edge_of(&f.router, "web", "t.Cmd");
+        assert_eq!((e.count, e.errors, e.latency.samples()), (2, 1, 2));
+
+        // A timeout is an error with the deadline as its latency.
+        f.router.route(&D, "s1", request("r3", "t.Cmd", 100));
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let e = edge_of(&f.router, "web", "t.Cmd");
+        assert_eq!((e.count, e.errors, e.latency.samples()), (3, 2, 3));
+        let max = e.latency.quantile(1.0).unwrap().as_secs_f64() * 1000.0;
+        assert!((max - 100.0).abs() <= 5.0, "{max}");
+
+        // An immediate NO_HANDLER is counted without a latency.
+        f.router.route(&D, "s1", request("r4", "t.Nope", 0));
+        let e = edge_of(&f.router, "web", "t.Nope");
+        assert_eq!((e.count, e.errors, e.latency.samples()), (1, 1, 0));
+        while f.sender_rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn no_edge_statistics_without_the_dashboard() {
+        let mut f = fixture_with(
+            Config {
+                dashboard_enabled: false,
+                ..Config::default()
+            },
+            16,
+        );
+        assert!(f.router.edges().is_none());
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.on_reply(&D, "h1", payload_reply("r1"));
+        assert!(f.sender_rx.try_recv().is_ok());
     }
 
     #[tokio::test]

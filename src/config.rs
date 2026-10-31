@@ -59,6 +59,19 @@ pub struct Config {
     /// A new `Connect` stream must send `Register` within this long or it is closed with
     /// `DEADLINE_EXCEEDED`. `KRAKEN_HUB_HANDSHAKE_TIMEOUT`, default 10 s.
     pub handshake_timeout: Duration,
+    /// Serve the read-only dashboard (`/ui/`) and its JSON API (`/api/v1/`) on the HTTP port and
+    /// keep the edge statistics they show. `KRAKEN_HUB_DASHBOARD_ENABLED`, default true.
+    /// `GET /topology` is served either way.
+    pub dashboard_enabled: bool,
+    /// Grafana base URL the dashboard links to (`http://` or `https://`).
+    /// `KRAKEN_HUB_GRAFANA_URL`, default none (no link).
+    pub grafana_url: Option<String>,
+    /// Cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least
+    /// recently used edges are dropped. `KRAKEN_HUB_EDGE_STATS_MAX_EDGES`, default 10 000.
+    pub edge_stats_max_edges: usize,
+    /// Sliding window of the edge statistics. `KRAKEN_HUB_EDGE_STATS_WINDOW`, default 5 minutes,
+    /// at least 10 s.
+    pub edge_stats_window: Duration,
 }
 
 impl Default for Config {
@@ -81,6 +94,10 @@ impl Default for Config {
             owner_grace: Duration::from_secs(60),
             session_buffer: 1024,
             handshake_timeout: Duration::from_secs(10),
+            dashboard_enabled: true,
+            grafana_url: None,
+            edge_stats_max_edges: 10_000,
+            edge_stats_window: Duration::from_secs(300),
         }
     }
 }
@@ -157,6 +174,21 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_HANDSHAKE_TIMEOUT") {
             c.handshake_timeout = parse_duration(&v).context("KRAKEN_HUB_HANDSHAKE_TIMEOUT")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_DASHBOARD_ENABLED") {
+            c.dashboard_enabled = parse_bool(&v).context("KRAKEN_HUB_DASHBOARD_ENABLED")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_GRAFANA_URL") {
+            c.grafana_url = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = var("KRAKEN_HUB_EDGE_STATS_MAX_EDGES") {
+            c.edge_stats_max_edges = v
+                .trim()
+                .parse()
+                .context("KRAKEN_HUB_EDGE_STATS_MAX_EDGES")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_EDGE_STATS_WINDOW") {
+            c.edge_stats_window = parse_duration(&v).context("KRAKEN_HUB_EDGE_STATS_WINDOW")?;
+        }
         c.validate()?;
         Ok(c)
     }
@@ -176,6 +208,18 @@ impl Config {
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
+        }
+        if self.edge_stats_max_edges == 0 {
+            bail!("KRAKEN_HUB_EDGE_STATS_MAX_EDGES must be positive");
+        }
+        if self.edge_stats_window < MIN_EDGE_STATS_WINDOW {
+            bail!(
+                "KRAKEN_HUB_EDGE_STATS_WINDOW ({:?}) must be at least {MIN_EDGE_STATS_WINDOW:?}",
+                self.edge_stats_window
+            );
+        }
+        if let Some(url) = &self.grafana_url {
+            check_link_url(url).context("KRAKEN_HUB_GRAFANA_URL")?;
         }
         // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
         if self.heartbeat_interval * 2 > self.heartbeat_timeout {
@@ -226,6 +270,35 @@ impl Config {
 
 /// v1 clients heartbeat every 10 s; a legacy timeout below two of their intervals is suspicious.
 const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
+
+/// Ten slots of at least a second each.
+const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
+
+/// A URL the dashboard may put in a link: `http://` or `https://` with a host, no whitespace or
+/// control characters (so it can never be a `javascript:` link or break out of an attribute).
+fn check_link_url(url: &str) -> anyhow::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    let rest = ["http://", "https://"]
+        .iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+        .with_context(|| format!("{url:?} must start with http:// or https://"))?;
+    if rest.is_empty() || rest.starts_with('/') {
+        bail!("{url:?} has no host");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("{url:?} contains whitespace or control characters");
+    }
+    Ok(())
+}
+
+/// `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, any case.
+pub fn parse_bool(s: &str) -> anyhow::Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => bail!("{other:?} is not a boolean (true or false)"),
+    }
+}
 
 /// `HOSTNAME` (set by Docker and Kubernetes), else `/etc/hostname`.
 fn hostname() -> Option<String> {
@@ -302,11 +375,18 @@ pub fn parse_size(s: &str) -> anyhow::Result<usize> {
         .with_context(|| format!("{s:?} is too large"))
 }
 
-/// Parses `"30"` (seconds), `"30s"` or `"500ms"`.
+/// Parses `"30"` (seconds), `"30s"`, `"500ms"` or `"5m"`.
 pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         return Ok(Duration::from_millis(ms.trim().parse()?));
+    }
+    if let Some(m) = s.strip_suffix('m') {
+        let minutes: u64 = m.trim().parse()?;
+        return minutes
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .with_context(|| format!("{s:?} is too large"));
     }
     let secs = s.strip_suffix('s').unwrap_or(s);
     Ok(Duration::from_secs(secs.trim().parse()?))
@@ -513,7 +593,68 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("m").is_err());
+    }
+
+    #[test]
+    fn dashboard_settings_default_and_parse() {
+        let c = Config::default();
+        assert!(c.dashboard_enabled);
+        assert_eq!(c.grafana_url, None);
+        assert_eq!(c.edge_stats_max_edges, 10_000);
+        assert_eq!(c.edge_stats_window, Duration::from_secs(300));
+        let c = with_env(&[
+            ("KRAKEN_HUB_DASHBOARD_ENABLED", "false"),
+            ("KRAKEN_HUB_GRAFANA_URL", " https://grafana.example/d/hub "),
+            ("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "500"),
+            ("KRAKEN_HUB_EDGE_STATS_WINDOW", "10m"),
+        ])
+        .unwrap();
+        assert!(!c.dashboard_enabled);
+        assert_eq!(
+            c.grafana_url.as_deref(),
+            Some("https://grafana.example/d/hub")
+        );
+        assert_eq!(c.edge_stats_max_edges, 500);
+        assert_eq!(c.edge_stats_window, Duration::from_secs(600));
+        for v in ["TRUE", "1", "yes", "On"] {
+            assert!(parse_bool(v).unwrap(), "{v}");
+        }
+        for v in ["False", "0", "no", "off"] {
+            assert!(!parse_bool(v).unwrap(), "{v}");
+        }
+        assert!(with_env(&[("KRAKEN_HUB_DASHBOARD_ENABLED", "maybe")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "0")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "9s")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "10s")]).is_ok());
+    }
+
+    #[test]
+    fn grafana_url_must_be_a_plain_http_link() {
+        for good in [
+            "http://localhost:3000",
+            "HTTPS://grafana.example/d/x?orgId=1",
+        ] {
+            assert!(
+                with_env(&[("KRAKEN_HUB_GRAFANA_URL", good)]).is_ok(),
+                "{good} rejected"
+            );
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "grafana.example",
+            "https://",
+            "http:///path",
+            "https://a b",
+            "ftp://grafana",
+        ] {
+            assert!(
+                with_env(&[("KRAKEN_HUB_GRAFANA_URL", bad)]).is_err(),
+                "{bad} accepted"
+            );
+        }
     }
 
     fn otlp(value: Option<&str>) -> Option<String> {
