@@ -63,13 +63,17 @@ cargo run
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `KRAKEN_HUB_ID` | hostname + `-` + 8 random hex digits | identifies this hub process in `RegisterAck.hub_id` and the topology (`hubId`) |
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
 | `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for `GET /topology`; empty disables the HTTP listener |
 | `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
 | `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
-| `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 |
-| `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` |
-| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold (`30`, `30s` or `500ms`) |
+| `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
+| `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` on types without an override |
+| `KRAKEN_HUB_TIMEOUT_OVERRIDES` | none | per-type timeouts, `type=ms,type=ms` (for example `files.Upload=120000`); see [Request timeouts](#request-timeouts) |
+| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to v2 clients in `RegisterAck`; must be shorter than `KRAKEN_HUB_HEARTBEAT_TIMEOUT` |
+| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold for v2 sessions (`10`, `10s` or `500ms`) |
+| `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold for v1 sessions (`Register.protocol_version` 0, clients that heartbeat every 10 s) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
@@ -82,6 +86,9 @@ The topology view (`GET /topology`, `kraken-hub --topology`) is described in [To
 - **Builder call:** `KRAKEN_HUB_HANDSHAKE_TIMEOUT` (default `10s`): a stream that sends nothing,
   or no `Register`, within it is closed with `DEADLINE_EXCEEDED` `no Register within 10s`. A
   `Register` with an empty `instance_id` or `service_name` is closed with `INVALID_ARGUMENT`.
+- Startup fails on a malformed `KRAKEN_HUB_TIMEOUT_OVERRIDES` (entry without `=`, empty type,
+  non-numeric, zero or above `u32::MAX` milliseconds, a type listed twice) and when
+  `KRAKEN_HUB_HEARTBEAT_INTERVAL` is not shorter than `KRAKEN_HUB_HEARTBEAT_TIMEOUT`.
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
   AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the topology HTTP port; map the compose
   host port accordingly).
@@ -122,9 +129,10 @@ Top level:
 
 | Field | Type | Meaning |
 |---|---|---|
+| `hubId` | string | `KRAKEN_HUB_ID` |
 | `hubStartedAtMs` | int64 | hub start, epoch milliseconds |
 | `nowMs` | int64 | snapshot time, epoch milliseconds |
-| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, in ms |
+| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (v2 sessions), in ms |
 | `services` | list | one entry per service with at least one live session |
 | `types` | list | one entry per owned type, including orphaned ones |
 | `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight` (all counts) |
@@ -136,11 +144,13 @@ Top level:
 | `instanceId` | string | instance id from `Register` |
 | `connectedSinceMs` | int64 | when the session started, epoch ms |
 | `lastHeartbeatAgeMs` | int64 | time since the last heartbeat, ms |
-| `stale` | bool | `lastHeartbeatAgeMs` > `heartbeatTimeoutMs` / 3 (see below) |
+| `stale` | bool | `lastHeartbeatAgeMs` > a third of this session's own eviction threshold (see below) |
 | `inFlightAsHandler` | uint32 | requests currently being handled by this instance |
 | `inFlightAsSender` | uint32 | requests this instance sent that have no terminal message yet |
 | `commandTypes` | list of string | command types this instance registered |
 | `queryTypes` | list of string | query types this instance registered |
+| `protocolVersion` | uint32 | `Register.protocol_version` of the session's first `Register` (0 = v1) |
+| `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty for v1 clients |
 
 `types[]`:
 
@@ -165,10 +175,10 @@ types and in-flight counts are attached by instance id (empty or zero when absen
 
 ### Staleness
 
-**Builder call:** an instance is `stale` when its last heartbeat is older than a third of
-`heartbeatTimeoutMs`. It is still connected and still receives requests; the flag is an early
-warning before the hub evicts it at the full timeout. `stale` assumes clients heartbeat at most
-every `heartbeatTimeoutMs / 3`; a brief `stale: true` right before a heartbeat arrives is normal.
+**Builder call:** an instance is `stale` when its last heartbeat is older than a third of its own
+eviction threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT` for v2 sessions, the legacy timeout for v1).
+It is still connected and still receives requests; the flag is an early warning before the hub
+evicts it at the full timeout. A brief `stale: true` right before a heartbeat arrives is normal.
 
 ### Orphaned types
 
@@ -190,7 +200,8 @@ sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
 ## Protocol summary
 
 A service connects with `Hub.Connect`, sends `Register` (service name, instance id, handled
-command and query types) and then `Heartbeat` messages. A `Request` (kind, type, id, payload,
+command and query types; v2 clients add `protocol_version`, `capabilities`, `client_version`
+and optionally `credentials`) and then `Heartbeat` messages. A `Request` (kind, type, id, payload,
 optional `timeout_ms`) is routed to one live instance of the service that owns the type; the
 handler answers with a `Reply` carrying the same id, which the hub relays to the sender. Each
 request id gets exactly one terminal message: a `Reply` or a hub-produced error. The hub forwards
@@ -212,6 +223,42 @@ whatever its code.
 The generated client stubs are built with `build_transport(false)`; Rust clients create the stub
 with `HubClient::new(channel)`.
 
+### Protocol versions
+
+Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
+
+| | v1 session (`protocol_version` 0, every client before P0) | v2 session (`protocol_version` >= 2) |
+|---|---|---|
+| `RegisterAck` | never | after every accepted `Register`; the first one is queued before the echo of the heartbeat that follows the `Register` |
+| Heartbeat timeout | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` (30 s) | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s), announced with the 3 s interval |
+| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck` |
+
+- The version, capabilities and client version are read from the first `Register` of a stream; a
+  later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
+  anything above 2 is answered as 2.
+- The ack carries `hub_id`, the negotiated version, the shared capabilities (none are defined
+  yet), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
+  before any ack knows it talks to an older hub and runs in legacy mode.
+- `credentials` (static token or JWT) is accepted and ignored until hub access control ships; it
+  is never logged.
+- `ErrorCode.UNSUPPORTED` (10) is declared but not produced yet.
+- `tests/compat.rs` is the compatibility suite: a raw v1 client gets no ack, only v1 messages and
+  the legacy timeout; a v2 client gets the ack with the configured values before the echo.
+
+### Request timeouts
+
+With `override` the `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for the request's type:
+
+| `Request.timeout_ms` | Deadline |
+|---|---|
+| `> 0` | `min(timeout_ms, override or KRAKEN_HUB_MAX_TIMEOUT_MS)` |
+| `0` | `override or KRAKEN_HUB_DEFAULT_TIMEOUT_MS` |
+
+An override thus also moves the clamp for its type, up (long-running commands) or down. v2
+clients send `timeout_ms = 0` unless their caller chose a timeout, so an override applies to them
+without any client change; v1 clients always send a timeout, so for them an override only clamps.
+
 ## Routing and limitations
 
 - **Builder call:** routing is per service. The hub routes to any live instance of the owning
@@ -228,9 +275,12 @@ with `HubClient::new(channel)`.
 
 - **Builder call:** HTTP/2 keepalive PINGs every 10 s, the connection is dropped when a PING is
   not answered within 20 s; TCP keepalive is 30 s. These are constants in `src/lib.rs`.
-- A stream that misses heartbeats for `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is evicted: its session is
-  removed, its stream task stops at once (even if the client no longer reads), its registration is
-  dropped and its in-flight requests fail with `HANDLER_DISCONNECTED`.
+- A stream that misses heartbeats for its session's threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT`
+  for v2, `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` for v1) is evicted: its session is removed, its
+  stream task stops at once (even if the client no longer reads), its registration is dropped and
+  its in-flight requests fail with `HANDLER_DISCONNECTED`. **Builder call:** the watchdog checks
+  every tenth of the shorter threshold (10 ms to 1 s), so an eviction lands at most about a
+  second after the threshold.
 - A `Register` with an instance id that already has a live stream replaces the old stream (logged
   at `info` as `session replaced by a new stream`); the old stream is closed.
 - **Builder call:** when a sender's buffer is full, a terminal `Reply` or `Error` is retried in
@@ -292,7 +342,9 @@ releases (`vX.Y.Z`) to `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:<tag>
 ```
 src/lib.rs        crate root, proto module, serve()
 src/main.rs       thin binary: config, telemetry, serve
-src/config.rs     KRAKEN_HUB_* parsing
+src/config.rs     KRAKEN_HUB_* parsing, effective request timeout, per-version heartbeat timeout
+src/context.rs    ContextId (always "default")
+src/protocol.rs   version negotiation, RegisterAck
 src/registry.rs   service/type ownership and instance selection
 src/session.rs    per-connection outbound buffers
 src/router.rs     request forwarding, timeouts, reply relay, one terminal message per id
@@ -300,7 +352,8 @@ src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
 src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
 src/cli.rs        --health-check and --topology client modes
-tests/            integration tests over a real gRPC connection (topology.rs, http.rs, cli.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, topology.rs, http.rs, cli.rs, proto_sync.rs)
+scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
 
@@ -318,6 +371,7 @@ flowchart LR
 | Stage | Job | Runs | Produces |
 |---|---|---|---|
 | fmt | `fmt` | always | formatting check |
+| fmt | `proto-sync` | always | `scripts/check-proto-sync.sh` against a fresh umbrella clone: `proto/hub.proto` must match `kraken/protocol/hub.proto` byte for byte |
 | clippy | `clippy` | always | lint with warnings as errors |
 | test | `test` | always | unit and in-process integration tests |
 | docker | `docker` | only on tags `vX.Y.Z` | `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:vX.Y.Z` and `:latest` |
