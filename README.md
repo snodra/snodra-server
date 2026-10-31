@@ -263,11 +263,23 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
 
 - A v2 session that declares the `flow-control` capability and sends `Register.initial_permits > 0`
   is **flow-controlled**: the hub forwards it a request only while it has a permit (one per
-  forward) and adds permits on every `Permits{count}` it sends. Every other session
-  (`initial_permits` 0, no capability, v1) is unlimited exactly as before P1.
-- Requests for a flow-controlled instance without a permit wait in its queue, ordered by
-  `Request.priority` (higher first) and then arrival. A queued request keeps its own deadline
-  (`TIMEOUT`) and fails with `HANDLER_DISCONNECTED` when the instance disconnects or is replaced.
+  forward) and adds permits on every `Permits{count}` it sends, never beyond its
+  `initial_permits`. Every other session (`initial_permits` 0, no capability, v1) is unlimited
+  exactly as before P1. A stream opens its flow state before its session becomes current, so a
+  request for the session always finds it; a request for a session whose flow is gone fails with
+  `HANDLER_DISCONNECTED` instead of going out unmetered. Of two concurrent handshakes of one
+  instance id the newer stream wins.
+- With a free permit and nobody waiting a request is forwarded at once; otherwise it waits in the
+  instance's queue, ordered by `Request.priority` (higher first) and then arrival, with its own
+  deadline (`TIMEOUT`).
+- A queued request never left the hub, so it is not failed with its instance: when the instance
+  disconnects it is routed again with the same id and its remaining deadline (a keyed command to
+  the new ring owner, an unkeyed one to another candidate, `NO_HANDLER` when none is left); when
+  the instance reconnects (a new stream replaces the old one) the new session takes the queue
+  over. Requests already forwarded fail with `HANDLER_DISCONNECTED` (outcome unknown).
+- An instance that re-registers without types (a graceful stop) is no routing target any more
+  (not a candidate, not on the ring) and its queue is routed to the other instances at once; it
+  still answers what it was forwarded.
 - A full queue (`KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` entries or
   `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), a hub whose queues together hold
   `KRAKEN_HUB_QUEUE_BYTES_TOTAL` bytes, like a full session buffer, answers
@@ -286,6 +298,11 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
   of `Register.tags` pairs equal to the sender's), then among those to instances that can take
   a request now (unlimited, or a permit and an empty queue), then to the least
   `(queued + forwarded) / load_factor`, round-robin among ties.
+- Consequences worth knowing: the ring saturates the load factor (clamped to 8..1024 virtual
+  nodes, so 800 and 5000 weigh the same for keys) while the least-loaded choice uses the raw
+  value; at idle (every load 0) unkeyed traffic round-robins whatever the load factors; tags are
+  a strict preference, so a saturated instance with the best match keeps queueing and never
+  spills over to a worse match.
 
 ### Request timeouts
 
@@ -338,11 +355,12 @@ without any client change; v1 clients always send a timeout, so for them an over
 - Traces: one span `hub.route` per request, with the outcome in `kraken.outcome`; parent context
   is taken from the request's trace headers. Exported over OTLP.
 - Metrics (OTLP): `kraken_hub_requests_total`, `kraken_hub_request_duration_seconds`,
-  `kraken_hub_in_flight`, `kraken_hub_sessions`, `kraken_hub_registered_types`,
+  `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
-  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`, `buffer_full`). No
-  per-instance labels.
+  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`,
+  `buffer_full`). No per-instance labels. Queue depth and permits are refreshed by the watchdog
+  every tick (at most a second), not per request.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
   `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
