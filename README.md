@@ -284,7 +284,9 @@ without any client change; v1 clients always send a timeout, so for them an over
   every tenth of the shorter threshold (10 ms to 1 s), so an eviction lands at most about a
   second after the threshold.
 - A `Register` with an instance id that already has a live stream replaces the old stream (logged
-  at `info` as `session replaced by a new stream`); the old stream is closed.
+  at `info` as `session replaced by a new stream`); the old stream is closed. Requests forwarded
+  to the old stream fail at once with `HANDLER_DISCONNECTED` (clients answer only on the stream a
+  request arrived on), requests it sent are dropped; the new session's requests are untouched.
 - **Builder call:** when a sender's buffer is full, a terminal `Reply` or `Error` is retried in
   the background for up to 5 s before it is dropped (logged at `warn`, counted in
   `kraken_hub_session_buffer_full_total{service}`).
