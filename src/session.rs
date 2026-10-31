@@ -36,6 +36,10 @@ impl fmt::Display for SendError {
     }
 }
 
+/// A newer session already holds the instance id: an older stream never replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Superseded;
+
 /// What a session negotiated in the first `Register` of its stream; fixed for the stream's life.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeta {
@@ -136,6 +140,56 @@ impl Sessions {
             .0
     }
 
+    /// A fresh session token, for a stream that must open state keyed by it (its flow) before
+    /// the session becomes current ([`Sessions::insert_with_token`]).
+    pub fn allocate_token(&self) -> u64 {
+        self.next_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Inserts the session under a token from [`Sessions::allocate_token`], replacing (and
+    /// cancelling) an older session of the instance id; a newer one is never replaced.
+    #[allow(clippy::too_many_arguments)] // the fields of a Session, as `insert` takes them
+    pub fn insert_with_token(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        meta: SessionMeta,
+        tx: mpsc::Sender<Result<ServerMessage, Status>>,
+        cancel: CancellationToken,
+        token: u64,
+    ) -> Result<Option<u64>, Superseded> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        // Tokens grow with every stream, so the newest stream of an instance id always wins, in
+        // the sessions map and (opened first, ADR 0014) in the router's flow state alike.
+        if inner.get(instance_id).is_some_and(|s| s.token > token) {
+            return Err(Superseded);
+        }
+        let session = Session {
+            context: ctx.clone(),
+            service: service.to_string(),
+            meta,
+            tx,
+            last_heartbeat: now,
+            connected_since: now,
+            token,
+            cancel,
+        };
+        let old = inner.insert(instance_id.to_string(), session);
+        drop(inner);
+        Ok(old.map(|old| {
+            old.cancel.cancel();
+            info!(
+                instance = %instance_id,
+                service = %service,
+                old_service = %old.service,
+                "session replaced by a new stream"
+            );
+            old.token
+        }))
+    }
+
     /// Like [`Sessions::insert`], also returning the token of the session it replaced, so the
     /// caller can end that session's requests (its stream task finds itself replaced and does not).
     pub fn insert_replacing(
@@ -147,33 +201,10 @@ impl Sessions {
         tx: mpsc::Sender<Result<ServerMessage, Status>>,
         cancel: CancellationToken,
     ) -> (u64, Option<u64>) {
-        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
-        let session = Session {
-            context: ctx.clone(),
-            service: service.to_string(),
-            meta,
-            tx,
-            last_heartbeat: now,
-            connected_since: now,
-            token,
-            cancel,
-        };
-        let old = self
-            .inner
-            .lock()
-            .unwrap()
-            .insert(instance_id.to_string(), session);
-        let replaced = old.map(|old| {
-            old.cancel.cancel();
-            info!(
-                instance = %instance_id,
-                service = %service,
-                old_service = %old.service,
-                "session replaced by a new stream"
-            );
-            old.token
-        });
+        let token = self.allocate_token();
+        let replaced = self
+            .insert_with_token(ctx, instance_id, service, meta, tx, cancel, token)
+            .expect("a fresh token is the newest");
         (token, replaced)
     }
 
@@ -379,6 +410,30 @@ mod tests {
     }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn an_older_session_never_replaces_a_newer_one() {
+        let sessions = Sessions::new();
+        let older = sessions.allocate_token();
+        let newer = sessions.allocate_token();
+        let (tx, _rx) = mpsc::channel(1);
+        let insert = |token| {
+            sessions.insert_with_token(
+                &D,
+                "a",
+                "svc",
+                v1(),
+                tx.clone(),
+                CancellationToken::new(),
+                token,
+            )
+        };
+        assert_eq!(insert(newer), Ok(None));
+        assert_eq!(insert(older), Err(Superseded));
+        assert_eq!(sessions.token_of(&D, "a"), Some(newer));
+        let newest = sessions.allocate_token();
+        assert_eq!(insert(newest), Ok(Some(newer)), "a newer one replaces");
+    }
 
     #[tokio::test]
     async fn send_to_unknown_instance_is_gone() {

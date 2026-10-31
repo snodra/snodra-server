@@ -68,6 +68,8 @@ struct Flow {
     service: String,
     /// Permits left; `None` is unlimited (no flow control, the v1 behaviour).
     permits: Option<u32>,
+    /// `Register.initial_permits`: permits never exceed it, whatever a client sends back.
+    initial: u32,
     queue: InstanceQueue,
     /// Requests assigned to this session and not ended yet: queued plus forwarded.
     assigned: u32,
@@ -233,7 +235,10 @@ impl Router {
     }
 
     /// Starts the flow state of a session (replacing an older session's): `permits` `Some` makes
-    /// it flow-controlled, `None` unlimited. Call before the session is registered.
+    /// it flow-controlled, `None` unlimited. Call before the session becomes current
+    /// ([`Sessions::insert_with_token`]), so a request routed to the session always finds its flow.
+    /// Returns false, and changes nothing, when a newer session of the instance already opened
+    /// its flow (a concurrent, older handshake must give up).
     pub fn open_session(
         &self,
         _ctx: &ContextId,
@@ -241,22 +246,27 @@ impl Router {
         token: u64,
         service: &str,
         permits: Option<u32>,
-    ) {
+    ) -> bool {
         let flow = Flow {
             token,
             service: service.to_string(),
             permits,
+            initial: permits.unwrap_or(0),
             queue: InstanceQueue::new(
                 self.config.queue_capacity_per_instance,
                 self.config.queue_bytes_per_instance,
             ),
             assigned: 0,
         };
-        self.flows
-            .lock()
-            .unwrap()
-            .insert(instance_id.to_string(), flow);
+        {
+            let mut flows = self.flows.lock().unwrap();
+            if flows.get(instance_id).is_some_and(|f| f.token > token) {
+                return false;
+            }
+            flows.insert(instance_id.to_string(), flow);
+        }
         self.refresh_flow_gauges(service);
+        true
     }
 
     /// `Permits{count}` from session `token`: adds permits and forwards queued requests. Ignored
@@ -270,7 +280,7 @@ impl Router {
             let Some(permits) = flow.permits.as_mut() else {
                 return;
             };
-            *permits = permits.saturating_add(count);
+            *permits = permits.saturating_add(count).min(flow.initial);
             (flow.service.clone(), drain(flow))
         };
         self.refresh_flow_gauges(&service);
@@ -380,7 +390,7 @@ impl Router {
                     .filter(|f| f.token == token)
                     && let Some(p) = f.permits.as_mut()
                 {
-                    *p += 1;
+                    *p = (*p + 1).min(f.initial);
                 }
                 self.forward_failed(&item.id, handler, service, e);
             }
@@ -590,12 +600,14 @@ impl Router {
             Send(ServerMessage, String),
             Drained(Vec<Queued>, String),
             Rejected(&'static str, String),
+            Closed,
         }
         let next = {
             let mut flows = self.flows.lock().unwrap();
             match flows.get_mut(handler).filter(|f| f.token == token) {
-                // No flow state: the session is gone or being replaced; the send reports it.
-                None => Next::Send(msg, "unknown".to_string()),
+                // No flow state for this session: it ended (or was replaced, or never became
+                // current). Sending would bypass its permits, so the request fails instead.
+                None => Next::Closed,
                 Some(flow) => {
                     flow.assigned += 1;
                     let service = flow.service.clone();
@@ -635,6 +647,11 @@ impl Router {
                 self.metrics.rejected(&service, reason);
                 self.reject_busy(id, "queue full");
             }
+            Next::Closed => self.fail(
+                id,
+                ErrorCode::HandlerDisconnected,
+                format!("handler instance {handler} disconnected"),
+            ),
         }
     }
 
@@ -694,6 +711,18 @@ impl Router {
     /// HANDLER_DISCONNECTED and drops the pending requests it sent. Entries of a newer session
     /// with the same instance id are untouched.
     pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str, token: u64) {
+        // The flow state goes first: a request routed concurrently then either finds no flow and
+        // fails at once, or was assigned before and is among the pending entries collected below.
+        let service = {
+            let mut flows = self.flows.lock().unwrap();
+            match flows.get(instance_id) {
+                Some(f) if f.token == token => flows.remove(instance_id).map(|f| f.service),
+                _ => None,
+            }
+        };
+        if let Some(service) = &service {
+            self.refresh_flow_gauges(service);
+        }
         let handled_by = |p: &Pending| p.handler == instance_id && p.handler_token == token;
         let sent_by = |p: &Pending| p.sender == instance_id && p.sender_token == Some(token);
         let (failed, dropped) = {
@@ -721,17 +750,6 @@ impl Router {
             // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in flight.
             self.metrics.in_flight_add(entry.kind, -1);
             entry.span.record("kraken.outcome", "sender_disconnected");
-        }
-        // The session's flow state (and its queue: every queued entry is among `failed`) goes.
-        let service = {
-            let mut flows = self.flows.lock().unwrap();
-            match flows.get(instance_id) {
-                Some(f) if f.token == token => flows.remove(instance_id).map(|f| f.service),
-                _ => None,
-            }
-        };
-        if let Some(service) = &service {
-            self.refresh_flow_gauges(service);
         }
         for (id, entry) in failed {
             entry.cancel.abort();
@@ -907,7 +925,29 @@ mod tests {
         handler_rx: Rx,
     }
 
+    /// Like [`fixture_with`], with the flow state of h1 and s1 opened (unlimited), as the stream
+    /// task does before a session becomes current.
     fn fixture_with(config: Config, handler_cap: usize) -> Fixture {
+        let f = fixture_unopened(config, handler_cap);
+        for (id, service) in [("h1", "orders"), ("s1", "web")] {
+            let token = f.sessions.token_of(&D, id).unwrap();
+            let _ = f.router.open_session(&D, id, token, service, None);
+        }
+        f
+    }
+
+    impl Fixture {
+        /// A new (unlimited) session for `id`, flow state first, as the stream task opens it.
+        fn connect(&self, id: &str, service: &str, cap: usize) -> Rx {
+            let rx = fake(&self.sessions, id, service, cap);
+            let token = self.sessions.token_of(&D, id).unwrap();
+            let _ = self.router.open_session(&D, id, token, service, None);
+            rx
+        }
+    }
+
+    /// h1 and s1 with sessions but no flow state yet.
+    fn fixture_unopened(config: Config, handler_cap: usize) -> Fixture {
         let registry = Arc::new(Registry::new(config.owner_grace));
         let sessions = Arc::new(Sessions::new());
         registry
@@ -1110,7 +1150,7 @@ mod tests {
         let old = f.sessions.token_of(&D, "h1").unwrap();
         f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
         // h1 reconnects: a new session with the same instance id.
-        let mut new_rx = fake(&f.sessions, "h1", "orders", 16);
+        let mut new_rx = f.connect("h1", "orders", 16);
         f.router.route(&D, "s1", request("r2", "t.Cmd", 0));
         assert!(new_rx.try_recv().is_ok(), "r2 goes to the new session");
         f.router.on_disconnect(&D, "h1", old);
@@ -1169,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn reply_to_busy_sender_is_delivered_once_there_is_room() {
         let f = fixture();
-        let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
+        let mut s2_rx = f.connect("s2", "web", 1);
         f.router.route(&D, "s2", request("r1", "t.Cmd", 0));
         // Fill s2's only slot so the reply's try_send hits a full buffer.
         f.sessions.send(&D, "s2", ServerMessage::default()).unwrap();
@@ -1193,7 +1233,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn error_to_busy_sender_is_given_up_after_the_delivery_timeout() {
         let f = fixture();
-        let mut s2_rx = fake(&f.sessions, "s2", "web", 1);
+        let mut s2_rx = f.connect("s2", "web", 1);
         f.sessions.send(&D, "s2", ServerMessage::default()).unwrap();
         f.router.route(&D, "s2", request("r1", "t.Nope", 0));
         tokio::time::sleep(TERMINAL_SEND_TIMEOUT + Duration::from_millis(1)).await;
@@ -1293,15 +1333,16 @@ mod tests {
         assert_eq!(f.router.queued_total(), 2);
         f.router.on_permits(&D, "h1", f.handler_token, 1);
         assert_eq!(forwarded(&mut f.handler_rx), ["r2"]);
-        f.router.on_permits(&D, "h1", f.handler_token, 5);
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
         assert_eq!(forwarded(&mut f.handler_rx), ["r3"]);
         assert_eq!(f.router.queued_total(), 0);
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(
             view,
             FlowView {
                 flow_controlled: true,
-                permits_available: 4,
+                permits_available: 1,
                 queued: 0
             }
         );
@@ -1322,11 +1363,12 @@ mod tests {
             f.router.route(&D, "s1", unkeyed(id, p, 0));
         }
         assert_eq!(forwarded(&mut f.handler_rx), ["first"]);
-        f.router.on_permits(&D, "h1", f.handler_token, 10);
-        assert_eq!(
-            forwarded(&mut f.handler_rx),
-            ["high-1", "high-2", "low-1", "low-2", "neg"]
-        );
+        let mut order = Vec::new();
+        for _ in 0..5 {
+            f.router.on_permits(&D, "h1", f.handler_token, 1);
+            order.extend(forwarded(&mut f.handler_rx));
+        }
+        assert_eq!(order, ["high-1", "high-2", "low-1", "low-2", "neg"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1445,6 +1487,47 @@ mod tests {
         f.router.route(&D, "s1", unkeyed("r2", 0, 0));
         f.router.on_permits(&D, "h1", f.handler_token + 1000, 5);
         assert_eq!(forwarded(&mut f.handler_rx), ["r1"]);
+    }
+
+    // ---- flow state and session lifecycle (review fixes) ----
+
+    /// The old replacement window: the session is current but its flow state is not open yet.
+    #[tokio::test]
+    async fn a_session_without_flow_state_is_never_sent_an_unmetered_request() {
+        let mut f = fixture_unopened(Config::default(), 16);
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerDisconnected);
+        assert!(f.handler_rx.try_recv().is_err(), "nothing forwarded");
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    /// A request routed while its handler disconnects must not land in the dying flow.
+    #[tokio::test]
+    async fn a_request_routed_after_the_flow_closed_fails_at_once() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.on_disconnect(&D, "h1", f.handler_token);
+        f.router.route(&D, "s1", unkeyed("late", 0, 0));
+        expect_error(&mut f.sender_rx, "late", ErrorCode::HandlerDisconnected);
+        assert!(forwarded(&mut f.handler_rx).is_empty());
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_older_handshake_never_replaces_a_newer_flow() {
+        let f = flow_fixture(Config::default(), Some(3), true);
+        let _ = f.router.open_session(&D, "h1", 1_000, "orders", Some(1));
+        // A concurrent, older handshake of the same instance id opens its flow late.
+        let _ = f.router.open_session(&D, "h1", 999, "orders", Some(7));
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(view.permits_available, 1, "the newer flow stays");
+    }
+
+    #[tokio::test]
+    async fn permits_never_exceed_the_initial_grant() {
+        let f = flow_fixture(Config::default(), Some(2), true);
+        f.router.on_permits(&D, "h1", f.handler_token, 5);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(view.permits_available, 2);
     }
 
     fn candidate(id: &str, load_factor: u32, tags: &[(&str, &str)]) -> Candidate {

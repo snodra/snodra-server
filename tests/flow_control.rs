@@ -109,9 +109,10 @@ async fn queued_requests_leave_by_priority_then_age() {
     }
     // Round trip on the sender's stream: the four requests were routed (queued) by now.
     handshake(&mut sender, 2).await;
-    handler.permits(4).await;
+    // One permit back per finished request, like a real client (permits never exceed the grant).
     let mut got = Vec::new();
     for _ in 0..4 {
+        handler.permits(1).await;
         got.push(expect_request(&mut handler).await.id);
     }
     assert_eq!(got, ["high", "high-2", "mid", "low"]);

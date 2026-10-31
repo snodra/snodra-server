@@ -33,7 +33,7 @@ use crate::proto::{
 use crate::protocol;
 use crate::registry::{Placement, RegisterError, Registry, effective_load_factor};
 use crate::router::Router;
-use crate::session::{SessionMeta, Sessions};
+use crate::session::{SessionMeta, Sessions, Superseded};
 use crate::topology::{ClockAnchor, snapshot};
 
 pub struct HubService {
@@ -302,24 +302,41 @@ async fn run_stream(
         placement: placement.clone(),
     };
     let permits = meta.permits();
-    // Session first, then the registration under it: a late disconnect of an older stream with
-    // the same instance id can then never unregister this stream's registration.
-    let (token, replaced) = ctx.sessions.insert_replacing(
+    // Flow state, then the session, then the registration under it (ADR 0014): a request routed
+    // to the session always finds its flow, and a late disconnect of an older stream with the
+    // same instance id can never unregister this stream's registration. Tokens grow per stream,
+    // so of two concurrent handshakes of one instance id the newer wins in both maps.
+    let token = ctx.sessions.allocate_token();
+    if !ctx
+        .router
+        .open_session(&ctx.context, &instance_id, token, &service, permits)
+    {
+        debug!(instance = %instance_id, "superseded by a newer stream during handshake");
+        return;
+    }
+    let replaced = match ctx.sessions.insert_with_token(
         &ctx.context,
         &instance_id,
         &service,
         meta,
         tx.clone(),
         cancel.clone(),
-    );
+        token,
+    ) {
+        Ok(replaced) => replaced,
+        Err(Superseded) => {
+            // The newer stream opened its flow after ours (replacing it); nothing to undo, but
+            // end anything that may still be keyed by our token.
+            ctx.router.on_disconnect(&ctx.context, &instance_id, token);
+            debug!(instance = %instance_id, "superseded by a newer stream during handshake");
+            return;
+        }
+    };
     // The replaced stream's task sees itself replaced and skips the disconnect sequence, so its
     // requests are ended here: nobody can answer requests forwarded to the old stream.
     if let Some(old) = replaced {
         ctx.router.on_disconnect(&ctx.context, &instance_id, old);
     }
-    // Flow state before the registration makes the instance routable.
-    ctx.router
-        .open_session(&ctx.context, &instance_id, token, &service, permits);
     match ctx.register(token, &first, &placement) {
         Some(Ok(())) => {}
         Some(Err(status)) => {
