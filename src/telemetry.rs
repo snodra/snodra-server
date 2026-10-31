@@ -131,6 +131,9 @@ pub enum Outcome {
     Timeout,
     HandlerDisconnected,
     HandlerError,
+    /// The hub rejected the request for capacity (full queue or session buffer), whatever code
+    /// the sender was sent (RESOURCE_EXHAUSTED, or HANDLER_ERROR "handler busy").
+    ResourceExhausted,
 }
 
 impl Outcome {
@@ -143,6 +146,7 @@ impl Outcome {
             Outcome::HandlerDisconnected => "handler_disconnected",
             Outcome::HandlerError => "handler_error",
             Outcome::InvalidRequest => "invalid_request",
+            Outcome::ResourceExhausted => "resource_exhausted",
         }
     }
 }
@@ -164,6 +168,10 @@ pub struct Metrics {
     sessions: Gauge<u64>,
     registered_types: Gauge<u64>,
     buffer_full: Counter<u64>,
+    queue_depth: Gauge<u64>,
+    permits_available: Gauge<u64>,
+    queue_wait: Histogram<f64>,
+    rejected: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -205,8 +213,55 @@ impl Metrics {
                 .u64_counter("kraken_hub_session_buffer_full_total")
                 .with_description("Messages not delivered because a session buffer was full (busy handler, or a terminal message the sender did not read in time)")
                 .build(),
+            queue_depth: meter
+                .u64_gauge("kraken_hub_queue_depth")
+                .with_description("Requests queued for flow-controlled instances, per service")
+                .build(),
+            permits_available: meter
+                .u64_gauge("kraken_hub_permits_available")
+                .with_description("Permits flow-controlled instances have left, per service")
+                .build(),
+            queue_wait: meter
+                .f64_histogram("kraken_hub_queue_wait_seconds")
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    30.0, 60.0,
+                ])
+                .with_description("Time a request waited in a queue before it was forwarded")
+                .build(),
+            rejected: meter
+                .u64_counter("kraken_hub_rejected_total")
+                .with_description("Requests rejected for capacity (queue_full, queue_bytes, buffer_full)")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
+    }
+
+    pub fn flow_set(&self, service: &str, queue_depth: u64, permits_available: u64) {
+        let attrs = [KeyValue::new("service", service.to_string())];
+        self.queue_depth.record(queue_depth, &attrs);
+        self.permits_available.record(permits_available, &attrs);
+    }
+
+    pub fn queue_waited(&self, service: &str, type_name: &str, waited: Duration) {
+        self.queue_wait.record(
+            waited.as_secs_f64(),
+            &[
+                KeyValue::new("service", service.to_string()),
+                KeyValue::new("type", type_name.to_string()),
+            ],
+        );
+    }
+
+    pub fn rejected(&self, service: &str, reason: &'static str) {
+        self.rejected.add(
+            1,
+            &[
+                KeyValue::new("service", service.to_string()),
+                KeyValue::new("reason", reason),
+            ],
+        );
     }
 
     /// Records nothing: the provider has no reader. For tests that do not look at metrics.

@@ -31,7 +31,7 @@ use crate::proto::{
     client_message, server_message,
 };
 use crate::protocol;
-use crate::registry::{RegisterError, Registry};
+use crate::registry::{Placement, RegisterError, Registry, effective_load_factor};
 use crate::router::Router;
 use crate::session::{SessionMeta, Sessions};
 use crate::topology::{ClockAnchor, snapshot};
@@ -161,16 +161,23 @@ struct StreamCtx {
 impl StreamCtx {
     /// Registers `reg` while the session `token` is provably the current one for its instance
     /// id. `None` means the session was removed or replaced meanwhile (nothing was changed).
-    fn register(&self, token: u64, reg: &Register) -> Option<Result<(), Status>> {
+    /// `placement` is the session's (from its first `Register`), not `reg`'s.
+    fn register(
+        &self,
+        token: u64,
+        reg: &Register,
+        placement: &Placement,
+    ) -> Option<Result<(), Status>> {
         let result = self
             .sessions
             .with_current(&self.context, &reg.instance_id, token, || {
-                self.registry.register(
+                self.registry.register_with(
                     &self.context,
                     &reg.instance_id,
                     &reg.service_name,
                     &reg.command_types,
                     &reg.query_types,
+                    placement.clone(),
                 )
             })?;
         Some(match result {
@@ -275,12 +282,26 @@ async fn run_stream(
             &first.capabilities,
         )
     });
+    // So are the flow-control settings and the placement (ADR 0014).
+    let flow_control = v2 && protocol::shares(&first.capabilities, protocol::FLOW_CONTROL);
+    let placement = Placement {
+        load_factor: effective_load_factor(first.load_factor),
+        tags: first
+            .tags
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
     let meta = SessionMeta {
         protocol_version: first.protocol_version,
         capabilities: first.capabilities.clone(),
         client_version: first.client_version.clone(),
         heartbeat_timeout: ctx.config.heartbeat_timeout_for(first.protocol_version),
+        flow_control,
+        initial_permits: first.initial_permits,
+        placement: placement.clone(),
     };
+    let permits = meta.permits();
     // Session first, then the registration under it: a late disconnect of an older stream with
     // the same instance id can then never unregister this stream's registration.
     let (token, replaced) = ctx.sessions.insert_replacing(
@@ -296,7 +317,10 @@ async fn run_stream(
     if let Some(old) = replaced {
         ctx.router.on_disconnect(&ctx.context, &instance_id, old);
     }
-    match ctx.register(token, &first) {
+    // Flow state before the registration makes the instance routable.
+    ctx.router
+        .open_session(&ctx.context, &instance_id, token, &service, permits);
+    match ctx.register(token, &first, &placement) {
         Some(Ok(())) => {}
         Some(Err(status)) => {
             // The replaced session's registration (if any) may still be in the registry; the
@@ -352,7 +376,7 @@ async fn run_stream(
                     reg.instance_id = instance_id.clone();
                     reg.service_name = service.clone();
                 }
-                match ctx.register(token, &reg) {
+                match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
                         ctx.router.refresh_gauges();
                         // Best effort like the heartbeat echo: a full buffer drops this ack.
@@ -396,8 +420,10 @@ async fn run_stream(
             Some(client_message::Message::Reply(reply)) => {
                 ctx.router.on_reply(&ctx.context, &instance_id, reply)
             }
-            // Flow control is not implemented yet: permits are ignored.
-            Some(client_message::Message::Permits(_)) => {}
+            Some(client_message::Message::Permits(p)) => {
+                ctx.router
+                    .on_permits(&ctx.context, &instance_id, token, p.count)
+            }
             None => {}
         }
     }

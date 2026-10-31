@@ -6,9 +6,16 @@
 //!
 //! Metrics outcomes: a `Reply` carrying an error from a handler is always `HandlerError`;
 //! `outcome_of` maps only errors the hub itself produces (NO_HANDLER, TIMEOUT,
-//! HANDLER_DISCONNECTED, INVALID_REQUEST, and busy as HANDLER_ERROR).
+//! HANDLER_DISCONNECTED, INVALID_REQUEST); a capacity rejection is `ResourceExhausted` whichever
+//! code the sender gets.
+//!
+//! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
+//! A flow-controlled session (permits `Some`) is forwarded a request only while it has a permit;
+//! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
+//! their own deadline passes. Lock order: the pending lock and the flows lock are never held
+//! together.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +26,8 @@ use tokio::time::Instant;
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
-use crate::registry::{InstanceId, Kind, PickError, Registry};
+use crate::queue::{InstanceQueue, Queued};
+use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, Sessions};
 use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 
@@ -36,6 +44,9 @@ struct Pending {
     /// The handler session the request was forwarded to. A reconnect with the same instance id
     /// is a different session: it cannot answer requests forwarded to the old stream.
     handler_token: u64,
+    /// The sender shares "flow-control": capacity rejections are RESOURCE_EXHAUSTED for it,
+    /// HANDLER_ERROR "handler busy" otherwise.
+    sender_flow_control: bool,
     kind: Kind,
     type_name: String,
     started: Instant,
@@ -51,10 +62,81 @@ pub struct InFlight {
     pub as_sender: u32,
 }
 
+/// Flow state of one session.
+struct Flow {
+    token: u64,
+    service: String,
+    /// Permits left; `None` is unlimited (no flow control, the v1 behaviour).
+    permits: Option<u32>,
+    queue: InstanceQueue,
+    /// Requests assigned to this session and not ended yet: queued plus forwarded.
+    assigned: u32,
+}
+
+/// One session's flow state, for the topology view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlowView {
+    pub flow_controlled: bool,
+    pub permits_available: u32,
+    pub queued: u32,
+}
+
+/// How busy a routing candidate is, for [`choose`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Load {
+    /// Unlimited, or has a permit and nothing queued: a request would be forwarded at once.
+    pub can_take: bool,
+    /// Queued plus forwarded requests.
+    pub assigned: u32,
+}
+
+/// Index of the candidate an unkeyed request goes to: the best tag-match score against the
+/// sender's tags (number of equal key/value pairs), then the candidates that can take a request
+/// now, then the least `assigned / load_factor`, then `rotation` among the remaining ties.
+pub(crate) fn choose(
+    candidates: &[Candidate],
+    sender_tags: &BTreeMap<String, String>,
+    rotation: usize,
+    load: impl Fn(&str) -> Load,
+) -> usize {
+    let score = |c: &Candidate| {
+        sender_tags
+            .iter()
+            .filter(|(k, v)| c.tags.get(*k) == Some(*v))
+            .count()
+    };
+    let loads: Vec<Load> = candidates.iter().map(|c| load(&c.id)).collect();
+    let best_score = candidates.iter().map(score).max().unwrap_or(0);
+    let mut pool: Vec<usize> = (0..candidates.len())
+        .filter(|&i| score(&candidates[i]) == best_score)
+        .collect();
+    if pool.iter().any(|&i| loads[i].can_take) {
+        pool.retain(|&i| loads[i].can_take);
+    }
+    // a / lf_a < b / lf_b  <=>  a * lf_b < b * lf_a (no floats, load factors are >= 1).
+    let weighted = |i: usize| {
+        (
+            u64::from(loads[i].assigned),
+            u64::from(candidates[i].load_factor.max(1)),
+        )
+    };
+    let lighter = |a: usize, b: usize| {
+        let ((la, fa), (lb, fb)) = (weighted(a), weighted(b));
+        (la * fb).cmp(&(lb * fa))
+    };
+    let min = *pool
+        .iter()
+        .min_by(|&&a, &&b| lighter(a, b))
+        .expect("at least one candidate");
+    pool.retain(|&i| lighter(i, min).is_eq());
+    pool[rotation % pool.len()]
+}
+
 pub struct Router {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     pending: Mutex<HashMap<String, Pending>>,
+    flows: Mutex<HashMap<InstanceId, Flow>>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
 }
@@ -83,11 +165,11 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::PermissionDenied => Outcome::HandlerError,
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
+        ErrorCode::ResourceExhausted => Outcome::ResourceExhausted,
         // UNSUPPORTED is declared by protocol v2 but not produced by this hub yet.
         ErrorCode::HandlerError
         | ErrorCode::Unauthenticated
         | ErrorCode::Unsupported
-        | ErrorCode::ResourceExhausted
         | ErrorCode::Unspecified => Outcome::HandlerError,
     }
 }
@@ -144,9 +226,196 @@ impl Router {
             registry,
             sessions,
             pending: Mutex::new(HashMap::new()),
+            flows: Mutex::new(HashMap::new()),
             config,
             metrics,
         })
+    }
+
+    /// Starts the flow state of a session (replacing an older session's): `permits` `Some` makes
+    /// it flow-controlled, `None` unlimited. Call before the session is registered.
+    pub fn open_session(
+        &self,
+        _ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        service: &str,
+        permits: Option<u32>,
+    ) {
+        let flow = Flow {
+            token,
+            service: service.to_string(),
+            permits,
+            queue: InstanceQueue::new(
+                self.config.queue_capacity_per_instance,
+                self.config.queue_bytes_per_instance,
+            ),
+            assigned: 0,
+        };
+        self.flows
+            .lock()
+            .unwrap()
+            .insert(instance_id.to_string(), flow);
+        self.refresh_flow_gauges(service);
+    }
+
+    /// `Permits{count}` from session `token`: adds permits and forwards queued requests. Ignored
+    /// for an unlimited or replaced session.
+    pub fn on_permits(&self, ctx: &ContextId, instance_id: &str, token: u64, count: u32) {
+        let (service, ready) = {
+            let mut flows = self.flows.lock().unwrap();
+            let Some(flow) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
+                return;
+            };
+            let Some(permits) = flow.permits.as_mut() else {
+                return;
+            };
+            *permits = permits.saturating_add(count);
+            (flow.service.clone(), drain(flow))
+        };
+        self.refresh_flow_gauges(&service);
+        for item in ready {
+            self.forward_queued(ctx, instance_id, token, &service, item);
+        }
+    }
+
+    /// Flow state per instance (current sessions only).
+    pub fn flow_by_instance(&self) -> HashMap<InstanceId, FlowView> {
+        self.flows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, f)| {
+                (
+                    id.clone(),
+                    FlowView {
+                        flow_controlled: f.permits.is_some(),
+                        permits_available: f.permits.unwrap_or(0),
+                        queued: f.queue.len() as u32,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Requests waiting in all queues.
+    pub fn queued_total(&self) -> usize {
+        self.flows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|f| f.queue.len())
+            .sum()
+    }
+
+    fn refresh_flow_gauges(&self, service: &str) {
+        let (depth, permits) = {
+            let flows = self.flows.lock().unwrap();
+            flows
+                .values()
+                .filter(|f| f.service == service)
+                .fold((0u64, 0u64), |(d, p), f| {
+                    (
+                        d + f.queue.len() as u64,
+                        p + u64::from(f.permits.unwrap_or(0)),
+                    )
+                })
+        };
+        self.metrics.flow_set(service, depth, permits);
+    }
+
+    /// Load information of `candidates` for [`choose`].
+    fn loads(&self, candidates: &[Candidate]) -> HashMap<InstanceId, Load> {
+        let flows = self.flows.lock().unwrap();
+        candidates
+            .iter()
+            .map(|c| {
+                let load = match flows.get(&c.id) {
+                    Some(f) => Load {
+                        can_take: f.permits.is_none_or(|p| p > 0) && f.queue.is_empty(),
+                        assigned: f.assigned,
+                    },
+                    None => Load {
+                        can_take: true,
+                        assigned: 0,
+                    },
+                };
+                (c.id.clone(), load)
+            })
+            .collect()
+    }
+
+    /// Ends the flow bookkeeping of a pending entry that was just removed from the map: out of
+    /// its handler's queue if it was still queued, and no longer assigned.
+    fn release(&self, id: &str, entry: &Pending) {
+        let mut flows = self.flows.lock().unwrap();
+        if let Some(f) = flows
+            .get_mut(&entry.handler)
+            .filter(|f| f.token == entry.handler_token)
+        {
+            f.queue.remove(id);
+            f.assigned = f.assigned.saturating_sub(1);
+        }
+    }
+
+    /// Sends a request popped from a queue; a failed write returns the permit.
+    fn forward_queued(
+        &self,
+        ctx: &ContextId,
+        handler: &str,
+        token: u64,
+        service: &str,
+        item: Queued,
+    ) {
+        self.metrics
+            .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
+        match self.sessions.send_if_current(ctx, handler, token, item.msg) {
+            Ok(()) => {}
+            Err(e) => {
+                if let Some(f) = self
+                    .flows
+                    .lock()
+                    .unwrap()
+                    .get_mut(handler)
+                    .filter(|f| f.token == token)
+                    && let Some(p) = f.permits.as_mut()
+                {
+                    *p += 1;
+                }
+                self.forward_failed(&item.id, handler, service, e);
+            }
+        }
+    }
+
+    fn forward_failed(&self, id: &str, handler: &str, service: &str, e: SendError) {
+        match e {
+            SendError::Busy => {
+                self.metrics.buffer_full(service);
+                self.metrics.rejected(service, "buffer_full");
+                self.reject_busy(id, "outbound buffer full");
+            }
+            SendError::Gone => self.fail(
+                id,
+                ErrorCode::HandlerDisconnected,
+                format!("handler instance {handler} disconnected"),
+            ),
+        }
+    }
+
+    /// Fails a pending request for capacity: RESOURCE_EXHAUSTED to a sender that shares
+    /// flow-control, HANDLER_ERROR "handler busy" (the v1 answer) to any other sender.
+    fn reject_busy(&self, id: &str, why: &str) {
+        let entry = self.pending.lock().unwrap().remove(id);
+        if let Some(entry) = entry {
+            entry.cancel.abort();
+            self.release(id, &entry);
+            let (code, message) = if entry.sender_flow_control {
+                (ErrorCode::ResourceExhausted, format!("handler busy: {why}"))
+            } else {
+                (ErrorCode::HandlerError, "handler busy".to_string())
+            };
+            self.finish_with_outcome(id, entry, code, message, Outcome::ResourceExhausted);
+        }
     }
 
     /// Called for every Request a sender wrote. Never returns an error to the caller: every
@@ -196,7 +465,7 @@ impl Router {
             return;
         };
 
-        let (kind, handler) = match self.registry.pick(ctx, &type_name, &req.routing_key) {
+        let (kind, target) = match self.registry.pick_target(ctx, &type_name, &req.routing_key) {
             Ok(picked) => picked,
             Err(e) => {
                 let message = match e {
@@ -227,8 +496,27 @@ impl Router {
             }
         };
 
+        let handler = match target {
+            Target::Keyed(id) => id,
+            Target::Candidates {
+                mut candidates,
+                rotation,
+            } => {
+                let sender_tags = self
+                    .registry
+                    .placement_of(ctx, sender)
+                    .map(|p| p.tags)
+                    .unwrap_or_default();
+                let loads = self.loads(&candidates);
+                let i = choose(&candidates, &sender_tags, rotation, |id| loads[id]);
+                candidates.swap_remove(i).id
+            }
+        };
         span.record("kraken.handler", handler.as_str());
-        let sender_token = self.sessions.token_of(ctx, sender);
+        let (sender_token, sender_flow_control) = match self.sessions.sender_info(ctx, sender) {
+            Some((token, flow)) => (Some(token), flow),
+            None => (None, false),
+        };
         // `None`: the handler's session vanished since the pick; the send below reports it Gone.
         let handler_token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
         let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
@@ -275,6 +563,7 @@ impl Router {
                 sender_token,
                 handler: handler.clone(),
                 handler_token,
+                sender_flow_control,
                 kind,
                 type_name,
                 started: Instant::now(),
@@ -284,30 +573,67 @@ impl Router {
             pending.insert(id.clone(), entry);
         }
 
-        let forwarded = ServerMessage {
+        self.dispatch(ctx, &id, &handler, handler_token, req);
+    }
+
+    /// Forwards a routed request (its pending entry exists) to `handler`'s session `token`: at
+    /// once when the session is unlimited, else through its queue and permits. Only to the
+    /// session the entry names: if it was replaced meanwhile the request fails (Gone) instead of
+    /// reaching a stream whose requests the replacement already failed.
+    fn dispatch(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, req: Request) {
+        let priority = req.priority;
+        let type_name = req.r#type.clone();
+        let msg = ServerMessage {
             message: Some(server_message::Message::Request(req)),
         };
-        // Only to the session the entry names: if it was replaced meanwhile the request fails now
-        // (Gone) instead of reaching a stream whose requests the replacement already failed.
-        match self
-            .sessions
-            .send_if_current(ctx, &handler, handler_token, forwarded)
-        {
-            Ok(()) => {}
-            Err(SendError::Busy) => {
-                let service = self
-                    .registry
-                    .service_of(ctx, &handler)
-                    .unwrap_or_else(|| "unknown".to_string());
-                self.metrics.buffer_full(&service);
-                self.fail(&id, ErrorCode::HandlerError, "handler busy".to_string());
+        enum Next {
+            Send(ServerMessage, String),
+            Drained(Vec<Queued>, String),
+            Rejected(&'static str, String),
+        }
+        let next = {
+            let mut flows = self.flows.lock().unwrap();
+            match flows.get_mut(handler).filter(|f| f.token == token) {
+                // No flow state: the session is gone or being replaced; the send reports it.
+                None => Next::Send(msg, "unknown".to_string()),
+                Some(flow) => {
+                    flow.assigned += 1;
+                    let service = flow.service.clone();
+                    if flow.permits.is_none() {
+                        Next::Send(msg, service)
+                    } else {
+                        let bytes = prost::Message::encoded_len(&msg);
+                        let item = Queued {
+                            id: id.to_string(),
+                            type_name,
+                            priority,
+                            bytes,
+                            enqueued_at: Instant::now().into_std(),
+                            msg,
+                        };
+                        match flow.queue.push(item) {
+                            Ok(()) => Next::Drained(drain(flow), service),
+                            Err((full, _)) => Next::Rejected(full.reason(), service),
+                        }
+                    }
+                }
             }
-            Err(SendError::Gone) => {
-                self.fail(
-                    &id,
-                    ErrorCode::HandlerDisconnected,
-                    format!("handler instance {handler} disconnected"),
-                );
+        };
+        match next {
+            Next::Send(msg, service) => {
+                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
+                    self.forward_failed(id, handler, &service, e);
+                }
+            }
+            Next::Drained(ready, service) => {
+                self.refresh_flow_gauges(&service);
+                for item in ready {
+                    self.forward_queued(ctx, handler, token, &service, item);
+                }
+            }
+            Next::Rejected(reason, service) => {
+                self.metrics.rejected(&service, reason);
+                self.reject_busy(id, "queue full");
             }
         }
     }
@@ -331,6 +657,7 @@ impl Router {
             }
         };
         entry.cancel.abort();
+        self.release(&id, &entry);
         let outcome = match &reply.result {
             Some(reply::Result::Error(_)) => Outcome::HandlerError,
             _ => Outcome::Ok,
@@ -383,16 +710,28 @@ impl Router {
                 if handled_by(&entry) {
                     failed.push((id, entry));
                 } else {
-                    dropped.push(entry);
+                    dropped.push((id, entry));
                 }
             }
             (failed, dropped)
         };
-        for entry in dropped {
+        for (id, entry) in dropped {
             entry.cancel.abort();
+            self.release(&id, &entry);
             // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in flight.
             self.metrics.in_flight_add(entry.kind, -1);
             entry.span.record("kraken.outcome", "sender_disconnected");
+        }
+        // The session's flow state (and its queue: every queued entry is among `failed`) goes.
+        let service = {
+            let mut flows = self.flows.lock().unwrap();
+            match flows.get(instance_id) {
+                Some(f) if f.token == token => flows.remove(instance_id).map(|f| f.service),
+                _ => None,
+            }
+        };
+        if let Some(service) = &service {
+            self.refresh_flow_gauges(service);
         }
         for (id, entry) in failed {
             entry.cancel.abort();
@@ -441,13 +780,24 @@ impl Router {
         let entry = self.pending.lock().unwrap().remove(id);
         if let Some(entry) = entry {
             entry.cancel.abort();
+            self.release(id, &entry);
             self.finish_with_error(id, entry, code, message);
         }
     }
 
-    /// `entry` must already have been removed from the map by the caller.
+    /// `entry` must already have been removed from the map (and released) by the caller.
     fn finish_with_error(&self, id: &str, entry: Pending, code: ErrorCode, message: String) {
-        let outcome = outcome_of(code);
+        self.finish_with_outcome(id, entry, code, message, outcome_of(code));
+    }
+
+    fn finish_with_outcome(
+        &self,
+        id: &str,
+        entry: Pending,
+        code: ErrorCode,
+        message: String,
+        outcome: Outcome,
+    ) {
         record_outcome(&entry.span, outcome);
         log_outcome(
             id,
@@ -461,7 +811,7 @@ impl Router {
         self.metrics.request_finished(
             entry.kind,
             &entry.type_name,
-            outcome_of(code),
+            outcome,
             entry.started.elapsed(),
         );
         self.send_to(
@@ -512,6 +862,17 @@ impl Router {
             }
         }
     }
+}
+
+/// Pops queued requests while the session has permits, one permit each.
+fn drain(flow: &mut Flow) -> Vec<Queued> {
+    let mut ready = Vec::new();
+    while let Some(permits) = flow.permits.as_mut().filter(|p| **p > 0) {
+        let Some(item) = flow.queue.pop() else { break };
+        *permits -= 1;
+        ready.push(item);
+    }
+    ready
 }
 
 #[cfg(test)]
@@ -841,5 +1202,380 @@ mod tests {
             ServerMessage::default()
         );
         assert!(s2_rx.try_recv().is_err());
+    }
+
+    // ---- flow control (P1) ----
+
+    struct FlowFx {
+        router: Arc<Router>,
+        sessions: Arc<Sessions>,
+        sender_rx: Rx,
+        handler_rx: Rx,
+        handler_token: u64,
+    }
+
+    fn meta(flow_control: bool) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            protocol_version: 2,
+            flow_control,
+            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
+        }
+    }
+
+    /// h1 (service "orders", t.Cmd and t.Qry) with `permits` (None = unlimited); sender s1 shares
+    /// flow-control when `sender_flow`.
+    fn flow_fixture(config: Config, permits: Option<u32>, sender_flow: bool) -> FlowFx {
+        let registry = Arc::new(Registry::new(config.owner_grace));
+        let sessions = Arc::new(Sessions::new());
+        registry
+            .register(&D, "h1", "orders", &["t.Cmd".into()], &["t.Qry".into()])
+            .unwrap();
+        let (tx, handler_rx) = mpsc::channel(64);
+        let handler_token = sessions.insert(
+            &D,
+            "h1",
+            "orders",
+            meta(permits.is_some()),
+            tx,
+            CancellationToken::new(),
+        );
+        let (tx, sender_rx) = mpsc::channel(64);
+        sessions.insert(
+            &D,
+            "s1",
+            "web",
+            meta(sender_flow),
+            tx,
+            CancellationToken::new(),
+        );
+        let router = Router::new(
+            registry,
+            sessions.clone(),
+            Arc::new(config),
+            Metrics::noop(),
+        );
+        router.open_session(&D, "h1", handler_token, "orders", permits);
+        FlowFx {
+            router,
+            sessions,
+            sender_rx,
+            handler_rx,
+            handler_token,
+        }
+    }
+
+    fn unkeyed(id: &str, priority: i32, timeout_ms: u32) -> Request {
+        Request {
+            routing_key: String::new(),
+            priority,
+            ..request(id, "t.Cmd", timeout_ms)
+        }
+    }
+
+    /// Ids of the requests forwarded to `rx` so far.
+    fn forwarded(rx: &mut Rx) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(Ok(m)) = rx.try_recv() {
+            if let Some(server_message::Message::Request(r)) = m.message {
+                out.push(r.id);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn permits_limit_forwarding_and_permits_drain_the_queue() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        for id in ["r1", "r2", "r3"] {
+            f.router.route(&D, "s1", unkeyed(id, 0, 0));
+        }
+        assert_eq!(forwarded(&mut f.handler_rx), ["r1"]);
+        assert_eq!(f.router.queued_total(), 2);
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        assert_eq!(forwarded(&mut f.handler_rx), ["r2"]);
+        f.router.on_permits(&D, "h1", f.handler_token, 5);
+        assert_eq!(forwarded(&mut f.handler_rx), ["r3"]);
+        assert_eq!(f.router.queued_total(), 0);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(
+            view,
+            FlowView {
+                flow_controlled: true,
+                permits_available: 4,
+                queued: 0
+            }
+        );
+        assert!(f.sender_rx.try_recv().is_err(), "nothing failed");
+    }
+
+    #[tokio::test]
+    async fn queue_orders_by_priority_then_age() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("first", 0, 0));
+        for (id, p) in [
+            ("low-1", 0),
+            ("high-1", 5),
+            ("low-2", 0),
+            ("high-2", 5),
+            ("neg", -3),
+        ] {
+            f.router.route(&D, "s1", unkeyed(id, p, 0));
+        }
+        assert_eq!(forwarded(&mut f.handler_rx), ["first"]);
+        f.router.on_permits(&D, "h1", f.handler_token, 10);
+        assert_eq!(
+            forwarded(&mut f.handler_rx),
+            ["high-1", "high-2", "low-1", "low-2", "neg"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_request_keeps_its_own_deadline() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("busy", 0, 10_000));
+        f.router.route(&D, "s1", unkeyed("waits", 0, 100));
+        assert_eq!(forwarded(&mut f.handler_rx), ["busy"]);
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let msg = expect_error(&mut f.sender_rx, "waits", ErrorCode::Timeout);
+        assert_eq!(msg, "no reply within 100 ms");
+        assert_eq!(
+            f.router.queued_total(),
+            0,
+            "the timed-out request left the queue"
+        );
+        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        assert!(forwarded(&mut f.handler_rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_answers_resource_exhausted_to_a_flow_control_sender() {
+        let config = Config {
+            queue_capacity_per_instance: 1,
+            ..Config::default()
+        };
+        let mut f = flow_fixture(config, Some(1), true);
+        for id in ["r1", "r2", "r3"] {
+            f.router.route(&D, "s1", unkeyed(id, 0, 0));
+        }
+        let msg = expect_error(&mut f.sender_rx, "r3", ErrorCode::ResourceExhausted);
+        assert!(msg.contains("queue full"), "{msg}");
+        assert_eq!(f.router.in_flight(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_answers_handler_busy_to_a_sender_without_flow_control() {
+        let config = Config {
+            queue_capacity_per_instance: 1,
+            ..Config::default()
+        };
+        let mut f = flow_fixture(config, Some(1), false);
+        for id in ["r1", "r2", "r3"] {
+            f.router.route(&D, "s1", unkeyed(id, 0, 0));
+        }
+        let msg = expect_error(&mut f.sender_rx, "r3", ErrorCode::HandlerError);
+        assert_eq!(msg, "handler busy");
+    }
+
+    #[tokio::test]
+    async fn the_byte_cap_rejects_a_request_that_does_not_fit() {
+        let config = Config {
+            queue_bytes_per_instance: 200,
+            ..Config::default()
+        };
+        let mut f = flow_fixture(config, Some(1), true);
+        f.router.route(&D, "s1", unkeyed("r1", 0, 0));
+        f.router.route(&D, "s1", unkeyed("small", 0, 0));
+        let mut big = unkeyed("big", 0, 0);
+        big.payload = vec![b'x'; 300];
+        f.router.route(&D, "s1", big);
+        let msg = expect_error(&mut f.sender_rx, "big", ErrorCode::ResourceExhausted);
+        assert!(msg.contains("queue full"), "{msg}");
+        assert_eq!(f.router.queued_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unlimited_instance_gets_everything_at_once() {
+        let mut f = flow_fixture(Config::default(), None, true);
+        for i in 0..20 {
+            f.router.route(&D, "s1", unkeyed(&format!("r{i}"), 0, 0));
+        }
+        assert_eq!(forwarded(&mut f.handler_rx).len(), 20);
+        // Permits for a session without flow control change nothing.
+        f.router.on_permits(&D, "h1", f.handler_token, 3);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(
+            view,
+            FlowView {
+                flow_controlled: false,
+                permits_available: 0,
+                queued: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_fails_queued_requests_like_forwarded_ones() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("sent", 0, 0));
+        f.router.route(&D, "s1", unkeyed("queued", 0, 0));
+        f.router.on_disconnect(&D, "h1", f.handler_token);
+        let mut codes = Vec::new();
+        while let Ok(Ok(m)) = f.sender_rx.try_recv() {
+            if let Some(server_message::Message::Error(e)) = m.message {
+                codes.push((e.request_id.clone(), e.code()));
+            }
+        }
+        codes.sort();
+        assert_eq!(
+            codes,
+            [
+                ("queued".to_string(), ErrorCode::HandlerDisconnected),
+                ("sent".to_string(), ErrorCode::HandlerDisconnected)
+            ]
+        );
+        assert_eq!(f.router.queued_total(), 0);
+        assert!(f.router.flow_by_instance().is_empty());
+        let _ = f.sessions;
+    }
+
+    #[tokio::test]
+    async fn permits_of_a_stale_token_are_ignored() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.route(&D, "s1", unkeyed("r1", 0, 0));
+        f.router.route(&D, "s1", unkeyed("r2", 0, 0));
+        f.router.on_permits(&D, "h1", f.handler_token + 1000, 5);
+        assert_eq!(forwarded(&mut f.handler_rx), ["r1"]);
+    }
+
+    fn candidate(id: &str, load_factor: u32, tags: &[(&str, &str)]) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            load_factor,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn tags(t: &[(&str, &str)]) -> BTreeMap<String, String> {
+        t.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn choose_prefers_the_best_tag_match() {
+        let cs = [
+            candidate("a", 100, &[("zone", "z1")]),
+            candidate("b", 100, &[("zone", "z2"), ("disk", "ssd")]),
+            candidate("c", 100, &[("zone", "z2")]),
+        ];
+        let idle = |_: &str| Load {
+            can_take: true,
+            assigned: 0,
+        };
+        let sender = tags(&[("zone", "z2"), ("disk", "ssd")]);
+        assert_eq!(choose(&cs, &sender, 0, idle), 1);
+        // A heavily loaded best match still wins over a lighter worse match.
+        let loads = |id: &str| Load {
+            can_take: true,
+            assigned: if id == "b" { 50 } else { 0 },
+        };
+        assert_eq!(choose(&cs, &sender, 0, loads), 1);
+        // No sender tags: every candidate scores 0, the load decides.
+        assert_eq!(choose(&cs, &BTreeMap::new(), 0, loads), 0);
+    }
+
+    #[test]
+    fn choose_prefers_instances_that_can_take_a_request_now_then_the_least_loaded() {
+        let cs = [
+            candidate("a", 100, &[]),
+            candidate("b", 200, &[]),
+            candidate("c", 100, &[]),
+        ];
+        let none = BTreeMap::new();
+        // a: 2 / 100, b: 3 / 200 = 1.5 / 100, c: 1 / 100 but out of permits.
+        let load = |id: &str| match id {
+            "a" => Load {
+                can_take: true,
+                assigned: 2,
+            },
+            "b" => Load {
+                can_take: true,
+                assigned: 3,
+            },
+            _ => Load {
+                can_take: false,
+                assigned: 1,
+            },
+        };
+        assert_eq!(choose(&cs, &none, 0, load), 1);
+        // Nobody can take one now: the least loaded queue wins (c).
+        let all_full = |id: &str| Load {
+            can_take: false,
+            ..load(id)
+        };
+        assert_eq!(choose(&cs, &none, 0, all_full), 2);
+    }
+
+    #[test]
+    fn choose_breaks_ties_by_rotation() {
+        let cs = [
+            candidate("a", 100, &[]),
+            candidate("b", 100, &[]),
+            candidate("c", 100, &[]),
+        ];
+        let idle = |_: &str| Load {
+            can_take: true,
+            assigned: 0,
+        };
+        let picks: Vec<usize> = (0..6)
+            .map(|r| choose(&cs, &BTreeMap::new(), r, idle))
+            .collect();
+        assert_eq!(picks, [0, 1, 2, 0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn unkeyed_requests_go_to_the_least_loaded_instance() {
+        let registry = Arc::new(Registry::new(Duration::from_secs(60)));
+        let sessions = Arc::new(Sessions::new());
+        let mut rxs = HashMap::new();
+        for id in ["h1", "h2"] {
+            registry
+                .register(&D, id, "orders", &["t.Cmd".into()], &[])
+                .unwrap();
+            let (tx, rx) = mpsc::channel(64);
+            let token =
+                sessions.insert(&D, id, "orders", meta(false), tx, CancellationToken::new());
+            rxs.insert(id, (rx, token));
+        }
+        let (tx, _sender_rx) = mpsc::channel(64);
+        sessions.insert(&D, "s1", "web", meta(false), tx, CancellationToken::new());
+        let router = Router::new(
+            registry,
+            sessions,
+            Arc::new(Config::default()),
+            Metrics::noop(),
+        );
+        for (id, (_, token)) in &rxs {
+            router.open_session(&D, id, *token, "orders", None);
+        }
+        // Six requests nobody answers: round-robin while equal, so three each.
+        for i in 0..6 {
+            router.route(&D, "s1", unkeyed(&format!("r{i}"), 0, 0));
+        }
+        let (rx1, _) = rxs.get_mut("h1").unwrap();
+        let h1 = forwarded(rx1);
+        assert_eq!(h1.len(), 3, "{h1:?}");
+        // h1 answers all of its requests: the next ones go to h1 until the loads are equal again.
+        for id in &h1 {
+            router.on_reply(&D, "h1", payload_reply(id));
+        }
+        for i in 6..9 {
+            router.route(&D, "s1", unkeyed(&format!("r{i}"), 0, 0));
+        }
+        let (rx1, _) = rxs.get_mut("h1").unwrap();
+        assert_eq!(forwarded(rx1).len(), 3);
     }
 }

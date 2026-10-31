@@ -14,9 +14,17 @@ use crate::proto::{RegisterAck, ServerMessage, server_message};
 /// The protocol version this hub implements.
 pub const HUB_PROTOCOL_VERSION: u32 = 2;
 
-/// Optional protocol features this hub supports. None are defined in P0; later phases add
-/// `flow-control`, `scatter-gather`, `streaming`, `subscription` and `processors`.
-pub const HUB_CAPABILITIES: &[&str] = &[];
+/// Capability of flow control (ADR 0014): permits, per-instance queues, RESOURCE_EXHAUSTED.
+pub const FLOW_CONTROL: &str = "flow-control";
+
+/// Optional protocol features this hub supports. Later phases add `scatter-gather`,
+/// `streaming`, `subscription` and `processors`.
+pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL];
+
+/// True when the client declared `capability` and this hub supports it.
+pub fn shares(client: &[String], capability: &str) -> bool {
+    HUB_CAPABILITIES.contains(&capability) && client.iter().any(|c| c == capability)
+}
 
 /// True when a session that declared `protocol_version` speaks v2 (gets acks, short timeout).
 pub fn is_v2(protocol_version: u32) -> bool {
@@ -110,7 +118,11 @@ mod tests {
     }
 
     #[test]
-    fn no_capability_is_shared_yet() {
-        assert!(shared_capabilities(&["flow-control".to_string()]).is_empty());
+    fn only_declared_capabilities_the_hub_knows_are_shared() {
+        let client = ["made-up".to_string(), "flow-control".to_string()];
+        assert_eq!(shared_capabilities(&client), ["flow-control"]);
+        assert!(shares(&client, FLOW_CONTROL));
+        assert!(!shares(&["made-up".to_string()], FLOW_CONTROL));
+        assert!(!shares(&client, "made-up"));
     }
 }

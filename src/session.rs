@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::context::ContextId;
 use crate::proto::ServerMessage;
-use crate::registry::InstanceId;
+use crate::registry::{InstanceId, Placement};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendError {
@@ -47,6 +47,13 @@ pub struct SessionMeta {
     pub client_version: String,
     /// The session is evicted after this long without a heartbeat (v2 or legacy timeout).
     pub heartbeat_timeout: Duration,
+    /// The session shares the "flow-control" capability: it may get RESOURCE_EXHAUSTED and,
+    /// with `initial_permits > 0`, is forwarded requests only with permits.
+    pub flow_control: bool,
+    /// `Register.initial_permits` as sent.
+    pub initial_permits: u32,
+    /// Load factor and tags from the first `Register`, re-applied on every re-register.
+    pub placement: Placement,
 }
 
 impl SessionMeta {
@@ -57,7 +64,16 @@ impl SessionMeta {
             capabilities: Vec::new(),
             client_version: String::new(),
             heartbeat_timeout,
+            flow_control: false,
+            initial_permits: 0,
+            placement: Placement::default(),
         }
+    }
+
+    /// The permits the hub starts this session with: `None` (unlimited, the v1 behaviour) unless
+    /// the session shares flow-control and asked for permits.
+    pub fn permits(&self) -> Option<u32> {
+        (self.flow_control && self.initial_permits > 0).then_some(self.initial_permits)
     }
 }
 
@@ -159,6 +175,16 @@ impl Sessions {
             old.token
         });
         (token, replaced)
+    }
+
+    /// The current session's token and whether it shares the "flow-control" capability.
+    pub fn sender_info(&self, ctx: &ContextId, instance_id: &str) -> Option<(u64, bool)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .filter(|s| s.context == *ctx)
+            .map(|s| (s.token, s.meta.flow_control))
     }
 
     /// The token of the current session of `instance_id`, if any.
