@@ -222,11 +222,7 @@ impl Router {
         };
 
         span.record("kraken.handler", handler.as_str());
-        let timeout = if req.timeout_ms == 0 {
-            self.config.default_timeout
-        } else {
-            Duration::from_millis(req.timeout_ms.into()).min(self.config.max_timeout)
-        };
+        let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
 
         // Insert before forwarding so a fast reply always finds its entry. The lock is held
         // while spawning so an immediate timeout cannot run before the entry exists.
@@ -656,6 +652,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60_000 - 1)).await;
         assert!(f.sender_rx.try_recv().is_err());
         tokio::time::sleep(Duration::from_millis(2)).await;
+        expect_error(&mut f.sender_rx, "r2", ErrorCode::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn per_type_override_replaces_default_and_clamp() {
+        let config = Config {
+            timeout_overrides: [("t.Cmd".to_string(), Duration::from_millis(90_000))].into(),
+            ..Config::default()
+        };
+        let mut f = fixture_with(config, 16);
+        f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
+        f.router.route(&D, "s1", request("r2", "t.Cmd", 999_999));
+        tokio::time::sleep(Duration::from_millis(90_000 - 1)).await;
+        assert!(f.sender_rx.try_recv().is_err(), "override not applied");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let first = expect_error(&mut f.sender_rx, "r1", ErrorCode::Timeout);
+        assert_eq!(first, "no reply within 90000 ms");
         expect_error(&mut f.sender_rx, "r2", ErrorCode::Timeout);
     }
 
