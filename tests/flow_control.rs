@@ -118,6 +118,28 @@ async fn queued_requests_leave_by_priority_then_age() {
     assert_eq!(got, ["high", "high-2", "mid", "low"]);
 }
 
+/// A multi-hub top-up (ADR 0016): `Permits{count, grant}` raises the cap first, so the hub
+/// forwards up to the grant, not just up to `initial_permits`.
+#[tokio::test]
+async fn a_permit_grant_raises_the_cap_over_the_wire() {
+    let addr = start_hub(config()).await;
+    let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 2, &[]).await;
+    handshake(&mut handler, 1).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    handshake(&mut sender, 1).await;
+    handler.permits_with_grant(2, 4).await;
+    handshake(&mut handler, 2).await;
+    for i in 0..5 {
+        sender.tx.send(request(&format!("r{i}"), 0)).await.unwrap();
+    }
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(expect_request(&mut handler).await.id);
+    }
+    assert_eq!(got, ["r0", "r1", "r2", "r3"]);
+    nothing_within(&mut handler, Duration::from_millis(200)).await;
+}
+
 #[tokio::test]
 async fn a_v1_handler_stays_unlimited() {
     let addr = start_hub(config()).await;

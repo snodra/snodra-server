@@ -71,8 +71,10 @@ struct Flow {
     service: String,
     /// Permits left; `None` is unlimited (no flow control, the v1 behaviour).
     permits: Option<u32>,
-    /// `Register.initial_permits`: permits never exceed it, whatever a client sends back.
-    initial: u32,
+    /// Permits never exceed it, whatever a client sends back. Starts at
+    /// `Register.initial_permits`; only a `Permits.grant` from the session raises it (multi-hub
+    /// top-up, ADR 0016), and nothing lowers it.
+    cap: u32,
     queue: InstanceQueue,
     /// Ids of the requests assigned to this session and not ended yet: queued plus forwarded.
     /// A set, so ending a request twice (or before it was assigned) cannot skew the count.
@@ -301,7 +303,7 @@ impl Router {
             token,
             service: service.to_string(),
             permits,
-            initial: permits.unwrap_or(0),
+            cap: permits.unwrap_or(0),
             queue: InstanceQueue::with_total(
                 self.config.queue_capacity_per_instance,
                 self.config.queue_bytes_per_instance,
@@ -392,9 +394,17 @@ impl Router {
         }
     }
 
-    /// `Permits{count}` from session `token`: adds permits and forwards queued requests. Ignored
-    /// for an unlimited or replaced session.
-    pub fn on_permits(&self, ctx: &ContextId, instance_id: &str, token: u64, count: u32) {
+    /// `Permits{count, grant}` from session `token`: raises the session's cap to `grant` when
+    /// above it (a grant never lowers the cap), then adds `count` permits, clamped at the cap, and
+    /// forwards queued requests. Ignored for an unlimited or replaced session.
+    pub fn on_permits(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        count: u32,
+        grant: u32,
+    ) {
         let (service, ready) = {
             let mut flows = self.flows.lock().unwrap();
             let Some(flow) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
@@ -403,7 +413,8 @@ impl Router {
             let Some(permits) = flow.permits.as_mut() else {
                 return;
             };
-            *permits = permits.saturating_add(count).min(flow.initial);
+            flow.cap = flow.cap.max(grant);
+            *permits = permits.saturating_add(count).min(flow.cap);
             (flow.service.clone(), drain(flow))
         };
         self.forward_ready(ctx, instance_id, token, &service, ready);
@@ -482,7 +493,7 @@ impl Router {
             .filter(|f| f.token == token)
             && let Some(p) = f.permits.as_mut()
         {
-            *p = (*p + 1).min(f.initial);
+            *p = (*p + 1).min(f.cap);
         }
     }
 
@@ -533,7 +544,7 @@ impl Router {
                     f.assigned.remove(id);
                 }
                 if let Some(p) = f.permits.as_mut() {
-                    *p = p.saturating_add(ended.len() as u32).min(f.initial);
+                    *p = p.saturating_add(ended.len() as u32).min(f.cap);
                 }
                 drain(f)
             };
@@ -1661,12 +1672,12 @@ mod tests {
         }
         assert_eq!(forwarded(&mut f.handler_rx), ["r1"]);
         assert_eq!(f.router.queued_total(), 2);
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         assert_eq!(forwarded(&mut f.handler_rx), ["r2"]);
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         assert_eq!(forwarded(&mut f.handler_rx), ["r3"]);
         assert_eq!(f.router.queued_total(), 0);
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(
             view,
@@ -1695,7 +1706,7 @@ mod tests {
         assert_eq!(forwarded(&mut f.handler_rx), ["first"]);
         let mut order = Vec::new();
         for _ in 0..5 {
-            f.router.on_permits(&D, "h1", f.handler_token, 1);
+            f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
             order.extend(forwarded(&mut f.handler_rx));
         }
         assert_eq!(order, ["high-1", "high-2", "low-1", "low-2", "neg"]);
@@ -1715,7 +1726,7 @@ mod tests {
             0,
             "the timed-out request left the queue"
         );
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         assert!(forwarded(&mut f.handler_rx).is_empty());
     }
 
@@ -1790,7 +1801,7 @@ mod tests {
         }
         assert_eq!(forwarded(&mut f.handler_rx).len(), 20);
         // Permits for a session without flow control change nothing.
-        f.router.on_permits(&D, "h1", f.handler_token, 3);
+        f.router.on_permits(&D, "h1", f.handler_token, 3, 0);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(
             view,
@@ -1880,7 +1891,7 @@ mod tests {
         }
 
         fn permit(&self, id: &str) {
-            self.router.on_permits(&D, id, self.handlers[id].1, 1);
+            self.router.on_permits(&D, id, self.handlers[id].1, 1, 0);
         }
 
         /// Errors the sender got so far, sorted by request id.
@@ -1979,7 +1990,7 @@ mod tests {
         let mut f = flow_fixture(Config::default(), Some(1), true);
         f.router.route(&D, "s1", unkeyed("r1", 0, 0));
         f.router.route(&D, "s1", unkeyed("r2", 0, 0));
-        f.router.on_permits(&D, "h1", f.handler_token + 1000, 5);
+        f.router.on_permits(&D, "h1", f.handler_token + 1000, 5, 0);
         assert_eq!(forwarded(&mut f.handler_rx), ["r1"]);
     }
 
@@ -2019,9 +2030,71 @@ mod tests {
     #[tokio::test]
     async fn permits_never_exceed_the_initial_grant() {
         let f = flow_fixture(Config::default(), Some(2), true);
-        f.router.on_permits(&D, "h1", f.handler_token, 5);
+        f.router.on_permits(&D, "h1", f.handler_token, 5, 0);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(view.permits_available, 2);
+    }
+
+    /// A grant (multi-hub top-up) raises the cap first, so the added permits are kept.
+    #[tokio::test]
+    async fn a_grant_raises_the_cap_and_the_permits() {
+        let f = flow_fixture(Config::default(), Some(4), true);
+        f.router.on_permits(&D, "h1", f.handler_token, 4, 8);
+        let permits = |f: &FlowFx| {
+            f.router
+                .flow_by_instance()
+                .remove("h1")
+                .unwrap()
+                .permits_available
+        };
+        assert_eq!(permits(&f), 8);
+        // The raised cap is the new invariant: further permits stay within it.
+        f.router.on_permits(&D, "h1", f.handler_token, 5, 0);
+        assert_eq!(permits(&f), 8);
+    }
+
+    #[tokio::test]
+    async fn a_grant_below_the_cap_changes_nothing() {
+        let mut f = flow_fixture(Config::default(), Some(4), true);
+        for id in ["r1", "r2"] {
+            f.router.route(&D, "s1", unkeyed(id, 0, 0));
+        }
+        assert_eq!(forwarded(&mut f.handler_rx), ["r1", "r2"]);
+        // A grant of 2 never lowers the cap of 4: the two permits come back to 4, not 2.
+        f.router.on_permits(&D, "h1", f.handler_token, 2, 2);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(view.permits_available, 4);
+        f.router.on_permits(&D, "h1", f.handler_token, 3, 3);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(view.permits_available, 4, "cap still 4");
+    }
+
+    #[tokio::test]
+    async fn a_grant_is_ignored_for_an_unlimited_session() {
+        let f = flow_fixture(Config::default(), None, true);
+        f.router.on_permits(&D, "h1", f.handler_token, 3, 8);
+        let view = f.router.flow_by_instance().remove("h1").unwrap();
+        assert_eq!(
+            view,
+            FlowView {
+                flow_controlled: false,
+                permits_available: 0,
+                queued: 0
+            }
+        );
+    }
+
+    /// The raised cap is what the hub forwards up to: grant 3 with count 2 on top of the one
+    /// initial permit lets three requests through at once.
+    #[tokio::test]
+    async fn a_raised_cap_lets_that_many_requests_through() {
+        let mut f = flow_fixture(Config::default(), Some(1), true);
+        f.router.on_permits(&D, "h1", f.handler_token, 2, 3);
+        for id in ["r1", "r2", "r3", "r4"] {
+            f.router.route(&D, "s1", unkeyed(id, 0, 0));
+        }
+        assert_eq!(forwarded(&mut f.handler_rx), ["r1", "r2", "r3"]);
+        assert_eq!(f.router.queued_total(), 1);
     }
 
     fn assigned_to(router: &Router, id: &str) -> u32 {
@@ -2050,7 +2123,7 @@ mod tests {
             .dispatch(&D, "ghost", "h1", f.handler_token, unkeyed("ghost", 0, 0));
         assert_eq!(f.router.queued_total(), 0, "no orphan queue entry");
         f.router.route(&D, "s1", unkeyed("real", 0, 0));
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         assert_eq!(forwarded(&mut f.handler_rx), ["busy", "real"]);
         assert_eq!(assigned_to(&f.router, "h1"), 2, "busy and real only");
     }
@@ -2071,7 +2144,7 @@ mod tests {
             .queue
             .push(queued_item("ghost"))
             .unwrap();
-        f.router.on_permits(&D, "h1", f.handler_token, 1);
+        f.router.on_permits(&D, "h1", f.handler_token, 1, 0);
         assert!(forwarded(&mut f.handler_rx).is_empty(), "ghost not sent");
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!((view.permits_available, view.queued), (1, 0));

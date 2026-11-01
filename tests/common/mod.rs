@@ -304,8 +304,13 @@ impl FakeClient {
     }
 
     pub async fn permits(&self, count: u32) {
+        self.permits_with_grant(count, 0).await;
+    }
+
+    /// `Permits{count, grant}`: a multi-hub top-up that raises the session's cap to `grant`.
+    pub async fn permits_with_grant(&self, count: u32, grant: u32) {
         let msg = ClientMessage {
-            message: Some(client_message::Message::Permits(Permits { count })),
+            message: Some(client_message::Message::Permits(Permits { count, grant })),
         };
         self.tx.send(msg).await.unwrap();
     }

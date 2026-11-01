@@ -448,7 +448,7 @@ async fn run_stream(
             }
             Some(client_message::Message::Permits(p)) => {
                 ctx.router
-                    .on_permits(&ctx.context, &instance_id, token, p.count)
+                    .on_permits(&ctx.context, &instance_id, token, p.count, p.grant)
             }
             Some(client_message::Message::Status(status)) => {
                 // Kept only for sessions that negotiated "instance-status"; ignored otherwise.

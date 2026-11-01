@@ -404,9 +404,11 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
 
 - A v2 session that declares the `flow-control` capability and sends `Register.initial_permits > 0`
   is **flow-controlled**: the hub forwards it a request only while it has a permit (one per
-  forward) and adds permits on every `Permits{count}` it sends, never beyond its
-  `initial_permits`. Every other session (`initial_permits` 0, no capability, v1) is unlimited
-  exactly as before P1. A stream opens its flow state before its session becomes current, so a
+  forward) and adds permits on every `Permits{count}` it sends, never beyond its cap. The cap
+  starts at `initial_permits`; a `Permits.grant > 0` from the session first raises it to
+  `max(cap, grant)` (a grant never lowers it), which is how a multi-hub client moves a departed
+  hub's share to the surviving hubs (umbrella ADR 0016). Every other session (`initial_permits`
+  0, no capability, v1) is unlimited exactly as before P1; it ignores grants. A stream opens its flow state before its session becomes current, so a
   request for the session always finds it; a request for a session whose flow is gone fails with
   `HANDLER_DISCONNECTED` instead of going out unmetered. Of two concurrent handshakes of one
   instance id the newer stream wins.

@@ -111,9 +111,16 @@ message Register {
 // Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
 // per handled request, batched (16, or 50 ms after the first unsent one), and at once when the
 // permits still held by the hub are down to min(16, initial_permits / 2). The hub never lets a
-// session hold more than its initial_permits. Ignored for sessions without flow control.
+// session hold more than its cap, which starts at initial_permits. Ignored for sessions without
+// flow control.
 message Permits {
   uint32 count = 1;
+  // Multi-hub HA (ADR 0016): when > 0, the hub first raises this session's cap to
+  // max(cap, grant), then adds `count` (still clamped at the cap). A grant never lowers the cap
+  // and is ignored for unlimited sessions (initial_permits 0 or no flow control). Clients send it
+  // with the top-up that moves a departed hub's share to the surviving ones; a hub that predates
+  // the field ignores it and keeps clamping at initial_permits.
+  uint32 grant = 2;
 }
 
 // Multi-hub HA (ADR 0016): an instance connected to several hubs reports, on each of its
