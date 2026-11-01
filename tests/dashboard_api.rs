@@ -288,7 +288,8 @@ async fn types_topology_settings_and_version_have_their_shape() {
             "flow-control",
             "instance-status",
             "scatter-gather",
-            "streaming"
+            "streaming",
+            "subscription"
         ])
     );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));

@@ -106,6 +106,10 @@ pub struct SessionMeta {
     /// STREAMING, is a target for them, and sends and receives the multi-part messages
     /// (ADR 0017, P4b).
     pub streaming: bool,
+    /// The session is v2 and shares the "subscription" capability: it may send requests with
+    /// mode SUBSCRIPTION, is a target for them, and sends and receives the multi-part messages
+    /// (ADR 0017, P4c).
+    pub subscription: bool,
 }
 
 impl SessionMeta {
@@ -122,6 +126,7 @@ impl SessionMeta {
             instance_status: false,
             scatter_gather: false,
             streaming: false,
+            subscription: false,
         }
     }
 
@@ -162,6 +167,8 @@ pub struct SenderInfo {
     pub scatter_gather: bool,
     /// The session shares "streaming".
     pub streaming: bool,
+    /// The session shares "subscription".
+    pub subscription: bool,
 }
 
 /// Read-only copy of one session's observable state, for the topology view.
@@ -293,6 +300,7 @@ impl Sessions {
                 protocol_version: s.meta.protocol_version,
                 scatter_gather: s.meta.scatter_gather,
                 streaming: s.meta.streaming,
+                subscription: s.meta.subscription,
             })
     }
 
@@ -304,6 +312,26 @@ impl Sessions {
             .unwrap()
             .get(instance_id)
             .is_some_and(|s| s.context == *ctx && s.meta.streaming)
+    }
+
+    /// True when the current session of `instance_id` negotiated the "subscription" capability
+    /// (ADR 0017, P4c: it serves subscription queries and understands the multi-part messages).
+    pub fn negotiated_subscription(&self, ctx: &ContextId, instance_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .is_some_and(|s| s.context == *ctx && s.meta.subscription)
+    }
+
+    /// True when the current session of `instance_id` understands the multi-part messages
+    /// (`ReplyPart`, `ReplyEnd`, `Flow`, `Cancel`): it negotiated "streaming" or "subscription".
+    pub fn negotiated_multipart(&self, ctx: &ContextId, instance_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .is_some_and(|s| s.context == *ctx && (s.meta.streaming || s.meta.subscription))
     }
 
     /// The token of the current session of `instance_id`, if any.
@@ -793,6 +821,42 @@ mod tests {
             status_of(&sessions, "a").unwrap().connected_hub_ids,
             ["h2", "h1"]
         );
+    }
+
+    #[test]
+    fn the_multipart_capabilities_are_read_per_session() {
+        let sessions = Sessions::new();
+        let mut rxs = Vec::new();
+        for (id, streaming, subscription) in [
+            ("plain", false, false),
+            ("stream", true, false),
+            ("sub", false, true),
+            ("both", true, true),
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            rxs.push(rx);
+            let meta = SessionMeta {
+                protocol_version: 2,
+                streaming,
+                subscription,
+                ..SessionMeta::v1(Duration::from_secs(10))
+            };
+            sessions.insert(&D, id, "svc", meta, tx, CancellationToken::new());
+        }
+        let negotiated = |id: &str| {
+            (
+                sessions.negotiated_streaming(&D, id),
+                sessions.negotiated_subscription(&D, id),
+                sessions.negotiated_multipart(&D, id),
+            )
+        };
+        assert_eq!(negotiated("plain"), (false, false, false));
+        assert_eq!(negotiated("stream"), (true, false, true));
+        assert_eq!(negotiated("sub"), (false, true, true));
+        assert_eq!(negotiated("both"), (true, true, true));
+        assert_eq!(negotiated("nobody"), (false, false, false));
+        let info = sessions.sender_info(&D, "sub").unwrap();
+        assert!(info.subscription && !info.streaming);
     }
 
     #[test]

@@ -298,6 +298,8 @@ async fn run_stream(
     let scatter_gather = v2 && protocol::shares(&first.capabilities, protocol::SCATTER_GATHER);
     // And whether it sends or serves streaming queries (ADR 0017, P4b).
     let streaming = v2 && protocol::shares(&first.capabilities, protocol::STREAMING);
+    // And subscription queries (ADR 0017, P4c).
+    let subscription = v2 && protocol::shares(&first.capabilities, protocol::SUBSCRIPTION);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -317,6 +319,7 @@ async fn run_stream(
         instance_status,
         scatter_gather,
         streaming,
+        subscription,
     };
     let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed
@@ -480,17 +483,18 @@ async fn run_stream(
                     debug!(instance = %instance_id, "InstanceStatus without the capability ignored");
                 }
             }
-            // Multi-part messages from a client (ADR 0017, P4b): a handler's streamed parts and
-            // end, a sender's credits and cancellation. Only a session that negotiated
-            // "streaming" sends them meaningfully; from any other they are ignored.
+            // Multi-part messages from a client (ADR 0017, P4b and P4c): a handler's streamed
+            // parts and end (or pushed updates), a sender's credits and cancellation. Only a
+            // session that negotiated "streaming" or "subscription" sends them meaningfully;
+            // from any other they are ignored.
             Some(
                 m @ (client_message::Message::Part(_)
                 | client_message::Message::End(_)
                 | client_message::Message::Flow(_)
                 | client_message::Message::Cancel(_)),
             ) => {
-                if !streaming {
-                    debug!(instance = %instance_id, "multi-part client message without the streaming capability ignored");
+                if !streaming && !subscription {
+                    debug!(instance = %instance_id, "multi-part client message without the streaming or subscription capability ignored");
                     continue;
                 }
                 match m {
