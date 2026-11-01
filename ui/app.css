@@ -144,6 +144,7 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .hub { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .hub .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
 .chip.self { font-weight: 600; }
+.card .tiles { margin-bottom: 12px; }
 
 .top-actions {
   display: flex;
@@ -319,8 +320,9 @@ table.data td {
 table.data tr:last-child td { border-bottom: 0; }
 
 /* Instance tables line up across service cards. */
-table.data.instances { table-layout: fixed; min-width: 1150px; }
-table.data.instances.merged { min-width: 1300px; }
+table.data.instances { table-layout: fixed; min-width: 1100px; }
+table.data.instances.merged { min-width: 1200px; }
+table.data.instances td.nowrap:not(:first-child) { overflow: hidden; text-overflow: ellipsis; }
 table.data.instances td:first-child, table.data.instances td:nth-child(n+11) { overflow-wrap: anywhere; white-space: normal; }
 table.data.instances th:nth-child(1) { width: 17%; }
 table.data.instances th:nth-child(2) { width: 14%; }
