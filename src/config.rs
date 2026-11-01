@@ -54,6 +54,10 @@ pub struct Config {
     /// Type ownership is kept this long after the last instance leaves.
     /// `KRAKEN_HUB_OWNER_GRACE`, default 60 s.
     pub owner_grace: Duration,
+    /// A streaming query (ADR 0017, P4b) open for longer than this ends with
+    /// `ReplyEnd{error = CANCELLED}` and a `Cancel` to its handler, however active it is.
+    /// `KRAKEN_HUB_MAX_STREAM_DURATION`, default 10 minutes, at least 1 s.
+    pub max_stream_duration: Duration,
     /// Per-session outbound buffer, in messages. `KRAKEN_HUB_SESSION_BUFFER`, default 1024.
     pub session_buffer: usize,
     /// A new `Connect` stream must send `Register` within this long or it is closed with
@@ -98,6 +102,7 @@ impl Default for Config {
             queue_bytes_per_instance: 64 * 1024 * 1024,
             queue_bytes_total: 512 * 1024 * 1024,
             owner_grace: Duration::from_secs(60),
+            max_stream_duration: Duration::from_secs(600),
             session_buffer: 1024,
             handshake_timeout: Duration::from_secs(10),
             dashboard_enabled: true,
@@ -175,6 +180,9 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_OWNER_GRACE") {
             c.owner_grace = parse_duration(&v).context("KRAKEN_HUB_OWNER_GRACE")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_MAX_STREAM_DURATION") {
+            c.max_stream_duration = parse_duration(&v).context("KRAKEN_HUB_MAX_STREAM_DURATION")?;
+        }
         if let Some(v) = var("KRAKEN_HUB_SESSION_BUFFER") {
             c.session_buffer = v.parse().context("KRAKEN_HUB_SESSION_BUFFER")?;
         }
@@ -226,6 +234,12 @@ impl Config {
             bail!(
                 "KRAKEN_HUB_EDGE_STATS_WINDOW ({:?}) must be at least {MIN_EDGE_STATS_WINDOW:?}",
                 self.edge_stats_window
+            );
+        }
+        if self.max_stream_duration < MIN_MAX_STREAM_DURATION {
+            bail!(
+                "KRAKEN_HUB_MAX_STREAM_DURATION ({:?}) must be at least {MIN_MAX_STREAM_DURATION:?}",
+                self.max_stream_duration
             );
         }
         if let Some(url) = &self.grafana_url {
@@ -283,6 +297,9 @@ const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
 
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
+
+/// Below a second a streaming query could never deliver anything.
+const MIN_MAX_STREAM_DURATION: Duration = Duration::from_secs(1);
 
 /// A URL the dashboard may put in a link: `http://` or `https://` with a host, no user info, no
 /// whitespace or control characters (so it can never be a `javascript:` link or break out of an attribute).
@@ -736,6 +753,24 @@ mod tests {
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "0")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "9s")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "10s")]).is_ok());
+    }
+
+    #[test]
+    fn max_stream_duration_defaults_to_ten_minutes_and_needs_at_least_a_second() {
+        assert_eq!(
+            Config::default().max_stream_duration,
+            Duration::from_secs(600)
+        );
+        let c = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "90s")]).unwrap();
+        assert_eq!(c.max_stream_duration, Duration::from_secs(90));
+        let c = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "1s")]).unwrap();
+        assert_eq!(c.max_stream_duration, Duration::from_secs(1));
+        let err = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "500ms")]).unwrap_err();
+        assert!(
+            err.to_string().contains("KRAKEN_HUB_MAX_STREAM_DURATION"),
+            "{err:#}"
+        );
+        assert!(with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "soon")]).is_err());
     }
 
     #[test]

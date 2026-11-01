@@ -633,6 +633,13 @@ pub fn settings(c: &Config) -> SettingsView {
             "type ownership kept after the last instance leaves",
         ),
         setting(
+            "KRAKEN_HUB_MAX_STREAM_DURATION",
+            fmt_duration(c.max_stream_duration),
+            Some(fmt_duration(d.max_stream_duration)),
+            Plain,
+            "a streaming query open for longer ends with CANCELLED and its handler is cancelled",
+        ),
+        setting(
             "KRAKEN_HUB_SESSION_BUFFER",
             c.session_buffer.to_string(),
             Some(d.session_buffer.to_string()),
@@ -1054,8 +1061,12 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 22);
+        assert_eq!(v.settings.len(), 23);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
+        assert_eq!(
+            get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
+            Some("10m")
+        );
         assert_eq!(get("KRAKEN_HUB_ID").default, None);
         let t = get("KRAKEN_HUB_DEFAULT_TIMEOUT_MS");
         assert_eq!(
