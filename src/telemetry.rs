@@ -183,6 +183,8 @@ pub struct Metrics {
     scatter_targets: Histogram<u64>,
     streams_open: UpDownCounter<i64>,
     stream_parts: Counter<u64>,
+    subscriptions_open: UpDownCounter<i64>,
+    subscription_updates: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -260,6 +262,14 @@ impl Metrics {
             stream_parts: meter
                 .u64_counter("kraken_hub_stream_parts_total")
                 .with_description("Parts of streaming queries relayed, per handler service and type")
+                .build(),
+            subscriptions_open: meter
+                .i64_up_down_counter("kraken_hub_subscriptions_open")
+                .with_description("Subscription query targets open, per handler service and instance")
+                .build(),
+            subscription_updates: meter
+                .u64_counter("kraken_hub_subscription_updates_total")
+                .with_description("Updates of subscription queries relayed, per handler service and type")
                 .build(),
             seen: Mutex::new(Seen::default()),
         })
@@ -372,6 +382,29 @@ impl Metrics {
     /// A part of a streaming query of `type_name`, served by `service`, was relayed.
     pub fn stream_part(&self, service: &str, type_name: &str) {
         self.stream_parts.add(
+            1,
+            &[
+                KeyValue::new("service", service.to_string()),
+                KeyValue::new("type", type_name.to_string()),
+            ],
+        );
+    }
+
+    /// A subscription query (ADR 0017, P4c) got `instance` of `service` as a target.
+    pub fn subscription_opened(&self, service: &str, instance: &str) {
+        self.subscriptions_open
+            .add(1, &stream_attrs(service, instance));
+    }
+
+    /// A subscription target served by `instance` of `service` ended, however.
+    pub fn subscription_closed(&self, service: &str, instance: &str) {
+        self.subscriptions_open
+            .add(-1, &stream_attrs(service, instance));
+    }
+
+    /// An update of a subscription query of `type_name`, pushed by `service`, was relayed.
+    pub fn subscription_update(&self, service: &str, type_name: &str) {
+        self.subscription_updates.add(
             1,
             &[
                 KeyValue::new("service", service.to_string()),
@@ -612,6 +645,36 @@ mod tests {
             "{attrs:?}"
         );
         assert_eq!(point.value(), 1);
+    }
+
+    /// The subscription instruments (ADR 0017, P4c): a gauge per handler instance and a counter
+    /// per handler service and type.
+    #[test]
+    fn subscription_instruments_count_open_targets_and_relayed_updates() {
+        let m = test_support::test_metrics();
+        m.metrics.subscription_opened("A", "a1");
+        m.metrics.subscription_opened("A", "a1");
+        m.metrics.subscription_opened("B", "b1");
+        m.metrics.subscription_closed("A", "a1");
+        m.metrics.subscription_update("A", "q.Watch");
+        m.metrics.subscription_update("A", "q.Watch");
+        m.metrics.subscription_update("B", "q.Watch");
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_subscription_updates_total", "service", "A"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_subscription_updates_total", "type", "q.Watch"),
+            Some(3)
+        );
     }
 
     fn exporter_and_metrics() -> (InMemoryMetricExporter, SdkMeterProvider, Arc<Metrics>) {
