@@ -13,7 +13,8 @@
 //!   (of every owner, for a shared type) ([`Target::Candidates`]); the router picks one by tag
 //!   match and load (ADR 0014). [`Registry::pick`] keeps the plain round-robin choice for callers
 //!   without load information;
-//! - a scatter-gather query goes to every live instance of every owner ([`Registry::scatter_targets`]).
+//! - a scatter-gather query goes to every live instance of every owner that lists the type
+//!   ([`Registry::scatter_targets`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -653,9 +654,11 @@ impl Registry {
         ))
     }
 
-    /// Every live instance of every owner of `type_name` (on an exclusive type, every instance
-    /// of its owner), sorted by service then instance id, and the type's kind (the router
-    /// rejects a scatter-gather command).
+    /// Every live instance of every owner of `type_name` that lists the type (on an exclusive
+    /// type, those instances of its owner), sorted by service then instance id, and the type's
+    /// kind (the router rejects a scatter-gather command). Unlike unary routing, an instance of
+    /// an owner that did not register the type is no target: during a rolling deploy that adds
+    /// a type, the old instances would only answer `NO_HANDLER`, a failed part in every gather.
     pub fn scatter_targets(
         &self,
         ctx: &ContextId,
@@ -664,14 +667,21 @@ impl Registry {
         check_context(ctx);
         let inner = self.inner.lock().unwrap();
         let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
+        let lists_type = |id: &InstanceId| {
+            inner
+                .instances
+                .get(id)
+                .is_some_and(|e| e.types.iter().any(|(t, _)| t == type_name))
+        };
         let targets: Vec<ScatterTarget> = owner
             .live_services()
             .filter_map(|s| inner.services.get(s).map(|svc| (s, svc)))
             .flat_map(|(s, svc)| {
-                candidates_of(svc, &inner.instances)
-                    .into_iter()
-                    .map(|c| ScatterTarget {
-                        id: c.id,
+                svc.instances
+                    .iter()
+                    .filter(|id| lists_type(id))
+                    .map(|id| ScatterTarget {
+                        id: id.clone(),
                         service: s.clone(),
                     })
             })
@@ -1378,6 +1388,27 @@ mod tests {
         // An instance without types (stopping) is no target.
         r.register(&D, "b2", "B", &[], &[]).unwrap();
         assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().1.len(), 2);
+    }
+
+    /// A rolling deploy of B adds the shared "q.New": b1 (old) does not list it, b2 does. A
+    /// gather asks only b2 (b1 would answer NO_HANDLER); a point query keeps every instance of
+    /// the owner (the homogeneity assumption of unary routing).
+    #[test]
+    fn scatter_targets_are_only_the_instances_that_list_the_type() {
+        let r = reg();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        shared(&r, "b2", "B", &["q.Find", "q.New"]).unwrap();
+        let (_, targets) = r.scatter_targets(&D, "q.New").unwrap();
+        let ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["b2"]);
+        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().1.len(), 2);
+        assert_eq!(candidate_ids(&r, "q.New").0, ["b1", "b2"]);
+        // An exclusive type: the same rule.
+        r.register(&D, "x1", "X", &[], &s(&["q.Own"])).unwrap();
+        r.register(&D, "x2", "X", &[], &s(&["q.Own", "q.Other"]))
+            .unwrap();
+        assert_eq!(r.scatter_targets(&D, "q.Own").unwrap().1.len(), 2);
+        assert_eq!(r.scatter_targets(&D, "q.Other").unwrap().1.len(), 1);
     }
 
     #[test]

@@ -471,9 +471,10 @@ umbrella `docs/05-services/hub.md` (Query modes).
   live instance of any owner: one pool over every owner, then the routing above, with one
   round-robin rotation per type.
 - **Scatter-gather.** A v2 sender that declared `scatter-gather` sends a query with
-  `Request.mode = SCATTER_GATHER`. Every live instance of every owner (on an exclusive type,
-  every instance of its owner) gets an ordinary unary `Request` with id `<id>#<n>`: v1 handlers
-  serve it unchanged, and flow control, queues and priority apply per target. Each answer reaches
+  `Request.mode = SCATTER_GATHER`. Every live instance of every owner that lists the type (on an
+  exclusive type, those instances of its owner; an old instance of a rolling deploy that adds the
+  type is no target) gets an ordinary unary `Request` with id `<id>#<n>`: v1 handlers serve it
+  unchanged, and flow control, queues and priority apply per target. Each answer reaches
   the sender as a `ReplyPart` (`request_id` = the sender's id, `seq` in send order, responder
   service and instance, payload or error), then one `ReplyEnd{parts, failed, timed_out}` once
   every target answered, `max_results > 0` successful parts arrived, or the deadline passed.
