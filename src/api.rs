@@ -96,6 +96,9 @@ pub struct Version {
     pub grafana_url: Option<String>,
     /// The edge-statistics window.
     pub window_ms: i64,
+    /// `KRAKEN_HUB_PEERS` as origins (ADR 0016): the hubs whose APIs the page merges. May list
+    /// this hub; the page skips it by hub id. Empty: the page shows this hub only.
+    pub peers: Vec<String>,
 }
 
 pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
@@ -113,6 +116,7 @@ pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
         // The config check rejects user info; dropped here too, as this route is unauthenticated.
         grafana_url: config.grafana_url.as_deref().map(without_userinfo),
         window_ms: ms(config.edge_stats_window),
+        peers: config.peers.clone(),
     }
 }
 
@@ -658,6 +662,13 @@ pub fn settings(c: &Config) -> SettingsView {
             Plain,
             "sliding window of the edge statistics",
         ),
+        setting(
+            "KRAKEN_HUB_PEERS",
+            c.peers.join(","),
+            Some(d.peers.join(",")),
+            Plain,
+            "other hubs' dashboard URLs the page merges (CORS and CSP allow exactly these)",
+        ),
     ];
     SettingsView { settings: s }
 }
@@ -937,7 +948,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 21);
+        assert_eq!(v.settings.len(), 22);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(get("KRAKEN_HUB_ID").default, None);
         let t = get("KRAKEN_HUB_DEFAULT_TIMEOUT_MS");

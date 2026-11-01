@@ -71,10 +71,25 @@ impl HttpResponse {
 
 /// Like [`http_get`], with the response headers.
 pub async fn http_get_full(addr: SocketAddr, path: &str) -> HttpResponse {
+    http_request(addr, "GET", path, &[]).await
+}
+
+/// One HTTP/1.1 request with extra headers (`name`, `value`), bounded to 3 s.
+pub async fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> HttpResponse {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let extra: String = headers
+        .iter()
+        .map(|(n, v)| format!("{n}: {v}\r\n"))
+        .collect();
     let fut = async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let request =
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await.unwrap();

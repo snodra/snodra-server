@@ -282,7 +282,10 @@ async fn types_topology_settings_and_version_have_their_shape() {
     let v = json(http, "/api/v1/version").await;
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(v["protocolVersion"], 2);
-    assert_eq!(v["capabilities"], serde_json::json!(["flow-control"]));
+    assert_eq!(
+        v["capabilities"],
+        serde_json::json!(["flow-control", "instance-status"])
+    );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(v["startedAtMs"].as_i64().unwrap() <= v["nowMs"].as_i64().unwrap());
     assert!(v["buildId"].as_str().is_some_and(|b| !b.is_empty()));

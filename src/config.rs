@@ -72,6 +72,12 @@ pub struct Config {
     /// Sliding window of the edge statistics. `KRAKEN_HUB_EDGE_STATS_WINDOW`, default 5 minutes,
     /// at least 10 s.
     pub edge_stats_window: Duration,
+    /// The other hubs' dashboards, as their HTTP base URLs reachable from the operator's browser
+    /// (ADR 0016). `KRAKEN_HUB_PEERS`, comma-separated, default none. Normalised to origins
+    /// (`scheme://host[:port]`, lowercase, default port dropped), deduplicated, at most
+    /// [`MAX_PEERS`]. The list may include this hub (the page skips it by hub id). The dashboard
+    /// merges the peers in the browser; each peer answers CORS for these origins only.
+    pub peers: Vec<String>,
 }
 
 impl Default for Config {
@@ -98,6 +104,7 @@ impl Default for Config {
             grafana_url: None,
             edge_stats_max_edges: 10_000,
             edge_stats_window: Duration::from_secs(300),
+            peers: Vec::new(),
         }
     }
 }
@@ -188,6 +195,9 @@ impl Config {
         }
         if let Some(v) = var("KRAKEN_HUB_EDGE_STATS_WINDOW") {
             c.edge_stats_window = parse_duration(&v).context("KRAKEN_HUB_EDGE_STATS_WINDOW")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_PEERS") {
+            c.peers = parse_peers(&v).context("KRAKEN_HUB_PEERS")?;
         }
         c.validate()?;
         Ok(c)
@@ -300,6 +310,92 @@ fn check_link_url(url: &str) -> anyhow::Result<()> {
         bail!("{url:?} contains whitespace or control characters");
     }
     Ok(())
+}
+
+/// Peer hubs a dashboard merges at most (`KRAKEN_HUB_PEERS`).
+pub const MAX_PEERS: usize = 16;
+
+/// `KRAKEN_HUB_PEERS`: comma-separated base URLs, each normalised by [`peer_origin`], blanks and
+/// duplicates dropped, at most [`MAX_PEERS`].
+fn parse_peers(s: &str) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let origin = peer_origin(entry)?;
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    if out.len() > MAX_PEERS {
+        bail!(
+            "{} peers listed; at most {MAX_PEERS} are allowed",
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+/// The browser origin of a peer's base URL: `http://` or `https://`, a host (name, IPv4, or
+/// `[IPv6]`), an optional port, and no path beyond `/`, no query, fragment or user info. Scheme
+/// and host are lowercased and the scheme's default port dropped, as browsers serialise an
+/// `Origin` header, so the CORS check can compare exactly.
+pub fn peer_origin(url: &str) -> anyhow::Result<String> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        bail!("{url:?} must start with http:// or https://");
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => bail!("{url:?} must start with http:// or https://"),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // Checked before anything echoes the URL: the value may hold a password.
+    if authority.contains('@') {
+        bail!("a peer URL carries user info (user:password@); peers are plain base URLs");
+    }
+    if !tail.is_empty() && tail != "/" {
+        bail!("{url:?} has a path, query or fragment; give the hub's base URL (http://host:port)");
+    }
+    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
+        let Some((v6, port)) = after.split_once(']') else {
+            bail!("{url:?} has an unclosed IPv6 address");
+        };
+        if v6.is_empty()
+            || !v6
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            bail!("{url:?} has an invalid IPv6 address");
+        }
+        (format!("[{}]", v6.to_ascii_lowercase()), port)
+    } else {
+        let end = authority.find(':').unwrap_or(authority.len());
+        let (host, port) = authority.split_at(end);
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            bail!("{url:?} has no valid host");
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    let port = match port {
+        "" => None,
+        p => {
+            let n: u16 = p
+                .strip_prefix(':')
+                .and_then(|d| d.parse().ok())
+                .filter(|n| *n > 0)
+                .with_context(|| format!("{url:?} has an invalid port"))?;
+            (n != default_port).then_some(n)
+        }
+    };
+    Ok(match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 /// `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, any case.
@@ -640,6 +736,99 @@ mod tests {
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "0")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "9s")]).is_err());
         assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "10s")]).is_ok());
+    }
+
+    #[test]
+    fn peers_default_to_none() {
+        assert!(Config::default().peers.is_empty());
+        assert!(
+            with_env(&[("KRAKEN_HUB_PEERS", "")])
+                .unwrap()
+                .peers
+                .is_empty()
+        );
+        assert!(
+            with_env(&[("KRAKEN_HUB_PEERS", " , ")])
+                .unwrap()
+                .peers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn peers_are_normalised_to_origins_and_deduplicated() {
+        let c = with_env(&[(
+            "KRAKEN_HUB_PEERS",
+            " http://localhost:7001 ,HTTP://LocalHost:7011/, https://hub.example, \
+             http://localhost:7001/, https://hub.example:443, http://10.0.0.5:80/, http://[::1]:7001",
+        )])
+        .unwrap();
+        assert_eq!(
+            c.peers,
+            [
+                "http://localhost:7001",
+                "http://localhost:7011",
+                "https://hub.example",
+                "http://10.0.0.5",
+                "http://[::1]:7001",
+            ]
+        );
+    }
+
+    #[test]
+    fn peers_must_be_plain_http_origins() {
+        for bad in [
+            "localhost:7001",
+            "ftp://hub.example",
+            "javascript:alert(1)",
+            "http://",
+            "http:///x",
+            "http://user:pw@hub.example",
+            "http://hub.example/ui",
+            "http://hub.example/?a=1",
+            "http://hub.example?a=1",
+            "http://hub.example#x",
+            "http://hub.example:notaport",
+            "http://hub.example:0",
+            "http://hub.example:70000",
+            "http://hub example",
+            "http://hub.example\u{7}",
+            "http://hub.example,https://ok.example/path",
+        ] {
+            let err =
+                with_env(&[("KRAKEN_HUB_PEERS", bad)]).expect_err(&format!("{bad:?} accepted"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("KRAKEN_HUB_PEERS"), "{msg}");
+            assert!(!msg.contains("pw@"), "the message echoes user info: {msg}");
+        }
+    }
+
+    #[test]
+    fn at_most_sixteen_peers() {
+        let list = |n: u16| {
+            (0..n)
+                .map(|i| format!("http://hub-{i}:7001"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(
+            with_env(&[("KRAKEN_HUB_PEERS", &list(16))])
+                .unwrap()
+                .peers
+                .len(),
+            16
+        );
+        let err = with_env(&[("KRAKEN_HUB_PEERS", &list(17))]).unwrap_err();
+        assert!(format!("{err:#}").contains("at most 16"), "{err:#}");
+        // Duplicates count once.
+        let twice = format!("{},{}", list(16), list(16));
+        assert_eq!(
+            with_env(&[("KRAKEN_HUB_PEERS", &twice)])
+                .unwrap()
+                .peers
+                .len(),
+            16
+        );
     }
 
     #[test]

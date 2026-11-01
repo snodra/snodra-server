@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -40,10 +40,20 @@ pub const STREAM_EVERY: Duration = Duration::from_secs(2);
 pub const MAX_STREAMS: usize = 64;
 
 /// `Content-Security-Policy` of every dashboard and API response: only the hub's own scripts,
-/// styles, images and API; no inline script or style, no framing, no plugins.
-pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; \
-connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; \
-frame-ancestors 'none'";
+/// styles, images and API, plus the peer hubs' APIs (`KRAKEN_HUB_PEERS`, ADR 0016) for
+/// `connect-src`; no inline script or style, no framing, no plugins.
+pub fn csp(peers: &[String]) -> String {
+    let mut connect = String::from("'self'");
+    for peer in peers {
+        connect.push(' ');
+        connect.push_str(peer);
+    }
+    format!(
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; \
+connect-src {connect}; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; \
+frame-ancestors 'none'"
+    )
+}
 
 /// Everything the HTTP handlers read; the same `Arc`s the gRPC service holds.
 #[derive(Clone)]
@@ -100,38 +110,107 @@ impl HttpState {
 }
 
 /// The HTTP routes: `/topology` always; the dashboard (`/`, `/ui` redirect to `/ui/`) and its
-/// API when enabled. Unknown paths are 404.
+/// API when enabled. Unknown paths are 404. The API answers CORS for the peer origins only.
 pub fn app(state: HttpState) -> axum::Router {
     let mut app = axum::Router::new().route("/topology", get(get_topology));
     if state.config.dashboard_enabled {
+        // Peer origins are validated at startup (no control characters), so the header is valid.
+        let csp = HeaderValue::from_str(&csp(&state.config.peers))
+            .expect("the CSP is a valid header value");
+        let peers: Arc<[String]> = state.config.peers.clone().into();
         let api = axum::Router::new()
-            .route("/", get(assets::to_index))
-            .route("/ui", get(assets::to_index))
-            .route("/ui/", get(assets::index))
-            .route("/ui/v/{build}/{*path}", get(assets::asset))
             .route("/api/v1/topology", get(api_topology))
             .route("/api/v1/types", get(api_types))
             .route("/api/v1/graph", get(api_graph))
             .route("/api/v1/settings", get(api_settings))
             .route("/api/v1/version", get(api_version))
             .route("/api/v1/stream", get(api_stream))
-            .layer(axum::middleware::map_response(security_headers));
-        app = app.merge(api);
+            .layer(axum::middleware::from_fn_with_state(peers, cors));
+        let site = axum::Router::new()
+            .route("/", get(assets::to_index))
+            .route("/ui", get(assets::to_index))
+            .route("/ui/", get(assets::index))
+            .route("/ui/v/{build}/{*path}", get(assets::asset))
+            .merge(api)
+            .layer(axum::middleware::map_response(move |r: Response| {
+                let csp = csp.clone();
+                async move { security_headers(r, csp) }
+            }));
+        app = app.merge(site);
     }
     app.with_state(state)
 }
 
 /// Headers every dashboard and API response carries.
-pub async fn security_headers(mut response: Response) -> Response {
+pub fn security_headers(mut response: Response, csp: HeaderValue) -> Response {
     let h = response.headers_mut();
     let set = |h: &mut axum::http::HeaderMap, name: HeaderName, value: &'static str| {
         h.entry(name)
             .or_insert_with(|| HeaderValue::from_static(value));
     };
-    set(h, header::CONTENT_SECURITY_POLICY, CSP);
+    h.entry(header::CONTENT_SECURITY_POLICY).or_insert(csp);
     set(h, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     set(h, header::REFERRER_POLICY, "no-referrer");
     set(h, header::X_FRAME_OPTIONS, "DENY");
+    response
+}
+
+/// CORS for `/api/v1/*` (ADR 0016): a request whose `Origin` is exactly one of the peer origins
+/// gets it back in `Access-Control-Allow-Origin` (never a wildcard, never credentials), so a
+/// peer hub's dashboard can merge this hub in the browser. A preflight (`OPTIONS` with
+/// `Access-Control-Request-Method`) is answered 204 for a peer asking for `GET`, else 403. Other
+/// origins get no CORS header, so the browser keeps the answer from their scripts.
+async fn cors(
+    State(peers): State<Arc<[String]>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .filter(|o| peers.iter().any(|p| p == o))
+        .map(str::to_string);
+    let preflight = request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    let mut response = if preflight {
+        let wants_get = request
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .is_some_and(|m| m == "GET");
+        if origin.is_none() || !wants_get {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        let h = r.headers_mut();
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("accept"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+        r
+    } else {
+        next.run(request).await
+    };
+    if !peers.is_empty() {
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("origin"));
+    }
+    if let Some(origin) = origin.and_then(|o| HeaderValue::from_str(&o).ok()) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
     response
 }
 
