@@ -80,6 +80,9 @@ cargo run
 | `KRAKEN_HUB_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all flow-controlled instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_MAX_STREAM_DURATION` | `10m` | a [streaming query](#query-modes) open for longer ends with `ReplyEnd{error = CANCELLED}` and its handler is cancelled; at least `1s` |
+| `KRAKEN_HUB_SUBSCRIPTION_BUFFER` | `256` | updates of a [subscription](#query-modes) the hub holds while its sender owes credit; one more ends it with `ReplyEnd{error = RESOURCE_EXHAUSTED}`; positive |
+| `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` | `1024` | subscription targets one handler instance serves at once; a subscription that would exceed it on any target is refused with `Error{RESOURCE_EXHAUSTED}` before anything is sent; positive |
+| `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` | `0` | a subscription open for longer ends with `ReplyEnd{error = CANCELLED}` and its targets are cancelled; `0` is unlimited, otherwise at least `1s` |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
 | `KRAKEN_HUB_DASHBOARD_ENABLED` | `true` | serve the read-only dashboard (`/ui/`) and its API (`/api/v1/`) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -365,7 +368,8 @@ and optionally `credentials`) and then `Heartbeat` messages. A `Request` (kind, 
 optional `timeout_ms`) is routed to one live instance of the service that owns the type; the
 handler answers with a `Reply` carrying the same id, which the hub relays to the sender. Each
 request id gets exactly one terminal message: a `Reply` or a hub-produced error; a
-[scatter-gather or streaming](#query-modes) query gets `ReplyPart`s and one `ReplyEnd` instead. The hub forwards
+[scatter-gather, streaming or subscription](#query-modes) query gets `ReplyPart`s and one
+`ReplyEnd` instead. The hub forwards
 the `Request` (headers included) unchanged and parents its `hub.route` span on the request's
 trace headers.
 
@@ -374,19 +378,22 @@ Error codes:
 - Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, **Builder call:**
   `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
   `Request.id`), `RESOURCE_EXHAUSTED` (full queue or session buffer; only to senders that
-  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`), `UNSUPPORTED` (a
-  v2 sender using a request mode it did not declare, one this hub does not implement yet, or a
-  streaming query whose owners have no instance with `streaming`) and `CANCELLED` (as
-  `ReplyEnd.error` of a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION`).
+  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`; also a subscription
+  refused by `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` or ended by a full
+  `KRAKEN_HUB_SUBSCRIPTION_BUFFER`), `UNSUPPORTED` (a v2 sender using a request mode it did not
+  declare, one this hub does not implement, or a streaming query or subscription whose owners
+  have no instance with the capability) and `CANCELLED` (as `ReplyEnd.error` of a stream that
+  outlived `KRAKEN_HUB_MAX_STREAM_DURATION` or a subscription that outlived
+  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`).
 - Handler-produced codes in a `Reply{error}`, a `ReplyPart.error` or a `ReplyEnd.error` are
   forwarded unchanged.
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
-`invalid_request`, `resource_exhausted`, `unsupported` and `cancelled` (a stream the sender
-cancelled, or one that outlived the max duration); `kraken_hub_requests_total` and
+`invalid_request`, `resource_exhausted`, `unsupported` and `cancelled` (a stream or subscription
+the sender cancelled, or one that outlived its max duration); `kraken_hub_requests_total` and
 `kraken_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
-`streaming`), so a gather's or stream's latency (to its `ReplyEnd`) stays apart from the unary
-latency of the same type.
+`streaming`, `subscription`), so a gather's or stream's latency (to its `ReplyEnd`) and a
+subscription's (to its initial part) stay apart from the unary latency of the same type.
 **Builder call:** any handler `Reply{error}` counts as
 `handler_error`, whatever its code; a capacity rejection by the hub (full queue or session
 buffer) counts as `resource_exhausted` whichever code the sender got.
@@ -402,21 +409,22 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
 |---|---|---|
 | `RegisterAck` | never | after every accepted `Register`; the first one is queued before the echo of the heartbeat that follows the `Register` |
 | Heartbeat timeout | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` (30 s) | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s), announced with the 3 s interval |
-| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck`; `RESOURCE_EXHAUSTED` with `flow-control`; `UNSUPPORTED`; `ReplyPart` and `ReplyEnd` with `scatter-gather`; those plus `Flow`, `Cancel`, `CANCELLED` and requests with `mode = STREAMING` with `streaming` |
+| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck`; `RESOURCE_EXHAUSTED` with `flow-control`; `UNSUPPORTED`; `ReplyPart` and `ReplyEnd` with `scatter-gather`; those plus `Flow`, `Cancel`, `CANCELLED` and requests with `mode = STREAMING` with `streaming`; the same set and requests with `mode = SUBSCRIPTION` with `subscription` |
 
 - The version, capabilities and client version are read from the first `Register` of a stream; a
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
 - The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`, `scatter-gather`, `streaming`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `instance-status`, `scatter-gather`, `streaming`, `subscription`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
 - `credentials` (static token or JWT) is accepted and ignored until hub access control ships; it
   is never logged.
 - `ErrorCode.UNSUPPORTED` (10) answers a request mode the session did not declare or the hub
   does not implement yet (v2 sessions only; a v1 session gets `INVALID_REQUEST`). `CANCELLED` (9)
-  ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION`. The client-sent `ReplyPart`,
-  `ReplyEnd`, `Flow` and `Cancel` are read from sessions that negotiated `streaming` and ignored
+  ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION` (or a subscription that outlived
+  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`). The client-sent `ReplyPart`, `ReplyEnd`, `Flow` and
+  `Cancel` are read from sessions that negotiated `streaming` or `subscription` and ignored
   from any other.
 - `tests/compat.rs` is the compatibility suite: a raw v1 client gets no ack, only v1 messages and
   the legacy timeout; a v2 client gets the ack with the configured values before the echo.
@@ -489,11 +497,10 @@ umbrella `docs/05-services/hub.md` (Query modes).
   every target answered, `max_results > 0` successful parts arrived, or the deadline passed.
   Answers after the end are dropped. A gather that ends early (`max_results`, the deadline,
   the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-forwarded target whose session
-  negotiated `streaming` (`max results`, `deadline`, `sender disconnected`); other targets keep
-  working and their late answers are dropped.
+  negotiated `streaming` or `subscription` (`max results`, `deadline`, `sender disconnected`);
+  other targets keep working and their late answers are dropped.
 - **Errors:** no live target is an ordinary `NO_HANDLER`; a command is `INVALID_REQUEST`; a v2
-  sender without the capability, or mode `SUBSCRIPTION` (P4c), gets `UNSUPPORTED`; a v1 sender
-  `INVALID_REQUEST`. A target that leaves, also while its request is still queued, is a failed
+  sender without the capability gets `UNSUPPORTED`; a v1 sender `INVALID_REQUEST`. A target that leaves, also while its request is still queued, is a failed
   part (`HANDLER_DISCONNECTED`).
 - **Accounting:** a scatter-gather is one request in flight, on its edge (latency to the
   `ReplyEnd`, an error when no part succeeded) and in `kraken_hub_requests_total{mode="scatter_gather"}`;
@@ -547,6 +554,73 @@ umbrella `docs/05-services/hub.md` (Query modes).
   libraries' READMEs: [kraken-messaging, Streaming queries](../kraken-messaging/README.md#streaming-queries)
   (Kotlin) and [kraken-messaging-rs, Streaming queries](../kraken-messaging-rs/README.md#streaming-queries)
   (Rust).
+- **Subscription.** A v2 sender that declared `subscription` sends a query with
+  `Request.mode = SUBSCRIPTION` (and `initial_credit`, `max_results`, `timeout_ms`). The targets
+  are **every** live instance of every owner (exclusive or shared) that lists the type and
+  negotiated `subscription` itself, as they are at the open: an instance registering later is
+  not added (updates are delivered at most once; the hub never resubscribes). Each target gets
+  `Request{id = <id>#n, mode = SUBSCRIPTION}` (`n` = 1, 2, ... in target order: service, then
+  instance id; `initial_credit` and `max_results` 0) **written directly**: a subscription is
+  passive, so it takes no permit, waits in no queue and counts in nobody's `inFlightAsHandler`;
+  a target whose buffer is full at the open is left out. One of the targets, chosen as for a
+  point query (tags, load, round-robin), also gets the **initial request**
+  `Request{id = <id>#0, mode = UNARY}` with the sender's `timeout_ms` and priority, through flow
+  control, queues and priority like any unary request, holding a permit. Its `Reply{payload}`
+  reaches the sender as `ReplyPart{<id>, seq 1, responder_*}`; `timeout_ms` (usual rules) bounds
+  only this request (queue wait plus handler).
+- **Updates.** A target pushes `ClientMessage.part = ReplyPart{<id>#n, payload, seq}` per update
+  and `ClientMessage.end = ReplyEnd{<id>#n, error?}` when its emitter completes. The hub relays
+  the updates to the sender in arrival order with its **own** `seq` (2, 3, ... after the initial
+  part; the handlers' `seq` is dropped), `request_id` rewritten to the sender's id and
+  `responder_service` / `responder_instance` naming the target, in order also when the sender's
+  buffer is full. Updates that arrive before the initial result wait behind it (the initial part
+  is always `seq` 1). A target's clean `ReplyEnd` removes it; the last target's clean end ends
+  the subscription with `ReplyEnd{parts}` once the buffered updates are out. Parts and ends for
+  an unknown id, from an instance that is not that target, or a unary `Reply` to an update
+  target are ignored (debug log).
+- **Credits and buffer.** The sender's credit is `initial_credit` (64 when 0) plus every
+  `Flow{<id>, credits}`; the initial part takes one, every update one. Updates beyond the credit
+  (or before the initial part) are buffered per subscription, up to
+  `KRAKEN_HUB_SUBSCRIPTION_BUFFER` (256); one more ends it with `ReplyEnd{error =
+  RESOURCE_EXHAUSTED "subscriber buffer (256) exceeded"}` and a `Cancel` to every target. A
+  `Flow` drains the buffer in order. Nothing is relayed to the targets: updates are pushed, a
+  slow sender is the hub's problem, not the handlers'.
+- **Ending it.** `max_results > 0` counts updates, not the initial part: after that many relayed
+  updates `ReplyEnd{parts}` and `Cancel{<id>#n, "max results"}` to every target (what is still
+  buffered is dropped). A `ReplyEnd{error}` or a part carrying `error` from any target ends it
+  with `ReplyEnd{error}` and a `Cancel` to the rest (the failed target ended by itself). The
+  initial request failing (`Reply{error}`, `TIMEOUT`, its handler gone, a capacity rejection)
+  ends it with that error and cancels every target; no part is sent.
+  `ClientMessage.cancel = Cancel{<id>, reason}` from the sender: `Cancel{<id>#n, reason}` to
+  every target, and to `<id>#0` while the initial request is still forwarded; nothing more to
+  the sender. The sender gone: the same with `"sender disconnected"`. A target gone: its target
+  ends silently; the last one gone: `ReplyEnd{error = HANDLER_DISCONNECTED}`. Open for
+  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` (off by default): `ReplyEnd{error = CANCELLED "max
+  subscription duration (<d>) exceeded"}` and a `Cancel` with that reason. There is no idle
+  timeout: a subscription without updates is a quiet one. The hub's shutdown closes every
+  session (as for unary requests).
+- **Subscription errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `subscription`
+  `UNSUPPORTED`; a command by request kind `INVALID_REQUEST`; no owner, or no live instance that
+  lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; owners with
+  instances but none that negotiated `subscription` `UNSUPPORTED` (the message names the services
+  and the capability); a duplicate id (`<id>`, `<id>#0`, or a pending `<id>#n`) `INVALID_REQUEST`;
+  a target already serving `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024) subscriptions
+  `RESOURCE_EXHAUSTED`. The gates apply in that order, all before anything is sent. **Builder
+  call:** an update target's id is no pending id (it is matched through its subscription), so a
+  request whose id equals one is routed normally.
+- **Subscription accounting:** one request in flight (`inFlight`, the sender's
+  `inFlightAsSender`; the initial request in its handler's `inFlightAsHandler`) until the initial
+  part is delivered, then the subscription counts nowhere but in
+  `kraken_hub_subscriptions_open{service,instance}` (targets per handler instance); one count on
+  its edge at the initial reply (an error when the initial failed, or when the subscription ended
+  before it other than by the sender's cancel), `kraken_hub_requests_total{mode="subscription"}`
+  and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
+  the max duration before the initial part; `kraken_hub_subscription_updates_total{service,type}`
+  per update relayed. A subscription that ends after its initial part counts nothing more.
+- `tests/subscription.rs` drives it over gRPC with raw clients. TODO (P4c client slice): the
+  client APIs (`queryBus.subscribe`, `QueryUpdateEmitter`, the Rust equivalents) are not shipped
+  yet; today's libraries do not declare `subscription`, so a hub never sends them one and a
+  sender gets `UNSUPPORTED` naming the owners.
 
 ### Request timeouts
 
@@ -571,8 +645,10 @@ without any client change; v1 clients always send a timeout, so for them an over
 - No authentication or authorization on the gRPC port.
 - Not durable: registrations, in-flight and queued requests and sessions are in memory only.
   Clients re-register after a reconnect.
-- No subscription queries yet (roadmap P4c). A scatter-gather cancels only the targets whose
-  session negotiated `streaming`; the others keep working for answers that are dropped.
+- A scatter-gather cancels only the targets whose session negotiated `streaming` or
+  `subscription`; the others keep working for answers that are dropped.
+- A subscription's targets are fixed at its open: an instance that registers later never
+  serves it (updates are at most once), and the hub never resubscribes on its behalf.
 
 ## Connection lifecycle
 
@@ -607,10 +683,12 @@ without any client change; v1 clients always send a timeout, so for them an over
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
   `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`,
   `buffer_full`), `kraken_hub_scatter_targets{type}` (targets per scatter-gather),
-  `kraken_hub_streams_open{service,instance}` (streaming queries open per handler instance, the
-  one metric with an instance label) and `kraken_hub_stream_parts_total{service,type}` (parts
-  relayed). Queue depth and permits are refreshed by the watchdog every tick (at most a
-  second), not per request.
+  `kraken_hub_streams_open{service,instance}` (streaming queries open per handler instance) and
+  `kraken_hub_stream_parts_total{service,type}` (parts relayed),
+  `kraken_hub_subscriptions_open{service,instance}` (subscription targets open per handler
+  instance; with `streams_open` the only metrics with an instance label) and
+  `kraken_hub_subscription_updates_total{service,type}` (updates relayed). Queue depth and
+  permits are refreshed by the watchdog every tick (at most a second), not per request.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
   `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
