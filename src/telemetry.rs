@@ -325,14 +325,16 @@ impl Metrics {
         mode: &'static str,
     ) {
         self.in_flight_add(kind, -1);
+        // The duration keeps the mode (a gather's latency is to its ReplyEnd, not comparable
+        // with a unary request of the same type) but never the outcome.
         let attrs = [
             KeyValue::new("kind", kind_label(kind)),
             KeyValue::new("type", type_name.to_string()),
-            KeyValue::new("outcome", outcome.as_str()),
             KeyValue::new("mode", mode),
+            KeyValue::new("outcome", outcome.as_str()),
         ];
         self.requests.add(1, &attrs);
-        self.duration.record(duration.as_secs_f64(), &attrs[..2]);
+        self.duration.record(duration.as_secs_f64(), &attrs[..3]);
     }
 
     /// The number of targets one scatter-gather query went to.
@@ -554,10 +556,19 @@ mod tests {
         (exporter, provider, metrics)
     }
 
+    /// The duration histogram has the `mode` label, so a gather's latency (to its `ReplyEnd`)
+    /// does not mix with the unary latency of the same type; never the outcome.
     #[test]
-    fn duration_histogram_has_kind_and_type_labels_only() {
+    fn duration_histogram_has_kind_type_and_mode_labels_only() {
         let (exporter, provider, metrics) = exporter_and_metrics();
         metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        metrics.request_finished_mode(
+            Kind::Query,
+            "q.F",
+            Outcome::Timeout,
+            Duration::from_millis(20),
+            "scatter_gather",
+        );
         provider.force_flush().unwrap();
         let finished = exporter.get_finished_metrics().unwrap();
         let metric = finished
@@ -569,20 +580,33 @@ mod tests {
         let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data() else {
             panic!("expected f64 histogram");
         };
-        let point = h.data_points().next().expect("one data point");
-        let mut attrs: Vec<(String, String)> = point
-            .attributes()
-            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+        let mut points: Vec<(Vec<(String, String)>, u64)> = h
+            .data_points()
+            .map(|point| {
+                let mut attrs: Vec<(String, String)> = point
+                    .attributes()
+                    .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                    .collect();
+                attrs.sort();
+                (attrs, point.count())
+            })
             .collect();
-        attrs.sort();
+        points.sort();
+        let labels = |kind: &str, type_name: &str, mode: &str| {
+            vec![
+                ("kind".to_string(), kind.to_string()),
+                ("mode".to_string(), mode.to_string()),
+                ("type".to_string(), type_name.to_string()),
+            ]
+        };
         assert_eq!(
-            attrs,
+            points,
             [
-                ("kind".to_string(), "command".to_string()),
-                ("type".to_string(), "a.B".to_string())
+                (labels("command", "a.B", "unary"), 1),
+                (labels("query", "q.F", "scatter_gather"), 1)
             ]
         );
-        assert_eq!(point.count(), 1);
+        let point = h.data_points().next().expect("one data point");
         assert_eq!(point.bounds().next(), Some(0.001));
     }
 

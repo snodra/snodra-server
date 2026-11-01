@@ -378,8 +378,10 @@ Error codes:
 - Handler-produced codes in a `Reply{error}` are forwarded unchanged.
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
-`invalid_request`, `resource_exhausted` and `unsupported`; `kraken_hub_requests_total` also has a
-`mode` label (`unary`, `scatter_gather`). **Builder call:** any handler `Reply{error}` counts as
+`invalid_request`, `resource_exhausted` and `unsupported`; `kraken_hub_requests_total` and
+`kraken_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`), so a
+gather's latency (to its `ReplyEnd`) stays apart from the unary latency of the same type.
+**Builder call:** any handler `Reply{error}` counts as
 `handler_error`, whatever its code; a capacity rejection by the hub (full queue or session
 buffer) counts as `resource_exhausted` whichever code the sender got.
 
