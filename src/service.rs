@@ -284,6 +284,8 @@ async fn run_stream(
     });
     // So are the flow-control settings and the placement (ADR 0014).
     let flow_control = v2 && protocol::shares(&first.capabilities, protocol::FLOW_CONTROL);
+    // And whether its InstanceStatus reports are kept (ADR 0016).
+    let instance_status = v2 && protocol::shares(&first.capabilities, protocol::INSTANCE_STATUS);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -300,6 +302,7 @@ async fn run_stream(
         flow_control,
         initial_permits: first.initial_permits,
         placement: placement.clone(),
+        instance_status,
     };
     let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed
@@ -446,6 +449,19 @@ async fn run_stream(
             Some(client_message::Message::Permits(p)) => {
                 ctx.router
                     .on_permits(&ctx.context, &instance_id, token, p.count)
+            }
+            Some(client_message::Message::Status(status)) => {
+                // Kept only for sessions that negotiated "instance-status"; ignored otherwise.
+                let kept = ctx.sessions.set_status(
+                    &ctx.context,
+                    &instance_id,
+                    token,
+                    &status,
+                    Instant::now(),
+                );
+                if !kept {
+                    debug!(instance = %instance_id, "InstanceStatus without the capability ignored");
+                }
             }
             None => {}
         }

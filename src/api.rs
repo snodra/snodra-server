@@ -676,8 +676,8 @@ pub struct Summary {
     /// Requests and errors over the edge-statistics window.
     pub requests: u64,
     pub errors: u64,
-    /// Changes when services, instances, registrations, flow-control or staleness flags, type
-    /// ownership or the set of edges change; not with counters or ages. A page refreshes its
+    /// Changes when services, instances, registrations, flow-control or staleness flags, the
+    /// hubs an instance reports (ADR 0016), type ownership or the set of edges change; not with counters or ages. A page refreshes its
     /// view at once when it changes.
     pub revision: String,
 }
@@ -690,13 +690,14 @@ pub fn revision(t: &Topology, edges: &WindowTotals) -> String {
         s.push('\u{1}');
         for i in &svc.instances {
             s.push_str(&format!(
-                "{}|{}|{}|{}|{:?}|{:?}\u{2}",
+                "{}|{}|{}|{}|{:?}|{:?}|{:?}\u{2}",
                 i.instance_id,
                 i.protocol_version,
                 i.flow_controlled,
                 i.stale,
                 i.command_types,
-                i.query_types
+                i.query_types,
+                i.connected_hub_ids
             ));
         }
     }
@@ -746,6 +747,8 @@ mod tests {
             queued: 0,
             load_factor: 100,
             tags: BTreeMap::new(),
+            connected_hub_ids: vec![],
+            status_age_ms: -1,
         }
     }
 
@@ -1040,7 +1043,11 @@ mod tests {
         busier.totals.in_flight = 99;
         busier.now_ms += 2000;
         busier.services[0].instances[0].last_heartbeat_age_ms = 1234;
+        busier.services[0].instances[0].status_age_ms = 4321;
         assert_eq!(revision(&busier, &w), r);
+        let mut hubs = t.clone();
+        hubs.services[0].instances[0].connected_hub_ids = vec!["hub-2".into()];
+        assert_ne!(revision(&hubs, &w), r, "the reported hubs are structure");
         let mut stale = t.clone();
         stale.services[0].instances[0].stale = true;
         assert_ne!(revision(&stale, &w), r);

@@ -7,8 +7,8 @@ use std::time::Duration;
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
 use kraken_hub::proto::{
-    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, Permits, Register, Reply, Request,
-    RequestKind, ServerMessage, client_message, credentials, reply,
+    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, InstanceStatus, Permits, Register,
+    Reply, Request, RequestKind, ServerMessage, client_message, credentials, reply,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -257,6 +257,35 @@ impl FakeClient {
             ..self.register_message(service, commands, &[])
         };
         self.send_raw_register(reg).await;
+    }
+
+    /// A v2 client declaring exactly `capabilities`.
+    pub async fn register_v2_with(
+        addr: SocketAddr,
+        service: &str,
+        commands: &[&str],
+        capabilities: &[&str],
+    ) -> Self {
+        let client = Self::connect(addr).await;
+        let reg = Register {
+            protocol_version: 2,
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            client_version: "fake-client/1.0".to_string(),
+            ..client.register_message(service, commands, &[])
+        };
+        client.send_raw_register(reg).await;
+        client
+    }
+
+    /// Sends an `InstanceStatus` (multi-hub HA, ADR 0016).
+    pub async fn status(&self, connected_hub_ids: &[&str], handlers_in_flight: u32) {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::Status(InstanceStatus {
+                connected_hub_ids: connected_hub_ids.iter().map(|s| s.to_string()).collect(),
+                handlers_in_flight,
+            })),
+        };
+        self.tx.send(msg).await.unwrap();
     }
 
     pub async fn permits(&self, count: u32) {

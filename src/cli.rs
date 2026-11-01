@@ -248,6 +248,8 @@ mod tests {
             queued: 0,
             load_factor: 100,
             tags: Default::default(),
+            connected_hub_ids: vec![],
+            status_age_ms: -1,
         }
     }
 

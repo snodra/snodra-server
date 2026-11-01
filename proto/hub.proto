@@ -37,6 +37,10 @@ message ClientMessage {
     Heartbeat heartbeat = 4;
     // Flow control (capability "flow-control"): more requests this instance can take now.
     Permits permits = 5;
+    // Fields 6-9 are allocated to a later roadmap phase (multi-part messages).
+    // Multi-hub HA (capability "instance-status"): what this instance sees, every 5 s. Sent only
+    // to a hub whose RegisterAck lists "instance-status"; the hub keeps the latest per session.
+    InstanceStatus status = 10;
   }
 }
 
@@ -83,7 +87,8 @@ message Register {
   // file defines; 1 is never sent and reads as v1; anything above 2 is answered as 2.
   uint32 protocol_version = 5;
   // Optional protocol features this client supports; unknown names are ignored by the hub.
-  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED).
+  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED) and
+  // "instance-status" (ClientMessage.status).
   repeated string capabilities = 6;
   // Accepted and ignored until hub access control ships (roadmap P5). Never logged.
   Credentials credentials = 7;
@@ -109,6 +114,21 @@ message Register {
 // session hold more than its initial_permits. Ignored for sessions without flow control.
 message Permits {
   uint32 count = 1;
+}
+
+// Multi-hub HA (ADR 0016): an instance connected to several hubs reports, on each of its
+// streams, which hubs it currently holds an acknowledged stream to. Hubs never talk to each
+// other; this report is how one hub's topology (and the dashboard that merges all hubs) shows
+// that an instance is missing a hub. The hub keeps only the latest report per session, bounded
+// (at most 64 ids of at most 128 bytes each are kept; the rest is ignored).
+message InstanceStatus {
+  // RegisterAck.hub_id of every hub this instance has an acknowledged stream to, this one
+  // included.
+  repeated string connected_hub_ids = 1;
+  // Handlers of this instance running now, over all its hubs.
+  uint32 handlers_in_flight = 2;
+  // Field 3 is allocated to a later roadmap phase (event processor status).
+  reserved 3;
 }
 
 // How a client authenticates itself to the hub. Carried on Register; ignored until P5.
@@ -305,6 +325,10 @@ message InstanceTopology {
   map<string, string> tags = 14;
   // True when the hub forwards to this instance only with permits.
   bool flow_controlled = 15;
+  // InstanceStatus.connected_hub_ids as last reported; empty when never reported.
+  repeated string connected_hub_ids = 16;
+  // now_ms minus the time of the last InstanceStatus; -1 when never reported.
+  int64 status_age_ms = 17;
 }
 
 message TypeOwnership {

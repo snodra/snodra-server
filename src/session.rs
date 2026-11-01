@@ -16,7 +16,7 @@ use tonic::Status;
 use tracing::info;
 
 use crate::context::ContextId;
-use crate::proto::ServerMessage;
+use crate::proto::{InstanceStatus, ServerMessage};
 use crate::registry::{InstanceId, Placement};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +32,44 @@ impl fmt::Display for SendError {
         match self {
             Self::Gone => write!(f, "instance is gone"),
             Self::Busy => write!(f, "instance outbound buffer is full"),
+        }
+    }
+}
+
+/// Hub ids kept from one `InstanceStatus`; further ids are ignored.
+pub const MAX_STATUS_HUB_IDS: usize = 64;
+/// Longest hub id kept from an `InstanceStatus`, in bytes; a longer id is ignored (not cut, so it
+/// can never match another hub's id by accident).
+pub const MAX_STATUS_HUB_ID_BYTES: usize = 128;
+
+/// The latest `InstanceStatus` of a session (ADR 0016), bounded; replaced by each report and
+/// dropped with the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusDetail {
+    /// `connected_hub_ids` as reported: empty and over-long ids and duplicates removed, at most
+    /// [`MAX_STATUS_HUB_IDS`], in the reported order.
+    pub connected_hub_ids: Vec<String>,
+    pub handlers_in_flight: u32,
+    /// When the hub received the report.
+    pub at: Instant,
+}
+
+impl StatusDetail {
+    fn from_report(report: &InstanceStatus, at: Instant) -> Self {
+        let mut ids: Vec<String> = Vec::new();
+        for id in &report.connected_hub_ids {
+            if ids.len() == MAX_STATUS_HUB_IDS {
+                break;
+            }
+            if id.is_empty() || id.len() > MAX_STATUS_HUB_ID_BYTES || ids.contains(id) {
+                continue;
+            }
+            ids.push(id.clone());
+        }
+        Self {
+            connected_hub_ids: ids,
+            handlers_in_flight: report.handlers_in_flight,
+            at,
         }
     }
 }
@@ -58,6 +96,9 @@ pub struct SessionMeta {
     pub initial_permits: u32,
     /// Load factor and tags from the first `Register`, re-applied on every re-register.
     pub placement: Placement,
+    /// The session is v2 and shares the "instance-status" capability: its `InstanceStatus`
+    /// reports are kept (ADR 0016). Reports from any other session are ignored.
+    pub instance_status: bool,
 }
 
 impl SessionMeta {
@@ -71,6 +112,7 @@ impl SessionMeta {
             flow_control: false,
             initial_permits: 0,
             placement: Placement::default(),
+            instance_status: false,
         }
     }
 
@@ -95,6 +137,8 @@ pub struct Session {
     /// Cancelled when the session is removed or replaced; the stream task exits on it at once
     /// instead of waiting for the client to drain the response body.
     pub cancel: CancellationToken,
+    /// The latest `InstanceStatus`, if the session reported one (ADR 0016).
+    pub status: Option<StatusDetail>,
 }
 
 /// What the router needs to know about the sender of a request.
@@ -116,6 +160,8 @@ pub struct SessionDetail {
     pub heartbeat_timeout: Duration,
     pub connected_since: Instant,
     pub last_heartbeat: Instant,
+    /// The latest `InstanceStatus`, `None` when never reported.
+    pub status: Option<StatusDetail>,
 }
 
 /// Instance id -> session. Every lookup also matches the session's [`ContextId`], so a session is
@@ -183,6 +229,7 @@ impl Sessions {
             connected_since: now,
             token,
             cancel,
+            status: None,
         };
         let old = inner.insert(instance_id.to_string(), session);
         drop(inner);
@@ -337,8 +384,31 @@ impl Sessions {
                 heartbeat_timeout: s.meta.heartbeat_timeout,
                 connected_since: s.connected_since,
                 last_heartbeat: s.last_heartbeat,
+                status: s.status.clone(),
             })
             .collect()
+    }
+
+    /// Keeps `report` (bounded) as the latest `InstanceStatus` of the session `token`, replacing
+    /// the previous one. Ignored (`false`) unless that session is still the current one for
+    /// `instance_id` and negotiated "instance-status" (so never for a v1 session).
+    pub fn set_status(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        report: &InstanceStatus,
+        now: Instant,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(session) = inner
+            .get_mut(instance_id)
+            .filter(|s| s.context == *ctx && s.token == token && s.meta.instance_status)
+        else {
+            return false;
+        };
+        session.status = Some(StatusDetail::from_report(report, now));
+        true
     }
 
     /// A clone of the instance's outbound sender, for a delivery that must outlive `try_send`.
@@ -415,6 +485,8 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::InstanceStatus;
+    use crate::protocol;
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
 
@@ -540,6 +612,143 @@ mod tests {
         assert!(!c2.is_cancelled());
         sessions.remove_if(&D, "a", new).unwrap();
         assert!(c2.is_cancelled());
+    }
+
+    fn status(ids: &[&str], handlers: u32) -> InstanceStatus {
+        InstanceStatus {
+            connected_hub_ids: ids.iter().map(|s| s.to_string()).collect(),
+            handlers_in_flight: handlers,
+        }
+    }
+
+    fn with_status_capability() -> SessionMeta {
+        SessionMeta {
+            protocol_version: 2,
+            capabilities: vec![protocol::INSTANCE_STATUS.to_string()],
+            instance_status: true,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        }
+    }
+
+    fn status_of(sessions: &Sessions, id: &str) -> Option<StatusDetail> {
+        sessions
+            .details()
+            .into_iter()
+            .find(|d| d.instance_id == id)
+            .and_then(|d| d.status)
+    }
+
+    #[test]
+    fn instance_status_is_stored_replaced_and_dropped_with_the_session() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let token = sessions.insert(
+            &D,
+            "a",
+            "svc",
+            with_status_capability(),
+            tx,
+            CancellationToken::new(),
+        );
+        assert_eq!(status_of(&sessions, "a"), None, "nothing before a report");
+        let t0 = Instant::now();
+        assert!(sessions.set_status(&D, "a", token, &status(&["h1", "h2"], 3), t0));
+        let first = status_of(&sessions, "a").unwrap();
+        assert_eq!(first.connected_hub_ids, ["h1", "h2"]);
+        assert_eq!((first.handlers_in_flight, first.at), (3, t0));
+
+        let t1 = t0 + Duration::from_secs(5);
+        assert!(sessions.set_status(&D, "a", token, &status(&["h2"], 0), t1));
+        let second = status_of(&sessions, "a").unwrap();
+        assert_eq!(second.connected_hub_ids, ["h2"], "replaced, not merged");
+        assert_eq!((second.handlers_in_flight, second.at), (0, t1));
+
+        // A stale token (an older stream) never writes; the new session starts without status.
+        let (tx2, _rx2) = mpsc::channel(1);
+        let newer = sessions.insert(
+            &D,
+            "a",
+            "svc",
+            with_status_capability(),
+            tx2,
+            CancellationToken::new(),
+        );
+        assert_eq!(status_of(&sessions, "a"), None, "dropped with the session");
+        assert!(!sessions.set_status(&D, "a", token, &status(&["old"], 0), t1));
+        assert_eq!(status_of(&sessions, "a"), None);
+        sessions.remove_if(&D, "a", newer).unwrap();
+        assert!(!sessions.set_status(&D, "a", newer, &status(&["h1"], 0), t1));
+    }
+
+    #[test]
+    fn instance_status_is_ignored_without_the_capability_and_for_v1() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let v1 = sessions.insert(&D, "v1", "svc", v1(), tx, CancellationToken::new());
+        assert!(!sessions.set_status(&D, "v1", v1, &status(&["h1"], 1), Instant::now()));
+        assert_eq!(status_of(&sessions, "v1"), None);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let without = SessionMeta {
+            protocol_version: 2,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        };
+        let v2 = sessions.insert(&D, "v2", "svc", without, tx, CancellationToken::new());
+        assert!(!sessions.set_status(&D, "v2", v2, &status(&["h1"], 1), Instant::now()));
+        assert_eq!(status_of(&sessions, "v2"), None);
+    }
+
+    #[test]
+    fn instance_status_is_bounded() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let token = sessions.insert(
+            &D,
+            "a",
+            "svc",
+            with_status_capability(),
+            tx,
+            CancellationToken::new(),
+        );
+        let long = "x".repeat(MAX_STATUS_HUB_ID_BYTES + 1);
+        let edge = "y".repeat(MAX_STATUS_HUB_ID_BYTES);
+        let mut ids: Vec<String> = vec![long.clone(), String::new(), edge.clone(), "h0".into()];
+        ids.extend((0..200).map(|i| format!("hub-{i}")));
+        let report = InstanceStatus {
+            connected_hub_ids: ids,
+            handlers_in_flight: 7,
+        };
+        assert!(sessions.set_status(&D, "a", token, &report, Instant::now()));
+        let kept = status_of(&sessions, "a").unwrap().connected_hub_ids;
+        assert_eq!(kept.len(), MAX_STATUS_HUB_IDS);
+        assert!(!kept.contains(&long), "an over-long id is ignored, not cut");
+        assert!(!kept.contains(&String::new()), "an empty id is ignored");
+        assert_eq!(kept[0], edge, "an id of exactly the limit is kept");
+        assert_eq!(kept[1], "h0");
+        assert_eq!(
+            kept[MAX_STATUS_HUB_IDS - 1],
+            format!("hub-{}", MAX_STATUS_HUB_IDS - 3)
+        );
+    }
+
+    #[test]
+    fn instance_status_drops_duplicate_ids() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let token = sessions.insert(
+            &D,
+            "a",
+            "svc",
+            with_status_capability(),
+            tx,
+            CancellationToken::new(),
+        );
+        let report = status(&["h2", "h1", "h2"], 0);
+        assert!(sessions.set_status(&D, "a", token, &report, Instant::now()));
+        assert_eq!(
+            status_of(&sessions, "a").unwrap().connected_hub_ids,
+            ["h2", "h1"]
+        );
     }
 
     #[test]

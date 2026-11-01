@@ -96,6 +96,16 @@ pub struct InstanceTopology {
     /// As applied (0 in `Register` reads as 100).
     pub load_factor: u32,
     pub tags: BTreeMap<String, String>,
+    /// `InstanceStatus.connected_hub_ids` as last reported (ADR 0016); empty when never reported.
+    #[serde(default)]
+    pub connected_hub_ids: Vec<String>,
+    /// Milliseconds since the last `InstanceStatus`; -1 when never reported.
+    #[serde(default = "never_reported")]
+    pub status_age_ms: i64,
+}
+
+fn never_reported() -> i64 {
+    -1
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -160,6 +170,13 @@ pub fn snapshot(
             })
             .unwrap_or_else(|| (vec![], vec![], DEFAULT_LOAD_FACTOR, BTreeMap::new()));
         let flow = flows.get(&d.instance_id).copied().unwrap_or_default();
+        let (connected_hub_ids, status_age_ms) = match d.status {
+            Some(st) => (
+                st.connected_hub_ids,
+                ms(now.saturating_duration_since(st.at)),
+            ),
+            None => (vec![], never_reported()),
+        };
         let flight = in_flight.get(&d.instance_id).copied().unwrap_or_default();
         by_service
             .entry(d.service)
@@ -180,6 +197,8 @@ pub fn snapshot(
                 queued: flow.queued,
                 load_factor,
                 tags,
+                connected_hub_ids,
+                status_age_ms,
                 instance_id: d.instance_id,
             });
     }
@@ -268,6 +287,8 @@ impl Topology {
                             load_factor: i.load_factor,
                             tags: i.tags.clone().into_iter().collect(),
                             flow_controlled: i.flow_controlled,
+                            connected_hub_ids: i.connected_hub_ids.clone(),
+                            status_age_ms: i.status_age_ms,
                         })
                         .collect(),
                 })
@@ -332,6 +353,8 @@ impl Topology {
                             queued: i.queued,
                             load_factor: i.load_factor,
                             tags: i.tags.clone().into_iter().collect(),
+                            connected_hub_ids: i.connected_hub_ids.clone(),
+                            status_age_ms: i.status_age_ms,
                         })
                         .collect(),
                 })
@@ -571,6 +594,74 @@ mod tests {
             assert!(json.contains(field), "{field} missing: {json}");
         }
         assert_eq!(Topology::from_proto(&t.to_proto()), t);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_the_latest_instance_status() {
+        let f = fx();
+        let meta = SessionMeta {
+            protocol_version: 2,
+            instance_status: true,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        };
+        connect_with(&f, "reported", "svc", meta);
+        connect(&f, "silent", "svc");
+        let token = f.sessions.token_of(&D, "reported").unwrap();
+        let at = Instant::now();
+        let report = proto::InstanceStatus {
+            connected_hub_ids: vec!["hub-x".into(), "hub-y".into()],
+            handlers_in_flight: 2,
+        };
+        assert!(f.sessions.set_status(&D, "reported", token, &report, at));
+        let t = snap(
+            &f,
+            f.anchor.instant,
+            Duration::from_secs(10),
+            at + Duration::from_millis(1500),
+        );
+        let by_id = |id: &str| {
+            t.services[0]
+                .instances
+                .iter()
+                .find(|i| i.instance_id == id)
+                .unwrap()
+                .clone()
+        };
+        let reported = by_id("reported");
+        assert_eq!(reported.connected_hub_ids, ["hub-x", "hub-y"]);
+        assert_eq!(reported.status_age_ms, 1500);
+        let silent = by_id("silent");
+        assert!(silent.connected_hub_ids.is_empty());
+        assert_eq!(silent.status_age_ms, -1, "never reported");
+
+        let json = serde_json::to_value(&t).unwrap();
+        let instances = &json["services"][0]["instances"];
+        assert_eq!(
+            instances[0]["connectedHubIds"],
+            serde_json::json!(["hub-x", "hub-y"])
+        );
+        assert_eq!(instances[0]["statusAgeMs"], 1500);
+        assert_eq!(instances[1]["statusAgeMs"], -1);
+        assert_eq!(Topology::from_proto(&t.to_proto()), t);
+        let p = t.to_proto();
+        assert_eq!(
+            p.services[0].instances[0].connected_hub_ids,
+            ["hub-x", "hub-y"]
+        );
+        assert_eq!(p.services[0].instances[1].status_age_ms, -1);
+    }
+
+    #[test]
+    fn json_without_the_status_fields_reads_as_never_reported() {
+        let json = serde_json::json!({
+            "instanceId": "i1", "connectedSinceMs": 1, "lastHeartbeatAgeMs": 0, "stale": false,
+            "inFlightAsHandler": 0, "inFlightAsSender": 0, "commandTypes": [], "queryTypes": [],
+            "protocolVersion": 0, "clientVersion": "", "flowControlled": false,
+            "permitsAvailable": 0, "queued": 0, "loadFactor": 100, "tags": {}
+        });
+        let i: InstanceTopology = serde_json::from_value(json).unwrap();
+        assert!(i.connected_hub_ids.is_empty());
+        assert_eq!(i.status_age_ms, -1);
     }
 
     fn sample() -> Topology {

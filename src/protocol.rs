@@ -17,9 +17,13 @@ pub const HUB_PROTOCOL_VERSION: u32 = 2;
 /// Capability of flow control (ADR 0014): permits, per-instance queues, RESOURCE_EXHAUSTED.
 pub const FLOW_CONTROL: &str = "flow-control";
 
+/// Capability of multi-hub HA (ADR 0016): the client reports `InstanceStatus` (the hubs it is
+/// connected to) on this stream, and the hub shows the latest report in the topology.
+pub const INSTANCE_STATUS: &str = "instance-status";
+
 /// Optional protocol features this hub supports. Later phases add `scatter-gather`,
 /// `streaming`, `subscription` and `processors`.
-pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL];
+pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS];
 
 /// True when the client declared `capability` and this hub supports it.
 pub fn shares(client: &[String], capability: &str) -> bool {
@@ -115,6 +119,22 @@ mod tests {
         assert_eq!(negotiate(1), 0);
         assert_eq!(negotiate(2), 2);
         assert_eq!(negotiate(9), 2);
+    }
+
+    #[test]
+    fn instance_status_is_shared_when_declared() {
+        let client = ["instance-status".to_string(), "flow-control".to_string()];
+        assert_eq!(
+            shared_capabilities(&client),
+            ["flow-control", "instance-status"]
+        );
+        assert!(shares(&client, INSTANCE_STATUS));
+        let Some(server_message::Message::RegisterAck(ack)) =
+            register_ack(&Config::default(), &ContextId::default(), 2, &client).message
+        else {
+            panic!("not an ack");
+        };
+        assert!(ack.capabilities.iter().any(|c| c == "instance-status"));
     }
 
     #[test]
