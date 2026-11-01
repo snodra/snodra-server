@@ -421,7 +421,6 @@ impl Sessions {
         true
     }
 
-    /// A clone of the instance's outbound sender, for a delivery that must outlive `try_send`.
     /// A weak handle on the outbound channel of `instance_id`'s session `token` (`None` when that
     /// session is no longer current). Holding it does not keep the stream open.
     pub fn weak_sender_if_current(
@@ -438,6 +437,7 @@ impl Sessions {
             .map(|s| s.tx.downgrade())
     }
 
+    /// A clone of the instance's outbound sender, for a delivery that must outlive `try_send`.
     pub fn sender(
         &self,
         ctx: &ContextId,
