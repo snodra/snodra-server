@@ -134,6 +134,9 @@ pub enum Outcome {
     /// The hub rejected the request for capacity (full queue or session buffer), whatever code
     /// the sender was sent (RESOURCE_EXHAUSTED, or HANDLER_ERROR "handler busy").
     ResourceExhausted,
+    /// The hub rejected a request mode the sender did not declare or the hub does not implement
+    /// (UNSUPPORTED).
+    Unsupported,
 }
 
 impl Outcome {
@@ -147,6 +150,7 @@ impl Outcome {
             Outcome::HandlerError => "handler_error",
             Outcome::InvalidRequest => "invalid_request",
             Outcome::ResourceExhausted => "resource_exhausted",
+            Outcome::Unsupported => "unsupported",
         }
     }
 }
@@ -172,6 +176,7 @@ pub struct Metrics {
     permits_available: Gauge<u64>,
     queue_wait: Histogram<f64>,
     rejected: Counter<u64>,
+    scatter_targets: Histogram<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -235,6 +240,13 @@ impl Metrics {
                 .u64_counter("kraken_hub_rejected_total")
                 .with_description("Requests rejected for capacity (queue_full, queue_bytes, queue_bytes_total, buffer_full)")
                 .build(),
+            scatter_targets: meter
+                .u64_histogram("kraken_hub_scatter_targets")
+                .with_boundaries(vec![
+                    1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+                ])
+                .with_description("Targets of one scatter-gather query")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -291,6 +303,7 @@ impl Metrics {
             .add(delta, &[KeyValue::new("kind", kind_label(kind))]);
     }
 
+    /// A unary request ended.
     pub fn request_finished(
         &self,
         kind: Kind,
@@ -298,14 +311,36 @@ impl Metrics {
         outcome: Outcome,
         duration: Duration,
     ) {
+        self.request_finished_mode(kind, type_name, outcome, duration, "unary");
+    }
+
+    /// A request of `mode` (`unary`, `scatter_gather`, ...) ended. A scatter-gather counts once,
+    /// whatever its number of targets.
+    pub fn request_finished_mode(
+        &self,
+        kind: Kind,
+        type_name: &str,
+        outcome: Outcome,
+        duration: Duration,
+        mode: &'static str,
+    ) {
         self.in_flight_add(kind, -1);
         let attrs = [
             KeyValue::new("kind", kind_label(kind)),
             KeyValue::new("type", type_name.to_string()),
             KeyValue::new("outcome", outcome.as_str()),
+            KeyValue::new("mode", mode),
         ];
         self.requests.add(1, &attrs);
         self.duration.record(duration.as_secs_f64(), &attrs[..2]);
+    }
+
+    /// The number of targets one scatter-gather query went to.
+    pub fn scatter_targets(&self, type_name: &str, targets: usize) {
+        self.scatter_targets.record(
+            targets as u64,
+            &[KeyValue::new("type", type_name.to_string())],
+        );
     }
 
     pub fn buffer_full(&self, service: &str) {
@@ -417,6 +452,29 @@ pub(crate) mod test_support {
                 .map(|p| p.value())
                 .collect();
             (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// `(count, sum)` of the histogram `name` over all its points, as exported now.
+        pub(crate) fn histogram_sum(&self, name: &str) -> Option<(u64, f64)> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            match metric.data() {
+                AggregatedMetrics::U64(MetricData::Histogram(h)) => Some(
+                    h.data_points()
+                        .fold((0, 0.0), |(c, s), p| (c + p.count(), s + p.sum() as f64)),
+                ),
+                AggregatedMetrics::F64(MetricData::Histogram(h)) => Some(
+                    h.data_points()
+                        .fold((0, 0.0), |(c, s), p| (c + p.count(), s + p.sum())),
+                ),
+                _ => panic!("{name} is not a histogram"),
+            }
         }
 
         /// The last value of the u64 gauge `name` for `service`, as exported now.

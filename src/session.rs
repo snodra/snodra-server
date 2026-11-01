@@ -99,6 +99,9 @@ pub struct SessionMeta {
     /// The session is v2 and shares the "instance-status" capability: its `InstanceStatus`
     /// reports are kept (ADR 0016). Reports from any other session are ignored.
     pub instance_status: bool,
+    /// The session is v2 and shares the "scatter-gather" capability: it may send requests with
+    /// mode SCATTER_GATHER and get ReplyPart / ReplyEnd (ADR 0017).
+    pub scatter_gather: bool,
 }
 
 impl SessionMeta {
@@ -113,6 +116,7 @@ impl SessionMeta {
             initial_permits: 0,
             placement: Placement::default(),
             instance_status: false,
+            scatter_gather: false,
         }
     }
 
@@ -147,6 +151,10 @@ pub struct SenderInfo {
     pub token: u64,
     pub flow_control: bool,
     pub service: String,
+    /// `Register.protocol_version` of the session (0 = v1).
+    pub protocol_version: u32,
+    /// The session shares "scatter-gather".
+    pub scatter_gather: bool,
 }
 
 /// Read-only copy of one session's observable state, for the topology view.
@@ -275,6 +283,8 @@ impl Sessions {
                 token: s.token,
                 flow_control: s.meta.flow_control,
                 service: s.service.clone(),
+                protocol_version: s.meta.protocol_version,
+                scatter_gather: s.meta.scatter_gather,
             })
     }
 
@@ -412,6 +422,22 @@ impl Sessions {
     }
 
     /// A clone of the instance's outbound sender, for a delivery that must outlive `try_send`.
+    /// A weak handle on the outbound channel of `instance_id`'s session `token` (`None` when that
+    /// session is no longer current). Holding it does not keep the stream open.
+    pub fn weak_sender_if_current(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+    ) -> Option<mpsc::WeakSender<Result<ServerMessage, Status>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .filter(|s| s.context == *ctx && s.token == token)
+            .map(|s| s.tx.downgrade())
+    }
+
     pub fn sender(
         &self,
         ctx: &ContextId,

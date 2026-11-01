@@ -294,6 +294,8 @@ async fn run_stream(
     let flow_control = v2 && protocol::shares(&first.capabilities, protocol::FLOW_CONTROL);
     // And whether its InstanceStatus reports are kept (ADR 0016).
     let instance_status = v2 && protocol::shares(&first.capabilities, protocol::INSTANCE_STATUS);
+    // And whether it may send scatter-gather queries (ADR 0017).
+    let scatter_gather = v2 && protocol::shares(&first.capabilities, protocol::SCATTER_GATHER);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -311,6 +313,7 @@ async fn run_stream(
         initial_permits: first.initial_permits,
         placement: placement.clone(),
         instance_status,
+        scatter_gather,
     };
     let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed

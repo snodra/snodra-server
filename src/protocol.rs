@@ -21,9 +21,13 @@ pub const FLOW_CONTROL: &str = "flow-control";
 /// connected to) on this stream, and the hub shows the latest report in the topology.
 pub const INSTANCE_STATUS: &str = "instance-status";
 
-/// Optional protocol features this hub supports. Later phases add `scatter-gather`,
-/// `streaming`, `subscription` and `processors`.
-pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS];
+/// Capability of scatter-gather queries (ADR 0017): the client may send `Request.mode`
+/// SCATTER_GATHER and receives `ReplyPart` / `ReplyEnd` for it.
+pub const SCATTER_GATHER: &str = "scatter-gather";
+
+/// Optional protocol features this hub supports. Later phases add `streaming`, `subscription`
+/// and `processors`.
+pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER];
 
 /// True when the client declared `capability` and this hub supports it.
 pub fn shares(client: &[String], capability: &str) -> bool {
@@ -135,6 +139,14 @@ mod tests {
             panic!("not an ack");
         };
         assert!(ack.capabilities.iter().any(|c| c == "instance-status"));
+    }
+
+    #[test]
+    fn scatter_gather_is_shared_when_declared() {
+        let client = ["scatter-gather".to_string()];
+        assert_eq!(shared_capabilities(&client), ["scatter-gather"]);
+        assert!(shares(&client, SCATTER_GATHER));
+        assert!(!shares(&[], SCATTER_GATHER));
     }
 
     #[test]

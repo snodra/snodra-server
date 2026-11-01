@@ -9,6 +9,12 @@
 //! HANDLER_DISCONNECTED, INVALID_REQUEST); a capacity rejection is `ResourceExhausted` whichever
 //! code the sender gets.
 //!
+//! Scatter-gather (ADR 0017): a [`Pending::Scatter`] keyed by the sender's request id holds the
+//! gather; each target is an ordinary [`Pending::Unary`] keyed `<id>#<n>` whose `part_of` names
+//! the gather, so flow control, queues, priority and disconnects apply per target unchanged. A
+//! target's terminal message becomes a `ReplyPart` to the sender instead; the gather's own
+//! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map.
+//!
 //! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
 //! A flow-controlled session (permits `Some`) is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
@@ -19,23 +25,47 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::mpsc::WeakSender;
 use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
+use tonic::Status;
 
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::edges::EdgeStats;
-use crate::proto::{ErrorCode, Reply, Request, RequestKind, ServerMessage, reply, server_message};
+use crate::proto::{
+    ErrorCode, Reply, ReplyEnd, ReplyPart, Request, RequestKind, RequestMode, ServerMessage, reply,
+    server_message,
+};
+use crate::protocol;
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
-use crate::session::{SendError, Sessions};
+use crate::session::{SendError, SenderInfo, Sessions};
 use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct Pending {
+/// Every request the hub has not answered yet, keyed by request id. P4b and P4c add streams and
+/// subscriptions.
+enum Pending {
+    /// A request forwarded to one handler: a unary request, or one target of a scatter-gather.
+    Unary(Unary),
+    /// A scatter-gather in progress; its targets are `Unary` entries with `part_of` set.
+    Scatter(Scatter),
+}
+
+/// The scatter-gather a forwarded request is a target of.
+#[derive(Debug, Clone)]
+struct PartOf {
+    /// The sender's request id: the gather's key.
+    parent: String,
+    /// The target's service, for `ReplyPart.responder_service`.
+    service: String,
+}
+
+struct Unary {
     /// Context of both sender and handler (requests never cross contexts).
     context: ContextId,
     sender: InstanceId,
@@ -53,9 +83,162 @@ struct Pending {
     kind: Kind,
     type_name: String,
     started: Instant,
-    cancel: AbortHandle,
+    /// The deadline timer; `None` for a scatter-gather target (its gather has the deadline).
+    cancel: Option<AbortHandle>,
     /// The `hub.route` span; closes (and exports) when the entry is dropped.
     span: tracing::Span,
+    /// `Some` for a scatter-gather target: its answer becomes a part of that gather.
+    part_of: Option<PartOf>,
+}
+
+impl Unary {
+    fn abort_timer(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.abort();
+        }
+    }
+}
+
+/// A scatter-gather in progress (ADR 0017).
+struct Scatter {
+    context: ContextId,
+    sender: InstanceId,
+    sender_token: Option<u64>,
+    sender_service: Option<String>,
+    kind: Kind,
+    type_name: String,
+    started: Instant,
+    /// The deadline timer of the whole gather.
+    cancel: AbortHandle,
+    span: tracing::Span,
+    /// The sender's outbound channel (weak: it never keeps a closed stream open).
+    out: WeakSender<Result<ServerMessage, Status>>,
+    /// The delivery still waiting for room in the sender's buffer, if any: later messages of
+    /// this gather queue behind it, so the sender sees the parts and the end in order.
+    delivery: Option<JoinHandle<()>>,
+    /// Target request ids (`<id>#<n>`) that have not answered.
+    outstanding: HashSet<String>,
+    /// Parts sent, successful ones and failed ones.
+    parts: u32,
+    ok: u32,
+    failed: u32,
+    /// `Request.max_results`: end after this many successful parts (0 = all).
+    max_results: u32,
+    /// The outcome of the last failed part, for the metrics when nothing succeeded.
+    last_failure: Option<Outcome>,
+}
+
+impl Pending {
+    fn unary(&self) -> Option<&Unary> {
+        match self {
+            Pending::Unary(u) => Some(u),
+            Pending::Scatter(_) => None,
+        }
+    }
+
+    fn unary_mut(&mut self) -> Option<&mut Unary> {
+        match self {
+            Pending::Unary(u) => Some(u),
+            Pending::Scatter(_) => None,
+        }
+    }
+
+    fn sender(&self) -> &str {
+        match self {
+            Pending::Unary(u) => &u.sender,
+            Pending::Scatter(g) => &g.sender,
+        }
+    }
+
+    fn sender_token(&self) -> Option<u64> {
+        match self {
+            Pending::Unary(u) => u.sender_token,
+            Pending::Scatter(g) => g.sender_token,
+        }
+    }
+
+    fn context(&self) -> &ContextId {
+        match self {
+            Pending::Unary(u) => &u.context,
+            Pending::Scatter(g) => &g.context,
+        }
+    }
+
+    /// A request its sender waits for (a scatter-gather target is part of its gather instead).
+    fn is_request(&self) -> bool {
+        !matches!(
+            self,
+            Pending::Unary(Unary {
+                part_of: Some(_),
+                ..
+            })
+        )
+    }
+}
+
+impl Scatter {
+    /// Sends `msg` to the sender in this gather's order: at once when nothing of the gather is
+    /// still waiting and the buffer has room, otherwise behind the waiting delivery, which waits
+    /// up to [`TERMINAL_SEND_TIMEOUT`] for room (as terminal messages do).
+    fn deliver(&mut self, msg: ServerMessage, metrics: &Arc<Metrics>) {
+        let Some(tx) = self.out.upgrade() else {
+            return;
+        };
+        let behind = self.delivery.as_ref().is_some_and(|h| !h.is_finished());
+        let item = if behind {
+            Ok(msg)
+        } else {
+            match tx.try_send(Ok(msg)) {
+                Ok(()) => return,
+                Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(item)) => item,
+            }
+        };
+        let previous = self.delivery.take();
+        let metrics = Arc::clone(metrics);
+        let service = self
+            .sender_service
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let instance = self.sender.clone();
+        self.delivery = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            if let Err(e) = tx.send_timeout(item, TERMINAL_SEND_TIMEOUT).await {
+                let reason = match e {
+                    SendTimeoutError::Timeout(_) => "buffer still full",
+                    SendTimeoutError::Closed(_) => "stream closed",
+                };
+                tracing::warn!(
+                    instance,
+                    service,
+                    reason,
+                    "scatter-gather message not delivered"
+                );
+                metrics.buffer_full(&service);
+            }
+        }));
+    }
+}
+
+/// A gather taken out of the map: its `ReplyEnd` is sent, the rest is bookkeeping.
+struct Closed {
+    gather: Scatter,
+    /// Targets that had not answered, removed from the map with the gather.
+    rest: Vec<(String, Unary)>,
+    timed_out: u32,
+}
+
+/// Label of `Request.mode` for the `mode` metric attribute.
+pub(crate) fn mode_label(mode: i32) -> &'static str {
+    match RequestMode::try_from(mode) {
+        Ok(RequestMode::Unary) => "unary",
+        Ok(RequestMode::ScatterGather) => "scatter_gather",
+        Ok(RequestMode::Streaming) => "streaming",
+        Ok(RequestMode::Subscription) => "subscription",
+        Err(_) => "unknown",
+    }
 }
 
 /// Pending requests touching one instance, by role.
@@ -343,6 +526,7 @@ impl Router {
             for id in &moved {
                 if let Some(p) = pending
                     .get_mut(id)
+                    .and_then(Pending::unary_mut)
                     .filter(|p| p.handler == instance_id && p.handler_token == old)
                 {
                     p.handler_token = token;
@@ -473,7 +657,7 @@ impl Router {
 
     /// Ends the flow bookkeeping of a pending entry that was just removed from the map: out of
     /// its handler's queue if it was still queued, and no longer assigned.
-    fn release(&self, id: &str, entry: &Pending) {
+    fn release(&self, id: &str, entry: &Unary) {
         let mut flows = self.flows.lock().unwrap();
         if let Some(f) = flows
             .get_mut(&entry.handler)
@@ -504,7 +688,20 @@ impl Router {
             .lock()
             .unwrap()
             .get(id)
+            .and_then(Pending::unary)
             .is_some_and(|p| p.handler == handler && p.handler_token == token)
+    }
+
+    /// Removes and returns the forwarded request `id`, if it is still pending.
+    fn take_unary(&self, id: &str) -> Option<Unary> {
+        let mut pending = self.pending.lock().unwrap();
+        if !matches!(pending.get(id), Some(Pending::Unary(_))) {
+            return None;
+        }
+        match pending.remove(id) {
+            Some(Pending::Unary(u)) => Some(u),
+            _ => None,
+        }
     }
 
     /// Sends requests popped from `handler`'s queue (one permit each). An entry whose request
@@ -570,9 +767,8 @@ impl Router {
     /// Fails a pending request for capacity: RESOURCE_EXHAUSTED to a sender that shares
     /// flow-control, HANDLER_ERROR "handler busy" (the v1 answer) to any other sender.
     fn reject_busy(&self, id: &str, why: &str) {
-        let entry = self.pending.lock().unwrap().remove(id);
-        if let Some(entry) = entry {
-            entry.cancel.abort();
+        if let Some(entry) = self.take_unary(id) {
+            entry.abort_timer();
             self.release(id, &entry);
             let (code, message) = if entry.sender_flow_control {
                 (ErrorCode::ResourceExhausted, format!("handler busy: {why}"))
@@ -631,6 +827,10 @@ impl Router {
             );
             return;
         };
+        if req.mode != RequestMode::Unary as i32 {
+            self.route_mode(ctx, sender, req, req_kind, sender_info, span);
+            return;
+        }
 
         let (kind, handler) = match self.pick_handler(ctx, sender, &type_name, &req.routing_key) {
             Ok(picked) => picked,
@@ -701,7 +901,7 @@ impl Router {
                 router.on_timeout(&task_id, timeout.as_millis());
             })
             .abort_handle();
-            let entry = Pending {
+            let entry = Unary {
                 context: ctx.clone(),
                 sender: sender.to_string(),
                 sender_token,
@@ -712,10 +912,11 @@ impl Router {
                 kind,
                 type_name,
                 started: Instant::now(),
-                cancel,
+                cancel: Some(cancel),
                 span,
+                part_of: None,
             };
-            pending.insert(id.clone(), entry);
+            pending.insert(id.clone(), Pending::Unary(entry));
         }
 
         self.dispatch(ctx, &id, &handler, handler_token, req);
@@ -758,15 +959,25 @@ impl Router {
             return;
         };
         let id = item.id;
-        let Some(sender) = self
+        let Some((sender, left, target)) = self
             .pending
             .lock()
             .unwrap()
             .get(&id)
-            .map(|p| p.sender.clone())
+            .and_then(Pending::unary)
+            .map(|p| (p.sender.clone(), p.handler.clone(), p.part_of.is_some()))
         else {
             return; // ended meanwhile
         };
+        if target {
+            // A scatter-gather target is that instance: another one already has its own target.
+            self.fail(
+                &id,
+                ErrorCode::HandlerDisconnected,
+                format!("handler instance {left} left before the request reached it"),
+            );
+            return;
+        }
         let handler = match self.pick_handler(ctx, &sender, &req.r#type, &req.routing_key) {
             Ok((_, handler)) => handler,
             Err(e) => {
@@ -778,7 +989,7 @@ impl Router {
         let token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
         {
             let mut pending = self.pending.lock().unwrap();
-            let Some(p) = pending.get_mut(&id) else {
+            let Some(p) = pending.get_mut(&id).and_then(Pending::unary_mut) else {
                 return;
             };
             p.handler = handler.clone();
@@ -893,7 +1104,7 @@ impl Router {
         let id = reply.request_id.clone();
         let entry = {
             let mut pending = self.pending.lock().unwrap();
-            match pending.get(&id) {
+            match pending.get(&id).and_then(Pending::unary) {
                 None => {
                     tracing::debug!(request_id = %id, "reply for unknown request ignored");
                     return;
@@ -902,11 +1113,34 @@ impl Router {
                     tracing::debug!(request_id = %id, from, "reply from non-handler ignored");
                     return;
                 }
-                Some(_) => pending.remove(&id).expect("entry checked above"),
+                Some(_) => match pending.remove(&id) {
+                    Some(Pending::Unary(u)) => u,
+                    _ => unreachable!("entry checked above"),
+                },
             }
         };
-        entry.cancel.abort();
+        entry.abort_timer();
         self.release(&id, &entry);
+        if entry.part_of.is_some() {
+            let result = match reply.result {
+                Some(reply::Result::Error(e)) => {
+                    log_outcome(
+                        &id,
+                        &entry.type_name,
+                        Some(entry.kind),
+                        &entry.sender,
+                        Some(&entry.handler),
+                        Outcome::HandlerError,
+                        true,
+                    );
+                    Err((e, Outcome::HandlerError))
+                }
+                Some(reply::Result::Payload(payload)) => Ok(payload),
+                None => Ok(Vec::new()),
+            };
+            self.on_part(&id, entry, result);
+            return;
+        }
         let outcome = match &reply.result {
             Some(reply::Result::Error(_)) => Outcome::HandlerError,
             _ => Outcome::Ok,
@@ -961,13 +1195,16 @@ impl Router {
         };
         // Queued requests never reached the instance: they are routed again, not failed.
         let waiting_ids: HashSet<&str> = waiting.iter().map(|q| q.id.as_str()).collect();
-        let handled_by = |p: &Pending| p.handler == instance_id && p.handler_token == token;
-        let sent_by = |p: &Pending| p.sender == instance_id && p.sender_token == Some(token);
+        let handled_by = |p: &Pending| {
+            p.unary()
+                .is_some_and(|u| u.handler == instance_id && u.handler_token == token)
+        };
+        let sent_by = |p: &Pending| p.sender() == instance_id && p.sender_token() == Some(token);
         let (failed, dropped) = {
             let mut pending = self.pending.lock().unwrap();
             let ids: Vec<String> = pending
                 .iter()
-                .filter(|(_, p)| p.context == *ctx && (handled_by(p) || sent_by(p)))
+                .filter(|(_, p)| p.context() == ctx && (handled_by(p) || sent_by(p)))
                 .map(|(id, _)| id.clone())
                 .collect();
             let mut failed = Vec::new();
@@ -977,27 +1214,38 @@ impl Router {
                 if !sent && waiting_ids.contains(id.as_str()) {
                     continue; // stays pending, routed again below
                 }
-                let entry = pending.remove(&id).expect("id collected under same lock");
-                if sent {
-                    dropped.push((id, entry));
-                } else {
-                    failed.push((id, entry));
+                match pending.remove(&id).expect("id collected under same lock") {
+                    entry if sent => dropped.push((id, entry)),
+                    Pending::Unary(entry) => failed.push((id, entry)),
+                    Pending::Scatter(_) => unreachable!("a gather has no handler"),
                 }
             }
             (failed, dropped)
         };
+        // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in
+        // flight. A gather's targets have the same sender, so they are dropped with it.
         for (id, entry) in dropped {
-            entry.cancel.abort();
-            self.release(&id, &entry);
-            // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in flight.
-            self.metrics.in_flight_add(entry.kind, -1);
-            entry.span.record("kraken.outcome", "sender_disconnected");
+            match entry {
+                Pending::Unary(entry) => {
+                    entry.abort_timer();
+                    self.release(&id, &entry);
+                    if entry.part_of.is_none() {
+                        self.metrics.in_flight_add(entry.kind, -1);
+                    }
+                    entry.span.record("kraken.outcome", "sender_disconnected");
+                }
+                Pending::Scatter(gather) => {
+                    gather.cancel.abort();
+                    self.metrics.in_flight_add(gather.kind, -1);
+                    gather.span.record("kraken.outcome", "sender_disconnected");
+                }
+            }
         }
         for item in waiting {
             self.reroute(ctx, item); // a dropped one is no longer pending: skipped
         }
         for (id, entry) in failed {
-            entry.cancel.abort();
+            entry.abort_timer();
             self.finish_with_error(
                 &id,
                 entry,
@@ -1034,15 +1282,31 @@ impl Router {
     pub fn in_flight_by_instance(&self) -> (HashMap<InstanceId, InFlight>, u32) {
         let pending = self.pending.lock().unwrap();
         let mut by_instance: HashMap<InstanceId, InFlight> = HashMap::new();
+        let mut requests = 0;
         for p in pending.values() {
-            by_instance.entry(p.handler.clone()).or_default().as_handler += 1;
-            by_instance.entry(p.sender.clone()).or_default().as_sender += 1;
+            if let Some(u) = p.unary() {
+                by_instance.entry(u.handler.clone()).or_default().as_handler += 1;
+            }
+            if p.is_request() {
+                by_instance
+                    .entry(p.sender().to_string())
+                    .or_default()
+                    .as_sender += 1;
+                requests += 1;
+            }
         }
-        (by_instance, pending.len() as u32)
+        (by_instance, requests)
     }
 
+    /// Requests in flight as their senders see them: a scatter-gather counts once, not per
+    /// target.
     pub fn in_flight(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| p.is_request())
+            .count()
     }
 
     fn on_timeout(&self, id: &str, timeout_ms: u128) {
@@ -1055,23 +1319,22 @@ impl Router {
 
     /// Removes the pending entry (if still present) and sends it a terminal error.
     fn fail(&self, id: &str, code: ErrorCode, message: String) {
-        let entry = self.pending.lock().unwrap().remove(id);
-        if let Some(entry) = entry {
-            entry.cancel.abort();
+        if let Some(entry) = self.take_unary(id) {
+            entry.abort_timer();
             self.release(id, &entry);
             self.finish_with_error(id, entry, code, message);
         }
     }
 
     /// `entry` must already have been removed from the map (and released) by the caller.
-    fn finish_with_error(&self, id: &str, entry: Pending, code: ErrorCode, message: String) {
+    fn finish_with_error(&self, id: &str, entry: Unary, code: ErrorCode, message: String) {
         self.finish_with_outcome(id, entry, code, message, outcome_of(code));
     }
 
     fn finish_with_outcome(
         &self,
         id: &str,
-        entry: Pending,
+        entry: Unary,
         code: ErrorCode,
         message: String,
         outcome: Outcome,
@@ -1086,6 +1349,16 @@ impl Router {
             outcome,
             false,
         );
+        if entry.part_of.is_some() {
+            let error = crate::proto::Error {
+                request_id: id.to_string(),
+                code: code as i32,
+                message,
+                details: vec![],
+            };
+            self.on_part(id, entry, Err((error, outcome)));
+            return;
+        }
         let elapsed = entry.started.elapsed();
         self.metrics
             .request_finished(entry.kind, &entry.type_name, outcome, elapsed);
@@ -1112,10 +1385,362 @@ impl Router {
         type_name: &str,
         outcome: Outcome,
     ) {
+        self.record_rejected_mode(sender_service, kind, type_name, outcome, "unary");
+    }
+
+    fn record_rejected_mode(
+        &self,
+        sender_service: Option<&str>,
+        kind: Kind,
+        type_name: &str,
+        outcome: Outcome,
+        mode: &'static str,
+    ) {
         self.metrics.request_started(kind);
         self.metrics
-            .request_finished(kind, type_name, outcome, Duration::ZERO);
+            .request_finished_mode(kind, type_name, outcome, Duration::ZERO, mode);
         self.record_edge(sender_service, type_name, kind, outcome, None);
+    }
+
+    /// A request with a mode other than UNARY (ADR 0017). Gates: a v1 sender cannot know the
+    /// newer codes (INVALID_REQUEST); a v2 sender gets UNSUPPORTED for a mode this hub does not
+    /// implement or its session did not declare; scatter-gather is for queries only
+    /// (INVALID_REQUEST); no live target is NO_HANDLER.
+    fn route_mode(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        sender: &str,
+        req: Request,
+        req_kind: Kind,
+        sender_info: Option<SenderInfo>,
+        span: tracing::Span,
+    ) {
+        let id = req.id.clone();
+        let type_name = req.r#type.clone();
+        let mode = mode_label(req.mode);
+        let sender_service = sender_info.as_ref().map(|s| s.service.clone());
+        let reject = |kind: Kind, code: ErrorCode, outcome: Outcome, message: String| {
+            self.record_rejected_mode(sender_service.as_deref(), kind, &type_name, outcome, mode);
+            record_outcome(&span, outcome);
+            log_outcome(&id, &type_name, Some(kind), sender, None, outcome, false);
+            self.send_to(ctx, sender, error_message(&id, code, message));
+        };
+        let Some(info) = sender_info.filter(|s| protocol::is_v2(s.protocol_version)) else {
+            let message = format!("invalid request: request mode {mode} needs protocol v2");
+            return reject(
+                req_kind,
+                ErrorCode::InvalidRequest,
+                Outcome::InvalidRequest,
+                message,
+            );
+        };
+        if req.mode != RequestMode::ScatterGather as i32 {
+            let message = format!("request mode {mode} is not supported by this hub");
+            return reject(
+                req_kind,
+                ErrorCode::Unsupported,
+                Outcome::Unsupported,
+                message,
+            );
+        }
+        if !info.scatter_gather {
+            let message = format!(
+                "request mode {mode} needs the \"{}\" capability, not declared by this session",
+                protocol::SCATTER_GATHER
+            );
+            return reject(
+                req_kind,
+                ErrorCode::Unsupported,
+                Outcome::Unsupported,
+                message,
+            );
+        }
+        let for_queries = |type_name: &str| {
+            format!("invalid request: {type_name} is a command; {mode} is for queries")
+        };
+        if req_kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return reject(
+                req_kind,
+                ErrorCode::InvalidRequest,
+                Outcome::InvalidRequest,
+                message,
+            );
+        }
+        let (kind, targets) = match self.registry.scatter_targets(ctx, &type_name) {
+            Ok(found) => found,
+            Err(e) => {
+                let message = no_handler_message(&type_name, e);
+                return reject(req_kind, ErrorCode::NoHandler, Outcome::NoHandler, message);
+            }
+        };
+        if kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return reject(
+                kind,
+                ErrorCode::InvalidRequest,
+                Outcome::InvalidRequest,
+                message,
+            );
+        }
+        // The sender's own stream, weakly: the gather never keeps a closed stream open.
+        let Some(out) = self
+            .sessions
+            .weak_sender_if_current(ctx, sender, info.token)
+        else {
+            return; // the sender left meanwhile: nobody to answer
+        };
+        let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
+        let targets: Vec<(String, crate::registry::ScatterTarget, u64)> = targets
+            .into_iter()
+            .enumerate()
+            .map(|(n, t)| {
+                let token = self.sessions.token_of(ctx, &t.id).unwrap_or(u64::MAX);
+                (format!("{id}#{n}"), t, token)
+            })
+            .collect();
+        span.record(
+            "kraken.handler",
+            format!("{} targets", targets.len()).as_str(),
+        );
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(&id) || targets.iter().any(|(t, _, _)| pending.contains_key(t))
+            {
+                drop(pending);
+                let message = "invalid request: duplicate id".to_string();
+                return reject(
+                    kind,
+                    ErrorCode::InvalidRequest,
+                    Outcome::InvalidRequest,
+                    message,
+                );
+            }
+            self.metrics.request_started(kind);
+            let router = Arc::clone(self);
+            let task_id = id.clone();
+            let cancel = tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                router.on_scatter_deadline(&task_id);
+            })
+            .abort_handle();
+            let now = Instant::now();
+            for (target_id, target, token) in &targets {
+                let entry = Unary {
+                    context: ctx.clone(),
+                    sender: sender.to_string(),
+                    sender_token: Some(info.token),
+                    sender_service: Some(info.service.clone()),
+                    handler: target.id.clone(),
+                    handler_token: *token,
+                    sender_flow_control: info.flow_control,
+                    kind,
+                    type_name: type_name.clone(),
+                    started: now,
+                    cancel: None,
+                    span: tracing::Span::none(),
+                    part_of: Some(PartOf {
+                        parent: id.clone(),
+                        service: target.service.clone(),
+                    }),
+                };
+                pending.insert(target_id.clone(), Pending::Unary(entry));
+            }
+            let gather = Scatter {
+                context: ctx.clone(),
+                sender: sender.to_string(),
+                sender_token: Some(info.token),
+                sender_service: Some(info.service.clone()),
+                kind,
+                type_name: type_name.clone(),
+                started: now,
+                cancel,
+                span,
+                out,
+                delivery: None,
+                outstanding: targets.iter().map(|(t, _, _)| t.clone()).collect(),
+                parts: 0,
+                ok: 0,
+                failed: 0,
+                max_results: req.max_results,
+                last_failure: None,
+            };
+            pending.insert(id.clone(), Pending::Scatter(gather));
+        }
+        self.metrics.scatter_targets(&type_name, targets.len());
+        // Each target gets an ordinary unary request with its own id: v1 handlers serve it
+        // unchanged, and its answer is matched to its target.
+        for (target_id, target, token) in targets {
+            let forwarded = Request {
+                id: target_id.clone(),
+                mode: RequestMode::Unary as i32,
+                max_results: 0,
+                initial_credit: 0,
+                ..req.clone()
+            };
+            self.dispatch(ctx, &target_id, &target.id, token, forwarded);
+        }
+    }
+
+    /// The answer of scatter-gather target `id` (already removed from the map and released):
+    /// a `ReplyPart` to the sender, and the `ReplyEnd` when it was the last one needed.
+    fn on_part(
+        &self,
+        id: &str,
+        entry: Unary,
+        result: Result<Vec<u8>, (crate::proto::Error, Outcome)>,
+    ) {
+        let Some(part_of) = entry.part_of else {
+            return;
+        };
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Scatter(gather)) = pending.get_mut(&part_of.parent) else {
+                return; // the gather ended (deadline, max_results, sender gone)
+            };
+            if !gather.outstanding.remove(id) {
+                return;
+            }
+            let seq = u64::from(gather.parts);
+            gather.parts += 1;
+            let (payload, error) = match result {
+                Ok(payload) => {
+                    gather.ok += 1;
+                    (payload, None)
+                }
+                Err((mut error, outcome)) => {
+                    gather.failed += 1;
+                    gather.last_failure = Some(outcome);
+                    error.request_id = part_of.parent.clone();
+                    (Vec::new(), Some(error))
+                }
+            };
+            let part = ServerMessage {
+                message: Some(server_message::Message::Part(ReplyPart {
+                    request_id: part_of.parent.clone(),
+                    payload,
+                    error,
+                    responder_service: part_of.service,
+                    responder_instance: entry.handler,
+                    seq,
+                })),
+            };
+            gather.deliver(part, &self.metrics);
+            let done = gather.outstanding.is_empty()
+                || (gather.max_results > 0 && gather.ok >= gather.max_results);
+            if done {
+                self.close_gather(&mut pending, &part_of.parent, false)
+            } else {
+                None
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_scatter(&part_of.parent, closed);
+        }
+    }
+
+    /// The deadline of gather `id`: it ends with the targets that did not answer as timed out.
+    fn on_scatter_deadline(&self, id: &str) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            self.close_gather(&mut pending, id, true)
+        };
+        if let Some(closed) = closed {
+            self.finish_scatter(id, closed);
+        }
+    }
+
+    /// Takes gather `id` and its unanswered targets out of the map and sends its `ReplyEnd`
+    /// (under the pending lock, so it follows every part). `deadline`: the unanswered targets
+    /// timed out (otherwise `max_results` was reached, or nobody is left).
+    fn close_gather(
+        &self,
+        pending: &mut HashMap<String, Pending>,
+        id: &str,
+        deadline: bool,
+    ) -> Option<Closed> {
+        if !matches!(pending.get(id), Some(Pending::Scatter(_))) {
+            return None;
+        }
+        let Some(Pending::Scatter(mut gather)) = pending.remove(id) else {
+            return None;
+        };
+        let rest: Vec<(String, Unary)> = gather
+            .outstanding
+            .drain()
+            .filter_map(|target| match pending.remove(&target) {
+                Some(Pending::Unary(u)) => Some((target, u)),
+                Some(other) => {
+                    pending.insert(target, other);
+                    None
+                }
+                None => None,
+            })
+            .collect();
+        let timed_out = if deadline { rest.len() as u32 } else { 0 };
+        let end = ServerMessage {
+            message: Some(server_message::Message::End(ReplyEnd {
+                request_id: id.to_string(),
+                error: None,
+                parts: gather.parts,
+                failed: gather.failed,
+                timed_out,
+            })),
+        };
+        gather.deliver(end, &self.metrics);
+        Some(Closed {
+            gather,
+            rest,
+            timed_out,
+        })
+    }
+
+    /// Bookkeeping of a closed gather: flow state of its unanswered targets, metrics and edge
+    /// (one request; an error when no part succeeded).
+    fn finish_scatter(&self, id: &str, closed: Closed) {
+        let Closed {
+            gather,
+            rest,
+            timed_out,
+        } = closed;
+        gather.cancel.abort();
+        for (target, entry) in &rest {
+            self.release(target, entry);
+        }
+        let outcome = if gather.ok > 0 {
+            Outcome::Ok
+        } else if timed_out > 0 {
+            Outcome::Timeout
+        } else {
+            gather.last_failure.unwrap_or(Outcome::HandlerError)
+        };
+        record_outcome(&gather.span, outcome);
+        if outcome != Outcome::Ok {
+            log_outcome(
+                id,
+                &gather.type_name,
+                Some(gather.kind),
+                &gather.sender,
+                None,
+                outcome,
+                false,
+            );
+        }
+        let elapsed = gather.started.elapsed();
+        self.metrics.request_finished_mode(
+            gather.kind,
+            &gather.type_name,
+            outcome,
+            elapsed,
+            mode_label(RequestMode::ScatterGather as i32),
+        );
+        self.record_edge(
+            gather.sender_service.as_deref(),
+            &gather.type_name,
+            gather.kind,
+            outcome,
+            Some(elapsed),
+        );
     }
 
     /// Sends a terminal message (`Reply` or `Error`) to `instance`. `try_send` is the fast path;
@@ -2365,5 +2990,593 @@ mod tests {
         }
         let (rx1, _) = rxs.get_mut("h1").unwrap();
         assert_eq!(forwarded(rx1).len(), 3);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Scatter-gather (ADR 0017)
+
+    use crate::proto::{ReplyEnd, ReplyPart, RequestMode};
+    use crate::registry::RegisteredTypes;
+
+    fn scatter_meta(protocol_version: u32, scatter: bool) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            protocol_version,
+            scatter_gather: scatter,
+            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
+        }
+    }
+
+    /// Owners A (a1) and B (b1, b2) of the shared query "q.Find"; X (x1) owns command "c.Do" and
+    /// exclusive query "q.Own"; sender s1 ("web", v2, scatter-gather), s-v1 (v1) and s-plain
+    /// (v2 without the capability).
+    struct Gather {
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        router: Arc<Router>,
+        rx: HashMap<&'static str, Rx>,
+        tokens: HashMap<&'static str, u64>,
+    }
+
+    impl Gather {
+        fn new() -> Self {
+            Self::with(Config::default(), Metrics::noop())
+        }
+
+        fn with(config: Config, metrics: Arc<Metrics>) -> Self {
+            let registry = Arc::new(Registry::new(config.owner_grace));
+            let sessions = Arc::new(Sessions::new());
+            let router = Router::new(
+                Arc::clone(&registry),
+                Arc::clone(&sessions),
+                Arc::new(config),
+                metrics,
+            );
+            let mut g = Gather {
+                registry,
+                sessions,
+                router,
+                rx: HashMap::new(),
+                tokens: HashMap::new(),
+            };
+            g.connect("s1", "web", scatter_meta(2, true), None);
+            g.connect("s-v1", "old", scatter_meta(0, false), None);
+            g.connect("s-plain", "plain", scatter_meta(2, false), None);
+            for (id, service) in [("a1", "A"), ("b1", "B"), ("b2", "B")] {
+                g.connect(id, service, scatter_meta(0, false), None);
+                g.shared(id, service, &["q.Find"]);
+            }
+            g.connect("x1", "X", scatter_meta(0, false), None);
+            g.registry
+                .register(&D, "x1", "X", &["c.Do".into()], &["q.Own".into()])
+                .unwrap();
+            g
+        }
+
+        fn connect(
+            &mut self,
+            id: &'static str,
+            service: &str,
+            meta: crate::session::SessionMeta,
+            permits: Option<u32>,
+        ) {
+            let token = self.sessions.allocate_token();
+            assert!(self.router.open_session(&D, id, token, service, permits));
+            let (tx, rx) = mpsc::channel(64);
+            self.sessions
+                .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
+                .unwrap();
+            self.router.start_session(&D, id, token);
+            self.rx.insert(id, rx);
+            self.tokens.insert(id, token);
+        }
+
+        fn shared(&self, id: &str, service: &str, types: &[&str]) {
+            self.registry
+                .register_types(
+                    &D,
+                    id,
+                    service,
+                    &RegisteredTypes {
+                        shared_query_types: types.iter().map(|t| t.to_string()).collect(),
+                        ..RegisteredTypes::default()
+                    },
+                    crate::registry::Placement::default(),
+                )
+                .unwrap();
+        }
+
+        fn leave(&self, id: &str) {
+            crate::service::disconnect(
+                &self.registry,
+                &self.sessions,
+                &self.router,
+                &D,
+                id,
+                self.tokens[id],
+            );
+        }
+
+        fn requests(&mut self, id: &str) -> Vec<Request> {
+            let mut out = Vec::new();
+            while let Ok(Ok(m)) = self.rx.get_mut(id).unwrap().try_recv() {
+                if let Some(server_message::Message::Request(r)) = m.message {
+                    out.push(r);
+                }
+            }
+            out
+        }
+
+        fn messages(&mut self, id: &str) -> Vec<server_message::Message> {
+            let mut out = Vec::new();
+            while let Ok(Ok(m)) = self.rx.get_mut(id).unwrap().try_recv() {
+                out.extend(m.message);
+            }
+            out
+        }
+
+        fn reply(&self, from: &str, id: &str, payload: &[u8]) {
+            self.router.on_reply(
+                &D,
+                from,
+                Reply {
+                    request_id: id.into(),
+                    result: Some(reply::Result::Payload(payload.to_vec())),
+                },
+            );
+        }
+
+        fn reply_error(&self, from: &str, id: &str) {
+            self.router.on_reply(
+                &D,
+                from,
+                Reply {
+                    request_id: id.into(),
+                    result: Some(reply::Result::Error(crate::proto::Error {
+                        request_id: id.into(),
+                        code: ErrorCode::HandlerError as i32,
+                        message: "boom".into(),
+                        details: vec![],
+                    })),
+                },
+            );
+        }
+    }
+
+    fn scatter(id: &str, type_name: &str, timeout_ms: u32, max_results: u32) -> Request {
+        Request {
+            id: id.into(),
+            kind: RequestKind::Query as i32,
+            r#type: type_name.into(),
+            payload: b"{\"q\":1}".to_vec(),
+            headers: HashMap::from([("traceparent".to_string(), "x".to_string())]),
+            timeout_ms,
+            mode: RequestMode::ScatterGather as i32,
+            max_results,
+            priority: 3,
+            ..Request::default()
+        }
+    }
+
+    fn part(m: &server_message::Message) -> &ReplyPart {
+        match m {
+            server_message::Message::Part(p) => p,
+            other => panic!("expected a part, got {other:?}"),
+        }
+    }
+
+    fn end(m: &server_message::Message) -> &ReplyEnd {
+        match m {
+            server_message::Message::End(e) => e,
+            other => panic!("expected an end, got {other:?}"),
+        }
+    }
+
+    fn error_code(m: &server_message::Message) -> (String, ErrorCode) {
+        match m {
+            server_message::Message::Error(e) => (e.request_id.clone(), e.code()),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_target_gets_an_ordinary_request_with_its_own_id() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        let mut ids = Vec::new();
+        for h in ["a1", "b1", "b2"] {
+            let got = g.requests(h);
+            assert_eq!(got.len(), 1, "{h}");
+            let r = &got[0];
+            assert_eq!(
+                r.mode,
+                RequestMode::Unary as i32,
+                "handlers see a unary request"
+            );
+            assert_eq!((r.max_results, r.priority), (0, 3));
+            assert_eq!(r.payload, b"{\"q\":1}");
+            assert_eq!(r.headers["traceparent"], "x");
+            ids.push(r.id.clone());
+        }
+        assert_eq!(ids, ["g1#0", "g1#1", "g1#2"]);
+        assert!(g.requests("x1").is_empty());
+        assert_eq!(
+            g.router.in_flight(),
+            1,
+            "a scatter-gather is one request in flight"
+        );
+        let (by_instance, total) = g.router.in_flight_by_instance();
+        assert_eq!(total, 1);
+        assert_eq!(by_instance["s1"].as_sender, 1);
+        for h in ["a1", "b1", "b2"] {
+            assert_eq!(by_instance[h].as_handler, 1, "{h}");
+        }
+        // An exclusive query: every instance of its owner.
+        g.router.route(&D, "s1", scatter("g2", "q.Own", 0, 0));
+        assert_eq!(g.requests("x1")[0].id, "g2#0");
+    }
+
+    #[tokio::test]
+    async fn answers_are_relayed_as_parts_in_arrival_order_then_one_end() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        g.reply("b2", "g1#2", b"two");
+        g.reply_error("a1", "g1#0");
+        g.reply("b1", "g1#1", b"one");
+        let got = g.messages("s1");
+        assert_eq!(got.len(), 4, "{got:?}");
+        let p0 = part(&got[0]);
+        assert_eq!(
+            (
+                p0.request_id.as_str(),
+                p0.seq,
+                p0.responder_service.as_str()
+            ),
+            ("g1", 0, "B")
+        );
+        assert_eq!(
+            (p0.responder_instance.as_str(), p0.payload.as_slice()),
+            ("b2", &b"two"[..])
+        );
+        assert!(p0.error.is_none());
+        let p1 = part(&got[1]);
+        assert_eq!((p1.seq, p1.responder_instance.as_str()), (1, "a1"));
+        let e = p1.error.as_ref().expect("a failed part");
+        assert_eq!(
+            (e.request_id.as_str(), e.code()),
+            ("g1", ErrorCode::HandlerError)
+        );
+        assert!(p1.payload.is_empty());
+        assert_eq!(part(&got[2]).seq, 2);
+        let end = end(&got[3]);
+        assert_eq!(
+            (
+                end.request_id.as_str(),
+                end.parts,
+                end.failed,
+                end.timed_out
+            ),
+            ("g1", 3, 1, 0)
+        );
+        assert!(end.error.is_none());
+        assert_eq!(g.router.in_flight(), 0);
+        assert!(g.router.in_flight_by_instance().0.is_empty());
+        // A late or repeated answer changes nothing.
+        g.reply("b1", "g1#1", b"again");
+        assert!(g.messages("s1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_results_ends_after_that_many_successful_parts() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 1));
+        g.reply_error("b1", "g1#1");
+        g.reply("a1", "g1#0", b"first");
+        g.reply("b2", "g1#2", b"dropped");
+        let got = g.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(
+            part(&got[0]).error.is_some(),
+            "a failed part does not count"
+        );
+        assert_eq!(part(&got[1]).payload, b"first");
+        let end = end(&got[2]);
+        assert_eq!((end.parts, end.failed, end.timed_out), (2, 1, 0));
+        assert_eq!(g.router.in_flight(), 0);
+        assert!(
+            g.router.in_flight_by_instance().0.is_empty(),
+            "the remaining targets' entries ended"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_ends_with_the_targets_that_did_not_answer() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 100, 0));
+        // Let the deadline timer start before the clock moves.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(30)).await;
+        g.reply("b1", "g1#1", b"one");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let got = g.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        let end = end(&got[1]);
+        assert_eq!((end.parts, end.failed, end.timed_out), (1, 0, 2));
+        assert!(end.error.is_none(), "partial answers are answers");
+        assert_eq!(g.router.in_flight(), 0);
+        g.reply("a1", "g1#0", b"late");
+        assert!(g.messages("s1").is_empty(), "a late answer is dropped");
+        let e = edge_of(&g.router, "web", "q.Find");
+        assert_eq!((e.count, e.errors), (1, 0), "one request on the edge");
+        let max = e.latency.quantile(1.0).unwrap().as_secs_f64() * 1000.0;
+        assert!((max - 100.0).abs() <= 5.0, "latency to the ReplyEnd: {max}");
+
+        // Nobody answers: the edge counts an error.
+        g.router.route(&D, "s1", scatter("g2", "q.Find", 100, 0));
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let got = g.messages("s1");
+        assert_eq!(end_of(&got), (0, 0, 3));
+        let e = edge_of(&g.router, "web", "q.Find");
+        assert_eq!((e.count, e.errors), (2, 1));
+    }
+
+    fn end_of(got: &[server_message::Message]) -> (u32, u32, u32) {
+        let e = end(got.last().expect("messages"));
+        (e.parts, e.failed, e.timed_out)
+    }
+
+    #[tokio::test]
+    async fn a_target_that_disconnects_is_a_failed_part() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        g.reply("a1", "g1#0", b"a");
+        g.leave("b1");
+        g.reply("b2", "g1#2", b"b");
+        let got = g.messages("s1");
+        assert_eq!(got.len(), 4, "{got:?}");
+        let p = part(&got[1]);
+        assert_eq!(p.responder_instance, "b1");
+        assert_eq!(
+            p.error.as_ref().unwrap().code(),
+            ErrorCode::HandlerDisconnected
+        );
+        assert_eq!(end_of(&got), (3, 1, 0));
+        let e = edge_of(&g.router, "web", "q.Find");
+        assert_eq!((e.count, e.errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn every_part_failed_counts_as_an_error_on_the_edge() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        for (h, id) in [("a1", "g1#0"), ("b1", "g1#1"), ("b2", "g1#2")] {
+            g.reply_error(h, id);
+        }
+        assert_eq!(end_of(&g.messages("s1")), (3, 3, 0));
+        let e = edge_of(&g.router, "web", "q.Find");
+        assert_eq!((e.count, e.errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn zero_targets_is_an_ordinary_no_handler_error() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Nope", 0, 0));
+        for h in ["a1", "b1", "b2"] {
+            g.leave(h);
+        }
+        g.router.route(&D, "s1", scatter("g2", "q.Find", 0, 0));
+        let got = g.messages("s1");
+        let codes: Vec<_> = got.iter().map(error_code).collect();
+        assert_eq!(
+            codes,
+            [
+                ("g1".to_string(), ErrorCode::NoHandler),
+                ("g2".to_string(), ErrorCode::NoHandler)
+            ]
+        );
+        assert_eq!(g.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn modes_are_gated_by_version_capability_mode_and_kind() {
+        let mut g = Gather::new();
+        // A v1 session cannot know UNSUPPORTED: INVALID_REQUEST.
+        g.router.route(&D, "s-v1", scatter("v1", "q.Find", 0, 0));
+        assert_eq!(
+            g.messages("s-v1")
+                .iter()
+                .map(error_code)
+                .collect::<Vec<_>>(),
+            [("v1".to_string(), ErrorCode::InvalidRequest)]
+        );
+        // A v2 session that did not declare scatter-gather.
+        g.router.route(&D, "s-plain", scatter("p1", "q.Find", 0, 0));
+        assert_eq!(
+            error_code(&g.messages("s-plain")[0]),
+            ("p1".to_string(), ErrorCode::Unsupported)
+        );
+        // Modes this hub does not implement yet.
+        for (id, mode) in [
+            ("st", RequestMode::Streaming),
+            ("sub", RequestMode::Subscription),
+        ] {
+            g.router.route(
+                &D,
+                "s1",
+                Request {
+                    mode: mode as i32,
+                    ..scatter(id, "q.Find", 0, 0)
+                },
+            );
+        }
+        g.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: 42,
+                ..scatter("weird", "q.Find", 0, 0)
+            },
+        );
+        // A command, by request kind or by the type's registered kind.
+        g.router.route(
+            &D,
+            "s1",
+            Request {
+                kind: RequestKind::Command as i32,
+                ..scatter("cmd", "c.Do", 0, 0)
+            },
+        );
+        g.router.route(&D, "s1", scatter("cmd-q", "c.Do", 0, 0));
+        let codes: Vec<_> = g.messages("s1").iter().map(error_code).collect();
+        assert_eq!(
+            codes,
+            [
+                ("st".to_string(), ErrorCode::Unsupported),
+                ("sub".to_string(), ErrorCode::Unsupported),
+                ("weird".to_string(), ErrorCode::Unsupported),
+                ("cmd".to_string(), ErrorCode::InvalidRequest),
+                ("cmd-q".to_string(), ErrorCode::InvalidRequest),
+            ]
+        );
+        for h in ["a1", "b1", "b2", "x1"] {
+            assert!(g.requests(h).is_empty(), "{h} got nothing");
+        }
+        assert_eq!(g.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_scatter_id_is_rejected_and_the_first_continues() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        g.router.route(&D, "s1", request("g1", "c.Do", 0));
+        let codes: Vec<_> = g.messages("s1").iter().map(error_code).collect();
+        assert_eq!(
+            codes,
+            [
+                ("g1".to_string(), ErrorCode::InvalidRequest),
+                ("g1".to_string(), ErrorCode::InvalidRequest)
+            ]
+        );
+        assert_eq!(g.router.in_flight(), 1);
+        for (h, id) in [("a1", "g1#0"), ("b1", "g1#1"), ("b2", "g1#2")] {
+            g.reply(h, id, b"x");
+        }
+        assert_eq!(end_of(&g.messages("s1")), (3, 0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn targets_are_flow_controlled_and_prioritised_like_unary_requests() {
+        let mut g = Gather::new();
+        g.leave("b2");
+        // b3 has one permit, already taken by a unary query.
+        g.connect("b3", "B", scatter_meta(2, false), Some(1));
+        g.shared("b3", "B", &["q.Find"]);
+        // A unary point query goes to one of a1, b1, b3; send until b3 holds its permit.
+        let mut n = 0;
+        while g.router.flow_by_instance()["b3"].permits_available > 0 {
+            g.router.route(
+                &D,
+                "s1",
+                Request {
+                    mode: 0,
+                    priority: 0,
+                    ..scatter(&format!("u{n}"), "q.Find", 10_000, 0)
+                },
+            );
+            n += 1;
+        }
+        g.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: 0,
+                priority: 0,
+                ..scatter("waiting", "q.Find", 10_000, 0)
+            },
+        );
+        let waiting_on_b3 = g.router.flow_by_instance()["b3"].queued == 1;
+        g.requests("b3");
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 100, 0));
+        let queued = g.router.flow_by_instance()["b3"].queued;
+        assert_eq!(queued, if waiting_on_b3 { 2 } else { 1 });
+        // A permit: the scatter target (priority 3) goes before the unary one (priority 0).
+        g.router.on_permits(&D, "b3", g.tokens["b3"], 1, 0);
+        let ids: Vec<String> = g.requests("b3").into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["g1#2"]);
+        // The deadline takes a still-queued target out of the queue.
+        g.router.route(&D, "s1", scatter("g2", "q.Find", 100, 0));
+        assert!(g.router.flow_by_instance()["b3"].queued >= 1);
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let q = g.router.flow_by_instance()["b3"].queued;
+        assert_eq!(
+            q,
+            u32::from(waiting_on_b3),
+            "only the unary request still waits"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_departing_sender_takes_its_gather_and_targets_with_it() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        g.leave("s1");
+        assert_eq!(g.router.in_flight(), 0);
+        assert!(g.router.in_flight_by_instance().0.is_empty());
+        g.reply("a1", "g1#0", b"x");
+        for h in ["a1", "b1", "b2"] {
+            assert!(
+                g.messages(h)
+                    .iter()
+                    .all(|m| matches!(m, server_message::Message::Request(_)))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_target_whose_instance_leaves_fails_instead_of_moving() {
+        let mut g = Gather::new();
+        g.leave("b2");
+        g.connect("b3", "B", scatter_meta(2, false), Some(0));
+        g.shared("b3", "B", &["q.Find"]);
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        assert_eq!(g.router.flow_by_instance()["b3"].queued, 1);
+        g.leave("b3");
+        let got = g.messages("s1");
+        let p = part(&got[0]);
+        assert_eq!(p.responder_instance, "b3");
+        assert_eq!(
+            p.error.as_ref().unwrap().code(),
+            ErrorCode::HandlerDisconnected
+        );
+        assert_eq!(g.requests("a1").len(), 1, "a1 got only its own target");
+        assert_eq!(g.requests("b1").len(), 1, "b1 got only its own target");
+    }
+
+    #[tokio::test]
+    async fn scatter_metrics_count_one_request_by_mode_and_the_targets() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut g = Gather::with(Config::default(), Arc::clone(&m.metrics));
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
+        for (h, id) in [("a1", "g1#0"), ("b1", "g1#1"), ("b2", "g1#2")] {
+            g.reply(h, id, b"x");
+        }
+        g.router.route(&D, "s-plain", scatter("p1", "q.Find", 0, 0));
+        g.messages("s1");
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "scatter_gather"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            None
+        );
+        assert_eq!(
+            m.histogram_sum("kraken_hub_scatter_targets"),
+            Some((1, 3.0))
+        );
     }
 }

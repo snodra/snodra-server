@@ -284,7 +284,7 @@ async fn types_topology_settings_and_version_have_their_shape() {
     assert_eq!(v["protocolVersion"], 2);
     assert_eq!(
         v["capabilities"],
-        serde_json::json!(["flow-control", "instance-status"])
+        serde_json::json!(["flow-control", "instance-status", "scatter-gather"])
     );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(v["startedAtMs"].as_i64().unwrap() <= v["nowMs"].as_i64().unwrap());
