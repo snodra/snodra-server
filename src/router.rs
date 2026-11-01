@@ -1473,15 +1473,24 @@ impl Router {
         outcome: Outcome,
     ) {
         record_outcome(&entry.span, outcome);
-        log_outcome(
-            id,
-            &entry.type_name,
-            Some(entry.kind),
-            &entry.sender,
-            Some(&entry.handler),
-            outcome,
-            false,
-        );
+        // A stream target's failure is the stream's: `finish_stream` logs it once, for `<id>`.
+        let stream_target = entry.part_of.as_ref().is_some_and(|p| {
+            matches!(
+                self.pending.lock().unwrap().get(&p.parent),
+                Some(Pending::Stream(_))
+            )
+        });
+        if !stream_target {
+            log_outcome(
+                id,
+                &entry.type_name,
+                Some(entry.kind),
+                &entry.sender,
+                Some(&entry.handler),
+                outcome,
+                false,
+            );
+        }
         if entry.part_of.is_some() {
             let error = crate::proto::Error {
                 request_id: id.to_string(),
@@ -5718,6 +5727,87 @@ mod stream_tests {
             [("g3#2".to_string(), "sender disconnected".to_string())]
         );
         assert_eq!(f.messages("a2").len(), 1);
+    }
+
+    thread_local! {
+        /// The `request_id` of every "request ended with error" line logged on this thread
+        /// (a test and its current-thread runtime share one thread).
+        static ENDED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records the "request ended with error" lines into [`ENDED`].
+    struct EndedLog;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndedLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields {
+                ended: bool,
+                request_id: Option<String>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    match field.name() {
+                        "message" => {
+                            self.ended = format!("{value:?}") == "request ended with error";
+                        }
+                        "request_id" => {
+                            self.request_id =
+                                Some(format!("{value:?}").trim_matches('"').to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut fields = Fields {
+                ended: false,
+                request_id: None,
+            };
+            event.record(&mut fields);
+            if fields.ended
+                && let Some(id) = fields.request_id
+            {
+                ENDED.with_borrow_mut(|lines| lines.push(id));
+            }
+        }
+    }
+
+    /// Installs [`EndedLog`] as the global subscriber (once per test binary: a scoped one is
+    /// racy, as any thread's first hit of a callsite rebuilds the global interest cache and the
+    /// max level against the global default) and clears this thread's lines.
+    fn capture_ended_log() {
+        use tracing_subscriber::layer::SubscriberExt;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(EndedLog);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        ENDED.with_borrow_mut(Vec::clear);
+    }
+
+    fn ended_log() -> Vec<String> {
+        ENDED.with_borrow(Vec::clone)
+    }
+
+    /// The target `<id>#1` failing hub-side (here: its handler left) ends the stream with that
+    /// error; it is logged once, as the stream's, not again as the target's.
+    #[tokio::test]
+    async fn a_hub_side_failure_of_a_forwarded_target_is_logged_once_for_the_stream() {
+        capture_ended_log();
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.leave(h);
+        let got = f.messages("s1");
+        assert_eq!(end_error(end(&got[0])).0, ErrorCode::HandlerDisconnected);
+        assert_eq!(ended_log(), ["st1"], "one line, the stream's");
     }
 
     #[tokio::test]
