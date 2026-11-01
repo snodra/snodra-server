@@ -296,6 +296,8 @@ async fn run_stream(
     let instance_status = v2 && protocol::shares(&first.capabilities, protocol::INSTANCE_STATUS);
     // And whether it may send scatter-gather queries (ADR 0017).
     let scatter_gather = v2 && protocol::shares(&first.capabilities, protocol::SCATTER_GATHER);
+    // And whether it sends or serves streaming queries (ADR 0017, P4b).
+    let streaming = v2 && protocol::shares(&first.capabilities, protocol::STREAMING);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -314,6 +316,7 @@ async fn run_stream(
         placement: placement.clone(),
         instance_status,
         scatter_gather,
+        streaming,
     };
     let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed

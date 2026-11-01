@@ -25,9 +25,14 @@ pub const INSTANCE_STATUS: &str = "instance-status";
 /// SCATTER_GATHER and receives `ReplyPart` / `ReplyEnd` for it.
 pub const SCATTER_GATHER: &str = "scatter-gather";
 
-/// Optional protocol features this hub supports. Later phases add `streaming`, `subscription`
-/// and `processors`.
-pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER];
+/// Capability of streaming queries (ADR 0017, P4b): a sender may send `Request.mode` STREAMING
+/// and receives `ReplyPart` / `ReplyEnd` for it; a handler receives such requests and answers
+/// with parts and an end under the sender's credits (`Flow`), and honours `Cancel`.
+pub const STREAMING: &str = "streaming";
+
+/// Optional protocol features this hub supports. Later phases add `subscription` and
+/// `processors`.
+pub const HUB_CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER, STREAMING];
 
 /// True when the client declared `capability` and this hub supports it.
 pub fn shares(client: &[String], capability: &str) -> bool {
@@ -147,6 +152,17 @@ mod tests {
         assert_eq!(shared_capabilities(&client), ["scatter-gather"]);
         assert!(shares(&client, SCATTER_GATHER));
         assert!(!shares(&[], SCATTER_GATHER));
+    }
+
+    #[test]
+    fn streaming_is_shared_when_declared() {
+        let client = ["streaming".to_string(), "scatter-gather".to_string()];
+        assert_eq!(
+            shared_capabilities(&client),
+            ["scatter-gather", "streaming"]
+        );
+        assert!(shares(&client, STREAMING));
+        assert!(!shares(&["scatter-gather".to_string()], STREAMING));
     }
 
     #[test]

@@ -102,6 +102,10 @@ pub struct SessionMeta {
     /// The session is v2 and shares the "scatter-gather" capability: it may send requests with
     /// mode SCATTER_GATHER and get ReplyPart / ReplyEnd (ADR 0017).
     pub scatter_gather: bool,
+    /// The session is v2 and shares the "streaming" capability: it may send requests with mode
+    /// STREAMING, is a target for them, and sends and receives the multi-part messages
+    /// (ADR 0017, P4b).
+    pub streaming: bool,
 }
 
 impl SessionMeta {
@@ -117,6 +121,7 @@ impl SessionMeta {
             placement: Placement::default(),
             instance_status: false,
             scatter_gather: false,
+            streaming: false,
         }
     }
 
@@ -155,6 +160,8 @@ pub struct SenderInfo {
     pub protocol_version: u32,
     /// The session shares "scatter-gather".
     pub scatter_gather: bool,
+    /// The session shares "streaming".
+    pub streaming: bool,
 }
 
 /// Read-only copy of one session's observable state, for the topology view.
@@ -285,7 +292,18 @@ impl Sessions {
                 service: s.service.clone(),
                 protocol_version: s.meta.protocol_version,
                 scatter_gather: s.meta.scatter_gather,
+                streaming: s.meta.streaming,
             })
+    }
+
+    /// True when the current session of `instance_id` negotiated the "streaming" capability
+    /// (so it understands `ReplyPart`, `ReplyEnd`, `Flow` and `Cancel`).
+    pub fn negotiated_streaming(&self, ctx: &ContextId, instance_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .is_some_and(|s| s.context == *ctx && s.meta.streaming)
     }
 
     /// The token of the current session of `instance_id`, if any.
