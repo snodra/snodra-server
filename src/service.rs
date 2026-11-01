@@ -480,15 +480,34 @@ async fn run_stream(
                     debug!(instance = %instance_id, "InstanceStatus without the capability ignored");
                 }
             }
-            // Multi-part messages from a client (streamed parts, credits, cancellation) belong to
-            // later phases (ADR 0017: P4b, P4c); this hub ignores them.
+            // Multi-part messages from a client (ADR 0017, P4b): a handler's streamed parts and
+            // end, a sender's credits and cancellation. Only a session that negotiated
+            // "streaming" sends them meaningfully; from any other they are ignored.
             Some(
-                client_message::Message::Part(_)
+                m @ (client_message::Message::Part(_)
                 | client_message::Message::End(_)
                 | client_message::Message::Flow(_)
-                | client_message::Message::Cancel(_),
+                | client_message::Message::Cancel(_)),
             ) => {
-                debug!(instance = %instance_id, "multi-part client message ignored");
+                if !streaming {
+                    debug!(instance = %instance_id, "multi-part client message without the streaming capability ignored");
+                    continue;
+                }
+                match m {
+                    client_message::Message::Part(part) => {
+                        ctx.router.on_stream_part(&ctx.context, &instance_id, part)
+                    }
+                    client_message::Message::End(end) => {
+                        ctx.router.on_stream_end(&ctx.context, &instance_id, end)
+                    }
+                    client_message::Message::Flow(flow) => {
+                        ctx.router.on_flow(&ctx.context, &instance_id, flow)
+                    }
+                    client_message::Message::Cancel(cancel) => {
+                        ctx.router.on_cancel(&ctx.context, &instance_id, cancel)
+                    }
+                    _ => unreachable!("matched above"),
+                }
             }
             None => {}
         }

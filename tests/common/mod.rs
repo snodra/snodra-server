@@ -7,8 +7,9 @@ use std::time::Duration;
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
 use kraken_hub::proto::{
-    ClientMessage, Credentials, Error, ErrorCode, Heartbeat, InstanceStatus, Permits, Register,
-    Reply, Request, RequestKind, ServerMessage, client_message, credentials, reply,
+    Cancel, ClientMessage, Credentials, Error, ErrorCode, Flow, Heartbeat, InstanceStatus, Permits,
+    Register, Reply, ReplyEnd, ReplyPart, Request, RequestKind, ServerMessage, client_message,
+    credentials, reply,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -366,6 +367,71 @@ impl FakeClient {
             message: Some(client_message::Message::Reply(Reply {
                 request_id: request_id.to_string(),
                 result: Some(reply::Result::Payload(payload.to_vec())),
+            })),
+        }
+    }
+
+    /// A handler's streamed part (ADR 0017, P4b).
+    pub fn part_ok(request_id: &str, seq: u64, payload: &[u8]) -> ClientMessage {
+        ClientMessage {
+            message: Some(client_message::Message::Part(ReplyPart {
+                request_id: request_id.to_string(),
+                payload: payload.to_vec(),
+                seq,
+                ..ReplyPart::default()
+            })),
+        }
+    }
+
+    /// A handler's part carrying an error (it ends the stream).
+    pub fn part_err(request_id: &str, seq: u64, code: ErrorCode, message: &str) -> ClientMessage {
+        ClientMessage {
+            message: Some(client_message::Message::Part(ReplyPart {
+                request_id: request_id.to_string(),
+                error: Some(Error {
+                    request_id: request_id.to_string(),
+                    code: code as i32,
+                    message: message.to_string(),
+                    details: Vec::new(),
+                }),
+                seq,
+                ..ReplyPart::default()
+            })),
+        }
+    }
+
+    /// A handler's end of stream, with an error when `error` is given.
+    pub fn end(request_id: &str, error: Option<(ErrorCode, &str)>) -> ClientMessage {
+        ClientMessage {
+            message: Some(client_message::Message::End(ReplyEnd {
+                request_id: request_id.to_string(),
+                error: error.map(|(code, message)| Error {
+                    request_id: request_id.to_string(),
+                    code: code as i32,
+                    message: message.to_string(),
+                    details: Vec::new(),
+                }),
+                ..ReplyEnd::default()
+            })),
+        }
+    }
+
+    /// A sender's credits for a stream.
+    pub fn flow(request_id: &str, credits: u32) -> ClientMessage {
+        ClientMessage {
+            message: Some(client_message::Message::Flow(Flow {
+                request_id: request_id.to_string(),
+                credits,
+            })),
+        }
+    }
+
+    /// A sender's cancellation of a stream.
+    pub fn cancel(request_id: &str, reason: &str) -> ClientMessage {
+        ClientMessage {
+            message: Some(client_message::Message::Cancel(Cancel {
+                request_id: request_id.to_string(),
+                reason: reason.to_string(),
             })),
         }
     }

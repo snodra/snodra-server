@@ -5329,7 +5329,8 @@ mod stream_tests {
             priority: 0,
             ..stream(id, "q.Find", 10_000, 0, 0)
         };
-        let end_paths: Vec<(&str, Box<dyn Fn(&mut Streams)>)> = vec![
+        type EndIt = Box<dyn Fn(&mut Streams)>;
+        let end_paths: Vec<(&str, EndIt)> = vec![
             ("end", Box::new(|f| f.end("b3", "st#1", None))),
             ("error part", Box::new(|f| f.part_error("b3", "st#1", 0))),
             ("cancel", Box::new(|f| f.cancel("s1", "st", "done"))),
