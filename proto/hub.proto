@@ -414,9 +414,9 @@ message InstanceTopology {
   int64 last_heartbeat_age_ms = 3;
   // True when the last heartbeat is older than a third of this session's eviction threshold.
   bool stale = 4;
-  // Pending requests forwarded to this instance.
+  // Pending requests forwarded to this instance (each scatter-gather target included).
   uint32 in_flight_as_handler = 5;
-  // Pending requests this instance sent.
+  // Pending requests this instance sent (a scatter-gather counts once).
   uint32 in_flight_as_sender = 6;
   // Sorted.
   repeated string command_types = 7;
@@ -467,7 +467,8 @@ message TopologyTotals {
   uint32 instances = 2;
   uint32 command_types = 3;
   uint32 query_types = 4;
-  // Size of the pending-request map (queued requests included).
+  // Requests awaiting their terminal message (queued requests included). A scatter-gather counts
+  // once, not per target.
   uint32 in_flight = 5;
   // Requests waiting in per-instance queues, all instances.
   uint32 queued = 6;

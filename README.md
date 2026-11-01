@@ -164,7 +164,8 @@ Top level:
 | `inFlightAsHandler` | uint32 | requests currently being handled by this instance |
 | `inFlightAsSender` | uint32 | requests this instance sent that have no terminal message yet |
 | `commandTypes` | list of string | command types this instance registered |
-| `queryTypes` | list of string | query types this instance registered |
+| `queryTypes` | list of string | query types this instance registered (shared ones included) |
+| `sharedQueryTypes` | list of string | the query types it registered as shared (`Register.shared_query_types`) |
 | `protocolVersion` | uint32 | `Register.protocol_version` of the session's first `Register` (0 = v1) |
 | `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty for v1 clients |
 | `flowControlled` | bool | the hub forwards to this instance only with permits |
@@ -181,13 +182,16 @@ Top level:
 |---|---|---|
 | `type` | string | the command or query type name |
 | `kind` | string | `COMMAND` or `QUERY` |
-| `ownerService` | string | the service that owns the type |
-| `liveInstances` | uint32 | live instances of the owner that registered it |
+| `ownerService` | string | the service that owns the type (the first owner of a shared type) |
+| `ownerServices` | list of string | every owning service, sorted (one for an exclusive type) |
+| `shared` | bool | a shared query type: many services may own it |
+| `liveInstances` | uint32 | live instances of the owner (of all owners) that registered it |
 | `orphaned` | bool | the owner has no live instance (ownership is held during the grace period) |
 | `orphanedForMs` | int64 | how long it has been orphaned, ms; 0 when not orphaned |
 
 `totals.inFlight` counts requests in the router, so it can differ from the per-instance sums when
-a sender or handler is already gone.
+a sender or handler is already gone. A scatter-gather counts once in `inFlight` and in its
+sender's `inFlightAsSender`, and once per target in each handler's `inFlightAsHandler`.
 
 ### Consistency
 
@@ -219,6 +223,10 @@ sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
   type that the owner holds as a command) is rejected with `ALREADY_EXISTS`. A type's kind cannot
   change while it is owned; change it only after every instance of the owner has left and the
   owner grace sweep has removed the type.
+- Shared query types (`Register.shared_query_types`, umbrella ADR 0017): a type registered
+  exclusive by one registrant and shared by another (even of the same service) fails the later
+  `Register` with `ALREADY_EXISTS`; a type listed as shared and as a command or exclusive query in
+  one `Register` is `INVALID_ARGUMENT`. Like a kind, the flag changes only once the type is gone.
 
 ## Dashboard
 
@@ -234,7 +242,7 @@ calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-
 |---|---|
 | Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
 | Services | every service with its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
-| Types | every type: kind, owner, live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
+| Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
 | Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
 | Processors, Dead letters, Events | placeholders: available from phase 6 (processors, dead letters) and phase 7 (events) |
 
@@ -355,7 +363,8 @@ command and query types; v2 clients add `protocol_version`, `capabilities`, `cli
 and optionally `credentials`) and then `Heartbeat` messages. A `Request` (kind, type, id, payload,
 optional `timeout_ms`) is routed to one live instance of the service that owns the type; the
 handler answers with a `Reply` carrying the same id, which the hub relays to the sender. Each
-request id gets exactly one terminal message: a `Reply` or a hub-produced error. The hub forwards
+request id gets exactly one terminal message: a `Reply` or a hub-produced error; a
+[scatter-gather](#query-modes) query gets `ReplyPart`s and one `ReplyEnd` instead. The hub forwards
 the `Request` (headers included) unchanged and parents its `hub.route` span on the request's
 trace headers.
 
@@ -363,12 +372,14 @@ Error codes:
 
 - Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, **Builder call:**
   `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
-  `Request.id`), and `RESOURCE_EXHAUSTED` (full queue or session buffer; only to senders that
-  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`).
+  `Request.id`), `RESOURCE_EXHAUSTED` (full queue or session buffer; only to senders that
+  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`) and `UNSUPPORTED` (a
+  v2 sender using a request mode it did not declare, or one this hub does not implement yet).
 - Handler-produced codes in a `Reply{error}` are forwarded unchanged.
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
-`invalid_request` and `resource_exhausted`. **Builder call:** any handler `Reply{error}` counts as
+`invalid_request`, `resource_exhausted` and `unsupported`; `kraken_hub_requests_total` also has a
+`mode` label (`unary`, `scatter_gather`). **Builder call:** any handler `Reply{error}` counts as
 `handler_error`, whatever its code; a capacity rejection by the hub (full queue or session
 buffer) counts as `resource_exhausted` whichever code the sender got.
 
@@ -383,18 +394,21 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
 |---|---|---|
 | `RegisterAck` | never | after every accepted `Register`; the first one is queued before the echo of the heartbeat that follows the `Register` |
 | Heartbeat timeout | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` (30 s) | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s), announced with the 3 s interval |
-| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck` |
+| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck`; `RESOURCE_EXHAUSTED` with `flow-control`; `UNSUPPORTED`; `ReplyPart` and `ReplyEnd` with `scatter-gather` |
 
 - The version, capabilities and client version are read from the first `Register` of a stream; a
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
 - The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `instance-status`, `scatter-gather`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
 - `credentials` (static token or JWT) is accepted and ignored until hub access control ships; it
   is never logged.
-- `ErrorCode.UNSUPPORTED` (10) is declared but not produced yet.
+- `ErrorCode.UNSUPPORTED` (10) answers a request mode the session did not declare or the hub
+  does not implement yet (v2 sessions only; a v1 session gets `INVALID_REQUEST`). `CANCELLED` (9)
+  and the client-sent `ReplyPart`, `ReplyEnd`, `Flow` and `Cancel` are allocated for P4b/P4c and
+  ignored.
 - `tests/compat.rs` is the compatibility suite: a raw v1 client gets no ack, only v1 messages and
   the legacy timeout; a v2 client gets the ack with the configured values before the echo.
 
@@ -447,6 +461,32 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
   a strict preference, so a saturated instance with the best match keeps queueing and never
   spills over to a worse match.
 
+### Query modes
+
+Decision record: umbrella `docs/adr/0017-query-modes-and-shared-query-types.md`; details in
+umbrella `docs/05-services/hub.md` (Query modes).
+
+- **Shared query types.** `Register.shared_query_types` lists query types many services may own
+  (exclusive `query_types` keep the one-owner rule). A point query on a shared type goes to one
+  live instance of any owner: one pool over every owner, then the routing above, with one
+  round-robin rotation per type.
+- **Scatter-gather.** A v2 sender that declared `scatter-gather` sends a query with
+  `Request.mode = SCATTER_GATHER`. Every live instance of every owner (on an exclusive type,
+  every instance of its owner) gets an ordinary unary `Request` with id `<id>#<n>`: v1 handlers
+  serve it unchanged, and flow control, queues and priority apply per target. Each answer reaches
+  the sender as a `ReplyPart` (`request_id` = the sender's id, `seq` in send order, responder
+  service and instance, payload or error), then one `ReplyEnd{parts, failed, timed_out}` once
+  every target answered, `max_results > 0` successful parts arrived, or the deadline passed.
+  Answers after the end are dropped; targets are not cancelled (Cancel is P4b).
+- **Errors:** no live target is an ordinary `NO_HANDLER`; a command is `INVALID_REQUEST`; a v2
+  sender without the capability, or mode `STREAMING` / `SUBSCRIPTION` (P4b, P4c), gets
+  `UNSUPPORTED`; a v1 sender `INVALID_REQUEST`. A target that leaves, also while its request is
+  still queued, is a failed part (`HANDLER_DISCONNECTED`).
+- **Accounting:** a scatter-gather is one request in flight, on its edge (latency to the
+  `ReplyEnd`, an error when no part succeeded) and in `kraken_hub_requests_total{mode="scatter_gather"}`;
+  `kraken_hub_scatter_targets{type}` records its targets.
+- `tests/scatter_gather.rs` drives it over gRPC with raw v2 and v1 clients.
+
 ### Request timeouts
 
 With `override` the `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for the request's type:
@@ -470,7 +510,8 @@ without any client change; v1 clients always send a timeout, so for them an over
 - No authentication or authorization on the gRPC port.
 - Not durable: registrations, in-flight and queued requests and sessions are in memory only.
   Clients re-register after a reconnect.
-- No scatter-gather: every request goes to exactly one handler.
+- No streaming or subscription queries yet (roadmap P4b, P4c); a scatter-gather does not cancel
+  the targets it no longer needs.
 
 ## Connection lifecycle
 
@@ -504,7 +545,7 @@ without any client change; v1 clients always send a timeout, so for them an over
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
   `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`,
-  `buffer_full`). No per-instance labels. Queue depth and permits are refreshed by the watchdog
+  `buffer_full`), and `kraken_hub_scatter_targets{type}` (targets per scatter-gather). No per-instance labels. Queue depth and permits are refreshed by the watchdog
   every tick (at most a second), not per request.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
