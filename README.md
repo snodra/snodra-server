@@ -85,6 +85,7 @@ cargo run
 | `KRAKEN_HUB_GRAFANA_URL` | none | Grafana base URL the dashboard links to; must be `http://` or `https://` without user info (`user:password@` is rejected at startup, as the link is served unauthenticated) |
 | `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` | `10000` | cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least recently used go first |
 | `KRAKEN_HUB_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
+| `KRAKEN_HUB_PEERS` | none | the other hubs' dashboard base URLs as the operator's browser reaches them, comma-separated, for example `http://localhost:7001,http://localhost:7011` (this hub's own URL may be listed; the page skips it by hub id). Each must be `http://` or `https://` with a host and optional port, no user info, no path beyond `/`; normalised to origins (lowercase, default port dropped), duplicates removed, at most 16; anything else stops the hub at startup. See [Multiple hubs](#multiple-hubs) |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -171,6 +172,8 @@ Top level:
 | `queued` | uint32 | requests waiting in the hub's queue for this instance |
 | `loadFactor` | uint32 | `Register.load_factor` as applied (0 reads as 100) |
 | `tags` | map | `Register.tags` |
+| `connectedHubIds` | list of string | `InstanceStatus.connected_hub_ids` as last reported: the hubs the instance holds a stream to; empty when never reported |
+| `statusAgeMs` | int64 | time since that report, ms; `-1` when never reported (also when a JSON snapshot from an older hub lacks the field) |
 
 `types[]`:
 
@@ -230,13 +233,15 @@ calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-
 | Page | Shows |
 |---|---|
 | Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
-| Services | every service with its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since; the types each service handles |
+| Services | every service with its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
 | Types | every type: kind, owner, live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
 | Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
 | Processors, Dead letters, Events | placeholders: available from phase 6 (processors, dead letters) and phase 7 (events) |
 
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
-`KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana.
+`KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana. With `KRAKEN_HUB_PEERS` set the header
+lists this hub and every peer with its reachability, and offers "All hubs" (the default,
+remembered per browser) or "This hub"; see [Multiple hubs](#multiple-hubs).
 
 - **Builder call:** any client can create thousands of types and edges by sending type names
   nobody owns (`NO_HANDLER`), so the pages draw a bounded amount. The graph draws at most 60
@@ -257,7 +262,7 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
-| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs` |
+| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
 
 - **Builder call:** at most 64 streams are open at once; the 65th gets `503` and its page polls.
@@ -265,8 +270,8 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 - **Builder call:** all streams read one shared summary, recomputed every 0.5 s only while at
   least one stream is open (edge totals are kept as requests arrive, so this does not walk the
   edges); without a stream nothing is computed.
-- **Builder call:** `revision` hashes services, instances, their registrations and flow-control
-  and stale flags, type ownership and the set of edges, not counters or ages, so a page can
+- **Builder call:** `revision` hashes services, instances, their registrations, flow-control
+  and stale flags and reported hubs, type ownership and the set of edges, not counters or ages, so a page can
   refresh at once on a structural change.
 
 ### Edge statistics
@@ -295,7 +300,7 @@ in the hub.
 ### Assets, caching and headers
 
 `ui/` holds `index.html`, `app.css`, `favicon.svg` and plain ES modules (`app.js`, `api.js`,
-`live.js`, `graph.js`, `dom.js`, `format.js`, `pages/*.js`). There is no third-party code, no
+`live.js`, `hubs.js`, `graph.js`, `dom.js`, `format.js`, `pages/*.js`). There is no third-party code, no
 package manager and no build step; the files are compiled into the binary with `rust-embed`.
 
 - `/ui/` is served `no-cache` and references every asset under `/ui/v/<build>/`, where `<build>`
@@ -304,13 +309,39 @@ package manager and no build step; the files are compiled into the binary with `
   answered with the current file, `no-cache` (a tab open across an upgrade keeps working; it
   also shows a "reload" banner).
 - Every dashboard and API response carries `Content-Security-Policy: default-src 'self';
-  script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self';
-  object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus
+  script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' <peers>; font-src 'self';
+  object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` (`<peers>`:
+  the `KRAKEN_HUB_PEERS` origins, nothing without peers), plus
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
-  Names registered by clients only ever reach the page as text.
+  Names registered by clients only ever reach the page as text, also those read from peers.
 - **Builder call:** `/` and `/ui` redirect to `/ui/` with `307` and a relative `Location`
   (`ui/`), so the redirect works behind a proxy that mounts the hub under a path and is not
   cached past a `KRAKEN_HUB_DASHBOARD_ENABLED=false`.
+
+### Multiple hubs
+
+Decision record: umbrella `docs/adr/0016-multi-hub-ha-without-hub-to-hub-traffic.md`. Hubs never
+talk to each other; each instance connects to every hub (the client libraries' P3 slice). The
+hub side:
+
+- **`instance-status` capability.** A v2 client that declares it gets it back in the ack and may
+  send `ClientMessage.status` (`InstanceStatus{connected_hub_ids, handlers_in_flight}`, every
+  5 s). The hub keeps the latest report per session, replaced by each and dropped with the
+  session, and shows it as `connectedHubIds` / `statusAgeMs`. **Builder call:** at most 64 ids of
+  at most 128 bytes are kept; empty, over-long (ignored, never cut) and duplicate ids are
+  dropped. Reports from a v1 session or one without the capability are ignored.
+- **Dashboard peers.** The page reads `/api/v1/topology` of every `KRAKEN_HUB_PEERS` entry from
+  the browser (3 s timeout each; on every refresh of a merging page, otherwise every 5 s for the
+  header) and, under "All hubs", merges them: the Services page by instance id with "Seen by",
+  the Overview with totals over all hubs and a list of disagreements (at most 200 rows): an
+  instance missing on a reachable hub, an instance with different types on different hubs, a
+  type owned by different services on different hubs, an instance whose reported hubs omit a
+  reachable hub. An unreachable peer is shown as unreachable, not as a disagreement. The traffic
+  graph and the Types page stay per hub.
+- **CORS.** `/api/v1/*` answers an `Origin` that is exactly one of `KRAKEN_HUB_PEERS` with
+  `Access-Control-Allow-Origin: <that origin>` (and `Vary: Origin` whenever peers are set), never
+  a wildcard, never credentials; a preflight is `204` (`GET` only) for such an origin and `403`
+  otherwise. Other origins, the page, its assets and `/topology` get no CORS header.
 
 Developing the page: edit `ui/`, `cargo run` (assets are embedded in debug builds too) and
 reload. `tests/dashboard_ui.rs` checks that every referenced asset and every import resolves,
@@ -357,8 +388,8 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
 - The version, capabilities and client version are read from the first `Register` of a stream; a
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
-- The ack carries `hub_id`, the negotiated version, the shared capabilities (none are defined
-  yet), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+- The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
+  `instance-status`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
 - `credentials` (static token or JWT) is accepted and ignored until hub access control ships; it
