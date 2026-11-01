@@ -24,13 +24,24 @@
 //! removes both entries, sends the sender its `ReplyEnd` where one is due and the handler a
 //! `Cancel` where it still streams.
 //!
+//! Subscription queries (ADR 0017, P4c): a [`Pending::Subscription`] keyed by the sender's
+//! request id holds the subscription. Its initial result is an ordinary [`Pending::Unary`]
+//! target `<id>#0` (forwarded through flow control, holding a permit, with its own timeout)
+//! whose answer becomes the first part; its update targets (`<id>#n`, n >= 1: every capable
+//! instance at open time) live inside the entry, not in the map: they are written
+//! `Request{mode = SUBSCRIPTION}` directly, outside flow control, and count nowhere. Their parts
+//! are relayed to the sender in arrival order under the sender's credit, buffered up to
+//! `KRAKEN_HUB_SUBSCRIPTION_BUFFER` while it owes credit (and behind the initial part); every
+//! ending path removes both entries, sends the sender its `ReplyEnd` where one is due and every
+//! target still serving a `Cancel`.
+//!
 //! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
 //! A flow-controlled session (permits `Some`) is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
 //! their own deadline passes. Lock order: the pending lock and the flows lock are never held
 //! together.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,15 +67,18 @@ use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Every request the hub has not answered yet, keyed by request id. P4c adds subscriptions.
+/// Every request the hub has not answered yet, keyed by request id.
 enum Pending {
-    /// A request forwarded to one handler: a unary request, or the target of a scatter-gather or
-    /// of a streaming query.
+    /// A request forwarded to one handler: a unary request, or the target of a scatter-gather,
+    /// of a streaming query, or the initial request of a subscription.
     Unary(Unary),
     /// A scatter-gather in progress; its targets are `Unary` entries with `part_of` set.
     Scatter(Scatter),
     /// A streaming query in progress; its target is the `Unary` entry `<id>#1`.
     Stream(Stream),
+    /// A subscription query in progress; its initial request is the `Unary` entry `<id>#0`,
+    /// its update targets are its own.
+    Subscription(Subscription),
 }
 
 /// Credits the handler of a streaming query starts with when the sender sent none.
@@ -200,6 +214,83 @@ struct ClosedStream {
     end: StreamEnd,
 }
 
+/// A subscription query in progress (ADR 0017, P4c).
+struct Subscription {
+    /// The sender's request id: the entry's key.
+    id: String,
+    context: ContextId,
+    sender: InstanceId,
+    sender_token: u64,
+    sender_service: String,
+    kind: Kind,
+    type_name: String,
+    started: Instant,
+    /// The initial request's id (`<id>#0`): a `Unary` entry forwarded to one target as a
+    /// unary request, with its own timeout, holding its handler permit.
+    initial_id: String,
+    /// The initial result was relayed (as part 1): the request is answered for the metrics,
+    /// the edge and the in-flight counts; updates may flow.
+    initial_done: bool,
+    /// The update targets by target id (`<id>#n`, n >= 1): every capable instance at the open.
+    /// Each was written the subscription request; each still here is owed a `Cancel` when the
+    /// subscription ends before it did.
+    targets: BTreeMap<String, SubTarget>,
+    /// Parts the sender may still be sent: the initial credit plus every `Flow`, less the
+    /// parts relayed.
+    credit: u32,
+    /// Updates waiting for credit, or for the initial part, in arrival order; at most
+    /// `KRAKEN_HUB_SUBSCRIPTION_BUFFER`.
+    buffered: VecDeque<Update>,
+    /// Parts relayed to the sender (the initial part and the updates): the next one's `seq`.
+    parts: u32,
+    /// Updates relayed, for `max_results`.
+    updates: u32,
+    /// `Request.max_results`: end after this many updates (0 = no limit).
+    max_results: u32,
+    /// The `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` timer, when set.
+    max_duration: Option<AbortHandle>,
+    span: tracing::Span,
+    /// Ordered delivery of the parts and the end to the sender.
+    relay: Relay,
+}
+
+/// One update target of a subscription: the handler session that was written `<id>#n`.
+struct SubTarget {
+    handler: InstanceId,
+    handler_token: u64,
+    /// The handler's service, for `ReplyPart.responder_service`.
+    service: String,
+}
+
+/// An update a target pushed, waiting for the sender's credit.
+struct Update {
+    payload: Vec<u8>,
+    service: String,
+    handler: InstanceId,
+}
+
+/// How a subscription ends: what the sender is told (if anything) and what the targets still
+/// serving (and the initial request, if still forwarded) are told.
+struct SubscriptionEnd {
+    /// The `ReplyEnd.error`; `None` for a normal end.
+    error: Option<crate::proto::Error>,
+    /// `false` when the sender gets no `ReplyEnd` (it cancelled).
+    tell_sender: bool,
+    /// The `Cancel.reason` for the targets; `None` when none is left to tell.
+    cancel: Option<String>,
+    outcome: Outcome,
+    /// The error is a handler's own (logged at info, not warn).
+    relayed: bool,
+}
+
+/// A subscription taken out of the map: its `ReplyEnd` is sent, the rest is bookkeeping.
+struct ClosedSubscription {
+    sub: Subscription,
+    /// The initial request, if it was still in the map.
+    initial: Option<Unary>,
+    end: SubscriptionEnd,
+}
+
 /// Ordered delivery of the multi-part messages of one request to its sender.
 struct Relay {
     /// The sender's outbound channel (weak: it never keeps a closed stream open).
@@ -272,14 +363,14 @@ impl Pending {
     fn unary(&self) -> Option<&Unary> {
         match self {
             Pending::Unary(u) => Some(u),
-            Pending::Scatter(_) | Pending::Stream(_) => None,
+            Pending::Scatter(_) | Pending::Stream(_) | Pending::Subscription(_) => None,
         }
     }
 
     fn unary_mut(&mut self) -> Option<&mut Unary> {
         match self {
             Pending::Unary(u) => Some(u),
-            Pending::Scatter(_) | Pending::Stream(_) => None,
+            Pending::Scatter(_) | Pending::Stream(_) | Pending::Subscription(_) => None,
         }
     }
 
@@ -288,6 +379,7 @@ impl Pending {
             Pending::Unary(u) => &u.sender,
             Pending::Scatter(g) => &g.sender,
             Pending::Stream(s) => &s.sender,
+            Pending::Subscription(s) => &s.sender,
         }
     }
 
@@ -296,6 +388,7 @@ impl Pending {
             Pending::Unary(u) => u.sender_token,
             Pending::Scatter(g) => g.sender_token,
             Pending::Stream(s) => Some(s.sender_token),
+            Pending::Subscription(s) => Some(s.sender_token),
         }
     }
 
@@ -304,18 +397,18 @@ impl Pending {
             Pending::Unary(u) => &u.context,
             Pending::Scatter(g) => &g.context,
             Pending::Stream(s) => &s.context,
+            Pending::Subscription(s) => &s.context,
         }
     }
 
-    /// A request its sender waits for (a scatter-gather target is part of its gather instead).
+    /// A request its sender waits for: a scatter-gather target is part of its gather instead,
+    /// and a subscription is waited for only until its initial part.
     fn is_request(&self) -> bool {
-        !matches!(
-            self,
-            Pending::Unary(Unary {
-                part_of: Some(_),
-                ..
-            })
-        )
+        match self {
+            Pending::Unary(u) => u.part_of.is_none(),
+            Pending::Scatter(_) | Pending::Stream(_) => true,
+            Pending::Subscription(s) => !s.initial_done,
+        }
     }
 }
 
@@ -1320,7 +1413,7 @@ impl Router {
                 .is_some_and(|u| u.handler == instance_id && u.handler_token == token)
         };
         let sent_by = |p: &Pending| p.sender() == instance_id && p.sender_token() == Some(token);
-        let (failed, dropped) = {
+        let (failed, dropped, targets_lost) = {
             let mut pending = self.pending.lock().unwrap();
             let ids: Vec<String> = pending
                 .iter()
@@ -1337,16 +1430,32 @@ impl Router {
                 match pending.remove(&id).expect("id collected under same lock") {
                     entry if sent => dropped.push((id, entry)),
                     Pending::Unary(entry) => failed.push((id, entry)),
-                    Pending::Scatter(_) | Pending::Stream(_) => {
-                        unreachable!("a gather or stream has no handler of its own")
+                    Pending::Scatter(_) | Pending::Stream(_) | Pending::Subscription(_) => {
+                        unreachable!("a gather, stream or subscription has no handler of its own")
                     }
                 }
             }
-            (failed, dropped)
+            // The subscriptions (of other senders) this session served updates for.
+            let targets_lost: Vec<(String, String)> = pending
+                .iter()
+                .filter(|(_, p)| p.context() == ctx)
+                .filter_map(|(id, p)| match p {
+                    Pending::Subscription(s) => Some((id, s)),
+                    _ => None,
+                })
+                .flat_map(|(id, s)| {
+                    s.targets
+                        .iter()
+                        .filter(|(_, t)| t.handler == instance_id && t.handler_token == token)
+                        .map(|(target_id, _)| (id.clone(), target_id.clone()))
+                })
+                .collect();
+            (failed, dropped, targets_lost)
         };
         // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in
-        // flight. A gather's or stream's targets have the same sender, so they are dropped with
-        // it; a target still streaming (or gathering, with a capable handler) is cancelled.
+        // flight. A gather's, stream's or subscription's targets have the same sender, so they
+        // are dropped with it; a target still streaming (or gathering, with a capable handler)
+        // is cancelled, and so is every update target of a subscription.
         for (id, entry) in dropped {
             match entry {
                 Pending::Unary(entry) => {
@@ -1372,6 +1481,16 @@ impl Router {
                         .stream_closed(&stream.handler_service, &stream.handler);
                     stream.span.record("kraken.outcome", "sender_disconnected");
                 }
+                Pending::Subscription(sub) => {
+                    if let Some(timer) = &sub.max_duration {
+                        timer.abort();
+                    }
+                    if !sub.initial_done {
+                        self.metrics.in_flight_add(sub.kind, -1);
+                    }
+                    self.cancel_subscription_targets(&sub, "sender disconnected");
+                    sub.span.record("kraken.outcome", "sender_disconnected");
+                }
             }
         }
         for item in waiting {
@@ -1382,6 +1501,16 @@ impl Router {
             self.finish_with_error(
                 &id,
                 entry,
+                ErrorCode::HandlerDisconnected,
+                format!("handler instance {instance_id} disconnected"),
+            );
+        }
+        // After the initial requests: a subscription whose initial target left ended above,
+        // with HANDLER_DISCONNECTED, cancelling the targets it had left.
+        for (id, target_id) in targets_lost {
+            self.drop_subscription_target(
+                &id,
+                &target_id,
                 ErrorCode::HandlerDisconnected,
                 format!("handler instance {instance_id} disconnected"),
             );
@@ -1473,11 +1602,12 @@ impl Router {
         outcome: Outcome,
     ) {
         record_outcome(&entry.span, outcome);
-        // A stream target's failure is the stream's: `finish_stream` logs it once, for `<id>`.
+        // A stream target's failure is the stream's, a subscription's initial request's its
+        // subscription's: `finish_stream` / `finish_subscription` log it once, for `<id>`.
         let stream_target = entry.part_of.as_ref().is_some_and(|p| {
             matches!(
                 self.pending.lock().unwrap().get(&p.parent),
-                Some(Pending::Stream(_))
+                Some(Pending::Stream(_) | Pending::Subscription(_))
             )
         });
         if !stream_target {
@@ -1547,8 +1677,8 @@ impl Router {
     /// A request with a mode other than UNARY (ADR 0017). Gates, in this order: a v1 sender
     /// cannot know the newer codes (INVALID_REQUEST); a v2 sender gets UNSUPPORTED for a mode
     /// this hub does not implement or its session did not declare; the modes are for queries
-    /// only (INVALID_REQUEST); no live target is NO_HANDLER (a streaming query whose owners have
-    /// no capable instance: UNSUPPORTED); a duplicate id is INVALID_REQUEST.
+    /// only (INVALID_REQUEST); no live target is NO_HANDLER (a streaming query or subscription
+    /// whose owners have no capable instance: UNSUPPORTED); a duplicate id is INVALID_REQUEST.
     fn route_mode(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -1579,6 +1709,9 @@ impl Router {
             Ok(RequestMode::ScatterGather) => {}
             Ok(RequestMode::Streaming) => {
                 return self.route_stream(ctx, sender, req, req_kind, info, span);
+            }
+            Ok(RequestMode::Subscription) => {
+                return self.route_subscription(ctx, sender, req, req_kind, info, span);
             }
             _ => {
                 let message = format!("request mode {mode} is not supported by this hub");
@@ -1727,7 +1860,8 @@ impl Router {
     /// released). For a scatter-gather target: a `ReplyPart` to the sender, and the `ReplyEnd`
     /// when it was the last one needed. For a streaming target it ends the stream: a failure
     /// (the handler left, or the hub could not forward) as `ReplyEnd{error}`; a unary `Reply`
-    /// from the handler as one part and the end, or `ReplyEnd{error}` for `Reply{error}`.
+    /// from the handler as one part and the end, or `ReplyEnd{error}` for `Reply{error}`. For
+    /// a subscription's initial request: the first part, or the end with the error.
     fn on_part(
         &self,
         id: &str,
@@ -1737,12 +1871,23 @@ impl Router {
         let Some(part_of) = entry.part_of else {
             return;
         };
-        if matches!(
-            self.pending.lock().unwrap().get(&part_of.parent),
-            Some(Pending::Stream(_))
-        ) {
-            self.on_stream_target_result(&part_of.parent, result);
-            return;
+        enum Parent {
+            Scatter,
+            Stream,
+            Subscription,
+        }
+        let parent = match self.pending.lock().unwrap().get(&part_of.parent) {
+            Some(Pending::Stream(_)) => Parent::Stream,
+            Some(Pending::Subscription(_)) => Parent::Subscription,
+            _ => Parent::Scatter,
+        };
+        match parent {
+            Parent::Stream => return self.on_stream_target_result(&part_of.parent, result),
+            Parent::Subscription => {
+                let responder = (part_of.service, entry.handler);
+                return self.on_subscription_initial(&part_of.parent, responder, result);
+            }
+            Parent::Scatter => {}
         }
         let closed = {
             let mut pending = self.pending.lock().unwrap();
@@ -2108,8 +2253,8 @@ impl Router {
     /// idle timeout starts over, so the handler gets the whole timeout for its first part
     /// whatever the queue wait was. An entry that ended between the pre-write check and the
     /// write (a close that found it neither queued nor forwarded, so sent no `Cancel`) gets its
-    /// `Cancel{id, "closed before forward"}` here, if the handler negotiated "streaming": it
-    /// must not serve a request the hub forgot.
+    /// `Cancel{id, "closed before forward"}` here, if the handler understands one ("streaming"
+    /// or "subscription"): it must not serve a request the hub forgot.
     fn note_forwarded(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, service: &str) {
         let mut pending = self.pending.lock().unwrap();
         let parent = match pending.get_mut(id).and_then(Pending::unary_mut) {
@@ -2119,7 +2264,7 @@ impl Router {
             }
             _ => {
                 drop(pending);
-                if self.sessions.negotiated_streaming(ctx, handler) {
+                if self.sessions.negotiated_multipart(ctx, handler) {
                     let msg = ServerMessage {
                         message: Some(server_message::Message::Cancel(Cancel {
                             request_id: id.to_string(),
@@ -2166,8 +2311,12 @@ impl Router {
 
     /// `ReplyPart` from a handler for a streaming target: relayed to the sender (its id, the
     /// responder, the handler's `seq`) under the sender's credits. A part beyond the credit, or
-    /// one carrying an error, ends the stream; so does the `max_results`-th part.
+    /// one carrying an error, ends the stream; so does the `max_results`-th part. A part for a
+    /// subscription's update target is an update ([`Router::on_subscription_part`]).
     pub fn on_stream_part(&self, ctx: &ContextId, from: &str, part: ReplyPart) {
+        let Some(part) = self.on_subscription_part(ctx, from, part) else {
+            return;
+        };
         let closed = {
             let mut pending = self.pending.lock().unwrap();
             let Some(id) = Self::stream_of_target(&pending, &part.request_id, from, ctx, "part")
@@ -2238,8 +2387,12 @@ impl Router {
     }
 
     /// `ReplyEnd` from a handler for a streaming target: the stream ends, with the handler's
-    /// error if it carries one.
+    /// error if it carries one. An end for a subscription's update target ends that target
+    /// ([`Router::on_subscription_end`]).
     pub fn on_stream_end(&self, ctx: &ContextId, from: &str, end: ReplyEnd) {
+        let Some(end) = self.on_subscription_end(ctx, from, end) else {
+            return;
+        };
         let closed = {
             let mut pending = self.pending.lock().unwrap();
             let Some(id) = Self::stream_of_target(&pending, &end.request_id, from, ctx, "end")
@@ -2270,12 +2423,16 @@ impl Router {
     }
 
     /// `Flow{request_id, credits}` from the sender of stream `request_id`: the credit grows and
-    /// the handler gets `Flow{<id>#1, credits}`. Ignored for an unknown id, from anyone but the
-    /// sender, and when it grants nothing.
+    /// the handler gets `Flow{<id>#1, credits}`. For a subscription the credit grows and the
+    /// buffered updates drain ([`Router::on_subscription_flow`]); nothing reaches its targets.
+    /// Ignored for an unknown id, from anyone but the sender, and when it grants nothing.
     pub fn on_flow(&self, ctx: &ContextId, from: &str, flow: FlowMsg) {
         let id = flow.request_id;
         if flow.credits == 0 {
             tracing::debug!(request_id = %id, from, "flow without credits ignored");
+            return;
+        }
+        if self.on_subscription_flow(ctx, from, &id, flow.credits) {
             return;
         }
         let (handler, token, service, target_id) = {
@@ -2318,23 +2475,40 @@ impl Router {
 
     /// `Cancel{request_id, reason}` from the sender of stream `request_id`: the handler gets
     /// `Cancel{<id>#1, reason}` (if it was forwarded the request), the stream ends without a
-    /// `ReplyEnd`. Ignored for an unknown id and from anyone but the sender.
+    /// `ReplyEnd`. For a subscription every target still serving gets `Cancel{<id>#n, reason}`
+    /// (and the initial request `<id>#0`, if still forwarded). Ignored for an unknown id and
+    /// from anyone but the sender.
     pub fn on_cancel(&self, ctx: &ContextId, from: &str, cancel: Cancel) {
         let id = cancel.request_id;
+        let reason = if cancel.reason.is_empty() {
+            "cancelled by the sender".to_string()
+        } else {
+            cancel.reason
+        };
         let closed = {
             let mut pending = self.pending.lock().unwrap();
-            if !matches!(
-                pending.get(&id),
-                Some(p @ Pending::Stream(_)) if p.sender() == from && p.context() == ctx
-            ) {
-                tracing::debug!(request_id = %id, from, "cancel for unknown stream ignored");
-                return;
+            match pending.get(&id) {
+                Some(p @ Pending::Stream(_)) if p.sender() == from && p.context() == ctx => {}
+                Some(p @ Pending::Subscription(_)) if p.sender() == from && p.context() == ctx => {
+                    let end = SubscriptionEnd {
+                        error: None,
+                        tell_sender: false,
+                        cancel: Some(reason),
+                        outcome: Outcome::Cancelled,
+                        relayed: false,
+                    };
+                    let closed = self.close_subscription(&mut pending, &id, end);
+                    drop(pending);
+                    if let Some(closed) = closed {
+                        self.finish_subscription(closed);
+                    }
+                    return;
+                }
+                _ => {
+                    tracing::debug!(request_id = %id, from, "cancel for unknown stream ignored");
+                    return;
+                }
             }
-            let reason = if cancel.reason.is_empty() {
-                "cancelled by the sender".to_string()
-            } else {
-                cancel.reason
-            };
             let end = StreamEnd {
                 error: None,
                 tell_sender: false,
@@ -2549,11 +2723,768 @@ impl Router {
         );
     }
 
+    // ------------------------------------------------------------------------------------
+    // Subscription queries (ADR 0017, P4c)
+
+    /// A query with mode SUBSCRIPTION from a v2 sender: every capable instance of every owner
+    /// gets `Request{<id>#n, mode = SUBSCRIPTION}` written directly (no permit, no queue), one
+    /// of them (chosen as for a point query) gets the initial request `<id>#0` as an ordinary
+    /// unary request, and a [`Pending::Subscription`] relays the initial result and the
+    /// updates to the sender.
+    fn route_subscription(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        sender: &str,
+        req: Request,
+        req_kind: Kind,
+        info: SenderInfo,
+        span: tracing::Span,
+    ) {
+        let id = req.id.clone();
+        let type_name = req.r#type.clone();
+        let mode = mode_label(req.mode);
+        let m = ModeContext {
+            ctx,
+            sender,
+            id: &id,
+            type_name: &type_name,
+            sender_service: Some(&info.service),
+            mode,
+            span: &span,
+        };
+        if !info.subscription {
+            let message = format!(
+                "request mode {mode} needs the \"{}\" capability, not declared by this session",
+                protocol::SUBSCRIPTION
+            );
+            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+        }
+        let for_queries = |type_name: &str| {
+            format!("invalid request: {type_name} is a command; {mode} is for queries")
+        };
+        if req_kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
+        }
+        let pool = match self.registry.stream_candidates(ctx, &type_name) {
+            Ok(pool) => pool,
+            Err(e) => {
+                let message = no_handler_message(&type_name, e);
+                return self.reject_mode(&m, req_kind, ErrorCode::NoHandler, message);
+            }
+        };
+        let kind = pool.kind;
+        if kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+        }
+        // Only an instance that negotiated "subscription" serves one.
+        let (capable, incapable): (Vec<Candidate>, Vec<Candidate>) = pool
+            .candidates
+            .into_iter()
+            .partition(|c| self.sessions.negotiated_subscription(ctx, &c.id));
+        if capable.is_empty() {
+            let mut services: Vec<String> = incapable
+                .iter()
+                .filter_map(|c| self.registry.service_of(ctx, &c.id))
+                .collect();
+            services.sort();
+            services.dedup();
+            let message = format!(
+                "no live instance of {} serving {type_name} negotiated the \"{}\" capability",
+                services.join(", "),
+                protocol::SUBSCRIPTION
+            );
+            return self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
+        }
+        // The initial result comes from one of them, chosen as a point query is.
+        let sender_tags = self
+            .registry
+            .placement_of(ctx, sender)
+            .map(|p| p.tags)
+            .unwrap_or_default();
+        let loads = self.loads(&capable);
+        let i = choose(&capable, &sender_tags, pool.rotation, |id| loads[id]);
+        let initial_handler = capable[i].id.clone();
+        let initial_service = self
+            .registry
+            .service_of(ctx, &initial_handler)
+            .unwrap_or_default();
+        // The update targets, numbered from 1 in target order: service, then instance id.
+        let mut targets: Vec<(InstanceId, String, u64)> = capable
+            .into_iter()
+            .map(|c| {
+                let service = self.registry.service_of(ctx, &c.id).unwrap_or_default();
+                let token = self.sessions.token_of(ctx, &c.id).unwrap_or(u64::MAX);
+                (c.id, service, token)
+            })
+            .collect();
+        targets.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+        let targets: Vec<(String, SubTarget)> = targets
+            .into_iter()
+            .enumerate()
+            .map(|(n, (handler, service, handler_token))| {
+                (
+                    format!("{id}#{}", n + 1),
+                    SubTarget {
+                        handler,
+                        handler_token,
+                        service,
+                    },
+                )
+            })
+            .collect();
+        span.record(
+            "kraken.handler",
+            format!("{initial_handler} + {} targets", targets.len()).as_str(),
+        );
+        // The sender's own stream, weakly: the subscription never keeps a closed stream open.
+        let Some(out) = self
+            .sessions
+            .weak_sender_if_current(ctx, sender, info.token)
+        else {
+            return; // the sender left meanwhile: nobody to answer
+        };
+        // `None`: the handler's session vanished since the pick; the dispatch reports it Gone.
+        let initial_token = self
+            .sessions
+            .token_of(ctx, &initial_handler)
+            .unwrap_or(u64::MAX);
+        let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
+        let credit = if req.initial_credit == 0 {
+            DEFAULT_STREAM_CREDIT
+        } else {
+            req.initial_credit
+        };
+        let initial_id = format!("{id}#0");
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(&id)
+                || pending.contains_key(&initial_id)
+                || targets.iter().any(|(t, _)| pending.contains_key(t))
+            {
+                drop(pending);
+                let message = "invalid request: duplicate id".to_string();
+                return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+            }
+            // The per-instance limit, over the targets of every open subscription.
+            let max = self.config.max_subscriptions_per_instance;
+            let mut open: HashMap<&str, u32> = targets
+                .iter()
+                .map(|(_, t)| (t.handler.as_str(), 0))
+                .collect();
+            for p in pending.values() {
+                if let Pending::Subscription(s) = p {
+                    for t in s.targets.values() {
+                        if let Some(n) = open.get_mut(t.handler.as_str()) {
+                            *n += 1;
+                        }
+                    }
+                }
+            }
+            if let Some((handler, _)) = open.iter().find(|(_, n)| **n >= max) {
+                let message = format!(
+                    "handler instance {handler} already serves {max} subscription{} (KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
+                    if max == 1 { "" } else { "s" }
+                );
+                drop(pending);
+                return self.reject_mode(&m, kind, ErrorCode::ResourceExhausted, message);
+            }
+            self.metrics.request_started(kind);
+            for (_, t) in &targets {
+                self.metrics.subscription_opened(&t.service, &t.handler);
+            }
+            let now = Instant::now();
+            // The initial request's deadline, as a unary request's: queue wait plus handler.
+            let router = Arc::clone(self);
+            let task_id = initial_id.clone();
+            let cancel = tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                router.on_timeout(&task_id, timeout.as_millis());
+            })
+            .abort_handle();
+            let max_duration = self.config.max_subscription_duration.map(|max| {
+                let router = Arc::clone(self);
+                let task_id = id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(max).await;
+                    router.on_subscription_max_duration(&task_id, max);
+                })
+                .abort_handle()
+            });
+            let initial = Unary {
+                context: ctx.clone(),
+                sender: sender.to_string(),
+                sender_token: Some(info.token),
+                sender_service: Some(info.service.clone()),
+                handler: initial_handler.clone(),
+                handler_token: initial_token,
+                forwarded: false,
+                sender_flow_control: info.flow_control,
+                kind,
+                type_name: type_name.clone(),
+                started: now,
+                cancel: Some(cancel),
+                span: tracing::Span::none(),
+                part_of: Some(PartOf {
+                    parent: id.clone(),
+                    service: initial_service,
+                }),
+            };
+            pending.insert(initial_id.clone(), Pending::Unary(initial));
+            let sub = Subscription {
+                id: id.clone(),
+                context: ctx.clone(),
+                sender: sender.to_string(),
+                sender_token: info.token,
+                sender_service: info.service.clone(),
+                kind,
+                type_name,
+                started: now,
+                initial_id: initial_id.clone(),
+                initial_done: false,
+                targets: targets
+                    .iter()
+                    .map(|(t, target)| {
+                        (
+                            t.clone(),
+                            SubTarget {
+                                handler: target.handler.clone(),
+                                handler_token: target.handler_token,
+                                service: target.service.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                credit,
+                buffered: VecDeque::new(),
+                parts: 0,
+                updates: 0,
+                max_results: req.max_results,
+                max_duration,
+                span,
+                relay: Relay::new(out, Some(&info.service), sender),
+            };
+            pending.insert(id.clone(), Pending::Subscription(sub));
+        }
+        // The update targets: written directly, outside flow control (a subscription is
+        // passive: no permit, no queue). One whose session cannot take the request is left out.
+        for (target_id, target) in &targets {
+            let msg = ServerMessage {
+                message: Some(server_message::Message::Request(Request {
+                    id: target_id.clone(),
+                    mode: RequestMode::Subscription as i32,
+                    initial_credit: 0,
+                    max_results: 0,
+                    ..req.clone()
+                })),
+            };
+            let written =
+                self.sessions
+                    .send_if_current(ctx, &target.handler, target.handler_token, msg);
+            let (code, message) = match written {
+                Ok(()) => continue,
+                Err(SendError::Busy) => {
+                    self.metrics.buffer_full(&target.service);
+                    self.metrics.rejected(&target.service, "buffer_full");
+                    (
+                        ErrorCode::ResourceExhausted,
+                        format!(
+                            "handler instance {} busy: outbound buffer full",
+                            target.handler
+                        ),
+                    )
+                }
+                Err(SendError::Gone) => (
+                    ErrorCode::HandlerDisconnected,
+                    format!("handler instance {} disconnected", target.handler),
+                ),
+            };
+            tracing::debug!(request_id = %target_id, handler = %target.handler, "subscription target not written: {message}");
+            self.drop_subscription_target(&id, target_id, code, message);
+        }
+        // The initial result: an ordinary unary request through flow control, queues and
+        // priority, with its handler permit; the hub enforces `max_results` itself.
+        let initial = Request {
+            id: initial_id.clone(),
+            mode: RequestMode::Unary as i32,
+            initial_credit: 0,
+            max_results: 0,
+            ..req
+        };
+        self.dispatch(ctx, &initial_id, &initial_handler, initial_token, initial);
+    }
+
+    /// The answer (or hub-side failure) of the initial request of subscription `id` (its
+    /// `Unary` entry already removed from the map and released). A `Reply{payload}` is the
+    /// first part (`seq` 1; the updates that arrived meanwhile follow under the credit); a
+    /// `Reply{error}` or a failure ends the subscription with that error.
+    fn on_subscription_initial(
+        &self,
+        id: &str,
+        responder: (String, InstanceId),
+        result: Result<Vec<u8>, (crate::proto::Error, Outcome)>,
+    ) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Subscription(sub)) = pending.get_mut(id) else {
+                return;
+            };
+            match result {
+                Ok(payload) => {
+                    sub.initial_done = true;
+                    sub.parts += 1;
+                    sub.credit = sub.credit.saturating_sub(1);
+                    let (service, instance) = responder;
+                    let part = ServerMessage {
+                        message: Some(server_message::Message::Part(ReplyPart {
+                            request_id: id.to_string(),
+                            payload,
+                            error: None,
+                            responder_service: service,
+                            responder_instance: instance,
+                            seq: u64::from(sub.parts),
+                        })),
+                    };
+                    sub.relay.deliver(part, &self.metrics);
+                    // The request is answered: counted once, with the latency to this part.
+                    let elapsed = sub.started.elapsed();
+                    record_outcome(&sub.span, Outcome::Ok);
+                    self.metrics.request_finished_mode(
+                        sub.kind,
+                        &sub.type_name,
+                        Outcome::Ok,
+                        elapsed,
+                        mode_label(RequestMode::Subscription as i32),
+                    );
+                    self.record_edge(
+                        Some(&sub.sender_service),
+                        &sub.type_name,
+                        sub.kind,
+                        Outcome::Ok,
+                        Some(elapsed),
+                    );
+                    if self.drain_subscription(sub) {
+                        self.close_subscription(&mut pending, id, max_results_end())
+                    } else {
+                        self.complete_subscription(&mut pending, id)
+                    }
+                }
+                Err((mut error, outcome)) => {
+                    error.request_id = id.to_string();
+                    let end = SubscriptionEnd {
+                        error: Some(error),
+                        tell_sender: true,
+                        cancel: Some("initial result failed".to_string()),
+                        outcome,
+                        relayed: outcome == Outcome::HandlerError,
+                    };
+                    self.close_subscription(&mut pending, id, end)
+                }
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+    }
+
+    /// The subscription whose update target `target_id` is, if `from` is that target's handler
+    /// in `ctx`: the id is `<parent>#<n>` and the parent a subscription listing it.
+    fn subscription_of_target(
+        pending: &HashMap<String, Pending>,
+        target_id: &str,
+        from: &str,
+        ctx: &ContextId,
+    ) -> Option<String> {
+        let (parent, _) = target_id.rsplit_once('#')?;
+        match pending.get(parent) {
+            Some(Pending::Subscription(s)) if s.context == *ctx => s
+                .targets
+                .get(target_id)
+                .filter(|t| t.handler == from)
+                .map(|_| parent.to_string()),
+            _ => None,
+        }
+    }
+
+    /// `ReplyPart` from a handler for a subscription's update target: an update, relayed in
+    /// arrival order under the sender's credit (buffered while it owes credit, and behind the
+    /// initial part); a part carrying an error ends the subscription with it. Returns the part
+    /// when it is not a subscription's (the caller treats it as a stream's).
+    fn on_subscription_part(
+        &self,
+        ctx: &ContextId,
+        from: &str,
+        part: ReplyPart,
+    ) -> Option<ReplyPart> {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(id) = Self::subscription_of_target(&pending, &part.request_id, from, ctx)
+            else {
+                return Some(part);
+            };
+            let Some(Pending::Subscription(sub)) = pending.get_mut(&id) else {
+                return Some(part);
+            };
+            if let Some(mut error) = part.error {
+                // The handler said it is done (as a streaming handler's error part): it is not
+                // cancelled; the others are.
+                if let Some(ended) = sub.targets.remove(&part.request_id) {
+                    self.metrics
+                        .subscription_closed(&ended.service, &ended.handler);
+                }
+                error.request_id = id.clone();
+                let end = SubscriptionEnd {
+                    error: Some(error),
+                    tell_sender: true,
+                    cancel: Some(format!("target {from} failed")),
+                    outcome: Outcome::HandlerError,
+                    relayed: true,
+                };
+                self.close_subscription(&mut pending, &id, end)
+            } else if sub.buffered.len() >= self.config.subscription_buffer {
+                let message = format!(
+                    "subscriber buffer ({}) exceeded",
+                    self.config.subscription_buffer
+                );
+                let end = SubscriptionEnd {
+                    error: Some(crate::proto::Error {
+                        request_id: id.clone(),
+                        code: ErrorCode::ResourceExhausted as i32,
+                        message,
+                        details: vec![],
+                    }),
+                    tell_sender: true,
+                    cancel: Some("subscriber buffer exceeded".to_string()),
+                    outcome: Outcome::ResourceExhausted,
+                    relayed: false,
+                };
+                self.close_subscription(&mut pending, &id, end)
+            } else {
+                let target = &sub.targets[&part.request_id];
+                sub.buffered.push_back(Update {
+                    payload: part.payload,
+                    service: target.service.clone(),
+                    handler: target.handler.clone(),
+                });
+                if sub.initial_done && self.drain_subscription(sub) {
+                    self.close_subscription(&mut pending, &id, max_results_end())
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+        None
+    }
+
+    /// `ReplyEnd` from a handler for a subscription's update target: that target is done; a
+    /// clean end of the last one ends the subscription (once the initial part and the buffered
+    /// updates are out), an error ends it at once with that error. Returns the end when it is
+    /// not a subscription's.
+    fn on_subscription_end(&self, ctx: &ContextId, from: &str, end: ReplyEnd) -> Option<ReplyEnd> {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(id) = Self::subscription_of_target(&pending, &end.request_id, from, ctx)
+            else {
+                return Some(end);
+            };
+            let Some(Pending::Subscription(sub)) = pending.get_mut(&id) else {
+                return Some(end);
+            };
+            if let Some(ended) = sub.targets.remove(&end.request_id) {
+                self.metrics
+                    .subscription_closed(&ended.service, &ended.handler);
+            }
+            match end.error {
+                Some(mut error) => {
+                    error.request_id = id.clone();
+                    let end = SubscriptionEnd {
+                        error: Some(error),
+                        tell_sender: true,
+                        cancel: Some(format!("target {from} failed")),
+                        outcome: Outcome::HandlerError,
+                        relayed: true,
+                    };
+                    self.close_subscription(&mut pending, &id, end)
+                }
+                None => self.complete_subscription(&mut pending, &id),
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+        None
+    }
+
+    /// `Flow{id, credits}` from the sender of subscription `id`: the credit grows and the
+    /// buffered updates drain in order (after the initial part). True when `id` is the
+    /// sender's subscription.
+    fn on_subscription_flow(&self, ctx: &ContextId, from: &str, id: &str, credits: u32) -> bool {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Subscription(sub)) = pending
+                .get_mut(id)
+                .filter(|p| p.sender() == from && p.context() == ctx)
+            else {
+                return false;
+            };
+            sub.credit = sub.credit.saturating_add(credits);
+            if sub.initial_done && self.drain_subscription(sub) {
+                self.close_subscription(&mut pending, id, max_results_end())
+            } else {
+                self.complete_subscription(&mut pending, id)
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+        true
+    }
+
+    /// Relays the buffered updates of `sub` while it has credit, with the hub's `seq`. True
+    /// when `max_results` is reached (the caller ends the subscription; what is left in the
+    /// buffer is dropped).
+    fn drain_subscription(&self, sub: &mut Subscription) -> bool {
+        while sub.credit > 0 {
+            let Some(update) = sub.buffered.pop_front() else {
+                return false;
+            };
+            sub.credit -= 1;
+            sub.parts += 1;
+            sub.updates += 1;
+            let part = ServerMessage {
+                message: Some(server_message::Message::Part(ReplyPart {
+                    request_id: sub.id.clone(),
+                    payload: update.payload,
+                    error: None,
+                    responder_service: update.service.clone(),
+                    responder_instance: update.handler,
+                    seq: u64::from(sub.parts),
+                })),
+            };
+            sub.relay.deliver(part, &self.metrics);
+            self.metrics
+                .subscription_update(&update.service, &sub.type_name);
+            if sub.max_results > 0 && sub.updates >= sub.max_results {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ends subscription `id` cleanly when nothing is left: every target ended, the initial
+    /// part is out and no update waits for credit (the end never overtakes an update).
+    fn complete_subscription(
+        &self,
+        pending: &mut HashMap<String, Pending>,
+        id: &str,
+    ) -> Option<ClosedSubscription> {
+        let done = matches!(
+            pending.get(id),
+            Some(Pending::Subscription(s))
+                if s.targets.is_empty() && s.initial_done && s.buffered.is_empty()
+        );
+        if !done {
+            return None;
+        }
+        let end = SubscriptionEnd {
+            error: None,
+            tell_sender: true,
+            cancel: None,
+            outcome: Outcome::Ok,
+            relayed: false,
+        };
+        self.close_subscription(pending, id, end)
+    }
+
+    /// Update target `target_id` of subscription `id` is gone (its instance left, or it could
+    /// not be written at the open): silently, unless it was the last one, which ends the
+    /// subscription with `code` and `message`.
+    fn drop_subscription_target(
+        &self,
+        id: &str,
+        target_id: &str,
+        code: ErrorCode,
+        message: String,
+    ) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Subscription(sub)) = pending.get_mut(id) else {
+                return;
+            };
+            let Some(gone) = sub.targets.remove(target_id) else {
+                return;
+            };
+            self.metrics
+                .subscription_closed(&gone.service, &gone.handler);
+            if !sub.targets.is_empty() {
+                tracing::debug!(request_id = %id, target = %target_id, "subscription target gone: {message}");
+                return;
+            }
+            let end = SubscriptionEnd {
+                error: Some(crate::proto::Error {
+                    request_id: id.to_string(),
+                    code: code as i32,
+                    message,
+                    details: vec![],
+                }),
+                tell_sender: true,
+                cancel: Some("no target left".to_string()),
+                outcome: outcome_of(code),
+                relayed: false,
+            };
+            self.close_subscription(&mut pending, id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+    }
+
+    /// Subscription `id` outlived `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`.
+    fn on_subscription_max_duration(&self, id: &str, max: Duration) {
+        let message = format!(
+            "max subscription duration ({}) exceeded",
+            crate::api::fmt_duration(max)
+        );
+        let end = SubscriptionEnd {
+            error: Some(crate::proto::Error {
+                request_id: id.to_string(),
+                code: ErrorCode::Cancelled as i32,
+                message: message.clone(),
+                details: vec![],
+            }),
+            tell_sender: true,
+            cancel: Some(message),
+            outcome: Outcome::Cancelled,
+            relayed: false,
+        };
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            self.close_subscription(&mut pending, id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_subscription(closed);
+        }
+    }
+
+    /// Takes subscription `id` and its initial request out of the map and, when due, sends
+    /// the sender its `ReplyEnd` (under the pending lock, so it follows every part).
+    fn close_subscription(
+        &self,
+        pending: &mut HashMap<String, Pending>,
+        id: &str,
+        end: SubscriptionEnd,
+    ) -> Option<ClosedSubscription> {
+        if !matches!(pending.get(id), Some(Pending::Subscription(_))) {
+            return None;
+        }
+        let Some(Pending::Subscription(mut sub)) = pending.remove(id) else {
+            return None;
+        };
+        let initial = match pending.remove(&sub.initial_id) {
+            Some(Pending::Unary(u)) if u.part_of.as_ref().is_some_and(|p| p.parent == id) => {
+                Some(u)
+            }
+            Some(other) => {
+                pending.insert(sub.initial_id.clone(), other);
+                None
+            }
+            None => None,
+        };
+        if end.tell_sender {
+            let msg = ServerMessage {
+                message: Some(server_message::Message::End(ReplyEnd {
+                    request_id: id.to_string(),
+                    error: end.error.clone(),
+                    parts: sub.parts,
+                    failed: 0,
+                    timed_out: 0,
+                })),
+            };
+            sub.relay.deliver(msg, &self.metrics);
+        }
+        Some(ClosedSubscription { sub, initial, end })
+    }
+
+    /// Bookkeeping of a closed subscription: its timer, the initial request's flow state (and
+    /// its `Cancel` when still forwarded), a `Cancel` and the gauge for every target still
+    /// serving, span and log line; the request metrics and edge when the initial part never
+    /// came (otherwise they were recorded at that part).
+    fn finish_subscription(&self, closed: ClosedSubscription) {
+        let ClosedSubscription { sub, initial, end } = closed;
+        if let Some(timer) = &sub.max_duration {
+            timer.abort();
+        }
+        if let Some(initial) = &initial {
+            initial.abort_timer();
+            self.release(&sub.initial_id, initial);
+            if let Some(reason) = &end.cancel
+                && initial.forwarded
+            {
+                self.cancel_target(&sub.context, &sub.initial_id, initial, reason);
+            }
+        }
+        if let Some(reason) = &end.cancel {
+            self.cancel_subscription_targets(&sub, reason);
+        } else {
+            for t in sub.targets.values() {
+                self.metrics.subscription_closed(&t.service, &t.handler);
+            }
+        }
+        record_outcome(&sub.span, end.outcome);
+        if end.outcome != Outcome::Ok {
+            log_outcome(
+                &sub.id,
+                &sub.type_name,
+                Some(sub.kind),
+                &sub.sender,
+                None,
+                end.outcome,
+                end.relayed,
+            );
+        }
+        if !sub.initial_done {
+            let elapsed = sub.started.elapsed();
+            self.metrics.request_finished_mode(
+                sub.kind,
+                &sub.type_name,
+                end.outcome,
+                elapsed,
+                mode_label(RequestMode::Subscription as i32),
+            );
+            self.record_edge_error(
+                Some(&sub.sender_service),
+                &sub.type_name,
+                sub.kind,
+                end.error.is_some(),
+                Some(elapsed),
+            );
+        }
+    }
+
+    /// `Cancel{<id>#n, reason}` to every update target still serving `sub`, each closing on
+    /// the gauge. (Every target was written the request and negotiated "subscription".)
+    fn cancel_subscription_targets(&self, sub: &Subscription, reason: &str) {
+        for (target_id, t) in &sub.targets {
+            self.metrics.subscription_closed(&t.service, &t.handler);
+            let msg = ServerMessage {
+                message: Some(server_message::Message::Cancel(Cancel {
+                    request_id: target_id.clone(),
+                    reason: reason.to_string(),
+                })),
+            };
+            self.send_to_handler(&sub.context, &t.handler, t.handler_token, &t.service, msg);
+        }
+    }
+
     /// Tells the handler of target `target_id` (forwarded, not answered) to stop, if its session
-    /// negotiated "streaming" (a scatter-gather target's handler may not have; a stream's always
-    /// has).
+    /// understands a `Cancel` ("streaming" or "subscription"; a scatter-gather target's handler
+    /// may not, a stream's or subscription's always does).
     fn cancel_target(&self, ctx: &ContextId, target_id: &str, target: &Unary, reason: &str) {
-        if !self.sessions.negotiated_streaming(ctx, &target.handler) {
+        if !self.sessions.negotiated_multipart(ctx, &target.handler) {
             return;
         }
         let service = target
@@ -2652,6 +3583,17 @@ impl Router {
                 });
             }
         }
+    }
+}
+
+/// How a subscription ends at `max_results`: cleanly for the sender, `Cancel` for the targets.
+fn max_results_end() -> SubscriptionEnd {
+    SubscriptionEnd {
+        error: None,
+        tell_sender: true,
+        cancel: Some("max results".to_string()),
+        outcome: Outcome::Ok,
+        relayed: false,
     }
 }
 
@@ -5846,5 +6788,1334 @@ mod stream_tests {
         f.part(h, "st1#1", 0, b"late");
         f.end(h, "st1#1", None);
         assert!(f.messages(h).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    //! Subscription queries (ADR 0017, P4c).
+    use super::*;
+    use crate::proto::{Cancel, Flow, ReplyEnd, ReplyPart, RequestMode};
+    use crate::registry::RegisteredTypes;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use tonic::Status;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
+
+    type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
+    /// The handler of a subscription's initial request, with the request.
+    type Initial = (&'static str, Request);
+    /// An update target: its handler, its target id and the request it got.
+    type Target = (&'static str, String, Request);
+
+    /// A v2 session with scatter-gather and flow control; `subscription` as given, never
+    /// `streaming` (a subscription-only library must do).
+    fn meta(protocol_version: u32, subscription: bool) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            protocol_version,
+            scatter_gather: protocol_version >= 2,
+            subscription,
+            flow_control: protocol_version >= 2,
+            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
+        }
+    }
+
+    /// Owners A (a1 with subscription, a2 without) and B (b1 with) of the shared query
+    /// "q.Watch"; X (x1 with, x2 without) owns command "c.Do" and exclusive query "q.Own"; N
+    /// (n1, without) owns "q.Legacy". Senders: s1 ("web", v2, subscription), s-v1 (v1) and
+    /// s-stream (v2 with scatter-gather and streaming but without subscription).
+    struct Subs {
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        router: Arc<Router>,
+        rx: HashMap<&'static str, Rx>,
+        tokens: HashMap<&'static str, u64>,
+    }
+
+    impl Subs {
+        fn new() -> Self {
+            Self::with(Config::default(), Metrics::noop())
+        }
+
+        fn with(config: Config, metrics: Arc<Metrics>) -> Self {
+            let registry = Arc::new(Registry::new(config.owner_grace));
+            let sessions = Arc::new(Sessions::new());
+            let router = Router::new(
+                Arc::clone(&registry),
+                Arc::clone(&sessions),
+                Arc::new(config),
+                metrics,
+            );
+            let mut f = Subs {
+                registry,
+                sessions,
+                router,
+                rx: HashMap::new(),
+                tokens: HashMap::new(),
+            };
+            f.connect("s1", "web", meta(2, true), None, 64);
+            f.connect("s-v1", "old", meta(0, false), None, 64);
+            f.connect(
+                "s-stream",
+                "plain",
+                crate::session::SessionMeta {
+                    streaming: true,
+                    ..meta(2, false)
+                },
+                None,
+                64,
+            );
+            for (id, service, subscription) in
+                [("a1", "A", true), ("a2", "A", false), ("b1", "B", true)]
+            {
+                f.connect(id, service, meta(2, subscription), None, 64);
+                f.shared(id, service, &["q.Watch"]);
+            }
+            for (id, subscription) in [("x1", true), ("x2", false)] {
+                f.connect(id, "X", meta(2, subscription), None, 64);
+                f.registry
+                    .register(&D, id, "X", &["c.Do".into()], &["q.Own".into()])
+                    .unwrap();
+            }
+            f.connect("n1", "N", meta(2, false), None, 64);
+            f.registry
+                .register(&D, "n1", "N", &[], &["q.Legacy".into()])
+                .unwrap();
+            f
+        }
+
+        /// A session as the stream task opens it: flow state, session, started.
+        fn connect(
+            &mut self,
+            id: &'static str,
+            service: &str,
+            meta: crate::session::SessionMeta,
+            permits: Option<u32>,
+            cap: usize,
+        ) {
+            let token = self.sessions.allocate_token();
+            assert!(self.router.open_session(&D, id, token, service, permits));
+            let (tx, rx) = mpsc::channel(cap);
+            self.sessions
+                .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
+                .unwrap();
+            self.router.start_session(&D, id, token);
+            self.rx.insert(id, rx);
+            self.tokens.insert(id, token);
+        }
+
+        fn shared(&self, id: &str, service: &str, types: &[&str]) {
+            self.registry
+                .register_types(
+                    &D,
+                    id,
+                    service,
+                    &RegisteredTypes {
+                        shared_query_types: types.iter().map(|t| t.to_string()).collect(),
+                        ..RegisteredTypes::default()
+                    },
+                    crate::registry::Placement::default(),
+                )
+                .unwrap();
+        }
+
+        fn leave(&self, id: &str) {
+            crate::service::disconnect(
+                &self.registry,
+                &self.sessions,
+                &self.router,
+                &D,
+                id,
+                self.tokens[id],
+            );
+        }
+
+        fn messages(&mut self, id: &str) -> Vec<server_message::Message> {
+            let mut out = Vec::new();
+            while let Ok(Ok(m)) = self.rx.get_mut(id).unwrap().try_recv() {
+                out.extend(m.message);
+            }
+            out
+        }
+
+        fn requests(&mut self, id: &str) -> Vec<Request> {
+            self.messages(id)
+                .into_iter()
+                .filter_map(|m| match m {
+                    server_message::Message::Request(r) => Some(r),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Everything the handlers got for subscription `id`: the initial request `<id>#0` as
+        /// `(handler, request)`, and the update targets as `(handler, target id, request)` in
+        /// target order. Drains every session.
+        fn opened(&mut self, id: &str) -> (Initial, Vec<Target>) {
+            let initial_id = format!("{id}#0");
+            let mut initial = None;
+            let mut targets = Vec::new();
+            let handlers: Vec<&'static str> = self.rx.keys().copied().collect();
+            for h in handlers {
+                for r in self.requests(h) {
+                    if r.id == initial_id {
+                        assert!(initial.is_none(), "two initial requests");
+                        initial = Some((h, r));
+                    } else if r.id.starts_with(&format!("{id}#")) {
+                        targets.push((h, r.id.clone(), r));
+                    }
+                }
+            }
+            targets.sort_by(|a, b| a.1.cmp(&b.1));
+            (
+                initial.unwrap_or_else(|| panic!("no handler got {initial_id}")),
+                targets,
+            )
+        }
+
+        /// The handler of the initial request and the update targets `(handler, target id)`
+        /// of subscription `id`, the handlers drained.
+        fn open(&mut self, id: &str) -> (&'static str, Vec<(&'static str, String)>) {
+            let ((h, _), targets) = self.opened(id);
+            (h, targets.into_iter().map(|(h, t, _)| (h, t)).collect())
+        }
+
+        fn reply(&self, from: &str, id: &str, payload: &[u8]) {
+            self.router.on_reply(
+                &D,
+                from,
+                Reply {
+                    request_id: id.into(),
+                    result: Some(reply::Result::Payload(payload.to_vec())),
+                },
+            );
+        }
+
+        fn reply_error(&self, from: &str, id: &str, code: ErrorCode) {
+            self.router.on_reply(
+                &D,
+                from,
+                Reply {
+                    request_id: id.into(),
+                    result: Some(reply::Result::Error(crate::proto::Error {
+                        request_id: id.into(),
+                        code: code as i32,
+                        message: "no".into(),
+                        details: vec![],
+                    })),
+                },
+            );
+        }
+
+        fn part(&self, from: &str, target: &str, seq: u64, payload: &[u8]) {
+            self.router.on_stream_part(
+                &D,
+                from,
+                ReplyPart {
+                    request_id: target.into(),
+                    payload: payload.to_vec(),
+                    seq,
+                    ..ReplyPart::default()
+                },
+            );
+        }
+
+        fn part_error(&self, from: &str, target: &str) {
+            self.router.on_stream_part(
+                &D,
+                from,
+                ReplyPart {
+                    request_id: target.into(),
+                    error: Some(crate::proto::Error {
+                        request_id: target.into(),
+                        code: ErrorCode::HandlerError as i32,
+                        message: "boom".into(),
+                        details: vec![],
+                    }),
+                    seq: 1,
+                    ..ReplyPart::default()
+                },
+            );
+        }
+
+        fn end(&self, from: &str, target: &str, error: Option<ErrorCode>) {
+            self.router.on_stream_end(
+                &D,
+                from,
+                ReplyEnd {
+                    request_id: target.into(),
+                    error: error.map(|code| crate::proto::Error {
+                        request_id: target.into(),
+                        code: code as i32,
+                        message: "failed".into(),
+                        details: vec![],
+                    }),
+                    ..ReplyEnd::default()
+                },
+            );
+        }
+
+        fn flow(&self, from: &str, id: &str, credits: u32) {
+            self.router.on_flow(
+                &D,
+                from,
+                Flow {
+                    request_id: id.into(),
+                    credits,
+                },
+            );
+        }
+
+        fn cancel(&self, from: &str, id: &str, reason: &str) {
+            self.router.on_cancel(
+                &D,
+                from,
+                Cancel {
+                    request_id: id.into(),
+                    reason: reason.into(),
+                },
+            );
+        }
+
+        /// The `(request id, reason)` of every `Cancel` handler `h` got.
+        fn cancels(&mut self, h: &str) -> Vec<(String, String)> {
+            self.messages(h)
+                .iter()
+                .filter_map(|m| match m {
+                    server_message::Message::Cancel(c) => {
+                        Some((c.request_id.clone(), c.reason.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn subscribe(
+        id: &str,
+        type_name: &str,
+        timeout_ms: u32,
+        credit: u32,
+        max_results: u32,
+    ) -> Request {
+        Request {
+            id: id.into(),
+            kind: RequestKind::Query as i32,
+            r#type: type_name.into(),
+            payload: b"{\"watch\":1}".to_vec(),
+            headers: HashMap::from([("traceparent".to_string(), "x".to_string())]),
+            timeout_ms,
+            mode: RequestMode::Subscription as i32,
+            initial_credit: credit,
+            max_results,
+            priority: 3,
+            ..Request::default()
+        }
+    }
+
+    fn part(m: &server_message::Message) -> &ReplyPart {
+        match m {
+            server_message::Message::Part(p) => p,
+            other => panic!("expected a part, got {other:?}"),
+        }
+    }
+
+    fn end(m: &server_message::Message) -> &ReplyEnd {
+        match m {
+            server_message::Message::End(e) => e,
+            other => panic!("expected an end, got {other:?}"),
+        }
+    }
+
+    fn error_code(m: &server_message::Message) -> (String, ErrorCode, String) {
+        match m {
+            server_message::Message::Error(e) => {
+                (e.request_id.clone(), e.code(), e.message.clone())
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// `(code, message)` of a `ReplyEnd.error`.
+    fn end_error(e: &ReplyEnd) -> (ErrorCode, String) {
+        let err = e.error.as_ref().expect("an error on the end");
+        (err.code(), err.message.clone())
+    }
+
+    /// `(seq, payload, responder instance)` of every part among `got`.
+    fn parts_of(got: &[server_message::Message]) -> Vec<(u64, Vec<u8>, String)> {
+        got.iter()
+            .filter_map(|m| match m {
+                server_message::Message::Part(p) => {
+                    Some((p.seq, p.payload.clone(), p.responder_instance.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `(sender service, type)` edge of a request, from the router's statistics.
+    fn edge_of(router: &Router, sender: &str, type_name: &str) -> crate::edges::EdgeWindow {
+        let snap = router
+            .edges()
+            .expect("dashboard on")
+            .snapshot(Instant::now());
+        snap.edges
+            .into_iter()
+            .find(|e| e.sender == sender && e.type_name == type_name)
+            .unwrap_or_else(|| panic!("no edge {sender} -> {type_name}"))
+    }
+
+    #[tokio::test]
+    async fn every_capable_instance_gets_a_subscription_request_and_one_gets_the_initial() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let ((h, initial), targets) = f.opened("w1");
+        assert!(
+            ["a1", "b1"].contains(&h),
+            "a capable owner instance, got {h}"
+        );
+        assert_eq!(initial.mode, RequestMode::Unary as i32);
+        assert_eq!((initial.initial_credit, initial.max_results), (0, 0));
+        assert_eq!((initial.priority, initial.timeout_ms), (3, 0));
+        assert_eq!(initial.payload, b"{\"watch\":1}");
+        assert_eq!(initial.headers["traceparent"], "x");
+        assert_eq!(initial.r#type, "q.Watch");
+        let ids: Vec<(&str, &str)> = targets.iter().map(|(h, t, _)| (*h, t.as_str())).collect();
+        assert_eq!(
+            ids,
+            [("a1", "w1#1"), ("b1", "w1#2")],
+            "n = 1.. in target order (service, then instance id)"
+        );
+        for (_, _, r) in &targets {
+            assert_eq!(r.mode, RequestMode::Subscription as i32);
+            assert_eq!(
+                (r.initial_credit, r.max_results),
+                (0, 0),
+                "updates are pushed"
+            );
+            assert_eq!(
+                (r.priority, r.payload.as_slice()),
+                (3, &b"{\"watch\":1}"[..])
+            );
+            assert_eq!(r.headers["traceparent"], "x");
+        }
+        assert!(
+            f.requests("a2").is_empty(),
+            "a2 did not negotiate subscription"
+        );
+        assert_eq!(
+            f.router.in_flight(),
+            1,
+            "one request until the initial part"
+        );
+        let (by_instance, total) = f.router.in_flight_by_instance();
+        assert_eq!(total, 1);
+        assert_eq!(by_instance["s1"].as_sender, 1);
+        assert_eq!(by_instance[h].as_handler, 1, "the initial request only");
+        let other = if h == "a1" { "b1" } else { "a1" };
+        assert!(
+            !by_instance.contains_key(other),
+            "an update target is no handler in flight: {by_instance:?}"
+        );
+        assert!(f.messages("s1").is_empty(), "nothing to the sender yet");
+
+        // The initial target rotates among the capable instances.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let (h2, _) = f.open("w2");
+        assert_ne!(h, h2, "round-robin among the capable instances");
+
+        // An exclusive type: the owner's capable instance, initial and update target alike.
+        f.router.route(&D, "s1", subscribe("w3", "q.Own", 0, 0, 0));
+        let (h3, targets) = f.open("w3");
+        assert_eq!(h3, "x1");
+        assert_eq!(targets, [("x1", "w3#1".to_string())]);
+        assert!(f.requests("x2").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_initial_reply_is_part_one_then_updates_from_every_target_then_the_end() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.part("a1", "w1#1", 1, b"ua");
+        f.part("b1", "w1#2", 7, b"ub");
+        f.part("a1", "w1#1", 2, b"ua2");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 4, "{got:?}");
+        let p0 = part(&got[0]);
+        assert_eq!(
+            (p0.request_id.as_str(), p0.seq, p0.payload.as_slice()),
+            ("w1", 1, &b"initial"[..])
+        );
+        assert_eq!(p0.responder_instance, h);
+        assert_eq!(p0.responder_service, if h == "a1" { "A" } else { "B" });
+        assert!(p0.error.is_none());
+        assert_eq!(
+            parts_of(&got[1..]),
+            [
+                (2, b"ua".to_vec(), "a1".to_string()),
+                (3, b"ub".to_vec(), "b1".to_string()),
+                (4, b"ua2".to_vec(), "a1".to_string()),
+            ],
+            "the hub's seq in arrival order, not the handlers'"
+        );
+        assert_eq!(part(&got[2]).responder_service, "B");
+        assert_eq!(
+            f.router.in_flight(),
+            0,
+            "no longer in flight after the initial part"
+        );
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        // Targets end one by one; the end comes with the last.
+        f.end("a1", "w1#1", None);
+        assert!(f.messages("s1").is_empty(), "b1 still serves");
+        f.part("b1", "w1#2", 8, b"ub2");
+        f.end("b1", "w1#2", None);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(part(&got[0]).seq, 5);
+        let e = end(&got[1]);
+        assert_eq!(
+            (e.request_id.as_str(), e.parts, e.failed, e.timed_out),
+            ("w1", 5, 0, 0)
+        );
+        assert!(e.error.is_none());
+        for (h, _) in &targets {
+            assert!(f.messages(h).is_empty(), "{h}: no cancel, it ended");
+        }
+        // Late parts, ends and replies change nothing.
+        f.part("a1", "w1#1", 3, b"late");
+        f.end("b1", "w1#2", None);
+        f.reply(h, "w1#0", b"late");
+        assert!(f.messages("s1").is_empty());
+        let edge = edge_of(&f.router, "web", "q.Watch");
+        assert_eq!((edge.count, edge.errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn updates_before_the_initial_result_wait_behind_it() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.part("b1", "w1#2", 1, b"early");
+        f.part("a1", "w1#1", 1, b"early2");
+        assert!(
+            f.messages("s1").is_empty(),
+            "the initial part is always seq 1"
+        );
+        f.reply(h, "w1#0", b"initial");
+        let got = f.messages("s1");
+        assert_eq!(
+            parts_of(&got),
+            [
+                (1, b"initial".to_vec(), h.to_string()),
+                (2, b"early".to_vec(), "b1".to_string()),
+                (3, b"early2".to_vec(), "a1".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_initial_error_timeout_or_handler_loss_ends_the_subscription_with_that_error() {
+        let mut f = Subs::new();
+        // Reply{error}: relayed as the end's error, every update target cancelled.
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        f.part("a1", "w1#1", 1, b"early");
+        f.reply_error(h, "w1#0", ErrorCode::PermissionDenied);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "no part, the end only: {got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 0);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::PermissionDenied, "no".to_string())
+        );
+        assert_eq!(
+            e.error.as_ref().unwrap().request_id,
+            "w1",
+            "the sender's id"
+        );
+        for (h, t) in &targets {
+            let c = f.cancels(h);
+            assert_eq!(c.len(), 1, "{h}: {c:?}");
+            assert_eq!(c[0].0, *t);
+        }
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        let edge = edge_of(&f.router, "web", "q.Watch");
+        assert_eq!((edge.count, edge.errors), (1, 1));
+
+        // A timeout of the initial request: TIMEOUT.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 100, 0, 0));
+        let (_, targets) = f.open("w2");
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (code, message) = end_error(end(&got[0]));
+        assert_eq!(code, ErrorCode::Timeout);
+        assert!(message.contains("100 ms"), "{message}");
+        for (h, t) in &targets {
+            assert_eq!(f.cancels(h).len(), 1, "{h} ({t}) is cancelled");
+        }
+        assert_eq!(f.router.in_flight(), 0);
+
+        // The initial target leaves before answering: HANDLER_DISCONNECTED (as a unary).
+        f.router
+            .route(&D, "s1", subscribe("w3", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w3");
+        f.leave(h);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(end_error(end(&got[0])).0, ErrorCode::HandlerDisconnected);
+        let other = if h == "a1" { "b1" } else { "a1" };
+        assert_eq!(f.cancels(other).len(), 1, "the other target is cancelled");
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_targets_error_end_or_error_part_ends_the_subscription_with_that_error() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.part("b1", "w1#2", 1, b"u");
+        f.end("a1", "w1#1", Some(ErrorCode::HandlerError));
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        let e = end(&got[2]);
+        assert_eq!(e.parts, 2);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::HandlerError, "failed".to_string())
+        );
+        assert_eq!(e.error.as_ref().unwrap().request_id, "w1");
+        assert!(
+            f.cancels("a1").is_empty(),
+            "the failed target ended by itself"
+        );
+        assert_eq!(f.cancels("b1").len(), 1, "the other target is cancelled");
+        assert_eq!(f.router.in_flight(), 0);
+        f.part("b1", "w1#2", 2, b"late");
+        assert!(f.messages("s1").is_empty(), "the subscription is gone");
+
+        // A part carrying an error, as for a stream: the part is not relayed.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w2");
+        f.reply(h, "w2#0", b"initial");
+        f.part_error("b1", "w2#2");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        let e = end(&got[1]);
+        assert_eq!(e.parts, 1);
+        assert_eq!(end_error(e), (ErrorCode::HandlerError, "boom".to_string()));
+        assert!(f.cancels("b1").is_empty());
+        assert_eq!(f.cancels("a1").len(), 1);
+        // The request was counted once, at the initial part, as ok.
+        let edge = edge_of(&f.router, "web", "q.Watch");
+        assert_eq!((edge.count, edge.errors), (2, 0));
+    }
+
+    #[tokio::test]
+    async fn updates_wait_for_the_senders_credit_and_a_flow_drains_them_in_order() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 2, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.part("a1", "w1#1", 1, b"u1");
+        f.part("b1", "w1#2", 1, b"u2");
+        f.part("a1", "w1#1", 2, b"u3");
+        let got = f.messages("s1");
+        assert_eq!(
+            parts_of(&got)
+                .iter()
+                .map(|(seq, _, _)| *seq)
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "the initial part took one credit, one update the other: {got:?}"
+        );
+        // Flows that are not the sender's, for an unknown id, or empty are ignored.
+        f.flow("s-stream", "w1", 5);
+        f.flow("a1", "w1", 5);
+        f.flow("s1", "ghost", 5);
+        f.flow("s1", "w1", 0);
+        assert!(f.messages("s1").is_empty());
+        f.flow("s1", "w1", 1);
+        let got = f.messages("s1");
+        assert_eq!(
+            parts_of(&got),
+            [(3, b"u2".to_vec(), "b1".to_string())],
+            "one credit, the oldest update"
+        );
+        f.flow("s1", "w1", 5);
+        let got = f.messages("s1");
+        assert_eq!(parts_of(&got), [(4, b"u3".to_vec(), "a1".to_string())]);
+        f.part("b1", "w1#2", 2, b"u4");
+        assert_eq!(parts_of(&f.messages("s1")).len(), 1, "credit left: at once");
+        for h in ["a1", "b1"] {
+            assert!(
+                f.messages(h).is_empty(),
+                "{h}: no credit is relayed to a target"
+            );
+        }
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_buffer_ends_the_subscription_with_resource_exhausted_and_cancels_the_targets() {
+        let config = Config {
+            subscription_buffer: 2,
+            ..Config::default()
+        };
+        let mut f = Subs::with(config, Metrics::noop());
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 1, 0));
+        let (h, targets) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.part("a1", "w1#1", 1, b"u1");
+        f.part("b1", "w1#2", 1, b"u2");
+        assert_eq!(f.messages("s1").len(), 1, "the initial part; two buffered");
+        f.part("a1", "w1#1", 2, b"one too many");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 1, "the buffered updates are not delivered");
+        assert_eq!(
+            end_error(e),
+            (
+                ErrorCode::ResourceExhausted,
+                "subscriber buffer (2) exceeded".to_string()
+            )
+        );
+        for (h, t) in &targets {
+            let c = f.cancels(h);
+            assert_eq!(c.len(), 1, "{h}: {c:?}");
+            assert_eq!(
+                (c[0].0.as_str(), c[0].1.as_str()),
+                (t.as_str(), "subscriber buffer exceeded")
+            );
+        }
+        assert_eq!(f.router.in_flight(), 0);
+        f.flow("s1", "w1", 5);
+        assert!(f.messages("s1").is_empty(), "the subscription is gone");
+    }
+
+    #[tokio::test]
+    async fn max_results_counts_the_updates_not_the_initial_part() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 2));
+        let (h, targets) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.part("a1", "w1#1", 1, b"u1");
+        assert_eq!(f.messages("s1").len(), 2, "the initial part and one update");
+        assert!(f.cancels("a1").is_empty() && f.cancels("b1").is_empty());
+        f.part("b1", "w1#2", 1, b"u2");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        let e = end(&got[1]);
+        assert_eq!(e.parts, 3);
+        assert!(e.error.is_none());
+        for (h, t) in &targets {
+            assert_eq!(
+                f.cancels(h),
+                [(t.clone(), "max results".to_string())],
+                "{h}"
+            );
+        }
+        assert_eq!(f.router.in_flight(), 0);
+        f.part("a1", "w1#1", 2, b"late");
+        assert!(f.messages("s1").is_empty());
+        // Reached while draining the buffer: the rest of the buffer is dropped.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 1, 1));
+        let (h, _) = f.open("w2");
+        f.part("a1", "w2#1", 1, b"u1");
+        f.part("b1", "w2#2", 1, b"u2");
+        f.reply(h, "w2#0", b"initial");
+        assert_eq!(
+            f.messages("s1").len(),
+            1,
+            "the initial part; no credit left"
+        );
+        f.flow("s1", "w2", 10);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "one update, then the end: {got:?}");
+        assert_eq!(part(&got[0]).payload, b"u1");
+        assert_eq!(end(&got[1]).parts, 2);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_from_the_sender_reaches_every_target_and_ends_the_subscription_silently() {
+        let mut f = Subs::new();
+        // Before the initial result: the initial request is cancelled too.
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        // Cancels that are not the sender's or for an unknown id are ignored.
+        f.cancel("s-stream", "w1", "not mine");
+        f.cancel("a1", "w1", "not the handler's to cancel");
+        f.cancel("s1", "ghost", "nothing");
+        assert!(f.cancels("a1").is_empty() && f.cancels("b1").is_empty());
+        assert_eq!(f.router.in_flight(), 1);
+        f.cancel("s1", "w1", "enough");
+        let mut expected: Vec<(&str, String)> =
+            targets.iter().map(|(h, t)| (*h, t.clone())).collect();
+        expected.push((h, "w1#0".to_string()));
+        let got: Vec<(&str, String)> = ["a1", "b1"]
+            .into_iter()
+            .flat_map(|h| {
+                f.cancels(h)
+                    .into_iter()
+                    .map(move |(t, reason)| (h, t, reason))
+            })
+            .inspect(|(_, _, reason)| assert_eq!(reason, "enough"))
+            .map(|(h, t, _)| (h, t))
+            .collect();
+        for e in &expected {
+            assert!(got.contains(e), "{e:?} cancelled: {got:?}");
+        }
+        assert_eq!(
+            got.len(),
+            3,
+            "the initial request and both targets: {got:?}"
+        );
+        assert!(f.messages("s1").is_empty(), "nothing more to the sender");
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        f.reply(h, "w1#0", b"late");
+        f.part("a1", "w1#1", 1, b"late");
+        assert!(f.messages("s1").is_empty());
+        let edge = edge_of(&f.router, "web", "q.Watch");
+        assert_eq!((edge.count, edge.errors), (1, 0), "a cancel is no error");
+
+        // After the initial result: the update targets only; an empty reason gets a default.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w2");
+        f.reply(h, "w2#0", b"initial");
+        f.messages("s1");
+        f.cancel("s1", "w2", "");
+        for (h, t) in &targets {
+            let c = f.cancels(h);
+            assert_eq!(c.len(), 1, "{h}: {c:?}");
+            assert_eq!(c[0].0, *t);
+            assert!(!c[0].1.is_empty());
+        }
+        assert!(f.messages("s1").is_empty());
+        let edge = edge_of(&f.router, "web", "q.Watch");
+        assert_eq!(
+            (edge.count, edge.errors),
+            (2, 0),
+            "counted once, at the initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_leaves_cancels_every_target() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        f.leave("s1");
+        let mut expected: Vec<(&str, String)> =
+            targets.iter().map(|(h, t)| (*h, t.clone())).collect();
+        expected.push((h, "w1#0".to_string()));
+        let got: Vec<(&str, String)> = ["a1", "b1"]
+            .into_iter()
+            .flat_map(|h| {
+                f.cancels(h)
+                    .into_iter()
+                    .map(move |(t, reason)| (h, t, reason))
+            })
+            .inspect(|(_, _, reason)| assert_eq!(reason, "sender disconnected"))
+            .map(|(h, t, _)| (h, t))
+            .collect();
+        for e in &expected {
+            assert!(got.contains(e), "{e:?} cancelled: {got:?}");
+        }
+        assert_eq!(
+            got.len(),
+            3,
+            "the initial request and both targets: {got:?}"
+        );
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        // Late parts and ends are ignored.
+        f.part("a1", "w1#1", 1, b"late");
+        f.end("b1", "w1#2", None);
+        assert!(f.messages("a1").is_empty() && f.messages("b1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_target_that_leaves_ends_silently_and_the_last_one_ends_with_handler_disconnected() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.messages("s1");
+        f.leave("a1");
+        assert!(f.messages("s1").is_empty(), "b1 still serves");
+        assert!(f.messages("b1").is_empty(), "nothing to the other target");
+        assert_eq!(f.router.in_flight(), 0);
+        f.part("b1", "w1#2", 1, b"u");
+        assert_eq!(f.messages("s1").len(), 1);
+        f.leave("b1");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 2);
+        assert_eq!(end_error(e).0, ErrorCode::HandlerDisconnected);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+
+        // A new instance registering after the open is no target (at-most-once delivery).
+        f.connect("b9", "B", meta(2, true), None, 64);
+        f.shared("b9", "B", &["q.Watch"]);
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w2");
+        assert_eq!(h, "b9");
+        assert_eq!(targets, [("b9", "w2#1".to_string())]);
+        f.connect("b10", "B", meta(2, true), None, 64);
+        f.shared("b10", "B", &["q.Watch"]);
+        assert!(f.requests("b10").is_empty(), "registered after the open");
+    }
+
+    #[tokio::test]
+    async fn the_per_instance_limit_refuses_a_subscription_before_anything_is_sent() {
+        let config = Config {
+            max_subscriptions_per_instance: 1,
+            ..Config::default()
+        };
+        let mut f = Subs::with(config, Metrics::noop());
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (id, code, message) = error_code(&got[0]);
+        assert_eq!((id.as_str(), code), ("w2", ErrorCode::ResourceExhausted));
+        assert!(message.contains("1 subscription"), "{message}");
+        for h in ["a1", "b1"] {
+            assert!(f.requests(h).is_empty(), "{h} got nothing for w2");
+        }
+        assert_eq!(f.router.in_flight(), 1, "w1 only");
+        // Another type on other instances is not limited by it.
+        f.router.route(&D, "s1", subscribe("w3", "q.Own", 0, 0, 0));
+        assert_eq!(f.open("w3").0, "x1");
+        // Once w1 ends its targets are free again.
+        f.reply(h, "w1#0", b"initial");
+        f.end("a1", "w1#1", None);
+        f.end("b1", "w1#2", None);
+        f.messages("s1");
+        f.router
+            .route(&D, "s1", subscribe("w4", "q.Watch", 0, 0, 0));
+        assert!(f.messages("s1").is_empty(), "accepted");
+        f.open("w4");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_max_subscription_duration_ends_an_active_subscription_with_cancelled() {
+        let config = Config {
+            max_subscription_duration: Some(Duration::from_secs(1)),
+            ..Config::default()
+        };
+        let mut f = Subs::with(config, Metrics::noop());
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        tokio::task::yield_now().await;
+        for seq in 1..10 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            f.part("a1", "w1#1", seq, b"tick");
+        }
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 11, "{got:?}");
+        let e = end(&got[10]);
+        assert_eq!(e.parts, 10);
+        assert_eq!(
+            end_error(e),
+            (
+                ErrorCode::Cancelled,
+                "max subscription duration (1s) exceeded".to_string()
+            )
+        );
+        for (h, t) in &targets {
+            assert_eq!(
+                f.cancels(h),
+                [(
+                    t.clone(),
+                    "max subscription duration (1s) exceeded".to_string()
+                )],
+                "{h}"
+            );
+        }
+        assert_eq!(f.router.in_flight(), 0);
+        // Without the setting a subscription has no clock: a day later it is still open.
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+        f.part("a1", "w1#1", 1, b"still here");
+        assert_eq!(f.messages("s1").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_gated_by_version_capability_kind_targets_and_duplicates() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s-v1", subscribe("v1", "q.Watch", 0, 0, 0));
+        let got = f.messages("s-v1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(error_code(&got[0]).1, ErrorCode::InvalidRequest);
+
+        f.router
+            .route(&D, "s-stream", subscribe("p1", "q.Watch", 0, 0, 0));
+        let (_, code, message) = error_code(&f.messages("s-stream")[0]);
+        assert_eq!(code, ErrorCode::Unsupported);
+        assert!(message.contains("\"subscription\""), "{message}");
+
+        f.router
+            .route(&D, "s1", subscribe("in-flight", "q.Watch", 0, 0, 0));
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                kind: RequestKind::Command as i32,
+                ..subscribe("cmd", "c.Do", 0, 0, 0)
+            },
+        );
+        f.router
+            .route(&D, "s1", subscribe("cmd-q", "c.Do", 0, 0, 0));
+        f.router
+            .route(&D, "s1", subscribe("legacy", "q.Legacy", 0, 0, 0));
+        f.router
+            .route(&D, "s1", subscribe("nope", "q.Nope", 0, 0, 0));
+        f.router
+            .route(&D, "s1", subscribe("in-flight", "q.Watch", 0, 0, 0));
+        f.router
+            .route(&D, "s1", subscribe("in-flight#0", "q.Watch", 0, 0, 0));
+        let got = f.messages("s1");
+        let codes: Vec<(String, ErrorCode)> = got
+            .iter()
+            .map(|m| {
+                let (id, code, _) = error_code(m);
+                (id, code)
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("cmd".to_string(), ErrorCode::InvalidRequest),
+                ("cmd-q".to_string(), ErrorCode::InvalidRequest),
+                ("legacy".to_string(), ErrorCode::Unsupported),
+                ("nope".to_string(), ErrorCode::NoHandler),
+                ("in-flight".to_string(), ErrorCode::InvalidRequest),
+                ("in-flight#0".to_string(), ErrorCode::InvalidRequest),
+            ]
+        );
+        let legacy = error_code(&got[2]).2;
+        assert!(
+            legacy.contains('N') && legacy.contains("subscription"),
+            "names the service and the capability: {legacy}"
+        );
+        for h in ["a2", "x1", "x2", "n1"] {
+            assert!(f.requests(h).is_empty(), "{h} got nothing");
+        }
+        assert_eq!(f.router.in_flight(), 1, "only the first subscription");
+        f.open("in-flight");
+        // An update target's id is no pending id (it is matched through its subscription): a
+        // request with that id is routed, a subscription with it opens with ids of its own.
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: 0,
+                ..subscribe("in-flight#1", "q.Watch", 0, 0, 0)
+            },
+        );
+        f.router
+            .route(&D, "s1", subscribe("in-flight#2", "q.Watch", 0, 0, 0));
+        assert!(f.messages("s1").is_empty());
+        let (_, targets) = f.open("in-flight#2");
+        assert_eq!(targets[0].1, "in-flight#2#1");
+        assert_eq!(f.router.in_flight(), 3);
+    }
+
+    #[tokio::test]
+    async fn parts_and_ends_for_unknown_ids_or_from_non_targets_are_ignored() {
+        let mut f = Subs::new();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        f.messages("s1");
+        f.part("a2", "w1#1", 1, b"intruder");
+        f.part("b1", "w1#1", 1, b"the other target's id");
+        f.end("b1", "w1#1", None);
+        f.part("a1", "ghost#1", 1, b"ghost");
+        f.end("a1", "ghost#1", None);
+        f.part("a1", "w1", 1, b"the sender's id, not the target's");
+        f.part("a1", "w1#0", 1, b"the initial's id");
+        f.part("a1", "w1#9", 1, b"no such target");
+        f.part("s1", "w1#1", 1, b"the sender is no target");
+        f.reply("a1", "w1#1", b"a unary reply to an update target");
+        assert!(f.messages("s1").is_empty());
+        assert_eq!(f.router.in_flight(), 0);
+        f.part("a1", "w1#1", 1, b"real");
+        assert_eq!(f.messages("s1").len(), 1, "the subscription is untouched");
+        f.end("a1", "w1#1", None);
+        f.end("b1", "w1#2", None);
+        assert_eq!(end(&f.messages("s1")[0]).parts, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parts_and_the_end_reach_a_slow_sender_in_order() {
+        let mut f = Subs::new();
+        // A sender whose buffer holds one message: the initial part fills it, the rest wait.
+        f.connect("s-slow", "web", meta(2, true), None, 1);
+        f.router
+            .route(&D, "s-slow", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.reply(h, "w1#0", b"initial");
+        for seq in 1..4 {
+            f.part("a1", "w1#1", seq, format!("u{seq}").as_bytes());
+        }
+        f.end("a1", "w1#1", None);
+        f.end("b1", "w1#2", None);
+        assert_eq!(f.router.in_flight(), 0);
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            let m = tokio::time::timeout(
+                Duration::from_secs(1),
+                f.rx.get_mut("s-slow").unwrap().recv(),
+            )
+            .await
+            .expect("message within the delivery timeout")
+            .unwrap()
+            .unwrap();
+            got.extend(m.message);
+            tokio::task::yield_now().await;
+        }
+        let seqs: Vec<u64> = got[..4].iter().map(|m| part(m).seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4], "{got:?}");
+        assert_eq!(part(&got[3]).payload, b"u3");
+        assert_eq!(end(&got[4]).parts, 4);
+        tokio::task::yield_now().await;
+        assert!(f.messages("s-slow").is_empty(), "nothing follows the end");
+    }
+
+    fn candidate(id: &str) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            load_factor: 100,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// The initial request takes one of its handler's permits like any unary request; the
+    /// update targets are written outside flow control and hold none.
+    #[tokio::test]
+    async fn the_initial_request_holds_a_permit_and_the_update_targets_hold_none() {
+        let mut f = Subs::new();
+        for h in ["a1", "a2", "b1"] {
+            f.leave(h);
+        }
+        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.shared("b3", "B", &["q.Watch"]);
+        let assigned = |f: &Subs| f.router.loads(&[candidate("b3")])["b3"].assigned;
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let ((h, initial), targets) = f.opened("w1");
+        assert_eq!(h, "b3");
+        assert_eq!(initial.id, "w1#0");
+        assert_eq!(targets.len(), 1, "written at once, no permit needed");
+        assert_eq!(targets[0].1, "w1#1");
+        assert_eq!(assigned(&f), 1, "the initial request only");
+        assert_eq!(f.router.flow_by_instance()["b3"].permits_available, 0);
+        // A second subscription: its update target goes out, its initial request queues.
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let got = f.requests("b3");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].id, "w2#1");
+        assert_eq!(f.router.flow_by_instance()["b3"].queued, 1, "w2#0 waits");
+        assert_eq!(assigned(&f), 2);
+        // The initial reply releases the permit's accounting; the client returns the permit.
+        f.reply("b3", "w1#0", b"initial");
+        assert_eq!(assigned(&f), 1);
+        f.router.on_permits(&D, "b3", f.tokens["b3"], 1, 0);
+        let got = f.requests("b3");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].id, "w2#0");
+        // Update targets ending or being cancelled touch no permit.
+        f.end("b3", "w1#1", None);
+        f.cancel("s1", "w2", "bye");
+        assert_eq!(assigned(&f), 0, "w2#0 left the map with its subscription");
+        assert_eq!(
+            f.router.flow_by_instance()["b3"].permits_available,
+            0,
+            "the handler still holds w2#0's permit until it returns it"
+        );
+        assert_eq!(
+            f.cancels("b3"),
+            [
+                ("w2#0".to_string(), "bye".to_string()),
+                ("w2#1".to_string(), "bye".to_string())
+            ],
+            "the forwarded initial request and the update target"
+        );
+    }
+
+    /// An update target whose session cannot be written at the open (full buffer) is left out;
+    /// with no target written the subscription ends at once with that error.
+    #[tokio::test]
+    async fn a_target_that_cannot_be_written_at_the_open_is_left_out() {
+        let mut f = Subs::new();
+        f.connect("b4", "B", meta(2, true), None, 1);
+        f.shared("b4", "B", &["q.Watch"]);
+        // b4's one-slot buffer is full.
+        f.sessions
+            .send_if_current(&D, "b4", f.tokens["b4"], ServerMessage::default())
+            .unwrap();
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, targets) = f.open("w1");
+        assert_ne!(h, "b4", "b4 took nothing");
+        assert_eq!(
+            targets,
+            [("a1", "w1#1".to_string()), ("b1", "w1#2".to_string())],
+            "b4 was target 3, left out"
+        );
+        assert!(f.messages("s1").is_empty(), "the subscription goes on");
+        assert_eq!(f.router.in_flight(), 1);
+        f.cancel("s1", "w1", "done");
+        f.cancels("a1");
+        f.cancels("b1");
+        // No target written at all: the subscription ends at once.
+        for h in ["a1", "a2", "b1"] {
+            f.leave(h);
+        }
+        f.router
+            .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 0);
+        assert_eq!(end_error(e).0, ErrorCode::ResourceExhausted);
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscription_metrics_count_one_request_the_open_targets_and_the_updates() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut f = Subs::with(Config::default(), Arc::clone(&m.metrics));
+        f.router
+            .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
+        let (h, _) = f.open("w1");
+        f.router.route(&D, "s1", subscribe("w2", "q.Own", 0, 0, 0));
+        f.open("w2");
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "service", "X"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            None,
+            "nothing counted before the initial part"
+        );
+        f.reply(h, "w1#0", b"initial");
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "ok"),
+            Some(1)
+        );
+        f.part("a1", "w1#1", 1, b"u1");
+        f.part("b1", "w1#2", 1, b"u2");
+        f.end("a1", "w1#1", None);
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            Some(0)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_subscription_updates_total", "type", "q.Watch"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_subscription_updates_total", "service", "B"),
+            Some(1)
+        );
+        f.cancel("s1", "w1", "bye");
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            Some(0)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            Some(1),
+            "a cancel after the initial part counts nothing more"
+        );
+        // Cancelled before the initial part: counted once, as cancelled.
+        f.cancel("s1", "w2", "bye");
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance", "x1"),
+            Some(0)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "cancelled"),
+            Some(1)
+        );
+        f.router
+            .route(&D, "s-stream", subscribe("p1", "q.Watch", 0, 0, 0));
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            Some(3)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            None
+        );
+        assert_eq!(
+            m.histogram_sum("kraken_hub_request_duration_seconds")
+                .map(|(n, _)| n),
+            Some(3)
+        );
     }
 }
