@@ -187,10 +187,11 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
         ErrorCode::ResourceExhausted => Outcome::ResourceExhausted,
-        // UNSUPPORTED is declared by protocol v2 but not produced by this hub yet.
+        // CANCELLED is allocated for P4b and not produced by this hub yet.
         ErrorCode::HandlerError
         | ErrorCode::Unauthenticated
         | ErrorCode::Unsupported
+        | ErrorCode::Cancelled
         | ErrorCode::Unspecified => Outcome::HandlerError,
     }
 }
@@ -1254,7 +1255,7 @@ mod tests {
             payload: vec![1, 2, 3],
             headers: HashMap::from([("h".to_string(), "v".to_string())]),
             timeout_ms,
-            priority: 0,
+            ..Request::default()
         }
     }
 

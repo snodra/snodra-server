@@ -37,7 +37,13 @@ message ClientMessage {
     Heartbeat heartbeat = 4;
     // Flow control (capability "flow-control"): more requests this instance can take now.
     Permits permits = 5;
-    // Fields 6-9 are allocated to a later roadmap phase (multi-part messages).
+    // Multi-part messages (ADR 0017). Allocated now so no later phase renumbers; the hub ignores
+    // them until the phase that defines them ships: a handler's streamed parts and end (P4b,
+    // capability "streaming"), credits and cancellation (P4b/P4c).
+    ReplyPart part = 6;
+    ReplyEnd end = 7;
+    Flow flow = 8;
+    Cancel cancel = 9;
     // Multi-hub HA (capability "instance-status"): what this instance sees, every 5 s. Sent only
     // to a hub whose RegisterAck lists "instance-status"; the hub keeps the latest per session.
     InstanceStatus status = 10;
@@ -59,6 +65,14 @@ message ServerMessage {
     // Protocol v2 only: answers every accepted Register of a session that declared
     // Register.protocol_version >= 2. Never sent to a v1 session (protocol_version 0).
     RegisterAck register_ack = 5;
+    // Multi-part messages (ADR 0017), sent only to a session that declared the capability of the
+    // request mode. Scatter-gather (capability "scatter-gather", P4a): one ReplyPart per target
+    // that answered, then one ReplyEnd, for a Request with mode SCATTER_GATHER this instance
+    // sent. Streaming (P4b) and subscriptions (P4c) reuse them; Flow and Cancel arrive with P4b.
+    ReplyPart part = 6;
+    ReplyEnd end = 7;
+    Flow flow = 8;
+    Cancel cancel = 9;
   }
 }
 
@@ -68,12 +82,18 @@ message ServerMessage {
 // command_types and query_types is rejected with INVALID_ARGUMENT. A type whose kind differs from
 // the kind its current owner registered is rejected with ALREADY_EXISTS.
 //
+// Query ownership (ADR 0017): a type in query_types is exclusive, owned by one service only; a
+// type in shared_query_types may be owned by many services. Registrants must agree: a type
+// registered exclusive by one registrant and shared by another is rejected with ALREADY_EXISTS
+// (the later Register fails). A type listed in shared_query_types and in command_types or
+// query_types of the same Register is rejected with INVALID_ARGUMENT. Commands are never shared.
+//
 // Version negotiation (ADR 0013): protocol_version, capabilities and client_version are read from
 // the first Register of a stream only; later Registers cannot change them. A v2 session
 // (protocol_version >= 2) gets a RegisterAck for every accepted Register, written before the echo
 // of any Heartbeat that follows it, so a new client tells a new hub (ack first) from an old one
 // (echo first, no ack). Fields initial_permits, load_factor and tags (8-10) are read from the
-// first Register of a stream too. Fields 11 and 13 are allocated to later roadmap phases.
+// first Register of a stream too. Field 11 is allocated to a later roadmap phase (contexts).
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -87,8 +107,9 @@ message Register {
   // file defines; 1 is never sent and reads as v1; anything above 2 is answered as 2.
   uint32 protocol_version = 5;
   // Optional protocol features this client supports; unknown names are ignored by the hub.
-  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED) and
-  // "instance-status" (ClientMessage.status).
+  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED),
+  // "instance-status" (ClientMessage.status) and "scatter-gather" (Request.mode SCATTER_GATHER,
+  // ReplyPart, ReplyEnd).
   repeated string capabilities = 6;
   // Accepted and ignored until hub access control ships (roadmap P5). Never logged.
   Credentials credentials = 7;
@@ -106,6 +127,12 @@ message Register {
   // Free text naming the client library and its version, for example "kraken-messaging/0.1.0".
   // Shown in the topology view; never used for routing decisions.
   string client_version = 12;
+  // Fully qualified query type names this instance handles that many services may own (ADR
+  // 0017), for example a "search.FindAnything" every service answers. A point query to such a
+  // type goes to one live instance of any owner; a scatter-gather query to all of them. Plain
+  // (no capability needed): a hub that predates the field ignores it, so a client relying on it
+  // should check the hub's RegisterAck lists "scatter-gather".
+  repeated string shared_query_types = 13;
 }
 
 // Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
@@ -173,6 +200,23 @@ message RegisterAck {
   map<string, uint32> type_timeouts_ms = 9;
 }
 
+// How the hub delivers a Request and its answers (ADR 0017). A sender may use a mode other than
+// UNARY only if its session declared the mode's capability and the hub's RegisterAck lists it;
+// otherwise the request fails with UNSUPPORTED (INVALID_REQUEST for a v1 session). Handlers
+// always receive mode UNARY.
+enum RequestMode {
+  // One handler, one Reply or Error. The v1 behaviour.
+  UNARY = 0;
+  // Queries only (capability "scatter-gather", P4a): every live instance of every owner gets an
+  // ordinary unary Request; the sender gets one ReplyPart per answer, in arrival order, then a
+  // ReplyEnd. A command fails with INVALID_REQUEST; no live instance, with an Error NO_HANDLER.
+  SCATTER_GATHER = 1;
+  // Allocated to P4b (streaming queries with credits). Rejected with UNSUPPORTED until then.
+  STREAMING = 2;
+  // Allocated to P4c (subscription queries). Rejected with UNSUPPORTED until then.
+  SUBSCRIPTION = 3;
+}
+
 // Whether a Request is a command (exactly one handler, side effects) or a query (read only).
 enum RequestKind {
   REQUEST_KIND_UNSPECIFIED = 0;
@@ -202,10 +246,19 @@ message Request {
   //   timeout_ms == 0: override or default_timeout_ms (5000 ms unless configured)
   // v2 clients send 0 unless their caller chose a timeout, so per-type overrides apply.
   uint32 timeout_ms = 7;
-  // Field 8 is allocated to a later roadmap phase (request mode).
+  // UNARY (the default) or a multi-part mode; see RequestMode. For SCATTER_GATHER, timeout_ms is
+  // the deadline of the whole gather: the ReplyEnd comes when every target answered or the
+  // deadline passed, whichever is first.
+  RequestMode mode = 8;
   // Higher first when the hub queues requests for a flow-controlled instance; equal priorities
   // keep arrival order. 0 is the default. Queued requests keep their own deadline.
   int32 priority = 9;
+  // Field 10 is allocated to a later roadmap phase (contexts).
+  // Streaming (P4b): credits the sender grants before its first Flow. Ignored until P4b.
+  uint32 initial_credit = 11;
+  // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
+  // remaining targets are dropped; the targets are not cancelled.
+  uint32 max_results = 12;
 }
 
 // Success or application-level failure returned by the handling instance.
@@ -225,7 +278,7 @@ message Reply {
 // (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED,
 // PERMISSION_DENIED and INVALID_REQUEST inside a Reply. The hub never sends a code above 7 to a
 // v1 session, and RESOURCE_EXHAUSTED only to a session that shares the "flow-control"
-// capability. Code 9 is allocated to a later roadmap phase.
+// capability.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
@@ -249,8 +302,11 @@ enum ErrorCode {
   // never saw the request. Sent only to senders that share the "flow-control" capability; other
   // senders get HANDLER_ERROR "handler busy" instead.
   RESOURCE_EXHAUSTED = 8;
-  // The request needs a feature the sender, the hub or the target did not declare. Declared in
-  // protocol v2; not produced yet.
+  // The request or the stream was cancelled (Cancel, P4b). Allocated; not produced yet.
+  CANCELLED = 9;
+  // The request needs a feature the sender, the hub or the target did not declare: a mode other
+  // than UNARY from a v2 session that did not declare its capability, or a mode this hub does
+  // not implement yet (STREAMING, SUBSCRIPTION). Never sent to a v1 session.
   UNSUPPORTED = 10;
 }
 
@@ -263,6 +319,54 @@ message Error {
   // Optional machine-readable details from the handler (for example a validation error list as
   // JSON). Empty for hub-generated errors.
   bytes details = 4;
+}
+
+// One answer of a multi-part request (ADR 0017). For scatter-gather, one per target that answered,
+// in arrival order, with the sender's Request.id. A target's Reply{error}, a hub-side failure of
+// one target (HANDLER_DISCONNECTED, RESOURCE_EXHAUSTED or HANDLER_ERROR "handler busy") is a part
+// with `error` set and no payload.
+message ReplyPart {
+  // The sender's Request.id.
+  string request_id = 1;
+  // JSON document, UTF-8, as the target's Reply.payload. Empty when `error` is set.
+  bytes payload = 2;
+  // The target's failure; its request_id is the sender's Request.id.
+  Error error = 3;
+  // The service and instance that answered.
+  string responder_service = 4;
+  string responder_instance = 5;
+  // 0, 1, 2, ... in the order the hub sent the parts of this request.
+  uint64 seq = 6;
+}
+
+// The last message of a multi-part request (ADR 0017): no ReplyPart for its id follows. For
+// scatter-gather: sent when every target answered, when max_results successful parts arrived, or
+// at the deadline, whichever is first.
+message ReplyEnd {
+  // The sender's Request.id.
+  string request_id = 1;
+  // Set when the request failed as a whole. Unset for scatter-gather in P4a: partial answers are
+  // answers, and the counts below tell what was missing.
+  Error error = 2;
+  // ReplyParts sent, failed ones included.
+  uint32 parts = 3;
+  // Of those, parts carrying an error.
+  uint32 failed = 4;
+  // Targets that had not answered by the deadline (no part was sent for them).
+  uint32 timed_out = 5;
+}
+
+// Streaming credits (P4b): the receiver of a stream may get `credits` more parts. Allocated; the
+// hub ignores it until P4b.
+message Flow {
+  string request_id = 1;
+  uint32 credits = 2;
+}
+
+// Cancels a multi-part request (P4b, both ways). Allocated; the hub ignores it until P4b.
+message Cancel {
+  string request_id = 1;
+  string reason = 2;
 }
 
 // Keep-alive. A v2 client sends one every RegisterAck.heartbeat_interval_ms (3 s by default) and
@@ -336,19 +440,26 @@ message InstanceTopology {
   repeated string connected_hub_ids = 16;
   // now_ms minus the time of the last InstanceStatus; -1 when never reported.
   int64 status_age_ms = 17;
+  // Sorted; the query types of query_types this instance registered as shared (ADR 0017).
+  repeated string shared_query_types = 18;
 }
 
 message TypeOwnership {
   string type = 1;
   // Reuses RequestKind (COMMAND or QUERY).
   RequestKind kind = 2;
+  // The owner; for a shared query type, the first of owner_services.
   string owner_service = 3;
-  // Instances currently listing the type.
+  // Instances currently listing the type (over all owners of a shared type).
   uint32 live_instances = 4;
   // No live instance; stays until the owner grace sweep removes the type.
   bool orphaned = 5;
   // 0 unless orphaned.
   int64 orphaned_for_ms = 6;
+  // Registered through Register.shared_query_types: many services may own it (ADR 0017).
+  bool shared = 7;
+  // Every owning service, sorted (one entry for an exclusive type).
+  repeated string owner_services = 8;
 }
 
 message TopologyTotals {

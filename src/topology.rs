@@ -102,6 +102,9 @@ pub struct InstanceTopology {
     /// Milliseconds since the last `InstanceStatus`; -1 when never reported.
     #[serde(default = "never_reported")]
     pub status_age_ms: i64,
+    /// The query types (of `query_types`) registered as shared (ADR 0017).
+    #[serde(default)]
+    pub shared_query_types: Vec<String>,
 }
 
 fn never_reported() -> i64 {
@@ -114,10 +117,28 @@ pub struct TypeOwnership {
     #[serde(rename = "type")]
     pub type_name: String,
     pub kind: KindName,
+    /// The first of `owner_services`.
     pub owner_service: String,
     pub live_instances: u32,
     pub orphaned: bool,
     pub orphaned_for_ms: i64,
+    /// A shared query type: many services may own it (ADR 0017).
+    #[serde(default)]
+    pub shared: bool,
+    /// Every owning service, sorted. Empty only when read from a hub that predates the field.
+    #[serde(default)]
+    pub owner_services: Vec<String>,
+}
+
+impl TypeOwnership {
+    /// Every owner: `owner_services`, or `owner_service` from a hub that predates the list.
+    pub fn owners(&self) -> Vec<String> {
+        if self.owner_services.is_empty() {
+            vec![self.owner_service.clone()]
+        } else {
+            self.owner_services.clone()
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -157,18 +178,19 @@ pub fn snapshot(
     let mut by_service: BTreeMap<String, Vec<InstanceTopology>> = BTreeMap::new();
     for d in details {
         let age = now.saturating_duration_since(d.last_heartbeat);
-        let (commands, queries, load_factor, tags) = reg
+        let (commands, queries, shared_queries, load_factor, tags) = reg
             .instances
             .get(&d.instance_id)
             .map(|i| {
                 (
                     i.command_types.clone(),
                     i.query_types.clone(),
+                    i.shared_query_types.clone(),
                     i.load_factor,
                     i.tags.clone(),
                 )
             })
-            .unwrap_or_else(|| (vec![], vec![], DEFAULT_LOAD_FACTOR, BTreeMap::new()));
+            .unwrap_or_else(|| (vec![], vec![], vec![], DEFAULT_LOAD_FACTOR, BTreeMap::new()));
         let flow = flows.get(&d.instance_id).copied().unwrap_or_default();
         let (connected_hub_ids, status_age_ms) = match d.status {
             Some(st) => (
@@ -199,6 +221,7 @@ pub fn snapshot(
                 tags,
                 connected_hub_ids,
                 status_age_ms,
+                shared_query_types: shared_queries,
                 instance_id: d.instance_id,
             });
     }
@@ -226,6 +249,8 @@ pub fn snapshot(
             live_instances: t.live_instances,
             orphaned: t.orphaned_for.is_some(),
             orphaned_for_ms: t.orphaned_for.map_or(0, ms),
+            shared: t.shared,
+            owner_services: t.owner_services.clone(),
         })
         .collect();
 
@@ -289,6 +314,7 @@ impl Topology {
                             flow_controlled: i.flow_controlled,
                             connected_hub_ids: i.connected_hub_ids.clone(),
                             status_age_ms: i.status_age_ms,
+                            shared_query_types: i.shared_query_types.clone(),
                         })
                         .collect(),
                 })
@@ -306,6 +332,8 @@ impl Topology {
                     live_instances: t.live_instances,
                     orphaned: t.orphaned,
                     orphaned_for_ms: t.orphaned_for_ms,
+                    shared: t.shared,
+                    owner_services: t.owner_services.clone(),
                 })
                 .collect(),
             totals: Some(proto::TopologyTotals {
@@ -355,6 +383,7 @@ impl Topology {
                             tags: i.tags.clone().into_iter().collect(),
                             connected_hub_ids: i.connected_hub_ids.clone(),
                             status_age_ms: i.status_age_ms,
+                            shared_query_types: i.shared_query_types.clone(),
                         })
                         .collect(),
                 })
@@ -376,6 +405,8 @@ impl Topology {
                     live_instances: t.live_instances,
                     orphaned: t.orphaned,
                     orphaned_for_ms: t.orphaned_for_ms,
+                    shared: t.shared,
+                    owner_services: t.owner_services.clone(),
                 })
                 .collect(),
             totals: Totals {

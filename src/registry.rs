@@ -2,14 +2,18 @@
 //!
 //! Model and routing rules (docs/05-services/hub.md):
 //! - a message type is owned by exactly one service; another service registering it is rejected;
-//! - when the last instance listing a type goes away the service keeps ownership for `owner_grace`
-//!   so a restarting service does not lose its types; `sweep` then drops it;
+//!   except a shared query type (`Register.shared_query_types`, ADR 0017), which many services may
+//!   own; registrants must agree on exclusive vs shared;
+//! - when the last instance of a service listing a type goes away the service keeps ownership for
+//!   `owner_grace` so a restarting service does not lose its types; `sweep` then drops it;
 //! - commands with a routing key go to one instance of the owning service chosen by consistent
 //!   hashing over a ring weighted by each instance's load factor (same key, same instance while
 //!   membership is stable; identical on every hub);
 //! - commands without a key and all queries return every live instance of the owning service
-//!   ([`Target::Candidates`]); the router picks one by tag match and load (ADR 0014). [`Registry::pick`]
-//!   keeps the plain round-robin choice for callers without load information.
+//!   (of every owner, for a shared type) ([`Target::Candidates`]); the router picks one by tag
+//!   match and load (ADR 0014). [`Registry::pick`] keeps the plain round-robin choice for callers
+//!   without load information;
+//! - a scatter-gather query goes to every live instance of every owner ([`Registry::scatter_targets`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -70,6 +74,21 @@ pub struct Candidate {
     pub tags: BTreeMap<String, String>,
 }
 
+/// One instance a scatter-gather query goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScatterTarget {
+    pub id: InstanceId,
+    pub service: String,
+}
+
+/// The types one `Register` lists. `shared_query_types` are queries many services may own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegisteredTypes {
+    pub command_types: Vec<String>,
+    pub query_types: Vec<String>,
+    pub shared_query_types: Vec<String>,
+}
+
 /// What the registry decided for a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -105,6 +124,17 @@ pub enum RegisterError {
     DuplicateTypeAcrossKinds {
         type_name: String,
     },
+    /// The request lists a shared query type also as a command or an exclusive query.
+    SharedAndExclusive {
+        type_name: String,
+    },
+    /// The type is already registered as shared (`owner_shared`) and this registrant lists it as
+    /// exclusive, or the other way round. `owner` is its first owning service.
+    SharingConflict {
+        type_name: String,
+        owner: String,
+        owner_shared: bool,
+    },
 }
 
 impl Kind {
@@ -134,6 +164,23 @@ impl fmt::Display for RegisterError {
             Self::DuplicateTypeAcrossKinds { type_name } => {
                 write!(f, "type {type_name} listed as both command and query")
             }
+            Self::SharedAndExclusive { type_name } => write!(
+                f,
+                "type {type_name} listed as a shared query type and as a command or exclusive query"
+            ),
+            Self::SharingConflict {
+                type_name,
+                owner,
+                owner_shared,
+            } => write!(
+                f,
+                "type {type_name} is registered as {} query type by service {owner}",
+                if *owner_shared {
+                    "a shared"
+                } else {
+                    "an exclusive"
+                }
+            ),
         }
     }
 }
@@ -168,7 +215,10 @@ pub struct ServiceSnapshot {
 pub struct InstanceTypes {
     pub service: String,
     pub command_types: Vec<String>,
+    /// Every query type, shared ones included.
     pub query_types: Vec<String>,
+    /// The query types registered as shared (a subset of `query_types`).
+    pub shared_query_types: Vec<String>,
     pub load_factor: u32,
     pub tags: BTreeMap<String, String>,
 }
@@ -177,7 +227,13 @@ pub struct InstanceTypes {
 pub struct TypeInfo {
     pub type_name: String,
     pub kind: Kind,
+    /// The first of `owner_services`.
     pub owner_service: String,
+    /// Every owning service, sorted (one for an exclusive type).
+    pub owner_services: Vec<String>,
+    /// Registered as a shared query type.
+    pub shared: bool,
+    /// Over all owners.
     pub live_instances: u32,
     /// `Some(age)` while no live instance lists the type (until `sweep` drops it).
     pub orphaned_for: Option<Duration>,
@@ -231,13 +287,57 @@ impl Ring {
     }
 }
 
-struct Owner {
-    service: String,
-    kind: Kind,
-    /// Number of live instances currently listing the type.
+/// One service's hold on a type.
+#[derive(Default)]
+struct Holding {
+    /// Number of live instances of the service currently listing the type.
     holders: usize,
-    /// Set when `holders` dropped to zero; ownership is released after the grace period.
+    /// Set when `holders` dropped to zero; this service's ownership is released after the grace
+    /// period.
     orphaned_at: Option<Instant>,
+}
+
+struct Owner {
+    kind: Kind,
+    /// Registered through `shared_query_types`: many services may own it. Exclusive types have
+    /// exactly one entry in `services`.
+    shared: bool,
+    /// Owning services, sorted. Never empty (an emptied owner is removed with its type).
+    services: BTreeMap<String, Holding>,
+    /// Round-robin counter of a shared type (an exclusive type uses its service's).
+    rr: usize,
+}
+
+impl Owner {
+    fn first_service(&self) -> String {
+        self.services.keys().next().cloned().unwrap_or_default()
+    }
+
+    fn holders(&self) -> usize {
+        self.services.values().map(|h| h.holders).sum()
+    }
+
+    /// Owners with a live instance listing the type, sorted.
+    fn live_services(&self) -> impl Iterator<Item = &String> {
+        self.services
+            .iter()
+            .filter(|(_, h)| h.holders > 0)
+            .map(|(s, _)| s)
+    }
+
+    /// While no owner has a live instance: since the last one left.
+    fn orphaned_since(&self) -> Option<Instant> {
+        if self.holders() > 0 {
+            return None;
+        }
+        self.services.values().filter_map(|h| h.orphaned_at).max()
+    }
+
+    fn no_live_instance(&self) -> PickError {
+        PickError::NoLiveInstance {
+            service: self.services.keys().cloned().collect::<Vec<_>>().join(", "),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -251,6 +351,8 @@ struct ServiceEntry {
 struct InstanceEntry {
     service: String,
     types: Vec<(String, Kind)>,
+    /// The query types of `types` registered as shared.
+    shared: Vec<String>,
     placement: Placement,
 }
 
@@ -266,10 +368,14 @@ impl Inner {
     fn remove_instance(&mut self, instance_id: &str, now: Instant) -> Option<String> {
         let entry = self.instances.remove(instance_id)?;
         for (t, _) in &entry.types {
-            if let Some(owner) = self.types.get_mut(t) {
-                owner.holders = owner.holders.saturating_sub(1);
-                if owner.holders == 0 {
-                    owner.orphaned_at = Some(now);
+            if let Some(hold) = self
+                .types
+                .get_mut(t)
+                .and_then(|o| o.services.get_mut(&entry.service))
+            {
+                hold.holders = hold.holders.saturating_sub(1);
+                if hold.holders == 0 {
+                    hold.orphaned_at = Some(now);
                 }
             }
         }
@@ -326,8 +432,7 @@ impl Registry {
         )
     }
 
-    /// Atomic: on error nothing changes. Replaces a previous registration of the same instance.
-    /// A load factor of 0 in `placement` reads as 100.
+    /// [`Registry::register_types`] without shared query types.
     pub fn register_with(
         &self,
         ctx: &ContextId,
@@ -335,20 +440,51 @@ impl Registry {
         service: &str,
         command_types: &[String],
         query_types: &[String],
+        placement: Placement,
+    ) -> Result<(), RegisterError> {
+        let types = RegisteredTypes {
+            command_types: command_types.to_vec(),
+            query_types: query_types.to_vec(),
+            shared_query_types: Vec::new(),
+        };
+        self.register_types(ctx, instance_id, service, &types, placement)
+    }
+
+    /// Atomic: on error nothing changes. Replaces a previous registration of the same instance.
+    /// A load factor of 0 in `placement` reads as 100.
+    pub fn register_types(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        types: &RegisteredTypes,
         mut placement: Placement,
     ) -> Result<(), RegisterError> {
         check_context(ctx);
         placement.load_factor = effective_load_factor(placement.load_factor);
         let mut inner = self.inner.lock().unwrap();
 
-        let mut wanted: Vec<(&String, Kind)> = Vec::new();
-        let mut seen: HashMap<&String, Kind> = HashMap::new();
-        let commands = command_types.iter().map(|t| (t, Kind::Command));
-        let queries = query_types.iter().map(|t| (t, Kind::Query));
-        for (t, kind) in commands.chain(queries) {
-            match seen.insert(t, kind) {
-                None => wanted.push((t, kind)),
-                Some(prev) if prev != kind => {
+        // (type, kind, shared)
+        let mut wanted: Vec<(&String, Kind, bool)> = Vec::new();
+        let mut seen: HashMap<&String, (Kind, bool)> = HashMap::new();
+        let commands = types
+            .command_types
+            .iter()
+            .map(|t| (t, Kind::Command, false));
+        let queries = types.query_types.iter().map(|t| (t, Kind::Query, false));
+        let shared = types
+            .shared_query_types
+            .iter()
+            .map(|t| (t, Kind::Query, true));
+        for (t, kind, is_shared) in commands.chain(queries).chain(shared) {
+            match seen.insert(t, (kind, is_shared)) {
+                None => wanted.push((t, kind, is_shared)),
+                Some((_, prev_shared)) if prev_shared != is_shared => {
+                    return Err(RegisterError::SharedAndExclusive {
+                        type_name: t.clone(),
+                    });
+                }
+                Some((prev, _)) if prev != kind => {
                     return Err(RegisterError::DuplicateTypeAcrossKinds {
                         type_name: t.clone(),
                     });
@@ -357,19 +493,26 @@ impl Registry {
             }
         }
 
-        for (t, kind) in &wanted {
+        for (t, kind, is_shared) in &wanted {
             if let Some(owner) = inner.types.get(*t) {
                 if owner.kind != *kind {
                     return Err(RegisterError::KindConflict {
                         type_name: (*t).clone(),
-                        owner: owner.service.clone(),
+                        owner: owner.first_service(),
                         owner_kind: owner.kind,
                     });
                 }
-                if owner.service != service {
+                if owner.shared != *is_shared {
+                    return Err(RegisterError::SharingConflict {
+                        type_name: (*t).clone(),
+                        owner: owner.first_service(),
+                        owner_shared: owner.shared,
+                    });
+                }
+                if !owner.shared && !owner.services.contains_key(service) {
                     return Err(RegisterError::TypeOwnedByOtherService {
                         type_name: (*t).clone(),
-                        owner: owner.service.clone(),
+                        owner: owner.first_service(),
                     });
                 }
             }
@@ -378,15 +521,16 @@ impl Registry {
         let now = Instant::now();
         inner.remove_instance(instance_id, now);
 
-        for (t, kind) in &wanted {
+        for (t, kind, is_shared) in &wanted {
             let owner = inner.types.entry((*t).clone()).or_insert_with(|| Owner {
-                service: service.to_string(),
                 kind: *kind,
-                holders: 0,
-                orphaned_at: None,
+                shared: *is_shared,
+                services: BTreeMap::new(),
+                rr: 0,
             });
-            owner.holders += 1;
-            owner.orphaned_at = None;
+            let hold = owner.services.entry(service.to_string()).or_default();
+            hold.holders += 1;
+            hold.orphaned_at = None;
         }
 
         let svc = inner.services.entry(service.to_string()).or_default();
@@ -400,7 +544,12 @@ impl Registry {
             instance_id.to_string(),
             InstanceEntry {
                 service: service.to_string(),
-                types: wanted.into_iter().map(|(t, k)| (t.clone(), k)).collect(),
+                shared: wanted
+                    .iter()
+                    .filter(|(_, _, sh)| *sh)
+                    .map(|(t, _, _)| (*t).clone())
+                    .collect(),
+                types: wanted.into_iter().map(|(t, k, _)| (t.clone(), k)).collect(),
                 placement,
             },
         );
@@ -434,7 +583,8 @@ impl Registry {
         Ok((kind, id))
     }
 
-    /// The ring target of a keyed command, or every live instance of the owner.
+    /// The ring target of a keyed command, or every live instance of the owner (of every owner,
+    /// for a shared type).
     pub fn pick_target(
         &self,
         ctx: &ContextId,
@@ -443,45 +593,57 @@ impl Registry {
     ) -> Result<(Kind, Target), PickError> {
         check_context(ctx);
         let mut inner = self.inner.lock().unwrap();
-        let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
-        let (kind, holders, service) = (owner.kind, owner.holders, owner.service.clone());
-        let no_live = || PickError::NoLiveInstance {
-            service: service.clone(),
-        };
-        if holders == 0 {
-            return Err(no_live());
-        }
         let Inner {
+            types,
             services,
             instances,
-            ..
         } = &mut *inner;
-        let svc = services.get_mut(&service).ok_or_else(no_live)?;
-        if svc.instances.is_empty() {
-            return Err(no_live());
+        let owner = types.get_mut(type_name).ok_or(PickError::UnknownType)?;
+        let kind = owner.kind;
+        if owner.holders() == 0 {
+            return Err(owner.no_live_instance());
         }
-        if kind == Kind::Command && !routing_key.is_empty() {
-            let hash = xxh64(format!("{service}:{routing_key}").as_bytes(), 0);
-            let id = svc.ring.lookup(hash).cloned().ok_or_else(no_live)?;
-            return Ok((kind, Target::Keyed(id)));
+        if !owner.shared {
+            let service = owner.first_service();
+            let svc = services
+                .get_mut(&service)
+                .filter(|s| !s.instances.is_empty())
+                .ok_or_else(|| owner.no_live_instance())?;
+            if kind == Kind::Command && !routing_key.is_empty() {
+                let hash = xxh64(format!("{service}:{routing_key}").as_bytes(), 0);
+                let id = svc
+                    .ring
+                    .lookup(hash)
+                    .cloned()
+                    .ok_or_else(|| owner.no_live_instance())?;
+                return Ok((kind, Target::Keyed(id)));
+            }
+            let candidates = candidates_of(svc, instances);
+            if candidates.is_empty() {
+                return Err(owner.no_live_instance());
+            }
+            let rotation = svc.rr;
+            svc.rr = svc.rr.wrapping_add(1);
+            return Ok((
+                kind,
+                Target::Candidates {
+                    candidates,
+                    rotation,
+                },
+            ));
         }
-        let candidates: Vec<Candidate> = svc
-            .instances
-            .iter()
-            .filter_map(|id| {
-                let entry = instances.get(id).filter(|e| !e.types.is_empty())?;
-                Some(Candidate {
-                    id: id.clone(),
-                    load_factor: entry.placement.load_factor,
-                    tags: entry.placement.tags.clone(),
-                })
-            })
+        // A shared query type: one pool over every live owner, one rotation per type.
+        let mut candidates: Vec<Candidate> = owner
+            .live_services()
+            .filter_map(|s| services.get(s))
+            .flat_map(|svc| candidates_of(svc, instances))
             .collect();
         if candidates.is_empty() {
-            return Err(no_live());
+            return Err(owner.no_live_instance());
         }
-        let rotation = svc.rr;
-        svc.rr = svc.rr.wrapping_add(1);
+        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+        let rotation = owner.rr;
+        owner.rr = owner.rr.wrapping_add(1);
         Ok((
             kind,
             Target::Candidates {
@@ -489,6 +651,35 @@ impl Registry {
                 rotation,
             },
         ))
+    }
+
+    /// Every live instance of every owner of `type_name` (on an exclusive type, every instance
+    /// of its owner), sorted by service then instance id, and the type's kind (the router
+    /// rejects a scatter-gather command).
+    pub fn scatter_targets(
+        &self,
+        ctx: &ContextId,
+        type_name: &str,
+    ) -> Result<(Kind, Vec<ScatterTarget>), PickError> {
+        check_context(ctx);
+        let inner = self.inner.lock().unwrap();
+        let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
+        let targets: Vec<ScatterTarget> = owner
+            .live_services()
+            .filter_map(|s| inner.services.get(s).map(|svc| (s, svc)))
+            .flat_map(|(s, svc)| {
+                candidates_of(svc, &inner.instances)
+                    .into_iter()
+                    .map(|c| ScatterTarget {
+                        id: c.id,
+                        service: s.clone(),
+                    })
+            })
+            .collect();
+        if targets.is_empty() {
+            return Err(owner.no_live_instance());
+        }
+        Ok((owner.kind, targets))
     }
 
     /// The placement an instance registered with (the sender's tags, for tag matching).
@@ -501,15 +692,18 @@ impl Registry {
             .map(|e| e.placement.clone())
     }
 
-    /// Drops ownership of types that have had no live instance for longer than `owner_grace`.
-    /// Returns the number of types dropped.
+    /// Drops each service's ownership of a type it has had no live instance for longer than
+    /// `owner_grace`, and the types left without an owner. Returns the number of types dropped.
     pub fn sweep(&self, now: Instant) -> usize {
         let grace = self.owner_grace;
         let mut inner = self.inner.lock().unwrap();
         let before = inner.types.len();
-        inner.types.retain(|_, o| match o.orphaned_at {
-            Some(at) if o.holders == 0 => now.saturating_duration_since(at) <= grace,
-            _ => true,
+        inner.types.retain(|_, o| {
+            o.services.retain(|_, h| match h.orphaned_at {
+                Some(at) if h.holders == 0 => now.saturating_duration_since(at) <= grace,
+                _ => true,
+            });
+            !o.services.is_empty()
         });
         before - inner.types.len()
     }
@@ -541,6 +735,7 @@ impl Registry {
                         service: e.service.clone(),
                         command_types: of_kind(Kind::Command),
                         query_types: of_kind(Kind::Query),
+                        shared_query_types: e.shared.clone(),
                         load_factor: e.placement.load_factor,
                         tags: e.placement.tags.clone(),
                     },
@@ -553,18 +748,20 @@ impl Registry {
             .map(|(name, o)| TypeInfo {
                 type_name: name.clone(),
                 kind: o.kind,
-                owner_service: o.service.clone(),
-                live_instances: o.holders as u32,
-                orphaned_for: match o.orphaned_at {
-                    Some(at) if o.holders == 0 => Some(now.saturating_duration_since(at)),
-                    _ => None,
-                },
+                owner_service: o.first_service(),
+                owner_services: o.services.keys().cloned().collect(),
+                shared: o.shared,
+                live_instances: o.holders() as u32,
+                orphaned_for: o
+                    .orphaned_since()
+                    .map(|at| now.saturating_duration_since(at)),
             })
             .collect();
         drop(inner);
         for it in instances.values_mut() {
             it.command_types.sort();
             it.query_types.sort();
+            it.shared_query_types.sort();
         }
         types.sort_by(|a, b| a.type_name.cmp(&b.type_name));
         RegistryTopology { instances, types }
@@ -586,10 +783,12 @@ impl Registry {
             );
         }
         for owner in inner.types.values() {
-            if let Some(s) = by_service.get_mut(owner.service.as_str()) {
-                match owner.kind {
-                    Kind::Command => s.command_types += 1,
-                    Kind::Query => s.query_types += 1,
+            for service in owner.services.keys() {
+                if let Some(s) = by_service.get_mut(service.as_str()) {
+                    match owner.kind {
+                        Kind::Command => s.command_types += 1,
+                        Kind::Query => s.query_types += 1,
+                    }
                 }
             }
         }
@@ -597,6 +796,24 @@ impl Registry {
             services: by_service.into_values().collect(),
         }
     }
+}
+
+/// The instances of `svc` that are routing targets (registered with at least one type), sorted.
+fn candidates_of(
+    svc: &ServiceEntry,
+    instances: &HashMap<InstanceId, InstanceEntry>,
+) -> Vec<Candidate> {
+    svc.instances
+        .iter()
+        .filter_map(|id| {
+            let entry = instances.get(id).filter(|e| !e.types.is_empty())?;
+            Some(Candidate {
+                id: id.clone(),
+                load_factor: entry.placement.load_factor,
+                tags: entry.placement.tags.clone(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -993,5 +1210,227 @@ mod tests {
         let err = r.register(&D, "a2", "A", &[], &s(&["t.X"])).unwrap_err();
         assert!(matches!(err, RegisterError::KindConflict { .. }));
         assert_eq!(r.service_of(&D, "a2"), None);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Shared query types (ADR 0017)
+
+    /// Registers `id` of `service` with `shared` as shared query types (default placement).
+    fn shared(r: &Registry, id: &str, service: &str, shared: &[&str]) -> Result<(), RegisterError> {
+        r.register_types(
+            &D,
+            id,
+            service,
+            &RegisteredTypes {
+                shared_query_types: s(shared),
+                ..RegisteredTypes::default()
+            },
+            Placement::default(),
+        )
+    }
+
+    fn candidate_ids(r: &Registry, t: &str) -> (Vec<String>, usize) {
+        match r.pick_target(&D, t, "").unwrap().1 {
+            Target::Candidates {
+                candidates,
+                rotation,
+            } => (candidates.into_iter().map(|c| c.id).collect(), rotation),
+            Target::Keyed(id) => panic!("keyed target {id}"),
+        }
+    }
+
+    #[test]
+    fn a_shared_query_type_may_be_owned_by_many_services() {
+        let r = reg();
+        shared(&r, "a1", "A", &["q.Find"]).unwrap();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        shared(&r, "b2", "B", &["q.Find"]).unwrap();
+        let info = r.topology(Instant::now()).types.remove(0);
+        assert!(info.shared);
+        assert_eq!(info.owner_services, ["A", "B"]);
+        assert_eq!(info.owner_service, "A", "the first owner, for old readers");
+        assert_eq!((info.kind, info.live_instances), (Kind::Query, 3));
+        let snap = r.snapshot();
+        assert_eq!(
+            snap.services
+                .iter()
+                .map(|s| (s.service.as_str(), s.query_types))
+                .collect::<Vec<_>>(),
+            [("A", 1), ("B", 1)]
+        );
+    }
+
+    #[test]
+    fn a_point_query_on_a_shared_type_round_robins_over_every_owner() {
+        let r = reg();
+        shared(&r, "a1", "A", &["q.Find"]).unwrap();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        shared(&r, "b2", "B", &["q.Find"]).unwrap();
+        let (ids, first) = candidate_ids(&r, "q.Find");
+        assert_eq!(ids, ["a1", "b1", "b2"]);
+        let (_, second) = candidate_ids(&r, "q.Find");
+        assert_eq!(second, first + 1, "one rotation per shared type");
+        let mut hits: BTreeMap<String, usize> = BTreeMap::new();
+        for _ in 0..300 {
+            *hits
+                .entry(r.pick(&D, "q.Find", "k").unwrap().1)
+                .or_default() += 1;
+        }
+        assert_eq!(hits.values().collect::<Vec<_>>(), [&100, &100, &100]);
+    }
+
+    #[test]
+    fn exclusive_and_shared_registrants_of_one_type_conflict_either_way() {
+        let r = reg();
+        r.register(&D, "a1", "A", &[], &s(&["q.X"])).unwrap();
+        let err = shared(&r, "b1", "B", &["q.X", "q.Y"]).unwrap_err();
+        assert_eq!(
+            err,
+            RegisterError::SharingConflict {
+                type_name: "q.X".into(),
+                owner: "A".into(),
+                owner_shared: false,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "type q.X is registered as an exclusive query type by service A"
+        );
+        assert_eq!(r.pick(&D, "q.Y", ""), Err(PickError::UnknownType), "atomic");
+        // The owner's own next instance cannot switch the type to shared either.
+        assert!(matches!(
+            shared(&r, "a2", "A", &["q.X"]),
+            Err(RegisterError::SharingConflict { .. })
+        ));
+
+        shared(&r, "c1", "C", &["q.S"]).unwrap();
+        let err = r.register(&D, "d1", "D", &[], &s(&["q.S"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type q.S is registered as a shared query type by service C"
+        );
+        assert_eq!(r.service_of(&D, "d1"), None);
+    }
+
+    #[test]
+    fn a_shared_type_listed_again_in_the_same_register_is_rejected() {
+        let r = reg();
+        for (commands, queries) in [(s(&["q.X"]), vec![]), (vec![], s(&["q.X"]))] {
+            let err = r
+                .register_types(
+                    &D,
+                    "a",
+                    "A",
+                    &RegisteredTypes {
+                        command_types: commands,
+                        query_types: queries,
+                        shared_query_types: s(&["q.X"]),
+                    },
+                    Placement::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                err,
+                RegisterError::SharedAndExclusive {
+                    type_name: "q.X".into()
+                }
+            );
+        }
+        assert_eq!(r.service_of(&D, "a"), None);
+    }
+
+    #[test]
+    fn a_shared_query_type_owned_as_a_command_is_a_kind_conflict() {
+        let r = reg();
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
+        assert!(matches!(
+            shared(&r, "b", "B", &["t.X"]),
+            Err(RegisterError::KindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn scatter_targets_are_every_live_instance_of_every_owner() {
+        let r = reg();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        shared(&r, "a1", "A", &["q.Find"]).unwrap();
+        shared(&r, "b2", "B", &["q.Find"]).unwrap();
+        r.register(&D, "x1", "X", &s(&["c.Do"]), &s(&["q.Own"]))
+            .unwrap();
+        r.register(&D, "x2", "X", &s(&["c.Do"]), &s(&["q.Own"]))
+            .unwrap();
+        let (kind, targets) = r.scatter_targets(&D, "q.Find").unwrap();
+        assert_eq!(kind, Kind::Query);
+        let got: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|t| (t.service.as_str(), t.id.as_str()))
+            .collect();
+        assert_eq!(got, [("A", "a1"), ("B", "b1"), ("B", "b2")]);
+        // An exclusive type: every instance of its owner.
+        let (_, targets) = r.scatter_targets(&D, "q.Own").unwrap();
+        assert_eq!(targets.len(), 2);
+        // A command reports its kind; the router rejects the mode.
+        assert_eq!(r.scatter_targets(&D, "c.Do").unwrap().0, Kind::Command);
+        assert_eq!(
+            r.scatter_targets(&D, "q.Nope").unwrap_err(),
+            PickError::UnknownType
+        );
+        // An instance without types (stopping) is no target.
+        r.register(&D, "b2", "B", &[], &[]).unwrap();
+        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().1.len(), 2);
+    }
+
+    #[test]
+    fn a_shared_type_stays_owned_while_any_owner_is_live_and_each_owner_has_its_own_grace() {
+        let r = reg();
+        shared(&r, "a1", "A", &["q.Find"]).unwrap();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        let t0 = Instant::now();
+        r.unregister(&D, "a1", t0);
+        let info = r.topology(t0).types.remove(0);
+        assert_eq!(info.orphaned_for, None, "B still serves it");
+        assert_eq!(info.owner_services, ["A", "B"], "A within its grace");
+        assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 0, "the type stays");
+        let info = r.topology(t0).types.remove(0);
+        assert_eq!(info.owner_services, ["B"], "A's ownership expired");
+        assert_eq!(candidate_ids(&r, "q.Find").0, ["b1"]);
+        // Now an exclusive registrant still conflicts: B holds the type as shared.
+        assert!(r.register(&D, "c1", "C", &[], &s(&["q.Find"])).is_err());
+        r.unregister(&D, "b1", t0);
+        assert_eq!(
+            r.pick(&D, "q.Find", ""),
+            Err(PickError::NoLiveInstance {
+                service: "B".into()
+            })
+        );
+        assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 1);
+        assert_eq!(r.pick(&D, "q.Find", ""), Err(PickError::UnknownType));
+    }
+
+    #[test]
+    fn topology_lists_shared_query_types_among_the_instance_queries() {
+        let r = reg();
+        r.register_types(
+            &D,
+            "a",
+            "A",
+            &RegisteredTypes {
+                command_types: vec![],
+                query_types: s(&["q.Own"]),
+                shared_query_types: s(&["q.Z", "q.Find"]),
+            },
+            Placement::default(),
+        )
+        .unwrap();
+        let topo = r.topology(Instant::now());
+        let it = &topo.instances["a"];
+        assert_eq!(it.query_types, ["q.Find", "q.Own", "q.Z"]);
+        assert_eq!(it.shared_query_types, ["q.Find", "q.Z"]);
+        let flags: Vec<(&str, bool)> = topo
+            .types
+            .iter()
+            .map(|t| (t.type_name.as_str(), t.shared))
+            .collect();
+        assert_eq!(flags, [("q.Find", true), ("q.Own", false), ("q.Z", true)]);
     }
 }

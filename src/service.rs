@@ -31,7 +31,7 @@ use crate::proto::{
     client_message, server_message,
 };
 use crate::protocol;
-use crate::registry::{Placement, RegisterError, Registry, effective_load_factor};
+use crate::registry::{Placement, RegisterError, RegisteredTypes, Registry, effective_load_factor};
 use crate::router::Router;
 use crate::session::{SessionMeta, Sessions, Superseded};
 use crate::topology::{ClockAnchor, snapshot};
@@ -171,12 +171,15 @@ impl StreamCtx {
         let result = self
             .sessions
             .with_current(&self.context, &reg.instance_id, token, || {
-                self.registry.register_with(
+                self.registry.register_types(
                     &self.context,
                     &reg.instance_id,
                     &reg.service_name,
-                    &reg.command_types,
-                    &reg.query_types,
+                    &RegisteredTypes {
+                        command_types: reg.command_types.clone(),
+                        query_types: reg.query_types.clone(),
+                        shared_query_types: reg.shared_query_types.clone(),
+                    },
                     placement.clone(),
                 )
             })?;
@@ -188,6 +191,7 @@ impl StreamCtx {
                     instance = %reg.instance_id,
                     commands = reg.command_types.len(),
                     queries = reg.query_types.len(),
+                    shared_queries = reg.shared_query_types.len(),
                     protocol_version = reg.protocol_version,
                     client_version = %reg.client_version,
                     "register"
@@ -197,11 +201,15 @@ impl StreamCtx {
             Err(e) => {
                 warn!(error = %e, service = %reg.service_name, instance = %reg.instance_id, "register rejected");
                 Err(match e {
-                    RegisterError::DuplicateTypeAcrossKinds { .. } => {
+                    RegisterError::DuplicateTypeAcrossKinds { .. }
+                    | RegisterError::SharedAndExclusive { .. } => {
                         Status::invalid_argument(e.to_string())
                     }
                     RegisterError::TypeOwnedByOtherService { .. }
-                    | RegisterError::KindConflict { .. } => Status::already_exists(e.to_string()),
+                    | RegisterError::KindConflict { .. }
+                    | RegisterError::SharingConflict { .. } => {
+                        Status::already_exists(e.to_string())
+                    }
                 })
             }
         })
@@ -401,7 +409,10 @@ async fn run_stream(
                 match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
                         // No types left: a graceful stop. Its queue goes to other instances.
-                        if reg.command_types.is_empty() && reg.query_types.is_empty() {
+                        if reg.command_types.is_empty()
+                            && reg.query_types.is_empty()
+                            && reg.shared_query_types.is_empty()
+                        {
                             ctx.router.on_stopping(&ctx.context, &instance_id, token);
                         }
                         ctx.router.refresh_gauges();
@@ -462,6 +473,16 @@ async fn run_stream(
                 if !kept {
                     debug!(instance = %instance_id, "InstanceStatus without the capability ignored");
                 }
+            }
+            // Multi-part messages from a client (streamed parts, credits, cancellation) belong to
+            // later phases (ADR 0017: P4b, P4c); this hub ignores them.
+            Some(
+                client_message::Message::Part(_)
+                | client_message::Message::End(_)
+                | client_message::Message::Flow(_)
+                | client_message::Message::Cancel(_),
+            ) => {
+                debug!(instance = %instance_id, "multi-part client message ignored");
             }
             None => {}
         }

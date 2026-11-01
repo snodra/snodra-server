@@ -250,6 +250,7 @@ mod tests {
             tags: Default::default(),
             connected_hub_ids: vec![],
             status_age_ms: -1,
+            shared_query_types: vec![],
         }
     }
 
@@ -296,6 +297,8 @@ mod tests {
                     live_instances: 2,
                     orphaned: false,
                     orphaned_for_ms: 0,
+                    shared: false,
+                    owner_services: vec![],
                 },
                 TypeOwnership {
                     type_name: "Archive".into(),
@@ -304,6 +307,8 @@ mod tests {
                     live_instances: 0,
                     orphaned: true,
                     orphaned_for_ms: 125_000,
+                    shared: false,
+                    owner_services: vec![],
                 },
             ],
             totals: Totals {

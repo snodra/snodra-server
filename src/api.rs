@@ -760,6 +760,7 @@ mod tests {
             tags: BTreeMap::new(),
             connected_hub_ids: vec![],
             status_age_ms: -1,
+            shared_query_types: vec![],
         }
     }
 
@@ -771,6 +772,8 @@ mod tests {
             live_instances: live,
             orphaned: live == 0,
             orphaned_for_ms: if live == 0 { 1500 } else { 0 },
+            shared: false,
+            owner_services: vec![],
         }
     }
 
