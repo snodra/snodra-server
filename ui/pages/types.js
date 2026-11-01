@@ -9,6 +9,14 @@ function state(t) {
   return badge('good', 'owned');
 }
 
+/** The owners cell: every owner, and a "shared" badge for a shared query type (ADR 0017). */
+function owners(t) {
+  if (!t.owners.length) return { class: 'dim', content: 'none' };
+  if (!t.shared) return t.owners.join(', ');
+  return h('span', null, t.owners.join(', '), ' ',
+    badge('plain', 'shared', 'Shared query type: every owner answers it; a point query goes to one of their instances, a scatter-gather to all'));
+}
+
 function problem(t) {
   return !t.registered || t.orphaned || fmt.errorLevel(t.traffic.errors, t.traffic.count) === 'warn'
     || fmt.errorLevel(t.traffic.errors, t.traffic.count) === 'crit';
@@ -74,7 +82,7 @@ export default {
       ], shown.slice(0, MAX_ROWS).map((t) => [
         { class: 'mono', content: t.type },
         h('span', { class: 'kind', title: t.kind === 'QUERY' ? 'query' : 'command' }, t.kind === 'QUERY' ? 'Q' : 'C'),
-        t.owners.length ? t.owners.join(', ') : { class: 'dim', content: 'none' },
+        owners(t),
         num(t.registered ? fmt.int(t.liveInstances) : h('span', { class: 'dim' }, '—'), t.instances.join(', ')),
         state(t),
         t.senders.length ? t.senders.join(', ') : { class: 'dim', content: 'none' },

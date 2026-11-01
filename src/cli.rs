@@ -149,7 +149,8 @@ pub fn render_table(t: &Topology) -> String {
                 "  {} {} owner={} for {}\n",
                 ty.type_name,
                 kind,
-                ty.owner_service,
+                // Every owner of a shared query type (ADR 0017), comma-separated.
+                ty.owners().join(","),
                 fmt_duration_ms(ty.orphaned_for_ms)
             ));
         }

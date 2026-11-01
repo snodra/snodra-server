@@ -137,8 +137,10 @@ pub struct TypeView {
     #[serde(rename = "type")]
     pub type_name: String,
     pub kind: KindName,
-    /// Owning services: one today; a list so shared query types (roadmap P4a) fit.
+    /// Owning services, sorted: one, or several for a shared query type (ADR 0017).
     pub owners: Vec<String>,
+    /// A shared query type: many services may own it.
+    pub shared: bool,
     /// False for a type only seen in traffic (sent, but nobody registered it: `NO_HANDLER`).
     pub registered: bool,
     /// Live instances that registered the type.
@@ -172,7 +174,8 @@ pub fn types(t: &Topology, edges: &EdgeSnapshot) -> TypesView {
             TypeView {
                 type_name: o.type_name.clone(),
                 kind: o.kind,
-                owners: vec![o.owner_service.clone()],
+                owners: o.owners(),
+                shared: o.shared,
                 registered: true,
                 instances: instances.remove(o.type_name.as_str()).unwrap_or_default(),
                 live_instances: o.live_instances,
@@ -187,6 +190,7 @@ pub fn types(t: &Topology, edges: &EdgeSnapshot) -> TypesView {
         type_name: name.to_string(),
         kind: tt.kind.map_or(KindName::Command, kind_name),
         owners: vec![],
+        shared: false,
         registered: false,
         instances: vec![],
         live_instances: 0,
@@ -219,7 +223,8 @@ pub struct Graph {
     /// Services (`service:<name>`) and types (`type:<name>`), each sorted by name.
     pub nodes: Vec<Node>,
     /// `send` edges (sender service -> type, traffic in the window) and `handle` edges (type ->
-    /// owner service, every owned type, traffic merged over its senders).
+    /// owner service, every owned type and every owner of a shared type, traffic merged over its
+    /// senders; a shared type's traffic is not split by owner).
     pub edges: Vec<GraphEdge>,
 }
 
@@ -257,6 +262,8 @@ pub enum Node {
         name: String,
         type_kind: KindName,
         owners: Vec<String>,
+        /// A shared query type (ADR 0017).
+        shared: bool,
         registered: bool,
         orphaned: bool,
     },
@@ -300,7 +307,9 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
         })
         .collect();
     for o in &t.types {
-        services.entry(o.owner_service.clone()).or_default();
+        for owner in o.owners() {
+            services.entry(owner).or_default();
+        }
     }
     for e in &edges.edges {
         services.entry(e.sender.clone()).or_default();
@@ -325,7 +334,8 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
                     id: type_id(&o.type_name),
                     name: o.type_name.clone(),
                     type_kind: o.kind,
-                    owners: vec![o.owner_service.clone()],
+                    owners: o.owners(),
+                    shared: o.shared,
                     registered: true,
                     orphaned: o.orphaned,
                 },
@@ -338,6 +348,7 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
             name: name.to_string(),
             type_kind: tt.kind.map_or(KindName::Command, kind_name),
             owners: vec![],
+            shared: false,
             registered: false,
             orphaned: false,
         });
@@ -354,16 +365,17 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
             traffic: Traffic::of(e.count, e.errors, &e.latency),
         })
         .collect();
-    graph_edges.extend(t.types.iter().map(|o| {
+    graph_edges.extend(t.types.iter().flat_map(|o| {
         let tt = traffic.get(o.type_name.as_str());
-        GraphEdge {
+        let traffic = tt.map_or_else(Traffic::default, |tt| {
+            Traffic::of(tt.count, tt.errors, &tt.latency)
+        });
+        o.owners().into_iter().map(move |owner| GraphEdge {
             from: type_id(&o.type_name),
-            to: service_id(&o.owner_service),
+            to: service_id(&owner),
             role: EdgeRole::Handle,
-            traffic: tt.map_or_else(Traffic::default, |tt| {
-                Traffic::of(tt.count, tt.errors, &tt.latency)
-            }),
-        }
+            traffic: traffic.clone(),
+        })
     }));
 
     let totals = GraphTotals {
@@ -701,21 +713,27 @@ pub fn revision(t: &Topology, edges: &WindowTotals) -> String {
         s.push('\u{1}');
         for i in &svc.instances {
             s.push_str(&format!(
-                "{}|{}|{}|{}|{:?}|{:?}|{:?}\u{2}",
+                "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}\u{2}",
                 i.instance_id,
                 i.protocol_version,
                 i.flow_controlled,
                 i.stale,
                 i.command_types,
                 i.query_types,
+                i.shared_query_types,
                 i.connected_hub_ids
             ));
         }
     }
     for o in &t.types {
         s.push_str(&format!(
-            "{}|{:?}|{}|{}|{}\u{3}",
-            o.type_name, o.kind, o.owner_service, o.orphaned, o.live_instances
+            "{}|{:?}|{:?}|{}|{}|{}\u{3}",
+            o.type_name,
+            o.kind,
+            o.owners(),
+            o.shared,
+            o.orphaned,
+            o.live_instances
         ));
     }
     format!("{:016x}", xxh64(s.as_bytes(), edges.keys_hash))
@@ -932,6 +950,91 @@ mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["types"][1]["type"], "orders.Get");
         assert_eq!(json["types"][1]["liveInstances"], 2);
+    }
+
+    /// The fixture plus `search.Find`, a query shared by orders and catalog (ADR 0017).
+    fn with_shared_type() -> Topology {
+        let mut t = topology();
+        t.types.push(TypeOwnership {
+            shared: true,
+            owner_services: vec!["catalog".into(), "orders".into()],
+            ..owned("search.Find", KindName::Query, "catalog", 3)
+        });
+        t
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_type_lists_every_owner_and_the_graph_draws_an_edge_to_each() {
+        let t = with_shared_type();
+        let v = types(&t, &edges());
+        let find = v
+            .types
+            .iter()
+            .find(|t| t.type_name == "search.Find")
+            .unwrap();
+        assert_eq!(find.owners, ["catalog", "orders"]);
+        assert!(find.shared);
+        let get = v
+            .types
+            .iter()
+            .find(|t| t.type_name == "orders.Get")
+            .unwrap();
+        assert!(!get.shared);
+        let json = serde_json::to_value(&v).unwrap();
+        let find_json = json["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["type"] == "search.Find")
+            .unwrap();
+        assert_eq!(find_json["shared"], true);
+
+        let g = graph(&t, &edges());
+        let handles: Vec<&str> = g
+            .edges
+            .iter()
+            .filter(|e| e.from == "type:search.Find" && e.role == EdgeRole::Handle)
+            .map(|e| e.to.as_str())
+            .collect();
+        assert_eq!(handles, ["service:catalog", "service:orders"]);
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| matches!(n, Node::Service { id, .. } if id == "service:catalog")),
+            "an owner without a session still has a node"
+        );
+        let node = g
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Type {
+                    id, owners, shared, ..
+                } if id == "type:search.Find" => Some((owners.clone(), *shared)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            node,
+            (vec!["catalog".to_string(), "orders".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn a_type_from_a_hub_without_owner_lists_reads_its_single_owner() {
+        let t = topology();
+        let v = types(&t, &edges());
+        assert_eq!(v.types[0].owners, ["billing"]);
+        assert!(!v.types[0].shared);
+    }
+
+    #[test]
+    fn the_revision_follows_the_owners_of_a_shared_type() {
+        let t = with_shared_type();
+        let totals = WindowTotals::default();
+        let before = revision(&t, &totals);
+        let mut changed = t.clone();
+        changed.types.last_mut().unwrap().owner_services = vec!["orders".into()];
+        assert_ne!(before, revision(&changed, &totals));
     }
 
     #[test]

@@ -262,7 +262,8 @@ function nodeInfo(model, windowText) {
       aria: `${t.typeKind === 'QUERY' ? 'Query' : 'Command'} ${t.name}, ${state}, ${into.req} requests from ${into.edges.length} senders, ${windowText}`,
       tip: [h('strong', null, t.name), rows([
         ['Kind', t.typeKind === 'QUERY' ? 'query' : 'command'],
-        ['Owner', t.owners.join(', ') || 'none: requests get NO_HANDLER'],
+        [t.owners.length > 1 ? 'Owners' : 'Owner', t.owners.join(', ') || 'none: requests get NO_HANDLER'],
+        ...(t.shared ? [['Shared', 'yes: every owner answers it']] : []),
         ['State', state],
         ['Senders', String(into.edges.length)],
         ...trafficRows({ count: into.req, errors: into.err, p50Ms: null, p99Ms: null }).slice(0, 2),

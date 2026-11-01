@@ -322,6 +322,57 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
     drop((a, b));
 }
 
+/// A shared query type (ADR 0017): the Types page lists every owner with a "shared" badge and
+/// the Overview graph draws an owner edge to each.
+#[tokio::test]
+async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let mut owners = Vec::new();
+    for service in ["service-a", "service-b"] {
+        let client = FakeClient::connect(grpc).await;
+        client
+            .send_raw_register(kraken_hub::proto::Register {
+                service_name: service.to_string(),
+                instance_id: client.instance_id.clone(),
+                shared_query_types: vec!["search.FindAnything".to_string()],
+                protocol_version: 2,
+                ..Default::default()
+            })
+            .await;
+        owners.push(client);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-shared-{}", std::process::id()));
+    // Without a live stream the page keeps no connection open, so the virtual-time load ends.
+    let _slots = take_stream_slots(http).await;
+    let (dom, _) = rendered(&browser, http, "types", &profiles.join("types")).await;
+    assert!(
+        dom.contains("service-a, service-b"),
+        "owners missing in {dom}"
+    );
+    assert!(
+        dom.contains(">shared</span>"),
+        "shared badge missing in {dom}"
+    );
+    let (dom, _) = rendered(&browser, http, "overview", &profiles.join("overview")).await;
+    for owner in ["service-a", "service-b"] {
+        assert!(
+            dom.contains(&format!(
+                "data-from=\"M:search.FindAnything\" data-to=\"R:{owner}\""
+            )),
+            "no owner edge to {owner} in {dom}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop(owners);
+}
+
 /// Opens every `/api/v1/stream` slot (each answered `200`), so the next stream gets `503`.
 async fn take_stream_slots(http: SocketAddr) -> Vec<tokio::net::TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -137,7 +137,10 @@ export function merge(ownTopology, remote, peerStates) {
       typeNames.add(type);
       let byOwner = owners.get(type);
       if (!byOwner) owners.set(type, byOwner = new Map());
-      const owner = str(t.ownerService);
+      // A shared query type (ADR 0017) is owned by the whole set; older hubs send one owner.
+      const owner = Array.isArray(t.ownerServices) && t.ownerServices.length
+        ? t.ownerServices.map(str).join(' + ')
+        : str(t.ownerService);
       if (!byOwner.has(owner)) byOwner.set(owner, []);
       byOwner.get(owner).push(v.hubId);
     }
