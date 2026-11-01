@@ -131,6 +131,20 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .hub-meta dt { color: var(--muted); }
 .hub-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Peer hubs (ADR 0016): this hub, each peer's reachability, and the all/this scope. */
+.hubs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+.hub-list { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.hub { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.hub .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
+.chip.self { font-weight: 600; }
+
 .top-actions {
   display: flex;
   align-items: center;
@@ -305,18 +319,21 @@ table.data td {
 table.data tr:last-child td { border-bottom: 0; }
 
 /* Instance tables line up across service cards. */
-table.data.instances { table-layout: fixed; min-width: 1000px; }
-table.data.instances td:first-child { overflow-wrap: anywhere; white-space: normal; }
-table.data.instances th:nth-child(1) { width: 20%; }
-table.data.instances th:nth-child(2) { width: 17%; }
-table.data.instances th:nth-child(3) { width: 6%; }
-table.data.instances th:nth-child(4) { width: 7%; }
-table.data.instances th:nth-child(5) { width: 6%; }
-table.data.instances th:nth-child(6) { width: 7%; }
-table.data.instances th:nth-child(7) { width: 8%; }
-table.data.instances th:nth-child(8) { width: 13%; }
-table.data.instances th:nth-child(9) { width: 8%; }
+table.data.instances { table-layout: fixed; min-width: 1150px; }
+table.data.instances.merged { min-width: 1300px; }
+table.data.instances td:first-child, table.data.instances td:nth-child(n+11) { overflow-wrap: anywhere; white-space: normal; }
+table.data.instances th:nth-child(1) { width: 17%; }
+table.data.instances th:nth-child(2) { width: 14%; }
+table.data.instances th:nth-child(3) { width: 5%; }
+table.data.instances th:nth-child(4) { width: 6%; }
+table.data.instances th:nth-child(5) { width: 5%; }
+table.data.instances th:nth-child(6) { width: 6%; }
+table.data.instances th:nth-child(7) { width: 6%; }
+table.data.instances th:nth-child(8) { width: 11%; }
+table.data.instances th:nth-child(9) { width: 7%; }
 table.data.instances th:nth-child(10) { width: 8%; }
+table.data.instances th:nth-child(11) { width: 15%; }
+table.data.instances th:nth-child(12) { width: 13%; }
 table.data .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.data .nowrap { white-space: nowrap; }
 table.data td.dim, .dim { color: var(--muted); }

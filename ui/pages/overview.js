@@ -3,6 +3,7 @@
 import { MAX_ROWS, badge, capNote, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
 import * as fmt from '../format.js';
 import { buildModel, hideTip, renderGraph, structureKey } from '../graph.js';
+import { KIND_LABELS } from '../hubs.js';
 
 function tile(label, value, sub) {
   return h('div', { class: 'tile' },
@@ -23,6 +24,29 @@ function renderTiles(el, t, windowMs) {
     tile(`Requests, last ${win}`, fmt.count(t.requests),
       t.errors ? badge(fmt.errorLevel(t.errors, t.requests) === 'ok' ? 'plain' : fmt.errorLevel(t.errors, t.requests),
         `${fmt.int(t.errors)} errors (${fmt.errorRate(t.errors, t.requests)})`) : 'no errors'));
+}
+
+/** Totals over every reachable hub and where they disagree (ADR 0016). */
+function renderAllHubs(el, m) {
+  const t = m.totals;
+  const tiles = h('div', { class: 'tiles' },
+    tile('Hubs', fmt.count(t.hubs),
+      t.unreachable ? badge('crit', `${t.unreachable} unreachable`, 'Listed in KRAKEN_HUB_PEERS but not answering; not counted as a disagreement') : 'all reachable'),
+    tile('Services', fmt.count(t.services), 'over all hubs'),
+    tile('Instances', fmt.count(t.instances), 'distinct instance ids'),
+    tile('Types', fmt.count(t.types), 'distinct type names'),
+    tile('Disagreements', fmt.count(m.disagreements.length),
+      m.disagreements.length ? badge('crit', 'hubs disagree') : badge('good', 'hubs agree')));
+  const list = m.disagreements.length
+    ? [table('Disagreements between hubs', ['Kind', 'Subject', 'Detail'],
+      m.disagreements.slice(0, MAX_ROWS).map((d) => [
+        badge('crit', KIND_LABELS[d.kind] || d.kind),
+        { class: 'mono', content: d.subject },
+        d.text,
+      ])), capNote(Math.min(m.disagreements.length, MAX_ROWS), m.disagreements.length, 'first', 'disagreements')]
+    : h('p', { class: 'empty' }, 'The reachable hubs agree on every instance and type.');
+  fill(el, h('div', { class: 'card-head' }, h('h2', null, 'All hubs'),
+    h('span', { class: 'meta' }, m.hubs.join(', '))), tiles, list);
 }
 
 function errorCell(e) {
@@ -58,7 +82,14 @@ export default {
   id: 'overview',
   title: 'Overview',
   live: true,
-  load: (ctx) => ctx.api.get('graph'),
+  load: async (ctx) => {
+    if (!ctx.allHubs) return ctx.api.get('graph');
+    const [graph, merged] = await Promise.all([
+      ctx.api.get('graph'),
+      ctx.api.get('topology').then((topology) => ctx.hubs.merged(topology)),
+    ]);
+    return { ...graph, merged };
+  },
 
   mount(root, ctx) {
     let data = null;
@@ -69,6 +100,7 @@ export default {
     let current = null;
 
     const tiles = h('div', { class: 'tiles' });
+    const allHubs = h('section', { class: 'card', 'aria-label': 'All hubs', hidden: true });
     const windowMeta = h('span', { class: 'meta' });
     const search = h('input', {
       type: 'search', value: query, placeholder: 'Filter by service or type',
@@ -88,6 +120,7 @@ export default {
 
     root.append(
       h('h1', { class: 'visually-hidden' }, 'Overview'),
+      allHubs,
       tiles,
       h('section', { class: 'card', 'aria-label': 'Traffic graph' },
         h('div', { class: 'card-head' }, h('h2', null, 'Traffic'), windowMeta),
@@ -166,8 +199,14 @@ export default {
     return {
       update(graph) {
         data = graph;
+        if (graph.merged) {
+          if (!selectionIn(allHubs)) renderAllHubs(allHubs, graph.merged);
+          allHubs.hidden = false;
+        } else {
+          allHubs.hidden = true;
+        }
         renderTiles(tiles, graph.totals, graph.windowMs);
-        windowMeta.textContent = `last ${fmt.windowLabel(graph.windowMs)}, refreshed ${fmt.clock(graph.nowMs)}`;
+        windowMeta.textContent = `${graph.merged ? 'this hub, ' : ''}last ${fmt.windowLabel(graph.windowMs)}, refreshed ${fmt.clock(graph.nowMs)}`;
         // Never replace what the reader is selecting; keep horizontal scroll on narrow screens.
         if (!selectionIn(edgesBox)) keepScroll(root, () => draw(false));
       },

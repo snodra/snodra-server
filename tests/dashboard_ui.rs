@@ -347,6 +347,17 @@ async fn rendered(
     page: &str,
     profile: &Path,
 ) -> (String, Duration) {
+    rendered_allowing(browser, http, page, profile, |_| false).await
+}
+
+/// [`rendered`], tolerating console lines `allow` accepts.
+async fn rendered_allowing(
+    browser: &Path,
+    http: SocketAddr,
+    page: &str,
+    profile: &Path,
+    allow: impl Fn(&str) -> bool,
+) -> (String, Duration) {
     let url = format!("http://{http}/ui/#/{page}");
     for _ in 0..8 {
         let started = std::time::Instant::now();
@@ -354,7 +365,10 @@ async fn rendered(
         // time (fetches complete, timers fast-forward) before the DOM is dumped.
         let (dom, console) =
             load_with(browser, &url, profile, &["--virtual-time-budget=5000"]).await;
-        assert!(console.is_empty(), "{page}: console messages: {console:#?}");
+        assert!(
+            console.iter().all(|l| allow(l)),
+            "{page}: console messages: {console:#?}"
+        );
         if dom.contains("data-ready=\"true\"") {
             return (dom, started.elapsed());
         }
@@ -433,6 +447,134 @@ async fn a_flood_of_types_and_edges_renders_bounded_and_in_time() {
         "types table not capped"
     );
     assert!(dom.matches("<tr>").count() < 260, "too many table rows");
+    let _ = std::fs::remove_dir_all(&profiles);
+}
+
+/// Registers `instance_id` of `service` on the hub at `grpc` as a v2 client with the
+/// "instance-status" capability, reports `connected` hub ids, and waits for the ack.
+async fn register_reporting(
+    grpc: SocketAddr,
+    service: &str,
+    instance_id: &str,
+    commands: &[&str],
+    connected: &[&str],
+) -> FakeClient {
+    let mut client = FakeClient::connect(grpc).await;
+    client.instance_id = instance_id.to_string();
+    client
+        .send_raw_register(kraken_hub::proto::Register {
+            service_name: service.to_string(),
+            instance_id: instance_id.to_string(),
+            command_types: commands.iter().map(|c| c.to_string()).collect(),
+            protocol_version: 2,
+            capabilities: vec!["instance-status".to_string()],
+            ..Default::default()
+        })
+        .await;
+    match client.next().await {
+        Some(Ok(ServerMessage {
+            message: Some(server_message::Message::RegisterAck(_)),
+        })) => {}
+        other => panic!("expected the ack, got {other:?}"),
+    }
+    client.status(connected, 0).await;
+    client
+}
+
+/// Two in-process hubs list each other (and a third URL nobody answers) in KRAKEN_HUB_PEERS.
+/// Hub A's page merges both: the instance registered on A only, the type owned by different
+/// services on A and B and the instance that reports no connection to B are flagged; the dead
+/// peer is shown as unreachable, not as a disagreement.
+#[tokio::test]
+async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
+    let (grpc_a, http_a, grpc_b, http_b) = (
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+    );
+    let dead = bind().await.unwrap().local_addr().unwrap(); // closed again: connection refused
+    let (ga, ha, gb, hb) = (
+        grpc_a.local_addr().unwrap(),
+        http_a.local_addr().unwrap(),
+        grpc_b.local_addr().unwrap(),
+        http_b.local_addr().unwrap(),
+    );
+    let peers = vec![
+        format!("http://{ha}"),
+        format!("http://{hb}"),
+        format!("http://{dead}"),
+    ];
+    for (id, grpc, http) in [("hub-a", grpc_a, http_a), ("hub-b", grpc_b, http_b)] {
+        let config = Config {
+            hub_id: id.to_string(),
+            peers: peers.clone(),
+            ..config()
+        };
+        tokio::spawn(async move {
+            kraken_hub::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
+                .await
+                .unwrap();
+        });
+    }
+
+    let both = ["hub-a", "hub-b"];
+    let _agree_a = register_reporting(ga, "service-b", "b-both", &["b.Do"], &both).await;
+    let _agree_b = register_reporting(gb, "service-b", "b-both", &["b.Do"], &both).await;
+    let _only_a = register_reporting(ga, "service-x", "x-only-on-a", &[], &["hub-a"]).await;
+    let _owner_a = register_reporting(ga, "service-y", "y-1", &["shared.Thing"], &both).await;
+    let _owner_b = register_reporting(gb, "service-z", "z-1", &["shared.Thing"], &both).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The live stream stops Chrome's virtual time; with every slot taken the page polls (see
+    // the flood test), and a virtual-time budget lets the chained fetches finish.
+    let _slots = take_stream_slots(ha).await;
+    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-peers-{}", std::process::id()));
+    let dead_port = dead.port().to_string();
+    // The browser logs the refused connection to the dead peer; nothing else may be logged.
+    let refused = |l: &str| l.contains("ERR_CONNECTION_REFUSED") || l.contains(&dead_port);
+    let mut pages = Vec::new();
+    for (page, markers) in [
+        (
+            "services",
+            vec![
+                "Seen by",
+                "not registered on hub-b",
+                "reports no connection to hub-b",
+                "not on hub-b",
+                "hubs disagree on 1",
+                "b-both",
+                "unreachable",
+            ],
+        ),
+        (
+            "overview",
+            vec![
+                "All hubs",
+                "Owner differs",
+                "owned by service-y on hub-a; service-z on hub-b",
+                "Missing on a hub",
+                "1 unreachable",
+            ],
+        ),
+    ] {
+        let (dom, _) = rendered_allowing(&browser, ha, page, &profiles.join(page), refused).await;
+        for marker in markers {
+            assert!(dom.contains(marker), "{page}: {marker:?} missing in {dom}");
+        }
+        pages.push(dom);
+    }
+    // The agreeing instance carries no flag.
+    let services = &pages[0];
+    let row = &services[services.find("b-both").unwrap()..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    assert!(!row.contains("not registered"), "{row}");
+    assert!(!row.contains("reports no connection"), "{row}");
     let _ = std::fs::remove_dir_all(&profiles);
 }
 
