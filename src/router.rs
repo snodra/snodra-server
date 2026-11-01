@@ -2351,7 +2351,7 @@ impl Router {
 
     /// The target of stream `id` ended without a part or an end of its own: a hub-side failure
     /// (`Err`) ends the stream with that error; a unary `Reply{payload}` is relayed as one part
-    /// and the end.
+    /// (`seq` = the parts relayed so far + 1, so 1 for a plain unary answer) and the end.
     fn on_stream_target_result(
         &self,
         id: &str,
@@ -2364,8 +2364,10 @@ impl Router {
             };
             let end = match result {
                 Ok(payload) => {
-                    let seq = u64::from(stream.parts);
+                    // Numbered as a streaming handler would (ruling 15: `seq` from 1), so a
+                    // sender checking continuity accepts it.
                     stream.parts += 1;
+                    let seq = u64::from(stream.parts);
                     let part = ServerMessage {
                         message: Some(server_message::Message::Part(ReplyPart {
                             request_id: id.to_string(),
@@ -5151,7 +5153,6 @@ mod stream_tests {
         let mut f = Streams::new();
         f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
         let (h, _) = f.target_of("st1");
-        f.part(h, "st1#1", 0, b"a");
         f.router.on_reply(
             &D,
             h,
@@ -5161,12 +5162,14 @@ mod stream_tests {
             },
         );
         let got = f.messages("s1");
-        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got.len(), 2, "{got:?}");
+        let p = part(&got[0]);
         assert_eq!(
-            (part(&got[1]).seq, part(&got[1]).payload.as_slice()),
-            (1, &b"whole"[..])
+            (p.seq, p.payload.as_slice(), p.responder_instance.as_str()),
+            (1, &b"whole"[..], h),
+            "the libraries check seq continuity from 1"
         );
-        assert_eq!(end(&got[2]).parts, 2);
+        assert_eq!(end(&got[1]).parts, 1);
         assert_eq!(f.router.in_flight(), 0);
         // A Reply{error} ends it with that error.
         f.router.route(&D, "s1", stream("st2", "q.Find", 0, 0, 0));

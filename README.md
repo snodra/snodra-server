@@ -529,7 +529,8 @@ umbrella `docs/05-services/hub.md` (Query modes).
   queued target and the write gets `Cancel{<id>#1, "closed before forward"}` right after the
   `Request` (so the handler never serves a stream the hub forgot). The hub's
   shutdown closes every session (as for unary requests). **Builder call:** a unary `Reply` to a
-  streaming target is relayed as one part and the end (`Reply{error}` as `ReplyEnd{error}`).
+  streaming target is relayed as one part (`seq` 1, as a streaming handler numbers its first
+  part) and the end (`Reply{error}` as `ReplyEnd{error}`).
 - **Streaming errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `streaming`
   `UNSUPPORTED`; a command by request kind `INVALID_REQUEST`; no owner, or no live instance that
   lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; owners with
