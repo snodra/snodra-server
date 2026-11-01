@@ -5215,6 +5215,378 @@ mod stream_tests {
     }
 
     #[tokio::test]
+    async fn a_cancel_from_the_sender_reaches_the_handler_and_ends_the_stream_silently() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        // Cancels that are not the sender's or for an unknown stream are ignored.
+        f.cancel("s-plain", "st1", "not mine");
+        f.cancel(h, "st1", "not the handler's to cancel");
+        f.cancel("s1", "ghost", "nothing");
+        assert!(f.messages(h).is_empty());
+        assert_eq!(f.router.in_flight(), 1);
+        f.cancel("s1", "st1", "enough");
+        let got = f.messages(h);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let c = cancel(&got[0]);
+        assert_eq!(
+            (c.request_id.as_str(), c.reason.as_str()),
+            ("st1#1", "enough")
+        );
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "the part only, no end: {got:?}");
+        assert!(matches!(got[0], server_message::Message::Part(_)));
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        f.part(h, "st1#1", 1, b"late");
+        assert!(f.messages("s1").is_empty());
+        let edge = edge_of(&f.router, "web", "q.Find");
+        assert_eq!((edge.count, edge.errors), (1, 0), "a cancel is no error");
+        // An empty reason gets a default one.
+        f.router.route(&D, "s1", stream("st2", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st2");
+        f.cancel("s1", "st2", "");
+        assert!(!cancel(&f.messages(h)[0]).reason.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_part_within_the_timeout_ends_the_stream_and_cancels_the_handler() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 100, 0, 0));
+        let (h, _) = f.target_of("st1");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(80)).await;
+        f.part(h, "st1#1", 0, b"a");
+        // The part reset the idle timeout: nothing at 100 ms from the start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(f.messages("s1").len(), 1, "the part only");
+        tokio::time::sleep(Duration::from_millis(51)).await;
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 1);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::Timeout, "no part within 100 ms".to_string())
+        );
+        let got = f.messages(h);
+        assert_eq!(cancel(&got[0]).reason, "idle timeout");
+        assert_eq!(f.router.in_flight(), 0);
+        let edge = edge_of(&f.router, "web", "q.Find");
+        assert_eq!((edge.count, edge.errors), (1, 1));
+        let max = edge.latency.quantile(1.0).unwrap().as_secs_f64() * 1000.0;
+        assert!((max - 180.0).abs() <= 5.0, "latency to the end: {max}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_max_stream_duration_ends_an_active_stream_with_cancelled() {
+        let config = Config {
+            max_stream_duration: Duration::from_secs(1),
+            ..Config::default()
+        };
+        let mut f = Streams::with(config, Metrics::noop());
+        f.router
+            .route(&D, "s1", stream("st1", "q.Find", 60_000, 0, 0));
+        let (h, _) = f.target_of("st1");
+        tokio::task::yield_now().await;
+        for seq in 0..9 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            f.part(h, "st1#1", seq, b"tick");
+        }
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 10, "{got:?}");
+        let e = end(&got[9]);
+        assert_eq!(e.parts, 9);
+        assert_eq!(
+            end_error(e),
+            (
+                ErrorCode::Cancelled,
+                "max stream duration (1s) exceeded".to_string()
+            )
+        );
+        assert_eq!(
+            cancel(&f.messages(h)[0]).reason,
+            "max stream duration (1s) exceeded"
+        );
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    /// The target of a stream takes one of its handler's permits for the whole stream, and
+    /// every ending path gives the flow state back (the client returns the permit itself).
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_holds_a_permit_until_it_ends_whichever_way() {
+        let mut f = Streams::new();
+        for h in ["a1", "a2", "b1"] {
+            f.leave(h);
+        }
+        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.shared("b3", "B", &["q.Find"]);
+        let assigned = |f: &Streams| f.router.loads(&[candidate("b3")])["b3"].assigned;
+        let unary = |id: &str| Request {
+            mode: 0,
+            priority: 0,
+            ..stream(id, "q.Find", 10_000, 0, 0)
+        };
+        let end_paths: Vec<(&str, Box<dyn Fn(&mut Streams)>)> = vec![
+            ("end", Box::new(|f| f.end("b3", "st#1", None))),
+            ("error part", Box::new(|f| f.part_error("b3", "st#1", 0))),
+            ("cancel", Box::new(|f| f.cancel("s1", "st", "done"))),
+            (
+                "over credit",
+                Box::new(|f| {
+                    f.part("b3", "st#1", 0, b"a");
+                    f.part("b3", "st#1", 1, b"b");
+                }),
+            ),
+            ("max results", Box::new(|f| f.part("b3", "st#1", 0, b"a"))),
+            (
+                "idle timeout",
+                Box::new(|_| {
+                    // advanced below
+                }),
+            ),
+        ];
+        for (name, end_it) in end_paths {
+            let max_results = u32::from(name == "max results");
+            f.router
+                .route(&D, "s1", stream("st", "q.Find", 200, 1, max_results));
+            assert_eq!(f.target_of("st").0, "b3", "{name}");
+            f.router.route(&D, "s1", unary("waits"));
+            assert_eq!(
+                f.router.flow_by_instance()["b3"].queued,
+                1,
+                "{name}: no permit left"
+            );
+            assert_eq!(assigned(&f), 2, "{name}");
+            tokio::task::yield_now().await;
+            if name == "idle timeout" {
+                tokio::time::sleep(Duration::from_millis(201)).await;
+            } else {
+                end_it(&mut f);
+            }
+            assert_eq!(f.router.in_flight(), 1, "{name}: the unary request stays");
+            assert_eq!(assigned(&f), 1, "{name}: the stream's target is released");
+            assert_eq!(
+                f.router.flow_by_instance()["b3"].queued,
+                1,
+                "{name}: still no permit"
+            );
+            // The handler returns the permit when its stream handler finishes.
+            f.router.on_permits(&D, "b3", f.tokens["b3"], 1, 0);
+            assert_eq!(
+                f.requests("b3")
+                    .iter()
+                    .map(|r| r.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["waits"],
+                "{name}"
+            );
+            f.router.on_reply(
+                &D,
+                "b3",
+                Reply {
+                    request_id: "waits".into(),
+                    result: Some(reply::Result::Payload(vec![])),
+                },
+            );
+            f.router.on_permits(&D, "b3", f.tokens["b3"], 1, 0);
+            f.messages("s1");
+            f.messages("b3");
+            assert_eq!(assigned(&f), 0, "{name}");
+        }
+        // A stream still queued when it ends never took a permit: the queue entry goes.
+        f.router.route(&D, "s1", unary("busy"));
+        assert_eq!(f.requests("b3").len(), 1);
+        f.router
+            .route(&D, "s1", stream("queued", "q.Find", 100, 0, 0));
+        assert_eq!(f.router.flow_by_instance()["b3"].queued, 1);
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        let got = f.messages("s1");
+        assert_eq!(end_error(end(&got[0])).0, ErrorCode::Timeout, "{got:?}");
+        assert_eq!(
+            f.router.flow_by_instance()["b3"].queued,
+            0,
+            "left the queue"
+        );
+        assert!(f.messages("b3").is_empty(), "never forwarded: no cancel");
+        assert_eq!(assigned(&f), 1, "busy only");
+    }
+
+    /// The idle timeout starts over when the target is forwarded: a queue wait leaves the
+    /// handler the whole timeout for its first part, and is itself bounded by the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_timeout_starts_over_at_the_forward() {
+        let mut f = Streams::new();
+        for h in ["a1", "a2", "b1"] {
+            f.leave(h);
+        }
+        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.shared("b3", "B", &["q.Find"]);
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: 0,
+                ..stream("busy", "q.Find", 10_000, 0, 0)
+            },
+        );
+        f.requests("b3");
+        f.router.route(&D, "s1", stream("st1", "q.Find", 100, 0, 0));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        f.router.on_reply(
+            &D,
+            "b3",
+            Reply {
+                request_id: "busy".into(),
+                result: Some(reply::Result::Payload(vec![])),
+            },
+        );
+        f.router.on_permits(&D, "b3", f.tokens["b3"], 1, 0);
+        assert_eq!(f.target_of("st1").0, "b3");
+        f.messages("s1");
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert!(
+            f.messages("s1").is_empty(),
+            "150 ms after the route, 90 after the forward"
+        );
+        tokio::time::sleep(Duration::from_millis(11)).await;
+        let got = f.messages("s1");
+        assert_eq!(end_error(end(&got[0])).0, ErrorCode::Timeout, "{got:?}");
+    }
+
+    fn candidate(id: &str) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            load_factor: 100,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_metrics_count_one_request_the_open_streams_and_the_parts() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut f = Streams::with(Config::default(), Arc::clone(&m.metrics));
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.router.route(&D, "s1", stream("st2", "q.Own", 0, 0, 0));
+        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", h), Some(1));
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "instance", "x1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "service", "X"),
+            Some(1)
+        );
+        f.part(h, "st1#1", 0, b"a");
+        f.part(h, "st1#1", 1, b"b");
+        f.end(h, "st1#1", None);
+        f.cancel("s1", "st2", "bye");
+        f.router
+            .route(&D, "s-plain", stream("p1", "q.Find", 0, 0, 0));
+        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", h), Some(0));
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "instance", "x1"),
+            Some(0)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_stream_parts_total", "type", "q.Find"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "streaming"),
+            Some(3)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "cancelled"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "ok"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            None
+        );
+    }
+
+    /// A gather that ends early tells the targets still working for it to stop, when their
+    /// session understands `Cancel` (a1 and b1 negotiated streaming, a2 did not).
+    #[tokio::test(start_paused = true)]
+    async fn a_gather_that_ends_early_cancels_its_capable_targets() {
+        let mut f = Streams::new();
+        let scatter = |id: &str, timeout_ms: u32, max_results: u32| Request {
+            mode: RequestMode::ScatterGather as i32,
+            ..stream(id, "q.Find", timeout_ms, 0, max_results)
+        };
+        let cancels = |f: &mut Streams, h: &str| -> Vec<(String, String)> {
+            f.messages(h)
+                .iter()
+                .filter_map(|m| match m {
+                    server_message::Message::Cancel(c) => {
+                        Some((c.request_id.clone(), c.reason.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // max_results: a2 answers first, the others are cancelled.
+        f.router.route(&D, "s1", scatter("g1", 0, 1));
+        let a2_target = f.requests("a2")[0].id.clone();
+        f.router.on_reply(
+            &D,
+            "a2",
+            Reply {
+                request_id: a2_target,
+                result: Some(reply::Result::Payload(b"first".to_vec())),
+            },
+        );
+        assert_eq!(f.messages("s1").len(), 2, "a part and the end");
+        assert_eq!(
+            cancels(&mut f, "a1"),
+            [("g1#0".to_string(), "max results".to_string())]
+        );
+        assert_eq!(
+            cancels(&mut f, "b1"),
+            [("g1#2".to_string(), "max results".to_string())]
+        );
+        assert!(f.messages("a2").is_empty(), "a2 cannot understand a cancel");
+        // The deadline: every unanswered capable target.
+        f.router.route(&D, "s1", scatter("g2", 100, 0));
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        assert_eq!(end(&f.messages("s1")[0]).timed_out, 3);
+        assert_eq!(
+            cancels(&mut f, "a1"),
+            [("g2#0".to_string(), "deadline".to_string())]
+        );
+        assert_eq!(
+            cancels(&mut f, "b1"),
+            [("g2#2".to_string(), "deadline".to_string())]
+        );
+        assert_eq!(f.messages("a2").len(), 1, "the request only");
+        // The sender leaves.
+        f.router.route(&D, "s1", scatter("g3", 0, 0));
+        f.leave("s1");
+        assert_eq!(
+            cancels(&mut f, "a1"),
+            [("g3#0".to_string(), "sender disconnected".to_string())]
+        );
+        assert_eq!(
+            cancels(&mut f, "b1"),
+            [("g3#2".to_string(), "sender disconnected".to_string())]
+        );
+        assert_eq!(f.messages("a2").len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_handler_that_leaves_ends_the_stream_with_handler_disconnected() {
         let mut f = Streams::new();
         f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
