@@ -4812,6 +4812,18 @@ mod stream_tests {
         }
     }
 
+    /// The `(sender service, type)` edge of a request, from the router's statistics.
+    fn edge_of(router: &Router, sender: &str, type_name: &str) -> crate::edges::EdgeWindow {
+        let snap = router
+            .edges()
+            .expect("dashboard on")
+            .snapshot(Instant::now());
+        snap.edges
+            .into_iter()
+            .find(|e| e.sender == sender && e.type_name == type_name)
+            .unwrap_or_else(|| panic!("no edge {sender} -> {type_name}"))
+    }
+
     /// `(code, message)` of a `ReplyEnd.error`.
     fn end_error(e: &ReplyEnd) -> (ErrorCode, String) {
         let err = e.error.as_ref().expect("an error on the end");
@@ -4926,6 +4938,280 @@ mod stream_tests {
         }
         assert_eq!(f.router.in_flight(), 1, "only the first stream");
         f.target_of("in-flight");
+    }
+
+    #[tokio::test]
+    async fn parts_are_relayed_in_order_with_the_handlers_seq_then_the_end() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 3, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.part(h, "st1#1", 7, b"b");
+        f.end(h, "st1#1", None);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        let p0 = part(&got[0]);
+        assert_eq!(
+            (p0.request_id.as_str(), p0.seq, p0.payload.as_slice()),
+            ("st1", 0, &b"a"[..])
+        );
+        assert_eq!(p0.responder_instance, h);
+        assert_eq!(p0.responder_service, if h == "a1" { "A" } else { "B" });
+        assert!(p0.error.is_none());
+        let p1 = part(&got[1]);
+        assert_eq!((p1.seq, p1.payload.as_slice()), (7, &b"b"[..]));
+        let e = end(&got[2]);
+        assert_eq!(
+            (e.request_id.as_str(), e.parts, e.failed, e.timed_out),
+            ("st1", 2, 0, 0)
+        );
+        assert!(e.error.is_none());
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        assert!(f.messages(h).is_empty(), "no cancel: the handler ended");
+        // A late part or end changes nothing.
+        f.part(h, "st1#1", 8, b"late");
+        f.end(h, "st1#1", None);
+        assert!(f.messages("s1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_end_with_an_error_is_relayed_as_the_streams_error() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.end(h, "st1#1", Some(ErrorCode::HandlerError));
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        let e = end(&got[1]);
+        assert_eq!(e.parts, 1);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::HandlerError, "failed".to_string())
+        );
+        assert_eq!(
+            e.error.as_ref().unwrap().request_id,
+            "st1",
+            "the sender's id"
+        );
+        assert_eq!(f.router.in_flight(), 0);
+        let edge = edge_of(&f.router, "web", "q.Find");
+        assert_eq!((edge.count, edge.errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_part_carrying_an_error_ends_the_stream_with_that_error() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.part_error(h, "st1#1", 1);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(part(&got[0]).seq, 0);
+        let e = end(&got[1]);
+        assert_eq!(e.parts, 1, "the error part is not a part");
+        assert_eq!(end_error(e), (ErrorCode::HandlerError, "boom".to_string()));
+        assert!(f.messages(h).is_empty(), "no cancel: the handler ended");
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_part_beyond_the_credit_ends_the_stream_and_cancels_the_handler() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 2, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.part(h, "st1#1", 1, b"b");
+        f.part(h, "st1#1", 2, b"c");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        let e = end(&got[2]);
+        assert_eq!(e.parts, 2);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::InvalidRequest, "part without credit".to_string())
+        );
+        let got = f.messages(h);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let c = cancel(&got[0]);
+        assert_eq!(
+            (c.request_id.as_str(), c.reason.as_str()),
+            ("st1#1", "part without credit")
+        );
+        assert_eq!(f.router.in_flight(), 0);
+        f.part(h, "st1#1", 3, b"d");
+        assert!(f.messages("s1").is_empty(), "the stream is gone");
+    }
+
+    #[tokio::test]
+    async fn a_flow_from_the_sender_adds_credit_and_reaches_the_handler() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 1, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.flow("s1", "st1", 2);
+        let got = f.messages(h);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let fl = flow(&got[0]);
+        assert_eq!((fl.request_id.as_str(), fl.credits), ("st1#1", 2));
+        f.part(h, "st1#1", 1, b"b");
+        f.part(h, "st1#1", 2, b"c");
+        assert_eq!(f.messages("s1").len(), 3, "three parts within the credit");
+        // Flows that are not the sender's, for an unknown stream, or empty are ignored.
+        f.flow("s-plain", "st1", 5);
+        f.flow(h, "st1", 5);
+        f.flow("s1", "ghost", 5);
+        f.flow("s1", "st1", 0);
+        assert!(f.messages(h).is_empty(), "nothing reached the handler");
+        f.part(h, "st1#1", 3, b"d");
+        let got = f.messages("s1");
+        assert_eq!(
+            end_error(end(&got[0])).0,
+            ErrorCode::InvalidRequest,
+            "no credit was added: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_results_ends_after_that_many_parts_and_cancels_the_handler() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 2));
+        let (h, r) = f.target_of("st1");
+        assert_eq!(r.max_results, 0, "the hub enforces it");
+        f.part(h, "st1#1", 0, b"a");
+        assert!(f.messages(h).is_empty());
+        f.part(h, "st1#1", 1, b"b");
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        let e = end(&got[2]);
+        assert_eq!(e.parts, 2);
+        assert!(e.error.is_none());
+        let got = f.messages(h);
+        assert_eq!(cancel(&got[0]).reason, "max results");
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        f.part(h, "st1#1", 2, b"c");
+        assert!(f.messages("s1").is_empty(), "a late part is dropped");
+        let edge = edge_of(&f.router, "web", "q.Find");
+        assert_eq!((edge.count, edge.errors), (1, 0));
+    }
+
+    /// The hub does not know streaming handlers that answer with a unary `Reply`, but relays
+    /// one as a single part and the end rather than letting the stream idle out.
+    #[tokio::test]
+    async fn a_unary_reply_to_a_streaming_target_is_one_part_and_the_end() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.part(h, "st1#1", 0, b"a");
+        f.router.on_reply(
+            &D,
+            h,
+            Reply {
+                request_id: "st1#1".into(),
+                result: Some(reply::Result::Payload(b"whole".to_vec())),
+            },
+        );
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(
+            (part(&got[1]).seq, part(&got[1]).payload.as_slice()),
+            (1, &b"whole"[..])
+        );
+        assert_eq!(end(&got[2]).parts, 2);
+        assert_eq!(f.router.in_flight(), 0);
+        // A Reply{error} ends it with that error.
+        f.router.route(&D, "s1", stream("st2", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st2");
+        f.router.on_reply(
+            &D,
+            h,
+            Reply {
+                request_id: "st2#1".into(),
+                result: Some(reply::Result::Error(crate::proto::Error {
+                    request_id: "st2#1".into(),
+                    code: ErrorCode::PermissionDenied as i32,
+                    message: "no".into(),
+                    details: vec![],
+                })),
+            },
+        );
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(end_error(end(&got[0])).0, ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn parts_and_ends_for_unknown_ids_or_from_non_targets_are_ignored() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        let other = if h == "a1" { "b1" } else { "a1" };
+        f.part(other, "st1#1", 0, b"intruder");
+        f.end(other, "st1#1", None);
+        f.part(h, "ghost#1", 0, b"ghost");
+        f.end(h, "ghost#1", None);
+        f.part(h, "st1", 0, b"the sender's id, not the target's");
+        assert!(f.messages("s1").is_empty());
+        assert_eq!(f.router.in_flight(), 1, "the stream is untouched");
+        // A part for a scatter-gather target: not a streaming request.
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: RequestMode::ScatterGather as i32,
+                ..stream("g1", "q.Find", 0, 0, 0)
+            },
+        );
+        let targets: Vec<Request> = ["a1", "a2", "b1"]
+            .iter()
+            .flat_map(|h| f.requests(h))
+            .filter(|r| r.id.starts_with("g1#"))
+            .collect();
+        assert_eq!(targets.len(), 3);
+        f.part("a1", "g1#0", 0, b"not a stream");
+        f.end("a1", "g1#0", None);
+        assert!(f.messages("s1").is_empty());
+        assert_eq!(f.router.in_flight(), 2, "the gather continues");
+        f.part(h, "st1#1", 0, b"real");
+        assert_eq!(f.messages("s1").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parts_and_the_end_reach_a_slow_sender_in_order() {
+        let mut f = Streams::new();
+        // A sender whose buffer holds one message: the first part fills it, the rest wait.
+        f.connect("s-slow", "web", meta(2, true), None, 1);
+        f.router
+            .route(&D, "s-slow", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        for seq in 0..3 {
+            f.part(h, "st1#1", seq, format!("p{seq}").as_bytes());
+        }
+        f.end(h, "st1#1", None);
+        assert_eq!(f.router.in_flight(), 0, "ended before the sender drained");
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let m = tokio::time::timeout(
+                Duration::from_secs(1),
+                f.rx.get_mut("s-slow").unwrap().recv(),
+            )
+            .await
+            .expect("message within the delivery timeout")
+            .unwrap()
+            .unwrap();
+            got.extend(m.message);
+            tokio::task::yield_now().await;
+        }
+        let seqs: Vec<u64> = got[..3].iter().map(|m| part(m).seq).collect();
+        assert_eq!(seqs, [0, 1, 2], "{got:?}");
+        assert_eq!(part(&got[2]).payload, b"p2");
+        assert_eq!(end(&got[3]).parts, 3);
+        tokio::task::yield_now().await;
+        assert!(f.messages("s-slow").is_empty(), "nothing follows the end");
     }
 
     #[tokio::test]
