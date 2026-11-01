@@ -91,6 +91,10 @@ struct Unary {
     /// The handler session the request was forwarded to. A reconnect with the same instance id
     /// is a different session: it cannot answer requests forwarded to the old stream.
     handler_token: u64,
+    /// The request was written to the handler (set under the pending lock right after the
+    /// write): only such a target is sent a `Cancel` when its stream or gather ends; one whose
+    /// entry ended between the pop and the write is cancelled by [`Router::note_forwarded`].
+    forwarded: bool,
     /// The sender shares "flow-control": capacity rejections are RESOURCE_EXHAUSTED for it,
     /// HANDLER_ERROR "handler busy" otherwise.
     sender_flow_control: bool,
@@ -761,20 +765,18 @@ impl Router {
     }
 
     /// Ends the flow bookkeeping of a pending entry that was just removed from the map: out of
-    /// its handler's queue if it was still queued, and no longer assigned. Returns true when it
-    /// was still queued (so the handler never got it).
-    fn release(&self, id: &str, entry: &Unary) -> bool {
-        let mut flows = self.flows.lock().unwrap();
-        match flows
+    /// its handler's queue if it was still queued, and no longer assigned. (Whether the handler
+    /// got it is `entry.forwarded`, not "was it queued": a popped entry may not be written yet.)
+    fn release(&self, id: &str, entry: &Unary) {
+        if let Some(f) = self
+            .flows
+            .lock()
+            .unwrap()
             .get_mut(&entry.handler)
             .filter(|f| f.token == entry.handler_token)
         {
-            Some(f) => {
-                let queued = f.queue.remove(id).is_some();
-                f.assigned.remove(id);
-                queued
-            }
-            None => false,
+            f.queue.remove(id);
+            f.assigned.remove(id);
         }
     }
 
@@ -836,7 +838,7 @@ impl Router {
                 self.metrics
                     .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
                 match self.sessions.send_if_current(ctx, handler, token, item.msg) {
-                    Ok(()) => self.note_forwarded(&item.id),
+                    Ok(()) => self.note_forwarded(ctx, &item.id, handler, token, service),
                     Err(e) => {
                         self.return_permit(handler, token);
                         self.forward_failed(&item.id, handler, service, e);
@@ -1021,6 +1023,7 @@ impl Router {
                 sender_service: sender_info.map(|s| s.service),
                 handler: handler.clone(),
                 handler_token,
+                forwarded: false,
                 sender_flow_control,
                 kind,
                 type_name,
@@ -1174,13 +1177,13 @@ impl Router {
         match next {
             Next::Send(msg, service) => {
                 match self.sessions.send_if_current(ctx, handler, token, msg) {
-                    Ok(()) => self.note_forwarded(id),
+                    Ok(()) => self.note_forwarded(ctx, id, handler, token, &service),
                     Err(e) => self.forward_failed(id, handler, &service, e),
                 }
             }
             Next::Forward(msg, service) => {
                 match self.sessions.send_if_current(ctx, handler, token, msg) {
-                    Ok(()) => self.note_forwarded(id),
+                    Ok(()) => self.note_forwarded(ctx, id, handler, token, &service),
                     Err(e) => {
                         self.return_permit(handler, token);
                         self.forward_failed(id, handler, &service, e);
@@ -1348,10 +1351,10 @@ impl Router {
             match entry {
                 Pending::Unary(entry) => {
                     entry.abort_timer();
-                    let queued = self.release(&id, &entry);
+                    self.release(&id, &entry);
                     if entry.part_of.is_none() {
                         self.metrics.in_flight_add(entry.kind, -1);
-                    } else if !queued {
+                    } else if entry.forwarded {
                         self.cancel_target(ctx, &id, &entry, "sender disconnected");
                     }
                     entry.span.record("kraken.outcome", "sender_disconnected");
@@ -1662,6 +1665,7 @@ impl Router {
                     sender_service: Some(info.service.clone()),
                     handler: target.id.clone(),
                     handler_token: *token,
+                    forwarded: false,
                     sender_flow_control: info.flow_control,
                     kind,
                     type_name: type_name.clone(),
@@ -1857,7 +1861,8 @@ impl Router {
             "max results"
         };
         for (target, entry) in &rest {
-            if !self.release(target, entry) {
+            self.release(target, entry);
+            if entry.forwarded {
                 self.cancel_target(&gather.context, target, entry, reason);
             }
         }
@@ -2043,6 +2048,7 @@ impl Router {
                 sender_service: Some(info.service.clone()),
                 handler: handler.clone(),
                 handler_token,
+                forwarded: false,
                 sender_flow_control: info.flow_control,
                 kind,
                 type_name: type_name.clone(),
@@ -2088,20 +2094,37 @@ impl Router {
         self.dispatch(ctx, &target_id, &handler, handler_token, forwarded);
     }
 
-    /// The request `id` was just written to its handler: a streaming target's idle timeout
-    /// starts over, so the handler gets the whole timeout for its first part whatever the queue
-    /// wait was.
-    fn note_forwarded(&self, id: &str) {
+    /// The request `id` was just written to `handler`'s session `token`: the entry is marked
+    /// forwarded (its ending paths now owe the handler a `Cancel`), and a streaming target's
+    /// idle timeout starts over, so the handler gets the whole timeout for its first part
+    /// whatever the queue wait was. An entry that ended between the pre-write check and the
+    /// write (a close that found it neither queued nor forwarded, so sent no `Cancel`) gets its
+    /// `Cancel{id, "closed before forward"}` here, if the handler negotiated "streaming": it
+    /// must not serve a request the hub forgot.
+    fn note_forwarded(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, service: &str) {
         let mut pending = self.pending.lock().unwrap();
-        let Some(parent) = pending
-            .get(id)
-            .and_then(Pending::unary)
-            .and_then(|u| u.part_of.as_ref())
-            .map(|p| p.parent.clone())
-        else {
-            return;
+        let parent = match pending.get_mut(id).and_then(Pending::unary_mut) {
+            Some(u) if u.handler == handler && u.handler_token == token => {
+                u.forwarded = true;
+                u.part_of.as_ref().map(|p| p.parent.clone())
+            }
+            _ => {
+                drop(pending);
+                if self.sessions.negotiated_streaming(ctx, handler) {
+                    let msg = ServerMessage {
+                        message: Some(server_message::Message::Cancel(Cancel {
+                            request_id: id.to_string(),
+                            reason: "closed before forward".to_string(),
+                        })),
+                    };
+                    self.send_to_handler(ctx, handler, token, service, msg);
+                }
+                return;
+            }
         };
-        if let Some(Pending::Stream(stream)) = pending.get_mut(&parent) {
+        if let Some(parent) = parent
+            && let Some(Pending::Stream(stream)) = pending.get_mut(&parent)
+        {
             stream.last_activity = Instant::now();
         }
     }
@@ -2476,9 +2499,9 @@ impl Router {
         stream.idle.abort();
         stream.max_duration.abort();
         if let Some(target) = &target {
-            let queued = self.release(&stream.target_id, target);
+            self.release(&stream.target_id, target);
             if let Some(reason) = &end.cancel
-                && !queued
+                && target.forwarded
             {
                 self.cancel_target(&stream.context, &stream.target_id, target, reason);
             }
@@ -5505,6 +5528,67 @@ mod stream_tests {
         assert_eq!(flow(&got[0]).credits, 2);
         assert_eq!(cancel(&got[1]).reason, "idle timeout");
         assert_eq!(f.router.in_flight(), 0);
+    }
+
+    /// The stream closes between the pop of its queued target and the write to the handler
+    /// (`forward_ready` checked the entry, then lost the race): the handler must not serve a
+    /// stream the hub forgot, so it gets the `Request` and then one `Cancel`, and never a
+    /// `Cancel` before the `Request` (it would ignore that one as unknown).
+    #[tokio::test]
+    async fn a_stream_closed_between_the_pop_and_the_forward_is_cancelled_after_the_request() {
+        let mut f = Streams::new();
+        for h in ["a1", "a2", "b1"] {
+            f.leave(h);
+        }
+        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.shared("b3", "B", &["q.Find"]);
+        let token = f.tokens["b3"];
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: 0,
+                ..stream("busy", "q.Find", 10_000, 0, 0)
+            },
+        );
+        assert_eq!(f.requests("b3").len(), 1);
+        f.router
+            .route(&D, "s1", stream("st1", "q.Find", 10_000, 0, 0));
+        assert!(f.requests("b3").is_empty(), "queued behind busy");
+        // A permit comes back and the target is popped ...
+        let ready = {
+            let mut flows = f.router.flows.lock().unwrap();
+            let flow = flows.get_mut("b3").unwrap();
+            flow.permits = Some(1);
+            drain(flow)
+        };
+        let [item]: [Queued; 1] = ready.try_into().expect("the target");
+        assert!(f.router.is_pending_for(&item.id, "b3", token));
+        // ... the sender cancels before the write ...
+        f.cancel("s1", "st1", "changed my mind");
+        let got = f.messages("b3");
+        assert!(got.is_empty(), "no Cancel before the Request: {got:?}");
+        // ... and the write goes through.
+        f.sessions
+            .send_if_current(&D, "b3", token, item.msg)
+            .unwrap();
+        f.router.note_forwarded(&D, &item.id, "b3", token, "B");
+        let got = f.messages("b3");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            matches!(&got[0], server_message::Message::Request(r) if r.id == "st1#1"),
+            "{got:?}"
+        );
+        let c = cancel(&got[1]);
+        assert_eq!(
+            (c.request_id.as_str(), c.reason.as_str()),
+            ("st1#1", "closed before forward")
+        );
+        assert!(
+            f.messages("s1").is_empty(),
+            "the sender cancelled: nothing more"
+        );
+        assert_eq!(f.router.in_flight(), 1, "busy only");
     }
 
     fn candidate(id: &str) -> Candidate {

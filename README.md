@@ -524,7 +524,10 @@ umbrella `docs/05-services/hub.md` (Query modes).
   `ReplyEnd{error = TIMEOUT}` and `Cancel{<id>#1, "idle timeout"}`. Open for
   `KRAKEN_HUB_MAX_STREAM_DURATION`: `ReplyEnd{error = CANCELLED "max stream duration (10m)
   exceeded"}` and a `Cancel` with that reason. Handler gone: `ReplyEnd{error =
-  HANDLER_DISCONNECTED}`; sender gone: `Cancel{<id>#1, "sender disconnected"}`. The hub's
+  HANDLER_DISCONNECTED}`; sender gone: `Cancel{<id>#1, "sender disconnected"}`. A `Cancel` goes
+  only to a handler that was written the request; a stream that ends between the pop of its
+  queued target and the write gets `Cancel{<id>#1, "closed before forward"}` right after the
+  `Request` (so the handler never serves a stream the hub forgot). The hub's
   shutdown closes every session (as for unary requests). **Builder call:** a unary `Reply` to a
   streaming target is relayed as one part and the end (`Reply{error}` as `ReplyEnd{error}`).
 - **Streaming errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `streaming`
