@@ -137,6 +137,9 @@ pub enum Outcome {
     /// The hub rejected a request mode the sender did not declare or the hub does not implement
     /// (UNSUPPORTED).
     Unsupported,
+    /// A streaming query ended before its handler did: the sender cancelled it, or it outlived
+    /// `KRAKEN_HUB_MAX_STREAM_DURATION` (CANCELLED).
+    Cancelled,
 }
 
 impl Outcome {
@@ -151,6 +154,7 @@ impl Outcome {
             Outcome::InvalidRequest => "invalid_request",
             Outcome::ResourceExhausted => "resource_exhausted",
             Outcome::Unsupported => "unsupported",
+            Outcome::Cancelled => "cancelled",
         }
     }
 }
@@ -177,6 +181,8 @@ pub struct Metrics {
     queue_wait: Histogram<f64>,
     rejected: Counter<u64>,
     scatter_targets: Histogram<u64>,
+    streams_open: UpDownCounter<i64>,
+    stream_parts: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -246,6 +252,14 @@ impl Metrics {
                     1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
                 ])
                 .with_description("Targets of one scatter-gather query")
+                .build(),
+            streams_open: meter
+                .i64_up_down_counter("kraken_hub_streams_open")
+                .with_description("Streaming queries open, per handler service and instance")
+                .build(),
+            stream_parts: meter
+                .u64_counter("kraken_hub_stream_parts_total")
+                .with_description("Parts of streaming queries relayed, per handler service and type")
                 .build(),
             seen: Mutex::new(Seen::default()),
         })
@@ -345,6 +359,27 @@ impl Metrics {
         );
     }
 
+    /// A streaming query was routed to `instance` of `service`.
+    pub fn stream_opened(&self, service: &str, instance: &str) {
+        self.streams_open.add(1, &stream_attrs(service, instance));
+    }
+
+    /// A streaming query served by `instance` of `service` ended, however.
+    pub fn stream_closed(&self, service: &str, instance: &str) {
+        self.streams_open.add(-1, &stream_attrs(service, instance));
+    }
+
+    /// A part of a streaming query of `type_name`, served by `service`, was relayed.
+    pub fn stream_part(&self, service: &str, type_name: &str) {
+        self.stream_parts.add(
+            1,
+            &[
+                KeyValue::new("service", service.to_string()),
+                KeyValue::new("type", type_name.to_string()),
+            ],
+        );
+    }
+
     pub fn buffer_full(&self, service: &str) {
         self.buffer_full
             .add(1, &[KeyValue::new("service", service.to_string())]);
@@ -405,6 +440,13 @@ impl Metrics {
     }
 }
 
+fn stream_attrs(service: &str, instance: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("service", service.to_string()),
+        KeyValue::new("instance", instance.to_string()),
+    ]
+}
+
 /// In-memory metrics for unit tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -446,6 +488,31 @@ pub(crate) mod test_support {
                 panic!("{name} is not a u64 counter");
             };
             let points: Vec<u64> = sum
+                .data_points()
+                .filter(|p| {
+                    p.attributes()
+                        .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                })
+                .map(|p| p.value())
+                .collect();
+            (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// The sum of the i64 up-down counter `name` over the points whose attribute `key` is
+        /// `value`.
+        pub(crate) fn up_down(&self, name: &str, key: &str, value: &str) -> Option<i64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+                panic!("{name} is not an i64 up-down counter");
+            };
+            let points: Vec<i64> = sum
                 .data_points()
                 .filter(|p| {
                     p.attributes()

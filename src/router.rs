@@ -15,6 +15,15 @@
 //! target's terminal message becomes a `ReplyPart` to the sender instead; the gather's own
 //! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map.
 //!
+//! Streaming queries (ADR 0017, P4b): a [`Pending::Stream`] keyed by the sender's request id
+//! holds the stream; its one target is a [`Pending::Unary`] keyed `<id>#1` with `part_of` set,
+//! forwarded (with `mode = STREAMING` and the credit) through the same flow control as any
+//! request and kept in the map, holding its permit, until the stream ends. The handler's parts
+//! and end for `<id>#1` are relayed to the sender under the sender's credits; every ending path
+//! (end, error, over-credit, `max_results`, cancel, idle timeout, max duration, disconnects)
+//! removes both entries, sends the sender its `ReplyEnd` where one is due and the handler a
+//! `Cancel` where it still streams.
+//!
 //! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
 //! A flow-controlled session (permits `Some`) is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
@@ -35,8 +44,8 @@ use crate::config::Config;
 use crate::context::ContextId;
 use crate::edges::EdgeStats;
 use crate::proto::{
-    ErrorCode, Reply, ReplyEnd, ReplyPart, Request, RequestKind, RequestMode, ServerMessage, reply,
-    server_message,
+    Cancel, ErrorCode, Flow as FlowMsg, Reply, ReplyEnd, ReplyPart, Request, RequestKind,
+    RequestMode, ServerMessage, reply, server_message,
 };
 use crate::protocol;
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
@@ -47,14 +56,19 @@ use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Every request the hub has not answered yet, keyed by request id. P4b and P4c add streams and
-/// subscriptions.
+/// Every request the hub has not answered yet, keyed by request id. P4c adds subscriptions.
 enum Pending {
-    /// A request forwarded to one handler: a unary request, or one target of a scatter-gather.
+    /// A request forwarded to one handler: a unary request, or the target of a scatter-gather or
+    /// of a streaming query.
     Unary(Unary),
     /// A scatter-gather in progress; its targets are `Unary` entries with `part_of` set.
     Scatter(Scatter),
+    /// A streaming query in progress; its target is the `Unary` entry `<id>#1`.
+    Stream(Stream),
 }
+
+/// Credits the handler of a streaming query starts with when the sender sent none.
+pub const DEFAULT_STREAM_CREDIT: u32 = 64;
 
 /// The scatter-gather a forwarded request is a target of.
 #[derive(Debug, Clone)]
@@ -111,11 +125,8 @@ struct Scatter {
     /// The deadline timer of the whole gather.
     cancel: AbortHandle,
     span: tracing::Span,
-    /// The sender's outbound channel (weak: it never keeps a closed stream open).
-    out: WeakSender<Result<ServerMessage, Status>>,
-    /// The delivery still waiting for room in the sender's buffer, if any: later messages of
-    /// this gather queue behind it, so the sender sees the parts and the end in order.
-    delivery: Option<JoinHandle<()>>,
+    /// Ordered delivery of the parts and the end to the sender.
+    relay: Relay,
     /// Target request ids (`<id>#<n>`) that have not answered.
     outstanding: HashSet<String>,
     /// Parts sent, successful ones and failed ones.
@@ -128,58 +139,90 @@ struct Scatter {
     last_failure: Option<Outcome>,
 }
 
-impl Pending {
-    fn unary(&self) -> Option<&Unary> {
-        match self {
-            Pending::Unary(u) => Some(u),
-            Pending::Scatter(_) => None,
-        }
-    }
-
-    fn unary_mut(&mut self) -> Option<&mut Unary> {
-        match self {
-            Pending::Unary(u) => Some(u),
-            Pending::Scatter(_) => None,
-        }
-    }
-
-    fn sender(&self) -> &str {
-        match self {
-            Pending::Unary(u) => &u.sender,
-            Pending::Scatter(g) => &g.sender,
-        }
-    }
-
-    fn sender_token(&self) -> Option<u64> {
-        match self {
-            Pending::Unary(u) => u.sender_token,
-            Pending::Scatter(g) => g.sender_token,
-        }
-    }
-
-    fn context(&self) -> &ContextId {
-        match self {
-            Pending::Unary(u) => &u.context,
-            Pending::Scatter(g) => &g.context,
-        }
-    }
-
-    /// A request its sender waits for (a scatter-gather target is part of its gather instead).
-    fn is_request(&self) -> bool {
-        !matches!(
-            self,
-            Pending::Unary(Unary {
-                part_of: Some(_),
-                ..
-            })
-        )
-    }
+/// A streaming query in progress (ADR 0017, P4b).
+struct Stream {
+    context: ContextId,
+    sender: InstanceId,
+    sender_token: u64,
+    sender_service: String,
+    /// The handler chosen for the whole stream, and its service (`ReplyPart.responder_*`).
+    handler: InstanceId,
+    handler_service: String,
+    kind: Kind,
+    type_name: String,
+    started: Instant,
+    /// The target's request id (`<id>#1`): the `Unary` entry forwarded to the handler.
+    target_id: String,
+    /// Parts the handler may still send: the initial credit plus every `Flow` of the sender,
+    /// less the parts relayed.
+    credit: u32,
+    /// Parts relayed to the sender.
+    parts: u32,
+    /// `Request.max_results`: end after this many parts (0 = no limit).
+    max_results: u32,
+    /// When the stream was last active: routed, forwarded to the handler, or a part relayed.
+    /// The idle watch (`timeout_ms` under the usual rules) ends the stream when it gets old.
+    last_activity: Instant,
+    /// The idle watch and the max-duration timer.
+    idle: AbortHandle,
+    max_duration: AbortHandle,
+    span: tracing::Span,
+    /// Ordered delivery of the parts and the end to the sender.
+    relay: Relay,
 }
 
-impl Scatter {
-    /// Sends `msg` to the sender in this gather's order: at once when nothing of the gather is
-    /// still waiting and the buffer has room, otherwise behind the waiting delivery, which waits
-    /// up to [`TERMINAL_SEND_TIMEOUT`] for room (as terminal messages do).
+/// How a stream ends: what the sender is told (if anything) and what the handler is told (if
+/// it was forwarded the request).
+struct StreamEnd {
+    /// The `ReplyEnd.error`; `None` for a normal end.
+    error: Option<crate::proto::Error>,
+    /// `false` when the sender gets no `ReplyEnd` (it cancelled).
+    tell_sender: bool,
+    /// The `Cancel.reason` for the handler; `None` when the handler ended the stream itself or
+    /// is gone.
+    cancel: Option<String>,
+    outcome: Outcome,
+    /// The error is the handler's own (logged at info, not warn).
+    relayed: bool,
+}
+
+/// A stream taken out of the map: its `ReplyEnd` is sent, the rest is bookkeeping.
+struct ClosedStream {
+    stream: Stream,
+    /// The target, if it was still in the map (it is not after a handler disconnect).
+    target: Option<Unary>,
+    end: StreamEnd,
+}
+
+/// Ordered delivery of the multi-part messages of one request to its sender.
+struct Relay {
+    /// The sender's outbound channel (weak: it never keeps a closed stream open).
+    out: WeakSender<Result<ServerMessage, Status>>,
+    /// The delivery still waiting for room in the sender's buffer, if any: later messages of
+    /// the request queue behind it, so the sender sees the parts and the end in order.
+    delivery: Option<JoinHandle<()>>,
+    /// The sender's service and instance, for the log line and the buffer-full counter.
+    service: String,
+    instance: InstanceId,
+}
+
+impl Relay {
+    fn new(
+        out: WeakSender<Result<ServerMessage, Status>>,
+        service: Option<&str>,
+        instance: &str,
+    ) -> Self {
+        Self {
+            out,
+            delivery: None,
+            service: service.unwrap_or("unknown").to_string(),
+            instance: instance.to_string(),
+        }
+    }
+
+    /// Sends `msg` to the sender in order: at once when nothing is still waiting and the buffer
+    /// has room, otherwise behind the waiting delivery, which waits up to
+    /// [`TERMINAL_SEND_TIMEOUT`] for room (as terminal messages do).
     fn deliver(&mut self, msg: ServerMessage, metrics: &Arc<Metrics>) {
         let Some(tx) = self.out.upgrade() else {
             return;
@@ -196,11 +239,8 @@ impl Scatter {
         };
         let previous = self.delivery.take();
         let metrics = Arc::clone(metrics);
-        let service = self
-            .sender_service
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let instance = self.sender.clone();
+        let service = self.service.clone();
+        let instance = self.instance.clone();
         self.delivery = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
@@ -214,11 +254,62 @@ impl Scatter {
                     instance,
                     service,
                     reason,
-                    "scatter-gather message not delivered"
+                    "multi-part message not delivered"
                 );
                 metrics.buffer_full(&service);
             }
         }));
+    }
+}
+
+impl Pending {
+    fn unary(&self) -> Option<&Unary> {
+        match self {
+            Pending::Unary(u) => Some(u),
+            Pending::Scatter(_) | Pending::Stream(_) => None,
+        }
+    }
+
+    fn unary_mut(&mut self) -> Option<&mut Unary> {
+        match self {
+            Pending::Unary(u) => Some(u),
+            Pending::Scatter(_) | Pending::Stream(_) => None,
+        }
+    }
+
+    fn sender(&self) -> &str {
+        match self {
+            Pending::Unary(u) => &u.sender,
+            Pending::Scatter(g) => &g.sender,
+            Pending::Stream(s) => &s.sender,
+        }
+    }
+
+    fn sender_token(&self) -> Option<u64> {
+        match self {
+            Pending::Unary(u) => u.sender_token,
+            Pending::Scatter(g) => g.sender_token,
+            Pending::Stream(s) => Some(s.sender_token),
+        }
+    }
+
+    fn context(&self) -> &ContextId {
+        match self {
+            Pending::Unary(u) => &u.context,
+            Pending::Scatter(g) => &g.context,
+            Pending::Stream(s) => &s.context,
+        }
+    }
+
+    /// A request its sender waits for (a scatter-gather target is part of its gather instead).
+    fn is_request(&self) -> bool {
+        !matches!(
+            self,
+            Pending::Unary(Unary {
+                part_of: Some(_),
+                ..
+            })
+        )
     }
 }
 
@@ -370,11 +461,11 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
         ErrorCode::ResourceExhausted => Outcome::ResourceExhausted,
-        // CANCELLED is allocated for P4b and not produced by this hub yet.
+        // The hub cancels a stream that outlived KRAKEN_HUB_MAX_STREAM_DURATION.
+        ErrorCode::Cancelled => Outcome::Cancelled,
         ErrorCode::HandlerError
         | ErrorCode::Unauthenticated
         | ErrorCode::Unsupported
-        | ErrorCode::Cancelled
         | ErrorCode::Unspecified => Outcome::HandlerError,
     }
 }
@@ -456,17 +547,29 @@ impl Router {
         outcome: Outcome,
         latency: Option<Duration>,
     ) {
+        self.record_edge_error(
+            sender_service,
+            type_name,
+            kind,
+            outcome != Outcome::Ok,
+            latency,
+        );
+    }
+
+    /// Like [`Router::record_edge`] with the error decided by the caller (a stream the sender
+    /// cancelled is no error, whatever its outcome label).
+    fn record_edge_error(
+        &self,
+        sender_service: Option<&str>,
+        type_name: &str,
+        kind: Kind,
+        error: bool,
+        latency: Option<Duration>,
+    ) {
         if let (Some(edges), Some(sender)) = (&self.edges, sender_service)
             && !type_name.is_empty()
         {
-            edges.record(
-                sender,
-                type_name,
-                kind,
-                outcome != Outcome::Ok,
-                latency,
-                Instant::now(),
-            );
+            edges.record(sender, type_name, kind, error, latency, Instant::now());
         }
     }
 
@@ -656,15 +759,20 @@ impl Router {
     }
 
     /// Ends the flow bookkeeping of a pending entry that was just removed from the map: out of
-    /// its handler's queue if it was still queued, and no longer assigned.
-    fn release(&self, id: &str, entry: &Unary) {
+    /// its handler's queue if it was still queued, and no longer assigned. Returns true when it
+    /// was still queued (so the handler never got it).
+    fn release(&self, id: &str, entry: &Unary) -> bool {
         let mut flows = self.flows.lock().unwrap();
-        if let Some(f) = flows
+        match flows
             .get_mut(&entry.handler)
             .filter(|f| f.token == entry.handler_token)
         {
-            f.queue.remove(id);
-            f.assigned.remove(id);
+            Some(f) => {
+                let queued = f.queue.remove(id).is_some();
+                f.assigned.remove(id);
+                queued
+            }
+            None => false,
         }
     }
 
@@ -725,9 +833,12 @@ impl Router {
                 }
                 self.metrics
                     .queue_waited(service, &item.type_name, item.enqueued_at.elapsed());
-                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, item.msg) {
-                    self.return_permit(handler, token);
-                    self.forward_failed(&item.id, handler, service, e);
+                match self.sessions.send_if_current(ctx, handler, token, item.msg) {
+                    Ok(()) => self.note_forwarded(&item.id),
+                    Err(e) => {
+                        self.return_permit(handler, token);
+                        self.forward_failed(&item.id, handler, service, e);
+                    }
                 }
             }
             if ended.is_empty() {
@@ -1060,14 +1171,18 @@ impl Router {
         };
         match next {
             Next::Send(msg, service) => {
-                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
-                    self.forward_failed(id, handler, &service, e);
+                match self.sessions.send_if_current(ctx, handler, token, msg) {
+                    Ok(()) => self.note_forwarded(id),
+                    Err(e) => self.forward_failed(id, handler, &service, e),
                 }
             }
             Next::Forward(msg, service) => {
-                if let Err(e) = self.sessions.send_if_current(ctx, handler, token, msg) {
-                    self.return_permit(handler, token);
-                    self.forward_failed(id, handler, &service, e);
+                match self.sessions.send_if_current(ctx, handler, token, msg) {
+                    Ok(()) => self.note_forwarded(id),
+                    Err(e) => {
+                        self.return_permit(handler, token);
+                        self.forward_failed(id, handler, &service, e);
+                    }
                 }
             }
             Next::Drained(ready, service) => {
@@ -1217,20 +1332,25 @@ impl Router {
                 match pending.remove(&id).expect("id collected under same lock") {
                     entry if sent => dropped.push((id, entry)),
                     Pending::Unary(entry) => failed.push((id, entry)),
-                    Pending::Scatter(_) => unreachable!("a gather has no handler"),
+                    Pending::Scatter(_) | Pending::Stream(_) => {
+                        unreachable!("a gather or stream has no handler of its own")
+                    }
                 }
             }
             (failed, dropped)
         };
         // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in
-        // flight. A gather's targets have the same sender, so they are dropped with it.
+        // flight. A gather's or stream's targets have the same sender, so they are dropped with
+        // it; a target still streaming (or gathering, with a capable handler) is cancelled.
         for (id, entry) in dropped {
             match entry {
                 Pending::Unary(entry) => {
                     entry.abort_timer();
-                    self.release(&id, &entry);
+                    let queued = self.release(&id, &entry);
                     if entry.part_of.is_none() {
                         self.metrics.in_flight_add(entry.kind, -1);
+                    } else if !queued {
+                        self.cancel_target(ctx, &id, &entry, "sender disconnected");
                     }
                     entry.span.record("kraken.outcome", "sender_disconnected");
                 }
@@ -1238,6 +1358,14 @@ impl Router {
                     gather.cancel.abort();
                     self.metrics.in_flight_add(gather.kind, -1);
                     gather.span.record("kraken.outcome", "sender_disconnected");
+                }
+                Pending::Stream(stream) => {
+                    stream.idle.abort();
+                    stream.max_duration.abort();
+                    self.metrics.in_flight_add(stream.kind, -1);
+                    self.metrics
+                        .stream_closed(&stream.handler_service, &stream.handler);
+                    stream.span.record("kraken.outcome", "sender_disconnected");
                 }
             }
         }
@@ -1402,10 +1530,11 @@ impl Router {
         self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
-    /// A request with a mode other than UNARY (ADR 0017). Gates: a v1 sender cannot know the
-    /// newer codes (INVALID_REQUEST); a v2 sender gets UNSUPPORTED for a mode this hub does not
-    /// implement or its session did not declare; scatter-gather is for queries only
-    /// (INVALID_REQUEST); no live target is NO_HANDLER.
+    /// A request with a mode other than UNARY (ADR 0017). Gates, in this order: a v1 sender
+    /// cannot know the newer codes (INVALID_REQUEST); a v2 sender gets UNSUPPORTED for a mode
+    /// this hub does not implement or its session did not declare; the modes are for queries
+    /// only (INVALID_REQUEST); no live target is NO_HANDLER (a streaming query whose owners have
+    /// no capable instance: UNSUPPORTED); a duplicate id is INVALID_REQUEST.
     fn route_mode(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -1419,42 +1548,39 @@ impl Router {
         let type_name = req.r#type.clone();
         let mode = mode_label(req.mode);
         let sender_service = sender_info.as_ref().map(|s| s.service.clone());
-        let reject = |kind: Kind, code: ErrorCode, outcome: Outcome, message: String| {
-            self.record_rejected_mode(sender_service.as_deref(), kind, &type_name, outcome, mode);
-            record_outcome(&span, outcome);
-            log_outcome(&id, &type_name, Some(kind), sender, None, outcome, false);
-            self.send_to(ctx, sender, error_message(&id, code, message));
+        let m = ModeContext {
+            ctx,
+            sender,
+            id: &id,
+            type_name: &type_name,
+            sender_service: sender_service.as_deref(),
+            mode,
+            span: &span,
         };
         let Some(info) = sender_info.filter(|s| protocol::is_v2(s.protocol_version)) else {
             let message = format!("invalid request: request mode {mode} needs protocol v2");
-            return reject(
-                req_kind,
-                ErrorCode::InvalidRequest,
-                Outcome::InvalidRequest,
-                message,
-            );
+            return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
         };
-        if req.mode != RequestMode::ScatterGather as i32 {
-            let message = format!("request mode {mode} is not supported by this hub");
-            return reject(
-                req_kind,
-                ErrorCode::Unsupported,
-                Outcome::Unsupported,
-                message,
-            );
+        match RequestMode::try_from(req.mode) {
+            Ok(RequestMode::ScatterGather) => {}
+            Ok(RequestMode::Streaming) => {
+                return self.route_stream(ctx, sender, req, req_kind, info, span);
+            }
+            _ => {
+                let message = format!("request mode {mode} is not supported by this hub");
+                return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+            }
         }
         if !info.scatter_gather {
             let message = format!(
                 "request mode {mode} needs the \"{}\" capability, not declared by this session",
                 protocol::SCATTER_GATHER
             );
-            return reject(
-                req_kind,
-                ErrorCode::Unsupported,
-                Outcome::Unsupported,
-                message,
-            );
+            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
         }
+        let reject = |kind: Kind, code: ErrorCode, _outcome: Outcome, message: String| {
+            self.reject_mode(&m, kind, code, message);
+        };
         let for_queries = |type_name: &str| {
             format!("invalid request: {type_name} is a command; {mode} is for queries")
         };
@@ -1490,6 +1616,7 @@ impl Router {
         else {
             return; // the sender left meanwhile: nobody to answer
         };
+        let relay = Relay::new(out, Some(&info.service), sender);
         let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
         let targets: Vec<(String, crate::registry::ScatterTarget, u64)> = targets
             .into_iter()
@@ -1556,8 +1683,7 @@ impl Router {
                 started: now,
                 cancel,
                 span,
-                out,
-                delivery: None,
+                relay,
                 outstanding: targets.iter().map(|(t, _, _)| t.clone()).collect(),
                 parts: 0,
                 ok: 0,
@@ -1582,8 +1708,11 @@ impl Router {
         }
     }
 
-    /// The answer of scatter-gather target `id` (already removed from the map and released):
-    /// a `ReplyPart` to the sender, and the `ReplyEnd` when it was the last one needed.
+    /// The answer (or hub-side failure) of target `id` (already removed from the map and
+    /// released). For a scatter-gather target: a `ReplyPart` to the sender, and the `ReplyEnd`
+    /// when it was the last one needed. For a streaming target it ends the stream: a failure
+    /// (the handler left, or the hub could not forward) as `ReplyEnd{error}`; a unary `Reply`
+    /// from the handler as one part and the end, or `ReplyEnd{error}` for `Reply{error}`.
     fn on_part(
         &self,
         id: &str,
@@ -1593,6 +1722,13 @@ impl Router {
         let Some(part_of) = entry.part_of else {
             return;
         };
+        if matches!(
+            self.pending.lock().unwrap().get(&part_of.parent),
+            Some(Pending::Stream(_))
+        ) {
+            self.on_stream_target_result(&part_of.parent, result);
+            return;
+        }
         let closed = {
             let mut pending = self.pending.lock().unwrap();
             let Some(Pending::Scatter(gather)) = pending.get_mut(&part_of.parent) else {
@@ -1625,7 +1761,7 @@ impl Router {
                     seq,
                 })),
             };
-            gather.deliver(part, &self.metrics);
+            gather.relay.deliver(part, &self.metrics);
             let done = gather.outstanding.is_empty()
                 || (gather.max_results > 0 && gather.ok >= gather.max_results);
             if done {
@@ -1695,7 +1831,7 @@ impl Router {
                 timed_out,
             })),
         };
-        gather.deliver(end, &self.metrics);
+        gather.relay.deliver(end, &self.metrics);
         Some(Closed {
             gather,
             rest,
@@ -1703,8 +1839,9 @@ impl Router {
         })
     }
 
-    /// Bookkeeping of a closed gather: flow state of its unanswered targets, metrics and edge
-    /// (one request; an error when no part succeeded).
+    /// Bookkeeping of a closed gather: flow state of its unanswered targets (a forwarded one
+    /// whose handler negotiated "streaming" is told to cancel), metrics and edge (one request;
+    /// an error when no part succeeded).
     fn finish_scatter(&self, id: &str, closed: Closed) {
         let Closed {
             gather,
@@ -1712,8 +1849,15 @@ impl Router {
             timed_out,
         } = closed;
         gather.cancel.abort();
+        let reason = if timed_out > 0 {
+            "deadline"
+        } else {
+            "max results"
+        };
         for (target, entry) in &rest {
-            self.release(target, entry);
+            if !self.release(target, entry) {
+                self.cancel_target(&gather.context, target, entry, reason);
+            }
         }
         let outcome = if gather.ok > 0 {
             Outcome::Ok
@@ -1751,6 +1895,689 @@ impl Router {
         );
     }
 
+    /// Answers a non-unary request before it was routed.
+    fn reject_mode(&self, m: &ModeContext<'_>, kind: Kind, code: ErrorCode, message: String) {
+        let outcome = outcome_of(code);
+        let outcome = if code == ErrorCode::Unsupported {
+            Outcome::Unsupported
+        } else {
+            outcome
+        };
+        self.record_rejected_mode(m.sender_service, kind, m.type_name, outcome, m.mode);
+        record_outcome(m.span, outcome);
+        log_outcome(
+            m.id,
+            m.type_name,
+            Some(kind),
+            m.sender,
+            None,
+            outcome,
+            false,
+        );
+        self.send_to(m.ctx, m.sender, error_message(m.id, code, message));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Streaming queries (ADR 0017, P4b)
+
+    /// A query with mode STREAMING from a v2 sender: one capable instance gets the request with
+    /// the credit, as the target `<id>#1` of a [`Pending::Stream`].
+    fn route_stream(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        sender: &str,
+        req: Request,
+        req_kind: Kind,
+        info: SenderInfo,
+        span: tracing::Span,
+    ) {
+        let id = req.id.clone();
+        let type_name = req.r#type.clone();
+        let mode = mode_label(req.mode);
+        let m = ModeContext {
+            ctx,
+            sender,
+            id: &id,
+            type_name: &type_name,
+            sender_service: Some(&info.service),
+            mode,
+            span: &span,
+        };
+        if !info.streaming {
+            let message = format!(
+                "request mode {mode} needs the \"{}\" capability, not declared by this session",
+                protocol::STREAMING
+            );
+            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+        }
+        let for_queries = |type_name: &str| {
+            format!("invalid request: {type_name} is a command; {mode} is for queries")
+        };
+        if req_kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
+        }
+        let pool = match self.registry.stream_candidates(ctx, &type_name) {
+            Ok(pool) => pool,
+            Err(e) => {
+                let message = no_handler_message(&type_name, e);
+                return self.reject_mode(&m, req_kind, ErrorCode::NoHandler, message);
+            }
+        };
+        let kind = pool.kind;
+        if kind == Kind::Command {
+            let message = for_queries(&type_name);
+            return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+        }
+        // Only an instance that negotiated "streaming" understands the multi-part messages.
+        let (mut capable, incapable): (Vec<Candidate>, Vec<Candidate>) = pool
+            .candidates
+            .into_iter()
+            .partition(|c| self.sessions.negotiated_streaming(ctx, &c.id));
+        if capable.is_empty() {
+            let mut services: Vec<String> = incapable
+                .iter()
+                .filter_map(|c| self.registry.service_of(ctx, &c.id))
+                .collect();
+            services.sort();
+            services.dedup();
+            let message = format!(
+                "no live instance of {} serving {type_name} negotiated the \"{}\" capability",
+                services.join(", "),
+                protocol::STREAMING
+            );
+            return self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
+        }
+        let sender_tags = self
+            .registry
+            .placement_of(ctx, sender)
+            .map(|p| p.tags)
+            .unwrap_or_default();
+        let loads = self.loads(&capable);
+        let i = choose(&capable, &sender_tags, pool.rotation, |id| loads[id]);
+        let handler = capable.swap_remove(i).id;
+        let handler_service = self.registry.service_of(ctx, &handler).unwrap_or_default();
+        span.record("kraken.handler", handler.as_str());
+        // The sender's own stream, weakly: the stream never keeps a closed stream open.
+        let Some(out) = self
+            .sessions
+            .weak_sender_if_current(ctx, sender, info.token)
+        else {
+            return; // the sender left meanwhile: nobody to answer
+        };
+        // `None`: the handler's session vanished since the pick; the dispatch reports it Gone.
+        let handler_token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
+        let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
+        let credit = if req.initial_credit == 0 {
+            DEFAULT_STREAM_CREDIT
+        } else {
+            req.initial_credit
+        };
+        let target_id = format!("{id}#1");
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(&id) || pending.contains_key(&target_id) {
+                drop(pending);
+                let message = "invalid request: duplicate id".to_string();
+                return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+            }
+            self.metrics.request_started(kind);
+            self.metrics.stream_opened(&handler_service, &handler);
+            let now = Instant::now();
+            let router = Arc::clone(self);
+            let idle = tokio::spawn(idle_watch(router, id.clone(), timeout)).abort_handle();
+            let router = Arc::clone(self);
+            let task_id = id.clone();
+            let max = self.config.max_stream_duration;
+            let max_duration = tokio::spawn(async move {
+                tokio::time::sleep(max).await;
+                router.on_stream_max_duration(&task_id, max);
+            })
+            .abort_handle();
+            let target = Unary {
+                context: ctx.clone(),
+                sender: sender.to_string(),
+                sender_token: Some(info.token),
+                sender_service: Some(info.service.clone()),
+                handler: handler.clone(),
+                handler_token,
+                sender_flow_control: info.flow_control,
+                kind,
+                type_name: type_name.clone(),
+                started: now,
+                cancel: None,
+                span: tracing::Span::none(),
+                part_of: Some(PartOf {
+                    parent: id.clone(),
+                    service: handler_service.clone(),
+                }),
+            };
+            pending.insert(target_id.clone(), Pending::Unary(target));
+            let stream = Stream {
+                context: ctx.clone(),
+                sender: sender.to_string(),
+                sender_token: info.token,
+                sender_service: info.service.clone(),
+                handler: handler.clone(),
+                handler_service,
+                kind,
+                type_name,
+                started: now,
+                target_id: target_id.clone(),
+                credit,
+                parts: 0,
+                max_results: req.max_results,
+                last_activity: now,
+                idle,
+                max_duration,
+                span,
+                relay: Relay::new(out, Some(&info.service), sender),
+            };
+            pending.insert(id, Pending::Stream(stream));
+        }
+        // The handler gets the request with its own id and the credit; the hub enforces
+        // `max_results` itself.
+        let forwarded = Request {
+            id: target_id.clone(),
+            initial_credit: credit,
+            max_results: 0,
+            ..req
+        };
+        self.dispatch(ctx, &target_id, &handler, handler_token, forwarded);
+    }
+
+    /// The request `id` was just written to its handler: a streaming target's idle timeout
+    /// starts over, so the handler gets the whole timeout for its first part whatever the queue
+    /// wait was.
+    fn note_forwarded(&self, id: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        let Some(parent) = pending
+            .get(id)
+            .and_then(Pending::unary)
+            .and_then(|u| u.part_of.as_ref())
+            .map(|p| p.parent.clone())
+        else {
+            return;
+        };
+        if let Some(Pending::Stream(stream)) = pending.get_mut(&parent) {
+            stream.last_activity = Instant::now();
+        }
+    }
+
+    /// The stream whose target `target_id` is, if the target is pending for `from` in `ctx`.
+    fn stream_of_target(
+        pending: &HashMap<String, Pending>,
+        target_id: &str,
+        from: &str,
+        ctx: &ContextId,
+        what: &str,
+    ) -> Option<String> {
+        let Some(target) = pending.get(target_id).and_then(Pending::unary) else {
+            tracing::debug!(request_id = %target_id, from, "{what} for unknown request ignored");
+            return None;
+        };
+        if target.handler != from || target.context != *ctx {
+            tracing::debug!(request_id = %target_id, from, "{what} from non-handler ignored");
+            return None;
+        }
+        let parent = target.part_of.as_ref().map(|p| p.parent.clone());
+        match parent.filter(|p| matches!(pending.get(p), Some(Pending::Stream(_)))) {
+            Some(parent) => Some(parent),
+            None => {
+                tracing::debug!(request_id = %target_id, from, "{what} for a request that is not streaming ignored");
+                None
+            }
+        }
+    }
+
+    /// `ReplyPart` from a handler for a streaming target: relayed to the sender (its id, the
+    /// responder, the handler's `seq`) under the sender's credits. A part beyond the credit, or
+    /// one carrying an error, ends the stream; so does the `max_results`-th part.
+    pub fn on_stream_part(&self, ctx: &ContextId, from: &str, part: ReplyPart) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(id) = Self::stream_of_target(&pending, &part.request_id, from, ctx, "part")
+            else {
+                return;
+            };
+            let Some(Pending::Stream(stream)) = pending.get_mut(&id) else {
+                return;
+            };
+            if let Some(mut error) = part.error {
+                error.request_id = id.clone();
+                let end = StreamEnd {
+                    error: Some(error),
+                    tell_sender: true,
+                    cancel: None,
+                    outcome: Outcome::HandlerError,
+                    relayed: true,
+                };
+                self.close_stream(&mut pending, &id, end)
+            } else if stream.credit == 0 {
+                let end = StreamEnd {
+                    error: Some(crate::proto::Error {
+                        request_id: id.clone(),
+                        code: ErrorCode::InvalidRequest as i32,
+                        message: "part without credit".to_string(),
+                        details: vec![],
+                    }),
+                    tell_sender: true,
+                    cancel: Some("part without credit".to_string()),
+                    outcome: Outcome::InvalidRequest,
+                    relayed: false,
+                };
+                self.close_stream(&mut pending, &id, end)
+            } else {
+                stream.credit -= 1;
+                stream.parts += 1;
+                stream.last_activity = Instant::now();
+                let relayed = ServerMessage {
+                    message: Some(server_message::Message::Part(ReplyPart {
+                        request_id: id.clone(),
+                        payload: part.payload,
+                        error: None,
+                        responder_service: stream.handler_service.clone(),
+                        responder_instance: stream.handler.clone(),
+                        seq: part.seq,
+                    })),
+                };
+                stream.relay.deliver(relayed, &self.metrics);
+                self.metrics
+                    .stream_part(&stream.handler_service, &stream.type_name);
+                if stream.max_results > 0 && stream.parts >= stream.max_results {
+                    let end = StreamEnd {
+                        error: None,
+                        tell_sender: true,
+                        cancel: Some("max results".to_string()),
+                        outcome: Outcome::Ok,
+                        relayed: false,
+                    };
+                    self.close_stream(&mut pending, &id, end)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(closed) = closed {
+            self.finish_stream(closed);
+        }
+    }
+
+    /// `ReplyEnd` from a handler for a streaming target: the stream ends, with the handler's
+    /// error if it carries one.
+    pub fn on_stream_end(&self, ctx: &ContextId, from: &str, end: ReplyEnd) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(id) = Self::stream_of_target(&pending, &end.request_id, from, ctx, "end")
+            else {
+                return;
+            };
+            let error = end.error.map(|mut e| {
+                e.request_id = id.clone();
+                e
+            });
+            let relayed = error.is_some();
+            let end = StreamEnd {
+                outcome: if relayed {
+                    Outcome::HandlerError
+                } else {
+                    Outcome::Ok
+                },
+                error,
+                tell_sender: true,
+                cancel: None,
+                relayed,
+            };
+            self.close_stream(&mut pending, &id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_stream(closed);
+        }
+    }
+
+    /// `Flow{request_id, credits}` from the sender of stream `request_id`: the credit grows and
+    /// the handler gets `Flow{<id>#1, credits}`. Ignored for an unknown id, from anyone but the
+    /// sender, and when it grants nothing.
+    pub fn on_flow(&self, ctx: &ContextId, from: &str, flow: FlowMsg) {
+        let id = flow.request_id;
+        if flow.credits == 0 {
+            tracing::debug!(request_id = %id, from, "flow without credits ignored");
+            return;
+        }
+        let (handler, token, service, target_id) = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Stream(stream)) = pending
+                .get_mut(&id)
+                .filter(|p| p.sender() == from && p.context() == ctx)
+            else {
+                tracing::debug!(request_id = %id, from, "flow for unknown stream ignored");
+                return;
+            };
+            stream.credit = stream.credit.saturating_add(flow.credits);
+            let target_id = stream.target_id.clone();
+            let token = pending
+                .get(&target_id)
+                .and_then(Pending::unary)
+                .map_or(u64::MAX, |t| t.handler_token);
+            let Some(Pending::Stream(stream)) = pending.get(&id) else {
+                return;
+            };
+            (
+                stream.handler.clone(),
+                token,
+                stream.handler_service.clone(),
+                target_id,
+            )
+        };
+        let msg = ServerMessage {
+            message: Some(server_message::Message::Flow(FlowMsg {
+                request_id: target_id,
+                credits: flow.credits,
+            })),
+        };
+        self.send_to_handler(ctx, &handler, token, &service, msg);
+    }
+
+    /// `Cancel{request_id, reason}` from the sender of stream `request_id`: the handler gets
+    /// `Cancel{<id>#1, reason}` (if it was forwarded the request), the stream ends without a
+    /// `ReplyEnd`. Ignored for an unknown id and from anyone but the sender.
+    pub fn on_cancel(&self, ctx: &ContextId, from: &str, cancel: Cancel) {
+        let id = cancel.request_id;
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            if !matches!(
+                pending.get(&id),
+                Some(p @ Pending::Stream(_)) if p.sender() == from && p.context() == ctx
+            ) {
+                tracing::debug!(request_id = %id, from, "cancel for unknown stream ignored");
+                return;
+            }
+            let reason = if cancel.reason.is_empty() {
+                "cancelled by the sender".to_string()
+            } else {
+                cancel.reason
+            };
+            let end = StreamEnd {
+                error: None,
+                tell_sender: false,
+                cancel: Some(reason),
+                outcome: Outcome::Cancelled,
+                relayed: false,
+            };
+            self.close_stream(&mut pending, &id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_stream(closed);
+        }
+    }
+
+    /// The target of stream `id` ended without a part or an end of its own: a hub-side failure
+    /// (`Err`) ends the stream with that error; a unary `Reply{payload}` is relayed as one part
+    /// and the end.
+    fn on_stream_target_result(
+        &self,
+        id: &str,
+        result: Result<Vec<u8>, (crate::proto::Error, Outcome)>,
+    ) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(Pending::Stream(stream)) = pending.get_mut(id) else {
+                return;
+            };
+            let end = match result {
+                Ok(payload) => {
+                    let seq = u64::from(stream.parts);
+                    stream.parts += 1;
+                    let part = ServerMessage {
+                        message: Some(server_message::Message::Part(ReplyPart {
+                            request_id: id.to_string(),
+                            payload,
+                            error: None,
+                            responder_service: stream.handler_service.clone(),
+                            responder_instance: stream.handler.clone(),
+                            seq,
+                        })),
+                    };
+                    stream.relay.deliver(part, &self.metrics);
+                    self.metrics
+                        .stream_part(&stream.handler_service, &stream.type_name);
+                    StreamEnd {
+                        error: None,
+                        tell_sender: true,
+                        cancel: None,
+                        outcome: Outcome::Ok,
+                        relayed: false,
+                    }
+                }
+                Err((mut error, outcome)) => {
+                    error.request_id = id.to_string();
+                    StreamEnd {
+                        error: Some(error),
+                        tell_sender: true,
+                        cancel: None,
+                        outcome,
+                        relayed: outcome == Outcome::HandlerError,
+                    }
+                }
+            };
+            self.close_stream(&mut pending, id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_stream(closed);
+        }
+    }
+
+    /// No part within the idle timeout of stream `id`.
+    fn on_stream_idle(&self, id: &str, timeout: Duration) {
+        let end = StreamEnd {
+            error: Some(crate::proto::Error {
+                request_id: id.to_string(),
+                code: ErrorCode::Timeout as i32,
+                message: format!("no part within {} ms", timeout.as_millis()),
+                details: vec![],
+            }),
+            tell_sender: true,
+            cancel: Some("idle timeout".to_string()),
+            outcome: Outcome::Timeout,
+            relayed: false,
+        };
+        self.end_stream(id, end);
+    }
+
+    /// Stream `id` outlived `KRAKEN_HUB_MAX_STREAM_DURATION`.
+    fn on_stream_max_duration(&self, id: &str, max: Duration) {
+        let message = format!(
+            "max stream duration ({}) exceeded",
+            crate::api::fmt_duration(max)
+        );
+        let end = StreamEnd {
+            error: Some(crate::proto::Error {
+                request_id: id.to_string(),
+                code: ErrorCode::Cancelled as i32,
+                message: message.clone(),
+                details: vec![],
+            }),
+            tell_sender: true,
+            cancel: Some(message),
+            outcome: Outcome::Cancelled,
+            relayed: false,
+        };
+        self.end_stream(id, end);
+    }
+
+    /// Ends stream `id` (if still pending) the way `end` says.
+    fn end_stream(&self, id: &str, end: StreamEnd) {
+        let closed = {
+            let mut pending = self.pending.lock().unwrap();
+            self.close_stream(&mut pending, id, end)
+        };
+        if let Some(closed) = closed {
+            self.finish_stream(closed);
+        }
+    }
+
+    /// Takes stream `id` and its target out of the map and, when due, sends the sender its
+    /// `ReplyEnd` (under the pending lock, so it follows every part).
+    fn close_stream(
+        &self,
+        pending: &mut HashMap<String, Pending>,
+        id: &str,
+        end: StreamEnd,
+    ) -> Option<ClosedStream> {
+        if !matches!(pending.get(id), Some(Pending::Stream(_))) {
+            return None;
+        }
+        let Some(Pending::Stream(mut stream)) = pending.remove(id) else {
+            return None;
+        };
+        let target = match pending.remove(&stream.target_id) {
+            Some(Pending::Unary(u)) if u.part_of.as_ref().is_some_and(|p| p.parent == id) => {
+                Some(u)
+            }
+            Some(other) => {
+                pending.insert(stream.target_id.clone(), other);
+                None
+            }
+            None => None,
+        };
+        if end.tell_sender {
+            let msg = ServerMessage {
+                message: Some(server_message::Message::End(ReplyEnd {
+                    request_id: id.to_string(),
+                    error: end.error.clone(),
+                    parts: stream.parts,
+                    failed: 0,
+                    timed_out: 0,
+                })),
+            };
+            stream.relay.deliver(msg, &self.metrics);
+        }
+        Some(ClosedStream {
+            stream,
+            target,
+            end,
+        })
+    }
+
+    /// Bookkeeping of a closed stream: timers, the target's flow state (and its `Cancel` when
+    /// the handler still streams), metrics, edge, span and log line.
+    fn finish_stream(&self, closed: ClosedStream) {
+        let ClosedStream {
+            stream,
+            target,
+            end,
+        } = closed;
+        stream.idle.abort();
+        stream.max_duration.abort();
+        if let Some(target) = &target {
+            let queued = self.release(&stream.target_id, target);
+            if let Some(reason) = &end.cancel
+                && !queued
+            {
+                self.cancel_target(&stream.context, &stream.target_id, target, reason);
+            }
+        }
+        self.metrics
+            .stream_closed(&stream.handler_service, &stream.handler);
+        let id = stream.target_id.trim_end_matches("#1");
+        record_outcome(&stream.span, end.outcome);
+        if end.outcome != Outcome::Ok {
+            log_outcome(
+                id,
+                &stream.type_name,
+                Some(stream.kind),
+                &stream.sender,
+                Some(&stream.handler),
+                end.outcome,
+                end.relayed,
+            );
+        }
+        let elapsed = stream.started.elapsed();
+        self.metrics.request_finished_mode(
+            stream.kind,
+            &stream.type_name,
+            end.outcome,
+            elapsed,
+            mode_label(RequestMode::Streaming as i32),
+        );
+        self.record_edge_error(
+            Some(&stream.sender_service),
+            &stream.type_name,
+            stream.kind,
+            end.error.is_some(),
+            Some(elapsed),
+        );
+    }
+
+    /// Tells the handler of target `target_id` (forwarded, not answered) to stop, if its session
+    /// negotiated "streaming" (a scatter-gather target's handler may not have; a stream's always
+    /// has).
+    fn cancel_target(&self, ctx: &ContextId, target_id: &str, target: &Unary, reason: &str) {
+        if !self.sessions.negotiated_streaming(ctx, &target.handler) {
+            return;
+        }
+        let service = target
+            .part_of
+            .as_ref()
+            .map(|p| p.service.as_str())
+            .unwrap_or_default();
+        let msg = ServerMessage {
+            message: Some(server_message::Message::Cancel(Cancel {
+                request_id: target_id.to_string(),
+                reason: reason.to_string(),
+            })),
+        };
+        self.send_to_handler(ctx, &target.handler, target.handler_token, service, msg);
+    }
+
+    /// Sends a `Flow` or `Cancel` to the handler session `token` of `handler`: `try_send`, and
+    /// when its buffer is full a background delivery that waits up to
+    /// [`TERMINAL_SEND_TIMEOUT`] for room (a lost `Flow` would stall the stream, a lost `Cancel`
+    /// would leave the handler working for nobody).
+    fn send_to_handler(
+        &self,
+        ctx: &ContextId,
+        handler: &str,
+        token: u64,
+        service: &str,
+        msg: ServerMessage,
+    ) {
+        let Some(tx) = self
+            .sessions
+            .weak_sender_if_current(ctx, handler, token)
+            .and_then(|w| w.upgrade())
+        else {
+            tracing::debug!(
+                instance = handler,
+                "handler gone, dropping multi-part message"
+            );
+            return;
+        };
+        match tx.try_send(Ok(msg)) {
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(msg)) => {
+                let metrics = Arc::clone(&self.metrics);
+                let service = service.to_string();
+                let instance = handler.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send_timeout(msg, TERMINAL_SEND_TIMEOUT).await {
+                        let reason = match e {
+                            SendTimeoutError::Timeout(_) => "buffer still full",
+                            SendTimeoutError::Closed(_) => "stream closed",
+                        };
+                        tracing::warn!(
+                            instance,
+                            service,
+                            reason,
+                            "multi-part message not delivered"
+                        );
+                        metrics.buffer_full(&service);
+                    }
+                });
+            }
+        }
+    }
+
     /// Sends a terminal message (`Reply` or `Error`) to `instance`. `try_send` is the fast path;
     /// when the buffer is full the message is handed to a background delivery that waits up to
     /// [`TERMINAL_SEND_TIMEOUT`] for room, so a terminal message is never dropped just because
@@ -1785,6 +2612,39 @@ impl Router {
                 });
             }
         }
+    }
+}
+
+/// What every rejection of a non-unary request needs: the metrics labels, the log line, the
+/// span and the sender to answer.
+struct ModeContext<'a> {
+    ctx: &'a ContextId,
+    sender: &'a str,
+    id: &'a str,
+    type_name: &'a str,
+    sender_service: Option<&'a str>,
+    mode: &'static str,
+    span: &'a tracing::Span,
+}
+
+/// Ends stream `id` with TIMEOUT once `timeout` passed without activity (a forward or a
+/// relayed part); one task per stream, re-armed from the stream's `last_activity`.
+async fn idle_watch(router: Arc<Router>, id: String, timeout: Duration) {
+    let mut deadline = Instant::now() + timeout;
+    loop {
+        tokio::time::sleep_until(deadline).await;
+        let next = {
+            let pending = router.pending.lock().unwrap();
+            match pending.get(&id) {
+                Some(Pending::Stream(s)) => s.last_activity + timeout,
+                _ => return,
+            }
+        };
+        if next <= Instant::now() {
+            router.on_stream_idle(&id, timeout);
+            return;
+        }
+        deadline = next;
     }
 }
 
@@ -3663,5 +4523,443 @@ mod tests {
             m.histogram_sum("kraken_hub_scatter_targets"),
             Some((1, 3.0))
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    //! Streaming queries (ADR 0017, P4b).
+    use super::*;
+    use crate::proto::{Cancel, Flow, ReplyEnd, ReplyPart, RequestMode};
+    use crate::registry::RegisteredTypes;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use tonic::Status;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
+
+    type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
+
+    fn meta(protocol_version: u32, streaming: bool) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            protocol_version,
+            scatter_gather: protocol_version >= 2,
+            streaming,
+            flow_control: protocol_version >= 2,
+            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
+        }
+    }
+
+    /// Owners A (a1 streaming, a2 without) and B (b1 streaming) of the shared query "q.Find";
+    /// X (x1 streaming, x2 without) owns command "c.Do" and exclusive query "q.Own"; N (n1,
+    /// without streaming) owns "q.Legacy". Senders: s1 ("web", v2, streaming), s-v1 (v1) and
+    /// s-plain (v2 with scatter-gather but without streaming).
+    struct Streams {
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        router: Arc<Router>,
+        rx: HashMap<&'static str, Rx>,
+        tokens: HashMap<&'static str, u64>,
+    }
+
+    impl Streams {
+        fn new() -> Self {
+            Self::with(Config::default(), Metrics::noop())
+        }
+
+        fn with(config: Config, metrics: Arc<Metrics>) -> Self {
+            let registry = Arc::new(Registry::new(config.owner_grace));
+            let sessions = Arc::new(Sessions::new());
+            let router = Router::new(
+                Arc::clone(&registry),
+                Arc::clone(&sessions),
+                Arc::new(config),
+                metrics,
+            );
+            let mut f = Streams {
+                registry,
+                sessions,
+                router,
+                rx: HashMap::new(),
+                tokens: HashMap::new(),
+            };
+            f.connect("s1", "web", meta(2, true), None, 64);
+            f.connect("s-v1", "old", meta(0, false), None, 64);
+            f.connect("s-plain", "plain", meta(2, false), None, 64);
+            for (id, service, streaming) in
+                [("a1", "A", true), ("a2", "A", false), ("b1", "B", true)]
+            {
+                f.connect(id, service, meta(2, streaming), None, 64);
+                f.shared(id, service, &["q.Find"]);
+            }
+            for (id, streaming) in [("x1", true), ("x2", false)] {
+                f.connect(id, "X", meta(2, streaming), None, 64);
+                f.registry
+                    .register(&D, id, "X", &["c.Do".into()], &["q.Own".into()])
+                    .unwrap();
+            }
+            f.connect("n1", "N", meta(2, false), None, 64);
+            f.registry
+                .register(&D, "n1", "N", &[], &["q.Legacy".into()])
+                .unwrap();
+            f
+        }
+
+        /// A session as the stream task opens it: flow state, session, started.
+        fn connect(
+            &mut self,
+            id: &'static str,
+            service: &str,
+            meta: crate::session::SessionMeta,
+            permits: Option<u32>,
+            cap: usize,
+        ) {
+            let token = self.sessions.allocate_token();
+            assert!(self.router.open_session(&D, id, token, service, permits));
+            let (tx, rx) = mpsc::channel(cap);
+            self.sessions
+                .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
+                .unwrap();
+            self.router.start_session(&D, id, token);
+            self.rx.insert(id, rx);
+            self.tokens.insert(id, token);
+        }
+
+        fn shared(&self, id: &str, service: &str, types: &[&str]) {
+            self.registry
+                .register_types(
+                    &D,
+                    id,
+                    service,
+                    &RegisteredTypes {
+                        shared_query_types: types.iter().map(|t| t.to_string()).collect(),
+                        ..RegisteredTypes::default()
+                    },
+                    crate::registry::Placement::default(),
+                )
+                .unwrap();
+        }
+
+        fn leave(&self, id: &str) {
+            crate::service::disconnect(
+                &self.registry,
+                &self.sessions,
+                &self.router,
+                &D,
+                id,
+                self.tokens[id],
+            );
+        }
+
+        fn messages(&mut self, id: &str) -> Vec<server_message::Message> {
+            let mut out = Vec::new();
+            while let Ok(Ok(m)) = self.rx.get_mut(id).unwrap().try_recv() {
+                out.extend(m.message);
+            }
+            out
+        }
+
+        fn requests(&mut self, id: &str) -> Vec<Request> {
+            self.messages(id)
+                .into_iter()
+                .filter_map(|m| match m {
+                    server_message::Message::Request(r) => Some(r),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The handler that got the target of stream `id` (`<id>#1`), with the request.
+        fn target_of(&mut self, id: &str) -> (&'static str, Request) {
+            let target = format!("{id}#1");
+            let handlers: Vec<&'static str> = self.rx.keys().copied().collect();
+            for h in handlers {
+                if let Some(r) = self.requests(h).into_iter().find(|r| r.id == target) {
+                    return (h, r);
+                }
+            }
+            panic!("no handler got {target}");
+        }
+
+        fn part(&self, from: &str, target: &str, seq: u64, payload: &[u8]) {
+            self.router.on_stream_part(
+                &D,
+                from,
+                ReplyPart {
+                    request_id: target.into(),
+                    payload: payload.to_vec(),
+                    seq,
+                    ..ReplyPart::default()
+                },
+            );
+        }
+
+        fn part_error(&self, from: &str, target: &str, seq: u64) {
+            self.router.on_stream_part(
+                &D,
+                from,
+                ReplyPart {
+                    request_id: target.into(),
+                    error: Some(crate::proto::Error {
+                        request_id: target.into(),
+                        code: ErrorCode::HandlerError as i32,
+                        message: "boom".into(),
+                        details: vec![],
+                    }),
+                    seq,
+                    ..ReplyPart::default()
+                },
+            );
+        }
+
+        fn end(&self, from: &str, target: &str, error: Option<ErrorCode>) {
+            self.router.on_stream_end(
+                &D,
+                from,
+                ReplyEnd {
+                    request_id: target.into(),
+                    error: error.map(|code| crate::proto::Error {
+                        request_id: target.into(),
+                        code: code as i32,
+                        message: "failed".into(),
+                        details: vec![],
+                    }),
+                    ..ReplyEnd::default()
+                },
+            );
+        }
+
+        fn flow(&self, from: &str, id: &str, credits: u32) {
+            self.router.on_flow(
+                &D,
+                from,
+                Flow {
+                    request_id: id.into(),
+                    credits,
+                },
+            );
+        }
+
+        fn cancel(&self, from: &str, id: &str, reason: &str) {
+            self.router.on_cancel(
+                &D,
+                from,
+                Cancel {
+                    request_id: id.into(),
+                    reason: reason.into(),
+                },
+            );
+        }
+    }
+
+    fn stream(
+        id: &str,
+        type_name: &str,
+        timeout_ms: u32,
+        credit: u32,
+        max_results: u32,
+    ) -> Request {
+        Request {
+            id: id.into(),
+            kind: RequestKind::Query as i32,
+            r#type: type_name.into(),
+            payload: b"{\"q\":1}".to_vec(),
+            headers: HashMap::from([("traceparent".to_string(), "x".to_string())]),
+            timeout_ms,
+            mode: RequestMode::Streaming as i32,
+            initial_credit: credit,
+            max_results,
+            priority: 3,
+            ..Request::default()
+        }
+    }
+
+    fn part(m: &server_message::Message) -> &ReplyPart {
+        match m {
+            server_message::Message::Part(p) => p,
+            other => panic!("expected a part, got {other:?}"),
+        }
+    }
+
+    fn end(m: &server_message::Message) -> &ReplyEnd {
+        match m {
+            server_message::Message::End(e) => e,
+            other => panic!("expected an end, got {other:?}"),
+        }
+    }
+
+    fn cancel(m: &server_message::Message) -> &Cancel {
+        match m {
+            server_message::Message::Cancel(c) => c,
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+    }
+
+    fn flow(m: &server_message::Message) -> &Flow {
+        match m {
+            server_message::Message::Flow(f) => f,
+            other => panic!("expected a flow, got {other:?}"),
+        }
+    }
+
+    fn error_code(m: &server_message::Message) -> (String, ErrorCode, String) {
+        match m {
+            server_message::Message::Error(e) => {
+                (e.request_id.clone(), e.code(), e.message.clone())
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// `(code, message)` of a `ReplyEnd.error`.
+    fn end_error(e: &ReplyEnd) -> (ErrorCode, String) {
+        let err = e.error.as_ref().expect("an error on the end");
+        (err.code(), err.message.clone())
+    }
+
+    #[tokio::test]
+    async fn a_streaming_query_goes_to_one_capable_instance_with_its_credit() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, r) = f.target_of("st1");
+        assert!(
+            ["a1", "b1"].contains(&h),
+            "a capable owner instance, got {h}"
+        );
+        assert_eq!(r.mode, RequestMode::Streaming as i32);
+        assert_eq!(r.initial_credit, 64, "64 when the sender sent 0");
+        assert_eq!((r.max_results, r.priority), (0, 3));
+        assert_eq!(r.payload, b"{\"q\":1}");
+        assert_eq!(r.headers["traceparent"], "x");
+        assert_eq!(r.r#type, "q.Find");
+        assert!(
+            f.requests("a2").is_empty(),
+            "a2 did not negotiate streaming"
+        );
+        assert_eq!(f.router.in_flight(), 1, "a stream is one request in flight");
+        let (by_instance, total) = f.router.in_flight_by_instance();
+        assert_eq!(total, 1);
+        assert_eq!(by_instance["s1"].as_sender, 1);
+        assert_eq!(by_instance[h].as_handler, 1);
+
+        // The sender's credit is forwarded as is; the capable instances take turns.
+        f.router.route(&D, "s1", stream("st2", "q.Find", 0, 5, 0));
+        let (h2, r2) = f.target_of("st2");
+        assert_eq!(r2.initial_credit, 5);
+        assert_ne!(h, h2, "round-robin among the capable instances");
+
+        // An exclusive type: the owner's capable instance.
+        f.router.route(&D, "s1", stream("st3", "q.Own", 0, 0, 0));
+        assert_eq!(f.target_of("st3").0, "x1");
+        assert!(f.requests("x2").is_empty());
+        assert!(f.messages("s1").is_empty(), "nothing to the sender yet");
+    }
+
+    #[tokio::test]
+    async fn streaming_is_gated_by_version_capability_kind_and_targets() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s-v1", stream("v1", "q.Find", 0, 0, 0));
+        let got = f.messages("s-v1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(error_code(&got[0]).1, ErrorCode::InvalidRequest);
+
+        f.router
+            .route(&D, "s-plain", stream("p1", "q.Find", 0, 0, 0));
+        let (_, code, message) = error_code(&f.messages("s-plain")[0]);
+        assert_eq!(code, ErrorCode::Unsupported);
+        assert!(message.contains("\"streaming\""), "{message}");
+
+        f.router
+            .route(&D, "s1", stream("in-flight", "q.Find", 0, 0, 0));
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                kind: RequestKind::Command as i32,
+                ..stream("cmd", "c.Do", 0, 0, 0)
+            },
+        );
+        f.router.route(&D, "s1", stream("cmd-q", "c.Do", 0, 0, 0));
+        f.router
+            .route(&D, "s1", stream("legacy", "q.Legacy", 0, 0, 0));
+        f.router.route(&D, "s1", stream("nope", "q.Nope", 0, 0, 0));
+        f.router
+            .route(&D, "s1", stream("in-flight", "q.Find", 0, 0, 0));
+        f.router
+            .route(&D, "s1", stream("in-flight#1", "q.Find", 0, 0, 0));
+        f.router.route(
+            &D,
+            "s1",
+            Request {
+                mode: RequestMode::Subscription as i32,
+                ..stream("sub", "q.Find", 0, 0, 0)
+            },
+        );
+        let got = f.messages("s1");
+        let codes: Vec<(String, ErrorCode)> = got
+            .iter()
+            .map(|m| {
+                let (id, code, _) = error_code(m);
+                (id, code)
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("cmd".to_string(), ErrorCode::InvalidRequest),
+                ("cmd-q".to_string(), ErrorCode::InvalidRequest),
+                ("legacy".to_string(), ErrorCode::Unsupported),
+                ("nope".to_string(), ErrorCode::NoHandler),
+                ("in-flight".to_string(), ErrorCode::InvalidRequest),
+                ("in-flight#1".to_string(), ErrorCode::InvalidRequest),
+                ("sub".to_string(), ErrorCode::Unsupported),
+            ]
+        );
+        let legacy = error_code(&got[2]).2;
+        assert!(
+            legacy.contains('N') && legacy.contains("streaming"),
+            "names the service and the capability: {legacy}"
+        );
+        for h in ["a2", "x1", "x2", "n1"] {
+            assert!(f.requests(h).is_empty(), "{h} got nothing");
+        }
+        assert_eq!(f.router.in_flight(), 1, "only the first stream");
+        f.target_of("in-flight");
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_leaves_ends_the_stream_with_handler_disconnected() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.leave(h);
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.request_id, "st1");
+        assert_eq!(end_error(e).0, ErrorCode::HandlerDisconnected);
+        assert_eq!(e.parts, 0);
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_leaves_cancels_the_handler() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
+        let (h, _) = f.target_of("st1");
+        f.leave("s1");
+        let got = f.messages(h);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let c = cancel(&got[0]);
+        assert_eq!(c.request_id, "st1#1");
+        assert!(c.reason.contains("sender"), "{}", c.reason);
+        assert_eq!(f.router.in_flight(), 0);
+        assert!(f.router.in_flight_by_instance().0.is_empty());
+        // Late parts and ends are ignored.
+        f.part(h, "st1#1", 0, b"late");
+        f.end(h, "st1#1", None);
+        assert!(f.messages(h).is_empty());
     }
 }
