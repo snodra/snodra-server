@@ -1652,7 +1652,8 @@ impl Router {
 
     /// Takes gather `id` and its unanswered targets out of the map and sends its `ReplyEnd`
     /// (under the pending lock, so it follows every part). `deadline`: the unanswered targets
-    /// timed out (otherwise `max_results` was reached, or nobody is left).
+    /// timed out (otherwise `max_results` was reached, or nobody is left), so that
+    /// `parts + timed_out` is the number of targets.
     fn close_gather(
         &self,
         pending: &mut HashMap<String, Pending>,
@@ -1664,6 +1665,14 @@ impl Router {
         }
         let Some(Pending::Scatter(mut gather)) = pending.remove(id) else {
             return None;
+        };
+        // Every outstanding target had no part: counted here, before the drain, because one
+        // whose answer is between its two locks (taken out of the map, `on_part` not yet run) is
+        // no longer in the map and its answer is dropped when it finds no gather.
+        let timed_out = if deadline {
+            gather.outstanding.len() as u32
+        } else {
+            0
         };
         let rest: Vec<(String, Unary)> = gather
             .outstanding
@@ -1677,7 +1686,6 @@ impl Router {
                 None => None,
             })
             .collect();
-        let timed_out = if deadline { rest.len() as u32 } else { 0 };
         let end = ServerMessage {
             message: Some(server_message::Message::End(ReplyEnd {
                 request_id: id.to_string(),
@@ -3372,6 +3380,28 @@ mod tests {
         assert_eq!(end_of(&got), (0, 0, 3));
         let e = edge_of(&g.router, "web", "q.Find");
         assert_eq!((e.count, e.errors), (2, 1));
+    }
+
+    /// The two locks of an answer: `on_reply` takes the target out of the map, then `on_part`
+    /// takes the gather. A deadline between the two finds the target outstanding but no longer
+    /// in the map; it still had no part, so it timed out.
+    #[tokio::test]
+    async fn a_target_answered_as_the_deadline_closes_the_gather_is_timed_out() {
+        let mut g = Gather::new();
+        g.router.route(&D, "s1", scatter("g1", "q.Find", 100, 0));
+        let entry = g.router.take_unary("g1#1").expect("a forwarded target");
+        g.router.release("g1#1", &entry);
+        g.router.on_scatter_deadline("g1");
+        g.router.on_part("g1#1", entry, Ok(b"too late".to_vec()));
+        let got = g.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            end_of(&got),
+            (0, 0, 3),
+            "parts + timed_out = targets (failed parts are parts): every target counts once"
+        );
+        assert_eq!(g.router.in_flight(), 0);
+        assert!(g.router.in_flight_by_instance().0.is_empty());
     }
 
     fn end_of(got: &[server_message::Message]) -> (u32, u32, u32) {
