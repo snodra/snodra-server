@@ -519,7 +519,8 @@ umbrella `docs/05-services/hub.md` (Query modes).
   `max_results > 0` parts: `ReplyEnd{parts}` and `Cancel{<id>#1, "max results"}`.
 - **Ending it.** `ClientMessage.cancel = Cancel{<id>, reason}` from the sender: `Cancel{<id>#1,
   reason}` to the handler, nothing more to the sender. No part within `timeout_ms` (the usual
-  rules; from the forward, reset by every part; a queue wait is bounded by it too):
+  rules; from the forward, reset by every part, paused while the sender's credit is exhausted
+  and restarted by the `Flow` that raises it; a queue wait is bounded by it too):
   `ReplyEnd{error = TIMEOUT}` and `Cancel{<id>#1, "idle timeout"}`. Open for
   `KRAKEN_HUB_MAX_STREAM_DURATION`: `ReplyEnd{error = CANCELLED "max stream duration (10m)
   exceeded"}` and a `Cancel` with that reason. Handler gone: `ReplyEnd{error =

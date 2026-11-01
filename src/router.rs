@@ -160,8 +160,10 @@ struct Stream {
     parts: u32,
     /// `Request.max_results`: end after this many parts (0 = no limit).
     max_results: u32,
-    /// When the stream was last active: routed, forwarded to the handler, or a part relayed.
-    /// The idle watch (`timeout_ms` under the usual rules) ends the stream when it gets old.
+    /// When the stream was last active: routed, forwarded to the handler, a part relayed, or
+    /// a `Flow` that raised an exhausted credit. The idle watch (`timeout_ms` under the usual
+    /// rules) ends the stream when it gets old; it does not run while `credit` is 0 (nothing
+    /// can flow until the sender grants more: a slow consumer is no idle handler).
     last_activity: Instant,
     /// The idle watch and the max-duration timer.
     idle: AbortHandle,
@@ -2253,6 +2255,10 @@ impl Router {
                 tracing::debug!(request_id = %id, from, "flow for unknown stream ignored");
                 return;
             };
+            if stream.credit == 0 {
+                // The idle clock was paused while nothing could flow: it starts over now.
+                stream.last_activity = Instant::now();
+            }
             stream.credit = stream.credit.saturating_add(flow.credits);
             let target_id = stream.target_id.clone();
             let token = pending
@@ -2627,8 +2633,10 @@ struct ModeContext<'a> {
     span: &'a tracing::Span,
 }
 
-/// Ends stream `id` with TIMEOUT once `timeout` passed without activity (a forward or a
-/// relayed part); one task per stream, re-armed from the stream's `last_activity`.
+/// Ends stream `id` with TIMEOUT once `timeout` passed without activity (a forward, a relayed
+/// part, or a `Flow` that raised an exhausted credit); one task per stream, re-armed from the
+/// stream's `last_activity`. While the credit is 0 the clock is paused: the watch looks again
+/// after `timeout` (`on_flow` restarts `last_activity` when the credit comes back).
 async fn idle_watch(router: Arc<Router>, id: String, timeout: Duration) {
     let mut deadline = Instant::now() + timeout;
     loop {
@@ -2636,9 +2644,14 @@ async fn idle_watch(router: Arc<Router>, id: String, timeout: Duration) {
         let next = {
             let pending = router.pending.lock().unwrap();
             match pending.get(&id) {
-                Some(Pending::Stream(s)) => s.last_activity + timeout,
+                Some(Pending::Stream(s)) if s.credit == 0 => None,
+                Some(Pending::Stream(s)) => Some(s.last_activity + timeout),
                 _ => return,
             }
+        };
+        let Some(next) = next else {
+            deadline = Instant::now() + timeout;
+            continue;
         };
         if next <= Instant::now() {
             router.on_stream_idle(&id, timeout);
@@ -5456,6 +5469,42 @@ mod stream_tests {
         tokio::time::sleep(Duration::from_millis(11)).await;
         let got = f.messages("s1");
         assert_eq!(end_error(end(&got[0])).0, ErrorCode::Timeout, "{got:?}");
+    }
+
+    /// A consumer slower than the window is no idle handler: the idle clock does not run while
+    /// the sender's credit is exhausted, and starts over when a `Flow` raises it.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_clock_is_paused_while_the_credit_is_exhausted() {
+        let mut f = Streams::new();
+        f.router.route(&D, "s1", stream("st1", "q.Find", 100, 2, 0));
+        let (h, _) = f.target_of("st1");
+        tokio::task::yield_now().await;
+        f.part(h, "st1#1", 1, b"a");
+        f.part(h, "st1#1", 2, b"b");
+        assert_eq!(f.messages("s1").len(), 2, "the window");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = f.messages("s1");
+        assert!(
+            got.is_empty(),
+            "no TIMEOUT while the sender owes credit: {got:?}"
+        );
+        f.flow("s1", "st1", 2);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let got = f.messages("s1");
+        assert!(got.is_empty(), "the clock starts over at the flow: {got:?}");
+        tokio::time::sleep(Duration::from_millis(11)).await;
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = end(&got[0]);
+        assert_eq!(e.parts, 2);
+        assert_eq!(
+            end_error(e),
+            (ErrorCode::Timeout, "no part within 100 ms".to_string())
+        );
+        let got = f.messages(h);
+        assert_eq!(flow(&got[0]).credits, 2);
+        assert_eq!(cancel(&got[1]).reason, "idle timeout");
+        assert_eq!(f.router.in_flight(), 0);
     }
 
     fn candidate(id: &str) -> Candidate {
