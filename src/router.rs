@@ -3059,9 +3059,21 @@ mod tests {
             meta: crate::session::SessionMeta,
             permits: Option<u32>,
         ) {
+            self.connect_with_buffer(id, service, meta, permits, 64);
+        }
+
+        /// [`Gather::connect`] with an outbound buffer of `cap` messages.
+        fn connect_with_buffer(
+            &mut self,
+            id: &'static str,
+            service: &str,
+            meta: crate::session::SessionMeta,
+            permits: Option<u32>,
+            cap: usize,
+        ) {
             let token = self.sessions.allocate_token();
             assert!(self.router.open_session(&D, id, token, service, permits));
-            let (tx, rx) = mpsc::channel(64);
+            let (tx, rx) = mpsc::channel(cap);
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
                 .unwrap();
@@ -3263,6 +3275,49 @@ mod tests {
         // A late or repeated answer changes nothing.
         g.reply("b1", "g1#1", b"again");
         assert!(g.messages("s1").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parts_and_the_end_reach_a_slow_sender_in_order() {
+        let mut g = Gather::new();
+        // A sender whose buffer holds one message: the first part fills it, the rest wait.
+        g.connect_with_buffer("s-slow", "web", scatter_meta(2, true), None, 1);
+        g.router.route(&D, "s-slow", scatter("g1", "q.Find", 0, 0));
+        assert_eq!(
+            g.requests("a1").len() + g.requests("b1").len() + g.requests("b2").len(),
+            3
+        );
+        g.reply("a1", "g1#0", b"zero");
+        g.reply_error("b1", "g1#1");
+        g.reply("b2", "g1#2", b"two");
+        assert_eq!(
+            g.router.in_flight(),
+            0,
+            "the gather ended before the sender drained"
+        );
+        // Drain one message at a time, letting the waiting deliveries run in between.
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let m = tokio::time::timeout(
+                Duration::from_secs(1),
+                g.rx.get_mut("s-slow").unwrap().recv(),
+            )
+            .await
+            .expect("message within the delivery timeout")
+            .unwrap()
+            .unwrap();
+            got.extend(m.message);
+            tokio::task::yield_now().await;
+        }
+        let seqs: Vec<u64> = got[..3].iter().map(|m| part(m).seq).collect();
+        assert_eq!(seqs, [0, 1, 2], "{got:?}");
+        assert_eq!(part(&got[0]).payload, b"zero");
+        assert!(part(&got[1]).error.is_some());
+        assert_eq!(part(&got[2]).payload, b"two");
+        let e = end(&got[3]);
+        assert_eq!((e.parts, e.failed, e.timed_out), (3, 1, 0));
+        tokio::task::yield_now().await;
+        assert!(g.messages("s-slow").is_empty(), "nothing follows the end");
     }
 
     #[tokio::test]
