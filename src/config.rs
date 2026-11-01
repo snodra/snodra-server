@@ -58,6 +58,18 @@ pub struct Config {
     /// `ReplyEnd{error = CANCELLED}` and a `Cancel` to its handler, however active it is.
     /// `KRAKEN_HUB_MAX_STREAM_DURATION`, default 10 minutes, at least 1 s.
     pub max_stream_duration: Duration,
+    /// Updates of a subscription query (ADR 0017, P4c) the hub holds for a sender whose credit
+    /// is exhausted; one more ends the subscription with `RESOURCE_EXHAUSTED`.
+    /// `KRAKEN_HUB_SUBSCRIPTION_BUFFER`, default 256, positive.
+    pub subscription_buffer: usize,
+    /// Subscription targets one handler instance serves at once; a subscription that would
+    /// exceed it on any of its targets is refused with `RESOURCE_EXHAUSTED`.
+    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, default 1024, positive.
+    pub max_subscriptions_per_instance: u32,
+    /// A subscription open for longer than this ends with `ReplyEnd{error = CANCELLED}` and a
+    /// `Cancel` to every target. `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`, default `0` (`None`:
+    /// unlimited); when set, at least 1 s.
+    pub max_subscription_duration: Option<Duration>,
     /// Per-session outbound buffer, in messages. `KRAKEN_HUB_SESSION_BUFFER`, default 1024.
     pub session_buffer: usize,
     /// A new `Connect` stream must send `Register` within this long or it is closed with
@@ -103,6 +115,9 @@ impl Default for Config {
             queue_bytes_total: 512 * 1024 * 1024,
             owner_grace: Duration::from_secs(60),
             max_stream_duration: Duration::from_secs(600),
+            subscription_buffer: 256,
+            max_subscriptions_per_instance: 1024,
+            max_subscription_duration: None,
             session_buffer: 1024,
             handshake_timeout: Duration::from_secs(10),
             dashboard_enabled: true,
@@ -183,6 +198,20 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_MAX_STREAM_DURATION") {
             c.max_stream_duration = parse_duration(&v).context("KRAKEN_HUB_MAX_STREAM_DURATION")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_SUBSCRIPTION_BUFFER") {
+            c.subscription_buffer = v.trim().parse().context("KRAKEN_HUB_SUBSCRIPTION_BUFFER")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE") {
+            c.max_subscriptions_per_instance = v
+                .trim()
+                .parse()
+                .context("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION") {
+            c.max_subscription_duration =
+                Some(parse_duration(&v).context("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION")?)
+                    .filter(|d| !d.is_zero());
+        }
         if let Some(v) = var("KRAKEN_HUB_SESSION_BUFFER") {
             c.session_buffer = v.parse().context("KRAKEN_HUB_SESSION_BUFFER")?;
         }
@@ -242,6 +271,19 @@ impl Config {
                 self.max_stream_duration
             );
         }
+        if self.subscription_buffer == 0 {
+            bail!("KRAKEN_HUB_SUBSCRIPTION_BUFFER must be positive");
+        }
+        if self.max_subscriptions_per_instance == 0 {
+            bail!("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE must be positive");
+        }
+        if let Some(d) = self.max_subscription_duration
+            && d < MIN_MAX_STREAM_DURATION
+        {
+            bail!(
+                "KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION ({d:?}) must be 0 (unlimited) or at least {MIN_MAX_STREAM_DURATION:?}"
+            );
+        }
         if let Some(url) = &self.grafana_url {
             check_link_url(url).context("KRAKEN_HUB_GRAFANA_URL")?;
         }
@@ -298,7 +340,7 @@ const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
 
-/// Below a second a streaming query could never deliver anything.
+/// Below a second a streaming query (or a subscription) could never deliver anything.
 const MIN_MAX_STREAM_DURATION: Duration = Duration::from_secs(1);
 
 /// A URL the dashboard may put in a link: `http://` or `https://` with a host, no user info, no
@@ -771,6 +813,38 @@ mod tests {
             "{err:#}"
         );
         assert!(with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "soon")]).is_err());
+    }
+
+    #[test]
+    fn subscription_settings_default_parse_and_validate() {
+        let c = Config::default();
+        assert_eq!(c.subscription_buffer, 256);
+        assert_eq!(c.max_subscriptions_per_instance, 1024);
+        assert_eq!(c.max_subscription_duration, None, "unlimited by default");
+        let c = with_env(&[
+            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", " 16 "),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "3"),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "2m"),
+        ])
+        .unwrap();
+        assert_eq!(c.subscription_buffer, 16);
+        assert_eq!(c.max_subscriptions_per_instance, 3);
+        assert_eq!(c.max_subscription_duration, Some(Duration::from_secs(120)));
+        let c = with_env(&[("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "0")]).unwrap();
+        assert_eq!(c.max_subscription_duration, None, "0 is unlimited");
+        let c = with_env(&[("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "1s")]).unwrap();
+        assert_eq!(c.max_subscription_duration, Some(Duration::from_secs(1)));
+        for (name, value) in [
+            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", "0"),
+            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", "lots"),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "0"),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "-1"),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "500ms"),
+            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "later"),
+        ] {
+            let err = with_env(&[(name, value)]).unwrap_err();
+            assert!(err.to_string().contains(name), "{name}={value}: {err:#}");
+        }
     }
 
     #[test]

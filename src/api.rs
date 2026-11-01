@@ -476,6 +476,11 @@ pub fn fmt_duration(d: Duration) -> String {
     }
 }
 
+/// [`fmt_duration`] of a bound that may be off: `0` when `None` (the value that unsets it).
+fn optional_duration(d: Option<Duration>) -> String {
+    d.map_or_else(|| "0".to_string(), fmt_duration)
+}
+
 /// `64MiB`, `512KiB`, or plain bytes: the largest exact unit `parse_size` reads back.
 pub fn fmt_size(bytes: usize) -> String {
     for (unit, size) in [("GiB", 1usize << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
@@ -638,6 +643,27 @@ pub fn settings(c: &Config) -> SettingsView {
             Some(fmt_duration(d.max_stream_duration)),
             Plain,
             "a streaming query open for longer ends with CANCELLED and its handler is cancelled",
+        ),
+        setting(
+            "KRAKEN_HUB_SUBSCRIPTION_BUFFER",
+            c.subscription_buffer.to_string(),
+            Some(d.subscription_buffer.to_string()),
+            Plain,
+            "updates held per subscription while its sender owes credit; one more ends it with RESOURCE_EXHAUSTED",
+        ),
+        setting(
+            "KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE",
+            c.max_subscriptions_per_instance.to_string(),
+            Some(d.max_subscriptions_per_instance.to_string()),
+            Plain,
+            "subscription targets one handler instance serves at once; beyond it a new subscription is refused",
+        ),
+        setting(
+            "KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION",
+            optional_duration(c.max_subscription_duration),
+            Some(optional_duration(d.max_subscription_duration)),
+            Plain,
+            "a subscription open for longer ends with CANCELLED and its targets are cancelled; 0: unlimited",
         ),
         setting(
             "KRAKEN_HUB_SESSION_BUFFER",
@@ -1061,11 +1087,27 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 23);
+        assert_eq!(v.settings.len(), 26);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
             Some("10m")
+        );
+        assert_eq!(
+            get("KRAKEN_HUB_SUBSCRIPTION_BUFFER").value.as_deref(),
+            Some("256")
+        );
+        assert_eq!(
+            get("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE")
+                .value
+                .as_deref(),
+            Some("1024")
+        );
+        let m = get("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION");
+        assert_eq!(
+            (m.value.as_deref(), m.default.as_deref()),
+            (Some("0"), Some("0")),
+            "unlimited reads back as the value that unsets it"
         );
         assert_eq!(get("KRAKEN_HUB_ID").default, None);
         let t = get("KRAKEN_HUB_DEFAULT_TIMEOUT_MS");
