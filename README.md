@@ -531,18 +531,21 @@ umbrella `docs/05-services/hub.md` (Query modes).
   shutdown closes every session (as for unary requests). **Builder call:** a unary `Reply` to a
   streaming target is relayed as one part and the end (`Reply{error}` as `ReplyEnd{error}`).
 - **Streaming errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `streaming`
-  `UNSUPPORTED`; a command `INVALID_REQUEST`; no owner `NO_HANDLER`; an owner without a live
-  instance that lists the type and negotiated `streaming` `UNSUPPORTED` (the message names the
-  services and the capability); a duplicate id (`<id>` or `<id>#1`) `INVALID_REQUEST`. The gates
-  apply in that order.
+  `UNSUPPORTED`; a command by request kind `INVALID_REQUEST`; no owner, or no live instance that
+  lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; owners with
+  instances but none that negotiated `streaming` `UNSUPPORTED` (the message names the services
+  and the capability); a duplicate id (`<id>` or `<id>#1`) `INVALID_REQUEST`. The gates apply in
+  that order.
 - **Streaming accounting:** one request in flight (the sender's `inFlightAsSender`, the
   handler's `inFlightAsHandler`, one handler permit from the forward to the end, released on
   every ending path); one count on its edge with the latency to the end (an error when the end
   carries one); `kraken_hub_requests_total{mode="streaming"}` and the duration histogram;
   `kraken_hub_streams_open{service,instance}` (the handler's) and
   `kraken_hub_stream_parts_total{service,type}`.
-- `tests/streaming.rs` drives it over gRPC with raw clients. The client libraries get their
-  streaming APIs in the P4b client slice.
+- `tests/streaming.rs` drives it over gRPC with raw clients. The client APIs are in the
+  libraries' READMEs: [kraken-messaging, Streaming queries](../kraken-messaging/README.md#streaming-queries)
+  (Kotlin) and [kraken-messaging-rs, Streaming queries](../kraken-messaging-rs/README.md#streaming-queries)
+  (Rust).
 
 ### Request timeouts
 
