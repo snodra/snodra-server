@@ -82,6 +82,15 @@ pub struct ScatterTarget {
     pub service: String,
 }
 
+/// The instances a streaming query may go to (ADR 0017, P4b): those of every owner that list
+/// the type, sorted by id, with the rotation counter of the type (shared) or of its service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamPool {
+    pub kind: Kind,
+    pub candidates: Vec<Candidate>,
+    pub rotation: usize,
+}
+
 /// The types one `Register` lists. `shared_query_types` are queries many services may own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
@@ -690,6 +699,63 @@ impl Registry {
             return Err(owner.no_live_instance());
         }
         Ok((owner.kind, targets))
+    }
+
+    /// The candidates of a streaming query: like the unkeyed pool of [`Registry::pick_target`]
+    /// (every live instance of the owner, or of every owner of a shared type, one rotation per
+    /// type), but, as for [`Registry::scatter_targets`], only the instances that list the type
+    /// (a target must serve it). The router keeps those that negotiated "streaming" and chooses
+    /// among them as for any unkeyed request. The type's kind is reported for the router to
+    /// reject a command.
+    pub fn stream_candidates(
+        &self,
+        ctx: &ContextId,
+        type_name: &str,
+    ) -> Result<StreamPool, PickError> {
+        check_context(ctx);
+        let mut inner = self.inner.lock().unwrap();
+        let Inner {
+            types,
+            services,
+            instances,
+        } = &mut *inner;
+        let owner = types.get_mut(type_name).ok_or(PickError::UnknownType)?;
+        let kind = owner.kind;
+        if owner.holders() == 0 {
+            return Err(owner.no_live_instance());
+        }
+        let lists_type = |c: &Candidate| {
+            instances
+                .get(&c.id)
+                .is_some_and(|e| e.types.iter().any(|(t, _)| t == type_name))
+        };
+        let mut candidates: Vec<Candidate> = owner
+            .live_services()
+            .filter_map(|s| services.get(s))
+            .flat_map(|svc| candidates_of(svc, instances))
+            .filter(lists_type)
+            .collect();
+        if candidates.is_empty() {
+            return Err(owner.no_live_instance());
+        }
+        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+        let rotation = if owner.shared {
+            let rotation = owner.rr;
+            owner.rr = owner.rr.wrapping_add(1);
+            rotation
+        } else {
+            let svc = services
+                .get_mut(&owner.first_service())
+                .ok_or_else(|| owner.no_live_instance())?;
+            let rotation = svc.rr;
+            svc.rr = svc.rr.wrapping_add(1);
+            rotation
+        };
+        Ok(StreamPool {
+            kind,
+            candidates,
+            rotation,
+        })
     }
 
     /// The placement an instance registered with (the sender's tags, for tag matching).
@@ -1409,6 +1475,78 @@ mod tests {
             .unwrap();
         assert_eq!(r.scatter_targets(&D, "q.Own").unwrap().1.len(), 2);
         assert_eq!(r.scatter_targets(&D, "q.Other").unwrap().1.len(), 1);
+    }
+
+    /// A streaming query goes to one instance chosen like a point query, but only among the
+    /// instances that list the type (the router then keeps those that negotiated "streaming").
+    #[test]
+    fn stream_candidates_are_the_instances_that_list_the_type_with_one_rotation_per_type() {
+        let r = reg();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        shared(&r, "a1", "A", &["q.Find"]).unwrap();
+        shared(&r, "b2", "B", &["q.Find", "q.New"]).unwrap();
+        r.register_with(
+            &D,
+            "x1",
+            "X",
+            &s(&["c.Do"]),
+            &s(&["q.Own"]),
+            placed(300, &[]),
+        )
+        .unwrap();
+        r.register(&D, "x2", "X", &[], &s(&["q.Own", "q.Other"]))
+            .unwrap();
+        let pool = r.stream_candidates(&D, "q.Find").unwrap();
+        assert_eq!(pool.kind, Kind::Query);
+        let ids: Vec<&str> = pool.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "b1", "b2"], "every owner, sorted by id");
+        let (first, second) = (
+            pool.rotation,
+            r.stream_candidates(&D, "q.Find").unwrap().rotation,
+        );
+        assert_eq!(second, first + 1, "one rotation per shared type");
+        // A rolling deploy: only b2 lists q.New.
+        let ids: Vec<String> = r
+            .stream_candidates(&D, "q.New")
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, ["b2"]);
+        // An exclusive type: the owner's instances that list it, with the placement.
+        let pool = r.stream_candidates(&D, "q.Own").unwrap();
+        assert_eq!(pool.candidates.len(), 2);
+        assert_eq!(pool.candidates[0].load_factor, 300);
+        assert_eq!(
+            r.stream_candidates(&D, "q.Other").unwrap().candidates.len(),
+            1
+        );
+        let (first, second) = (
+            r.stream_candidates(&D, "q.Own").unwrap().rotation,
+            r.stream_candidates(&D, "q.Own").unwrap().rotation,
+        );
+        assert_eq!(
+            second,
+            first + 1,
+            "an exclusive type uses its service's rotation"
+        );
+        // A command reports its kind; the router rejects the mode.
+        assert_eq!(r.stream_candidates(&D, "c.Do").unwrap().kind, Kind::Command);
+        assert_eq!(
+            r.stream_candidates(&D, "q.Nope").unwrap_err(),
+            PickError::UnknownType
+        );
+        // An instance without types (stopping) is no candidate; an owner without one is
+        // "no live instance".
+        r.register(&D, "x1", "X", &[], &[]).unwrap();
+        r.register(&D, "x2", "X", &[], &[]).unwrap();
+        assert_eq!(
+            r.stream_candidates(&D, "q.Own").unwrap_err(),
+            PickError::NoLiveInstance {
+                service: "X".into()
+            }
+        );
     }
 
     #[test]
