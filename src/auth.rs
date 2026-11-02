@@ -31,10 +31,12 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::jwt::{Jwt, JwtError};
 use crate::proto::{Credentials, credentials};
 use crate::telemetry::Metrics;
 
@@ -418,10 +420,32 @@ impl Principal {
     }
 }
 
+/// What one service's JWTs may do (ADR 0019): the `[[service]]` table named after the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEntry {
+    /// The service name, which is the `azp` of its tokens.
+    pub name: String,
+    pub handle: Vec<Pattern>,
+    pub send: Vec<Pattern>,
+    /// Reserved for processor control (roadmap P6); parsed and kept, not used yet.
+    pub control: bool,
+}
+
+impl ServiceEntry {
+    fn rights(&self) -> Rights<'_> {
+        Rights {
+            service: &self.name,
+            handle: &self.handle,
+            send: &self.send,
+        }
+    }
+}
+
 /// The parsed ACL file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Acl {
     entries: Vec<AclEntry>,
+    services: Vec<ServiceEntry>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +453,39 @@ pub struct Acl {
 struct RawAcl {
     #[serde(default)]
     token: Vec<RawEntry>,
+    #[serde(default)]
+    service: Vec<RawService>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawService {
+    name: String,
+    #[serde(default)]
+    handle: Vec<String>,
+    #[serde(default)]
+    send: Vec<String>,
+    #[serde(default)]
+    control: bool,
+    contexts: Option<Vec<String>>,
+}
+
+/// `contexts` other than `["default"]` is an error: contexts are deferred indefinitely.
+fn check_contexts(at: &str, contexts: Option<&Vec<String>>) -> anyhow::Result<()> {
+    if let Some(contexts) = contexts
+        && !(contexts.is_empty() || contexts.iter().all(|c| c == DEFAULT_CONTEXT))
+    {
+        anyhow::bail!(
+            "{at}: contexts other than [\"default\"] are not supported (contexts are deferred)"
+        );
+    }
+    Ok(())
+}
+
+fn parse_patterns(at: &str, what: &str, list: &[String]) -> anyhow::Result<Vec<Pattern>> {
+    list.iter()
+        .map(|p| Pattern::parse(p).map_err(|m| anyhow::anyhow!("{at}: {what}: {m}")))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -467,28 +524,35 @@ impl Acl {
             if e.service.trim().is_empty() {
                 anyhow::bail!("{at}: service must not be empty");
             }
-            if let Some(contexts) = &e.contexts
-                && !(contexts.is_empty() || contexts.iter().all(|c| c == DEFAULT_CONTEXT))
-            {
-                anyhow::bail!(
-                    "{at}: contexts other than [\"default\"] are not supported (contexts are deferred)"
-                );
-            }
-            let patterns = |what: &str, list: &[String]| -> anyhow::Result<Vec<Pattern>> {
-                list.iter()
-                    .map(|p| Pattern::parse(p).map_err(|m| anyhow::anyhow!("{at}: {what}: {m}")))
-                    .collect()
-            };
+            check_contexts(&at, e.contexts.as_ref())?;
             entries.push(AclEntry {
                 digest,
-                handle: patterns("handle", &e.handle)?,
-                send: patterns("send", &e.send)?,
+                handle: parse_patterns(&at, "handle", &e.handle)?,
+                send: parse_patterns(&at, "send", &e.send)?,
                 control: e.control,
                 label: e.label,
                 service: e.service,
             });
         }
-        Ok(Self { entries })
+        let mut services = Vec::with_capacity(raw.service.len());
+        let mut names = HashSet::new();
+        for (n, e) in raw.service.into_iter().enumerate() {
+            let at = format!("service #{} ({})", n + 1, clip(&e.name));
+            if e.name.trim().is_empty() {
+                anyhow::bail!("{at}: name must not be empty");
+            }
+            if !names.insert(e.name.clone()) {
+                anyhow::bail!("{at}: duplicate [[service]] name");
+            }
+            check_contexts(&at, e.contexts.as_ref())?;
+            services.push(ServiceEntry {
+                handle: parse_patterns(&at, "handle", &e.handle)?,
+                send: parse_patterns(&at, "send", &e.send)?,
+                control: e.control,
+                name: e.name,
+            });
+        }
+        Ok(Self { entries, services })
     }
 
     pub fn entries(&self) -> &[AclEntry] {
@@ -507,16 +571,26 @@ impl Acl {
         found
     }
 
-    /// True when some entry is for `service`.
+    /// The `[[service]]` tables.
+    pub fn services(&self) -> &[ServiceEntry] {
+        &self.services
+    }
+
+    /// True when some entry, of either kind, is for `service`.
     pub fn has_service(&self, service: &str) -> bool {
         self.entries.iter().any(|e| e.service == service)
+            || self.services.iter().any(|e| e.name == service)
     }
 
     /// What the entry `key` names grants now, `None` when the file no longer has it.
     pub fn rights(&self, key: &AclKey) -> Option<Rights<'_>> {
         match key {
             AclKey::Token(digest) => self.lookup(digest).map(AclEntry::rights),
-            AclKey::Service(_) => None,
+            AclKey::Service(name) => self
+                .services
+                .iter()
+                .find(|e| e.name == *name)
+                .map(ServiceEntry::rights),
         }
     }
 }
@@ -538,6 +612,8 @@ pub struct Denied {
 pub enum DeniedCode {
     Unauthenticated,
     PermissionDenied,
+    /// The hub cannot decide yet (the JWKS is not loaded): the client retries.
+    Unavailable,
 }
 
 impl Denied {
@@ -554,6 +630,7 @@ impl Denied {
         match self.code {
             DeniedCode::Unauthenticated => Status::unauthenticated(self.message.clone()),
             DeniedCode::PermissionDenied => Status::permission_denied(self.message.clone()),
+            DeniedCode::Unavailable => Status::unavailable(self.message.clone()),
         }
     }
 
@@ -562,6 +639,9 @@ impl Denied {
         match self.code {
             DeniedCode::Unauthenticated => crate::proto::ErrorCode::Unauthenticated,
             DeniedCode::PermissionDenied => crate::proto::ErrorCode::PermissionDenied,
+            // Only a Register or a refresh is ever unavailable, never a request; the nearest
+            // code a request could carry.
+            DeniedCode::Unavailable => crate::proto::ErrorCode::HandlerError,
         }
     }
 }
@@ -637,6 +717,8 @@ pub struct Authorizer {
     path: Option<PathBuf>,
     metrics: Arc<Metrics>,
     limiter: LogLimiter,
+    /// Validates JWT credentials; `None` when `KRAKEN_HUB_JWT_ISSUER` is unset.
+    jwt: Option<Arc<Jwt>>,
 }
 
 impl Authorizer {
@@ -647,6 +729,16 @@ impl Authorizer {
 
     /// An authorizer over an ACL held in memory (no file to reload).
     pub fn with_acl(mode: AuthMode, acl: Acl, metrics: Arc<Metrics>) -> Arc<Self> {
+        Self::with_acl_and_jwt(mode, acl, metrics, None)
+    }
+
+    /// Like [`Authorizer::with_acl`], validating JWT credentials with `jwt`.
+    pub fn with_acl_and_jwt(
+        mode: AuthMode,
+        acl: Acl,
+        metrics: Arc<Metrics>,
+        jwt: Option<Arc<Jwt>>,
+    ) -> Arc<Self> {
         metrics.acl_generation_set(1);
         Arc::new(Self {
             mode,
@@ -655,6 +747,7 @@ impl Authorizer {
             path: None,
             metrics,
             limiter: LogLimiter::default(),
+            jwt,
         })
     }
 
@@ -686,6 +779,7 @@ impl Authorizer {
             acl: RwLock::new(Arc::new(acl)),
             generation: AtomicU64::new(1),
             path: Some(path),
+            jwt: Jwt::from_config(config, Arc::clone(&metrics))?,
             metrics,
             limiter: LogLimiter::default(),
         }))
@@ -693,6 +787,25 @@ impl Authorizer {
 
     pub fn mode(&self) -> AuthMode {
         self.mode
+    }
+
+    /// Makes the key cache ready for the JWT in `credentials` (a rotated key is fetched), so the
+    /// synchronous [`Authorizer::admit`] and [`Authorizer::check_topology`] can judge it. Call it
+    /// first for credentials that came from a client; it does nothing for a token.
+    pub async fn prepare(&self, credentials: Option<&Credentials>) {
+        if let (Some(jwt), Some(credentials::Kind::Jwt(token))) =
+            (&self.jwt, credentials.and_then(|c| c.kind.as_ref()))
+            && self.mode != AuthMode::Off
+        {
+            jwt.ensure_key(token).await;
+        }
+    }
+
+    /// Starts the background fetch of the JWKS, when JWT credentials are configured.
+    pub fn start_jwks(&self, stopping: CancellationToken) {
+        if let Some(jwt) = &self.jwt {
+            jwt.spawn(stopping);
+        }
     }
 
     /// The ACL file being watched, if any.
@@ -815,11 +928,10 @@ impl Authorizer {
                     )),
                 }
             }
-            Some(credentials::Kind::Jwt(_)) => denials.push(Denied::new(
-                "jwt_unsupported",
-                DeniedCode::Unauthenticated,
-                "jwt credentials are not supported by this hub yet",
-            )),
+            Some(credentials::Kind::Jwt(token)) => match self.resolve_jwt(&acl, token, service) {
+                Ok(found) => matched = Some(found),
+                Err(found) => denials.extend(found),
+            },
             Some(credentials::Kind::Token(_)) | None => denials.push(Denied::new(
                 "no_credentials",
                 DeniedCode::Unauthenticated,
@@ -876,6 +988,57 @@ impl Authorizer {
             refused: (self.mode == AuthMode::Enforce)
                 .then(|| denials.into_iter().next())
                 .flatten(),
+        }
+    }
+
+    /// What a JWT credential resolves to: the principal and the entry's rights when it is valid
+    /// and its service has an entry (the entry's own checks follow in [`Authorizer::admit`]), the
+    /// denials otherwise. A token for service A presented by a `Register` for service B names
+    /// both, before it says whether A has an entry.
+    fn resolve_jwt<'a>(
+        &self,
+        acl: &'a Acl,
+        token: &str,
+        service: &str,
+    ) -> Result<(Principal, Rights<'a>), Vec<Denied>> {
+        let Some(jwt) = &self.jwt else {
+            return Err(vec![Denied::new(
+                "jwt_not_configured",
+                DeniedCode::Unauthenticated,
+                "jwt credentials are not configured on this hub",
+            )]);
+        };
+        let verified = jwt.verify(token).map_err(|e| {
+            vec![match e {
+                JwtError::NotLoaded => {
+                    Denied::new("jwks_unavailable", DeniedCode::Unavailable, e.message())
+                }
+                _ => Denied::new("jwt_invalid", DeniedCode::Unauthenticated, e.message()),
+            }]
+        })?;
+        let principal = Principal {
+            key: AclKey::Service(verified.azp.clone()),
+            service: verified.azp,
+            expires_at: Some(verified.expires_at),
+        };
+        match acl.rights(&principal.key) {
+            Some(rights) => Ok((principal, rights)),
+            None => {
+                let mut denials = Vec::new();
+                if principal.service != service {
+                    denials.push(Denied::new(
+                        "wrong_service",
+                        DeniedCode::PermissionDenied,
+                        format!(
+                            "token azp {} is not service {}",
+                            clip(&principal.service),
+                            clip(service)
+                        ),
+                    ));
+                }
+                denials.push(entry_gone(&principal.key));
+                Err(denials)
+            }
         }
     }
 
@@ -1623,11 +1786,11 @@ contexts = ["default"]
             kind: Some(credentials::Kind::Jwt("a.b.c".into())),
         };
         let d = refused(Some(jwt), true, "billing", &[]);
-        assert_eq!(d.reason, "jwt_unsupported");
         assert_eq!(
-            d.message,
-            "jwt credentials are not supported by this hub yet"
+            (d.reason, d.code),
+            ("jwt_not_configured", DeniedCode::Unauthenticated)
         );
+        assert_eq!(d.message, "jwt credentials are not configured on this hub");
         let d = refused(Some(token("tok-billing")), true, "orders", &[]);
         assert_eq!(
             (d.reason, d.code),
@@ -1900,5 +2063,422 @@ contexts = ["default"]
             AuthMode::Permissive
         );
         assert!("strict".parse::<AuthMode>().is_err());
+    }
+
+    // ---- [[service]] tables (ADR 0019) ----
+
+    fn service_acl_text() -> String {
+        format!(
+            r#"{tokens}
+[[service]]
+name = "billing"
+handle = ["billing.*", "shared.Ping"]
+send = ["orders.*"]
+control = true
+contexts = ["default"]
+
+[[service]]
+name = "orders"
+handle = ["*"]
+"#,
+            tokens = acl_text()
+        )
+    }
+
+    #[test]
+    fn service_tables_parse_with_the_token_pattern_semantics() {
+        let acl = Acl::parse(&service_acl_text()).unwrap();
+        let rights = acl.rights(&AclKey::Service("billing".into())).unwrap();
+        assert_eq!(rights.service, "billing");
+        assert!(any_matches(rights.handle, "billing.Pay"));
+        assert!(any_matches(rights.handle, "shared.Ping"));
+        assert!(!any_matches(rights.handle, "billing"));
+        assert!(any_matches(rights.send, "orders.Place"));
+        assert!(!any_matches(rights.send, "admin.Wipe"));
+        assert!(acl.rights(&AclKey::Service("nobody".into())).is_none());
+        // A file of service tables alone is a valid ACL.
+        let only = Acl::parse("[[service]]\nname = \"x\"\nsend = [\"*\"]\n").unwrap();
+        assert!(only.entries().is_empty());
+        assert!(only.rights(&AclKey::Service("x".into())).is_some());
+        // Two ACLs that differ only in a service table differ (a reload must notice).
+        assert_ne!(Acl::parse(&acl_text()).unwrap(), acl);
+    }
+
+    #[test]
+    fn token_entries_never_apply_to_jwts_and_service_entries_never_to_tokens() {
+        let acl = Acl::parse(&service_acl_text()).unwrap();
+        // `billing` is both a token entry's service and a [[service]] name; each key reaches
+        // only its own table.
+        let by_token = acl.rights(&tok("tok-billing", "billing").key).unwrap();
+        assert!(any_matches(by_token.handle, "billing.Pay"));
+        let token_only = Acl::parse(&acl_text()).unwrap();
+        assert!(
+            token_only
+                .rights(&AclKey::Service("billing".into()))
+                .is_none(),
+            "a token entry does not make a service entry"
+        );
+        let service_only = Acl::parse("[[service]]\nname = \"billing\"\n").unwrap();
+        assert!(
+            service_only
+                .rights(&tok("tok-billing", "billing").key)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_service_tables_are_errors() {
+        assert!(
+            Acl::parse("[[service]]\nname = \"a\"\n").is_ok(),
+            "the control parses"
+        );
+        for (bad, why) in [
+            ("[[service]]\n", "a name is required"),
+            ("[[service]]\nname = \"\"\n", "an empty name"),
+            ("[[service]]\nname = \"  \"\n", "a blank name"),
+            (
+                "[[service]]\nname = \"a\"\n[[service]]\nname = \"a\"\n",
+                "duplicates",
+            ),
+            (
+                "[[service]]\nname = \"a\"\nsnd = [\"x\"]\n",
+                "an unknown key",
+            ),
+            (
+                "[[service]]\nname = \"a\"\nlabel = \"x\"\n",
+                "no label on a service",
+            ),
+            (
+                "[[service]]\nname = \"a\"\ntoken_sha256 = \"00\"\n",
+                "no token key",
+            ),
+            (
+                "[[service]]\nname = \"a\"\nsend = [\"a*\"]\n",
+                "a bad pattern",
+            ),
+            (
+                "[[service]]\nname = \"a\"\nhandle = [\"x y\"]\n",
+                "whitespace",
+            ),
+            (
+                "[[service]]\nname = \"a\"\ncontexts = [\"other\"]\n",
+                "contexts",
+            ),
+        ] {
+            assert!(Acl::parse(bad).is_err(), "{why} should be an error");
+        }
+        // A `[[token]]` stays strict about a service-only key.
+        assert!(Acl::parse("[[token]]\nname = \"a\"\n").is_err());
+    }
+
+    // ---- JWT admission ----
+
+    use crate::jwt::test_support::{JwksServer, Signer, claims};
+
+    const ISS: &str = "https://sso.example/realms/kraken";
+
+    struct JwtFx {
+        auth: Arc<Authorizer>,
+        m: crate::telemetry::test_support::TestMetrics,
+        server: JwksServer,
+        key: Signer,
+        _stop: tokio_util::sync::DropGuard,
+    }
+
+    async fn jwt_fx(mode: AuthMode) -> JwtFx {
+        let key = Signer::es256("k1");
+        let server = JwksServer::start(&[&key]).await;
+        let config = Config {
+            jwt_issuer: Some(ISS.into()),
+            jwt_jwks_uri: Some(server.url()),
+            jwks_refetch_interval: Duration::from_millis(100),
+            ..Config::default()
+        };
+        let m = test_metrics();
+        let jwt = Jwt::from_config(&config, m.metrics.clone()).unwrap();
+        let stop = CancellationToken::new();
+        jwt.as_ref().unwrap().spawn(stop.clone());
+        let a = Authorizer::with_acl_and_jwt(
+            mode,
+            Acl::parse(&service_acl_text()).unwrap(),
+            m.metrics.clone(),
+            jwt.clone(),
+        );
+        let jwt = jwt.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !jwt.is_loaded() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the keys never loaded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        JwtFx {
+            auth: a,
+            m,
+            server,
+            key,
+            _stop: stop.drop_guard(),
+        }
+    }
+
+    fn jwt_creds(token: String) -> Credentials {
+        Credentials {
+            kind: Some(credentials::Kind::Jwt(token)),
+        }
+    }
+
+    impl JwtFx {
+        fn token(&self, azp: &str, exp_in: i64) -> Credentials {
+            jwt_creds(self.key.sign(&claims(ISS, azp, exp_in)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_jwt_registers_with_the_rights_of_its_service_entry() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let creds = fx.token("billing", 300);
+        let adm = fx.auth.admit(
+            Some(&creds),
+            true,
+            "billing",
+            &types(&["billing.Pay", "shared.Ping"]),
+        );
+        assert_eq!(adm.refused, None);
+        let p = adm.principal.expect("a principal");
+        assert_eq!(p.kind(), CredentialKind::Jwt);
+        assert_eq!(p.key, AclKey::Service("billing".into()));
+        assert_eq!(p.service, "billing");
+        assert!(p.expires_at.is_some_and(|t| t > SystemTime::now()));
+        assert_eq!(
+            adm.status,
+            AuthStatus::Authenticated {
+                service: "billing".into()
+            }
+        );
+        // The rights are the [[service]] table's, not the [[token]] table's: the token entry
+        // for `billing` has `billing.*` too, so tell them apart by a type only one grants.
+        let adm = fx
+            .auth
+            .admit(Some(&creds), true, "billing", &types(&["x.Only"]));
+        assert_eq!(adm.refused.expect("refused").reason, "handle_denied");
+    }
+
+    #[tokio::test]
+    async fn a_jwt_for_another_service_is_refused_naming_both() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let adm = fx
+            .auth
+            .admit(Some(&fx.token("orders", 300)), true, "billing", &[]);
+        let d = adm.refused.expect("refused");
+        assert_eq!(
+            (d.reason, d.code),
+            ("wrong_service", DeniedCode::PermissionDenied)
+        );
+        assert_eq!(d.message, "token azp orders is not service billing");
+        // An azp the ACL does not know says so, after the mismatch.
+        let adm = fx
+            .auth
+            .admit(Some(&fx.token("ghost", 300)), true, "billing", &[]);
+        assert_eq!(adm.refused.unwrap().reason, "wrong_service");
+    }
+
+    #[tokio::test]
+    async fn a_jwt_for_a_service_without_an_entry_is_refused() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        // `web` has a token elsewhere in the file but no [[service]] table; the user-token case
+        // (azp = the frontend client) is the same refusal.
+        for service in ["ghost", "kraken-frontend"] {
+            let adm = fx
+                .auth
+                .admit(Some(&fx.token(service, 300)), true, service, &[]);
+            let d = adm.refused.expect("refused");
+            assert_eq!(
+                (d.reason, d.code),
+                ("no_acl_entry", DeniedCode::PermissionDenied)
+            );
+            assert_eq!(d.message, format!("no ACL entry for service {service}"));
+            assert!(adm.principal.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_jwt_is_unauthenticated_and_never_echoed() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let expired = fx.token("billing", -120);
+        let d = fx
+            .auth
+            .admit(Some(&expired), true, "billing", &[])
+            .refused
+            .unwrap();
+        assert_eq!(
+            (d.reason, d.code),
+            ("jwt_invalid", DeniedCode::Unauthenticated)
+        );
+        assert_eq!(d.message, "token expired");
+        let wrong_key = jwt_creds(Signer::es256("k1").sign(&claims(ISS, "billing", 300)));
+        let d = fx
+            .auth
+            .admit(Some(&wrong_key), true, "billing", &[])
+            .refused
+            .unwrap();
+        assert_eq!(d.message, "invalid token signature");
+        let junk = jwt_creds("a.b.c".into());
+        let d = fx
+            .auth
+            .admit(Some(&junk), true, "billing", &[])
+            .refused
+            .unwrap();
+        assert_eq!(d.message, "malformed token");
+        assert_eq!(d.to_status().code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            fx.m.counter("kraken_hub_jwt_validations_total", "result", "expired"),
+            Some(1)
+        );
+        // Labels are fixed strings.
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn before_the_keys_load_a_jwt_is_unavailable() {
+        let server = JwksServer::unbound(JwksServer::reserve().await);
+        let config = Config {
+            jwt_issuer: Some(ISS.into()),
+            jwt_jwks_uri: Some(server.url()),
+            ..Config::default()
+        };
+        let m = test_metrics();
+        let jwt = Jwt::from_config(&config, m.metrics.clone()).unwrap();
+        let a = Authorizer::with_acl_and_jwt(
+            AuthMode::Enforce,
+            Acl::parse(&service_acl_text()).unwrap(),
+            m.metrics.clone(),
+            jwt,
+        );
+        let key = Signer::es256("k1");
+        let creds = jwt_creds(key.sign(&claims(ISS, "billing", 300)));
+        a.prepare(Some(&creds)).await;
+        let d = a.admit(Some(&creds), true, "billing", &[]).refused.unwrap();
+        assert_eq!(
+            (d.reason, d.code),
+            ("jwks_unavailable", DeniedCode::Unavailable)
+        );
+        assert_eq!(d.message, "jwks not loaded yet");
+        assert_eq!(d.to_status().code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_rotated_key_is_fetched_before_the_register_is_judged() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let rotated = Signer::es256("k2");
+        fx.server.serve(&[&rotated]);
+        let creds = jwt_creds(rotated.sign(&claims(ISS, "billing", 300)));
+        // Without the async step the sync check cannot know the key.
+        assert_eq!(
+            fx.auth
+                .admit(Some(&creds), true, "billing", &[])
+                .refused
+                .unwrap()
+                .message,
+            "unknown signing key"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fx.auth.prepare(Some(&creds)).await;
+        assert_eq!(
+            fx.auth.admit(Some(&creds), true, "billing", &[]).refused,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_counts_a_bad_jwt_and_lets_the_session_in_unauthenticated() {
+        let fx = jwt_fx(AuthMode::Permissive).await;
+        let adm = fx
+            .auth
+            .admit(Some(&fx.token("billing", -120)), true, "billing", &[]);
+        assert_eq!(adm.refused, None);
+        assert_eq!(adm.principal, None);
+        assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            Some(1)
+        );
+        // A valid one for the right service is authenticated.
+        let adm = fx
+            .auth
+            .admit(Some(&fx.token("billing", 300)), true, "billing", &[]);
+        assert!(adm.principal.is_some());
+    }
+
+    #[tokio::test]
+    async fn requests_and_reloads_judge_a_jwt_session_by_its_service_entry() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let adm = fx
+            .auth
+            .admit(Some(&fx.token("billing", 300)), true, "billing", &[]);
+        let p = adm.principal.unwrap();
+        assert!(
+            fx.auth
+                .check_send(Some(&p), "billing", "orders.Place")
+                .is_ok()
+        );
+        let d = fx
+            .auth
+            .check_send(Some(&p), "billing", "admin.Wipe")
+            .unwrap_err();
+        assert_eq!(d.reason, "send_denied");
+        assert!(
+            fx.auth
+                .recheck(Some(&p), "billing", &types(&["billing.Pay"]))
+                .is_empty()
+        );
+        assert_eq!(
+            fx.auth.recheck(Some(&p), "billing", &types(&["x.Y"]))[0].reason,
+            "handle_denied"
+        );
+        // The entry leaves the file: PERMISSION_DENIED, whatever the token still says.
+        let without = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse(&acl_text()).unwrap(),
+            fx.m.metrics.clone(),
+        );
+        let gone = without.recheck(Some(&p), "billing", &[]);
+        assert_eq!(
+            (gone[0].reason, gone[0].code),
+            ("no_acl_entry", DeniedCode::PermissionDenied)
+        );
+        assert_eq!(gone[0].message, "no ACL entry for service billing");
+        assert_eq!(
+            without
+                .check_send(Some(&p), "billing", "orders.Place")
+                .unwrap_err()
+                .reason,
+            "no_acl_entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_service_label_knows_the_names_of_service_tables() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let _ = fx.auth.admit(
+            Some(&fx.token("billing", 300)),
+            true,
+            "billing",
+            &types(&["x.Y"]),
+        );
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
+            Some(1)
+        );
+        let _ = fx
+            .auth
+            .admit(Some(&fx.token("ghost", 300)), true, "ghost", &[]);
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
+            Some(1)
+        );
     }
 }
