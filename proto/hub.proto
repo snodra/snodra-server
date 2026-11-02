@@ -111,7 +111,7 @@ message Register {
   // "instance-status" (ClientMessage.status) and "scatter-gather" (Request.mode SCATTER_GATHER,
   // ReplyPart, ReplyEnd).
   repeated string capabilities = 6;
-  // Accepted and ignored until hub access control ships (roadmap P5). Never logged.
+  // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
   // Flow control: requests the hub may forward before the next Permits message. Honoured only
   // when the session shares the "flow-control" capability; 0 (or no flow-control) means
@@ -165,7 +165,8 @@ message InstanceStatus {
   reserved 3;
 }
 
-// How a client authenticates itself to the hub. Carried on Register; ignored until P5.
+// How a client authenticates itself to the hub. Carried on Register (ADR 0018): token since
+// P5a; jwt is refused with UNAUTHENTICATED until P5b.
 message Credentials {
   oneof kind {
     // Static pre-shared token.
@@ -254,7 +255,7 @@ message Request {
   // keep arrival order. 0 is the default. Queued requests keep their own deadline.
   int32 priority = 9;
   // Field 10 is allocated to a later roadmap phase (contexts).
-  // Streaming (P4b): credits the sender grants before its first Flow. Ignored until P4b.
+  // Streaming and subscriptions: credits the sender grants before its first Flow.
   uint32 initial_credit = 11;
   // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
   // remaining targets are dropped; the targets are not cancelled.
