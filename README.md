@@ -617,10 +617,11 @@ umbrella `docs/05-services/hub.md` (Query modes).
   and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
   the max duration before the initial part; `kraken_hub_subscription_updates_total{service,type}`
   per update relayed. A subscription that ends after its initial part counts nothing more.
-- `tests/subscription.rs` drives it over gRPC with raw clients. TODO (P4c client slice): the
-  client APIs (`queryBus.subscribe`, `QueryUpdateEmitter`, the Rust equivalents) are not shipped
-  yet; today's libraries do not declare `subscription`, so a hub never sends them one and a
-  sender gets `UNSUPPORTED` naming the owners.
+- `tests/subscription.rs` drives it over gRPC with raw clients. The client libraries declare
+  `subscription` and implement the sender and handler sides; their READMEs:
+  [kraken-messaging, Subscription queries](../kraken-messaging/README.md#subscription-queries)
+  (Kotlin) and [kraken-messaging-rs, Subscription queries](../kraken-messaging-rs/README.md#subscription-queries)
+  (Rust).
 
 ### Request timeouts
 
