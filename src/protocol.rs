@@ -5,11 +5,32 @@
 //! applies the short heartbeat timeout. Version 1 was never defined and reads as v1; versions
 //! above 2 are answered as 2.
 
+use std::fmt;
 use std::time::Duration;
 
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::{RegisterAck, ServerMessage, server_message};
+
+/// Never prints the token or the JWT: the kind and `"***"`. The generated `Debug` is skipped for
+/// `Credentials` and its oneof in `build.rs`, because `Register` and `ClientMessage` print it too.
+impl fmt::Debug for crate::proto::Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for crate::proto::credentials::Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::proto::credentials::Kind;
+        match self {
+            Kind::Token(_) => f.debug_tuple("Token").field(&"***").finish(),
+            Kind::Jwt(_) => f.debug_tuple("Jwt").field(&"***").finish(),
+        }
+    }
+}
 
 /// The protocol version this hub implements.
 pub const HUB_PROTOCOL_VERSION: u32 = 2;
@@ -191,5 +212,57 @@ mod tests {
         assert!(shares(&client, FLOW_CONTROL));
         assert!(!shares(&["made-up".to_string()], FLOW_CONTROL));
         assert!(!shares(&client, "made-up"));
+    }
+
+    #[test]
+    fn credentials_and_register_never_print_the_token_in_debug() {
+        use crate::proto::{ClientMessage, Credentials, Register, client_message, credentials};
+        for (kind, secret) in [
+            (
+                credentials::Kind::Token("s3cret-static-token".into()),
+                "s3cret-static-token",
+            ),
+            (
+                credentials::Kind::Jwt("eyJhbGciOi.payload.sig".into()),
+                "eyJhbGciOi.payload.sig",
+            ),
+        ] {
+            let credentials = Credentials { kind: Some(kind) };
+            let register = Register {
+                service_name: "orders".into(),
+                instance_id: "i1".into(),
+                credentials: Some(credentials.clone()),
+                ..Register::default()
+            };
+            let message = ClientMessage {
+                message: Some(client_message::Message::Register(register.clone())),
+            };
+            for text in [
+                format!("{credentials:?}"),
+                format!("{register:?}"),
+                format!("{message:?}"),
+                format!("{register:#?}"),
+            ] {
+                assert!(!text.contains(secret), "{text}");
+                assert!(text.contains("***"), "{text}");
+            }
+            // The kind stays visible, and the rest of the Register still prints.
+            let text = format!("{register:?}");
+            assert!(text.contains("orders") && text.contains("i1"), "{text}");
+        }
+        let text = format!(
+            "{:?}",
+            Credentials {
+                kind: Some(credentials::Kind::Token("x".into()))
+            }
+        );
+        assert!(text.contains("Token"), "{text}");
+        let text = format!(
+            "{:?}",
+            Credentials {
+                kind: Some(credentials::Kind::Jwt("x".into()))
+            }
+        );
+        assert!(text.contains("Jwt"), "{text}");
     }
 }
