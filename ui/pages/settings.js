@@ -29,7 +29,7 @@ export default {
         h('div', { class: 'card-head' }, h('h2', null, 'Configuration'),
           h('span', { class: 'meta' }, 'Environment variables as the hub applied them. Read-only: change them in the deployment and restart.')),
         body,
-        h('p', { class: 'note' }, 'Secret settings are listed by name only; their values never leave the hub. The hub has none in this phase.')));
+        h('p', { class: 'note' }, 'Secret settings (the dashboard tokens) are listed by name only; their values never leave the hub. ACL tokens are not settings: the ACL file holds their digests.')));
 
     return {
       update({ settings, version: v }) {

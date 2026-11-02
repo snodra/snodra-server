@@ -22,6 +22,7 @@
     <div class="top-actions">
       <span class="live" id="live" role="status" data-state="connecting">Connecting</span>
       <a class="ext" id="grafana" hidden target="_blank" rel="noopener noreferrer">Grafana</a>
+      <button type="button" id="signout" hidden>Sign out</button>
     </div>
   </header>
   <nav class="tabs" aria-label="Dashboard pages">
@@ -32,8 +33,8 @@
     <p class="empty">Loading</p>
   </main>
   <footer class="foot">
-    Read-only dashboard. It has no authentication in this phase: keep the hub's HTTP port on the
-    private network. A dashboard token arrives with phase 5a.
+    Read-only dashboard. Without KRAKEN_HUB_DASHBOARD_TOKEN it has no authentication: keep the hub's
+    HTTP port on the private network, or set the token.
   </footer>
   <noscript><p class="empty">The dashboard needs JavaScript. The same data is at <code>/api/v1/topology</code>.</p></noscript>
 </body>

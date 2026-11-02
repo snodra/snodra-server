@@ -1,10 +1,12 @@
 // Live updates: the hub's server-sent `summary` events, with polling as the fallback while the
-// stream is unavailable (old proxies, too many open streams, a restarting hub).
+// stream is unavailable (old proxies, too many open streams, a restarting hub). The stream is
+// read with fetch (see readStream in api.js) so the dashboard token stays in a header.
 
-import { get, streamUrl } from './api.js';
+import { AuthError, canStream, get, readStream } from './api.js';
 
 const POLL_MS = 2000;
 const STREAM_RETRY_MS = 15000;
+const STREAM_RECONNECT_MS = 3000;
 
 /** A summary like the stream's, from a topology snapshot (the polling fallback). */
 function fromTopology(t) {
@@ -14,10 +16,12 @@ function fromTopology(t) {
 
 /**
  * Calls `onSummary(summary)` for every update and `onState(state)` with
- * live | polling | offline whenever the connection state changes.
+ * live | polling | offline whenever the connection state changes. Returns `{ restart }`, which
+ * starts over (after the reader entered a dashboard token, or to leave the polling fallback).
  */
 export function startLive({ onSummary, onState }) {
-  let source = null;
+  let controller = null;
+  let retryTimer = null;
   let pollTimer = null;
   let state = null;
 
@@ -53,37 +57,59 @@ export function startLive({ onSummary, onState }) {
     pollTimer = null;
   };
 
-  const connect = () => {
-    if (typeof EventSource !== 'function') {
+  const retryIn = (ms) => {
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, ms);
+  };
+
+  async function connect() {
+    if (!canStream()) {
       startPolling();
       return;
     }
-    source = new EventSource(streamUrl());
-    source.addEventListener('open', () => {
-      stopPolling();
-      setState('live');
-    });
-    source.addEventListener('summary', (event) => {
-      let summary;
-      try {
-        summary = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-      stopPolling();
-      setState('live');
-      onSummary(summary);
-    });
-    source.addEventListener('error', () => {
-      // CONNECTING: the browser retries by itself; poll meanwhile. CLOSED (for example a 503
-      // when too many streams are open): poll, and try the stream again later.
+    controller = new AbortController();
+    const mine = controller;
+    try {
+      await readStream({
+        signal: mine.signal,
+        onOpen: () => {
+          stopPolling();
+          setState('live');
+        },
+        onEvent: (name, data) => {
+          if (name !== 'summary') return;
+          let summary;
+          try {
+            summary = JSON.parse(data);
+          } catch {
+            return;
+          }
+          stopPolling();
+          setState('live');
+          onSummary(summary);
+        },
+      });
+      // The hub ended the stream (it restarts, or a proxy cut it): poll, then reconnect.
       startPolling();
-      if (source.readyState === EventSource.CLOSED) {
-        source = null;
-        setTimeout(connect, STREAM_RETRY_MS);
-      }
-    });
-  };
+      retryIn(STREAM_RECONNECT_MS);
+    } catch (error) {
+      if (mine.signal.aborted) return;
+      // 401: the page asks for a token and restarts the stream; no polling would work either.
+      if (error instanceof AuthError) return;
+      // A 503 (too many open streams) or a network error: poll, and try the stream again later.
+      startPolling();
+      retryIn(STREAM_RETRY_MS);
+    }
+  }
 
   connect();
+
+  return {
+    restart() {
+      controller?.abort();
+      clearTimeout(retryTimer);
+      stopPolling();
+      connect();
+    },
+  };
 }

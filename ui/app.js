@@ -6,6 +6,7 @@ import * as fmt from './format.js';
 import { hideTip } from './graph.js';
 import * as hubs from './hubs.js';
 import { startLive } from './live.js';
+import { showLogin } from './login.js';
 import overview from './pages/overview.js';
 import services from './pages/services.js';
 import settings from './pages/settings.js';
@@ -58,6 +59,8 @@ let lastRevision = null;
 let version = null;
 let lastUpdate = null;
 let scope = readScope();
+let live = null;
+let signedOut = false;
 
 function readScope() {
   try {
@@ -222,9 +225,38 @@ async function loadVersion() {
     version = await api.get('version');
     hubs.configure(version);
     renderHeader(null);
-  } catch {
-    fill($('hub-meta'), h('div', null, h('dd', null, 'hub unreachable')));
+  } catch (error) {
+    // A 401 already showed the sign-in form (see `api.onUnauthorized` below).
+    if (!(error instanceof api.AuthError)) {
+      fill($('hub-meta'), h('div', null, h('dd', null, 'hub unreachable')));
+    }
   }
+}
+
+/** The hub wants a dashboard token: ask for it, then start the page over. */
+function askForToken() {
+  if (signedOut) return;
+  signedOut = true;
+  api.clearToken();
+  $('signout').hidden = true;
+  fill($('hub-meta'));
+  showLogin(main, async (value) => {
+    api.setToken(value);
+    try {
+      await api.get('version');
+    } catch (error) {
+      api.clearToken();
+      return error instanceof api.AuthError ? 'The hub did not accept that token.' : `Could not reach the hub (${error.message}).`;
+    }
+    signedOut = false;
+    main.replaceChildren(errorSlot, content);
+    $('signout').hidden = false;
+    await loadVersion();
+    mount();
+    if (!(route.page.live && allHubs())) hubs.check();
+    live?.restart();
+    return null;
+  });
 }
 
 function showBanner(text, action) {
@@ -257,7 +289,13 @@ function onState(state) {
   }[state];
 }
 
+api.onUnauthorized(askForToken);
 hubs.onChange(renderHubs);
+$('signout').hidden = !api.hasToken();
+$('signout').addEventListener('click', () => {
+  api.clearToken();
+  location.reload();
+});
 // The header keeps the peers' reachability current; a page that merges the hubs reads them on
 // every refresh anyway.
 setInterval(() => {
@@ -277,4 +315,4 @@ loadVersion().then(() => {
   mount();
   if (!(route.page.live && allHubs())) hubs.check();
 });
-startLive({ onSummary, onState });
+live = startLive({ onSummary, onState });
