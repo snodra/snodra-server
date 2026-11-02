@@ -32,6 +32,7 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 - [Running locally](#running-locally)
 - [Topology view](#topology-view)
 - [Dashboard](#dashboard)
+- [Security](#security)
 - [Protocol summary](#protocol-summary)
 - [Routing and limitations](#routing-and-limitations)
 - [Connection lifecycle](#connection-lifecycle)
@@ -91,6 +92,14 @@ cargo run
 | `KRAKEN_HUB_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
 | `KRAKEN_HUB_PEERS` | none | the other hubs' dashboard base URLs as the operator's browser reaches them, comma-separated, for example `http://localhost:7001,http://localhost:7011` (this hub's own URL may be listed; the page skips it by hub id). Each must be `http://` or `https://` with a host and optional port, no user info, no path beyond `/`; normalised to origins (lowercase, default port dropped), duplicates removed, at most 16; anything else stops the hub at startup. See [Multiple hubs](#multiple-hubs) |
 
+| `KRAKEN_HUB_AUTH_MODE` | `off` | `off`, `permissive` (evaluate every rule, log and count violations, allow everything) or `enforce` (refuse them); anything but `off` needs `KRAKEN_HUB_ACL_FILE`. See [Security](#security) |
+| `KRAKEN_HUB_ACL_FILE` | none | TOML ACL: SHA-256 of each static token to its service, `handle` and `send` patterns; reloaded when it changes |
+| `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
+| `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
+| `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
+| `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/topology`, `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
+| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` | none | reserved for the processor controls of roadmap P6; parsed, unused |
+
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
 The topology view (`GET /topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view),
@@ -135,10 +144,13 @@ docker exec kraken-hub /app/kraken-hub --topology --json
   **Builder call:** the HTTP endpoint is a second port (7001), because the gRPC port speaks only
   HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
 - `kraken-hub --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
-  port of `KRAKEN_HUB_LISTEN` with a 3 s timeout. Exit codes: 0 success, 1 failure (hub
+  port of `KRAKEN_HUB_LISTEN` (or `--address host:port|https://host:port`) with a 3 s timeout, over
+  TLS as `--tls-ca <pem>`, an `https://` address or the environment's TLS setting say, with
+  `KRAKEN_HUB_DASHBOARD_TOKEN` from its environment when the hub has one. Exit codes: 0 success, 1 failure (hub
   unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
   With nothing connected it prints `no services connected` and a totals line.
-- Like the rest of the port-7000 surface, the topology has no authentication.
+- Without `KRAKEN_HUB_DASHBOARD_TOKEN` the topology has no authentication, like the rest of the
+  port-7000 surface; with it, the gRPC call and `GET /topology` need the token (see [Security](#security)).
 - The hub has no gRPC server reflection, hence the `-proto` flags. grpcurl's proto-JSON prints
   int64 as strings and omits default values, so its output differs textually from
   `curl :7001/topology`.
@@ -238,9 +250,10 @@ A read-only web dashboard is compiled into the binary and served on the HTTP por
 `http://localhost:7001/` (it redirects to `/ui/`). It shows what the topology view shows, plus who
 calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 
-> **No authentication in this phase.** The dashboard and `/api/v1/` are read-only and open to
-> anyone who reaches port 7001, like `GET /topology`. Keep the port on the private network; the
-> page footer says the same. A dashboard token arrives with hub access control (roadmap P5a).
+> **Authentication is opt-in.** The dashboard and `/api/v1/` are read-only. Without
+> `KRAKEN_HUB_DASHBOARD_TOKEN` they are open to anyone who reaches port 7001, like `GET /topology`:
+> keep the port on the private network (the page footer says the same). With the token set the
+> page asks for it and every data endpoint needs it; see [Security](#security).
 
 | Page | Shows |
 |---|---|
@@ -359,6 +372,55 @@ Developing the page: edit `ui/`, `cargo run` (assets are embedded in debug build
 reload. `tests/dashboard_ui.rs` checks that every referenced asset and every import resolves,
 and loads each page in headless Chrome when one is installed (`KRAKEN_HUB_TEST_BROWSER=<path>`
 picks a binary, `none` skips; CI without a browser runs the static checks only).
+
+## Security
+
+Roadmap P5a, decision record: umbrella `docs/adr/0018-hub-access-control.md`; operator how-to:
+umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) behaves as before.
+
+**Service tokens and the ACL.** With `KRAKEN_HUB_AUTH_MODE=enforce` a service must send a static
+token in `Register.credentials.token`. The ACL file (`KRAKEN_HUB_ACL_FILE`) holds one `[[token]]`
+table per token, keyed by the token's SHA-256 (never the token):
+
+```toml
+[[token]]
+token_sha256 = "<64 hex characters from `kraken-hub acl hash -`>"
+service = "billing-service"          # the only service name this token may register as
+handle  = ["billing.*"]              # types it may handle: commands, queries, shared queries
+send    = ["orders.*"]               # types it may send, in every request mode
+```
+
+Patterns are an exact type, `prefix.*` or `*`. `control` is reserved for P6 and `contexts` only
+accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
+`printf %s "$TOKEN" | kraken-hub acl hash -` (or `kraken-hub acl hash <token>`).
+
+| Violation | `enforce` | `permissive` |
+|---|---|---|
+| no credentials (a v1 client sends none), unknown token | stream closed with `UNAUTHENTICATED` | logged, counted, allowed |
+| `jwt` credentials | `UNAUTHENTICATED` "jwt credentials are not supported by this hub yet" (P5b) | same |
+| a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
+| a request for a type outside `send` (unary, scatter-gather, streaming, subscription) | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
+
+The ACL reloads when the file changes (5 s poll, or SIGHUP); a file that does not parse keeps the
+previous ACL (`kraken_hub_acl_generation`, `kraken_hub_acl_reload_errors_total`). Live sessions are
+judged again on a change: a removed token or a registration the file no longer allows closes the
+session. Violations are counted in `kraken_hub_auth_violations_total{reason,service}`; logs show a
+token only as the first 8 hex characters of its digest. Roll out with `permissive` first.
+
+**TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
+TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
+reloads on change without dropping open connections. `--health-check` and `--topology` take
+`--address` and `--tls-ca <pem>`; inside the hub's own container they pin its certificate, so the
+image `HEALTHCHECK` needs no change. Client certificates (mTLS) are P5c.
+
+**Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/topology`, `/api/v1/*`, the event stream
+and the gRPC `Topology` call; the page and its assets stay public. The token goes in an
+`Authorization: Bearer` header (the page keeps it in `sessionStorage` and reads the event stream
+with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`. Peers
+(`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
+
+The Kotlin and Rust libraries do not send the token yet (the P5a client slice); until then only
+`off` and `permissive` work with them, and a refused service reconnects every 0.5 to 5 s.
 
 ## Protocol summary
 
@@ -647,7 +709,8 @@ without any client change; v1 clients always send a timeout, so for them an over
   mixed-version rollout a request may reach an instance that dropped the type; that instance's
   library answers `NO_HANDLER` and the sender sees a transient error.
 - Single hub instance; no clustering or failover.
-- No authentication or authorization on the gRPC port.
+- No authentication or authorization on the gRPC port unless `KRAKEN_HUB_AUTH_MODE` is `permissive`
+  or `enforce` (see [Security](#security)).
 - Not durable: registrations, in-flight and queued requests and sessions are in memory only.
   Clients re-register after a reconnect.
 - A scatter-gather cancels only the targets whose session negotiated `streaming` or
@@ -682,7 +745,8 @@ without any client change; v1 clients always send a timeout, so for them an over
   is taken from the request's trace headers. Exported over OTLP.
 - Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
   [Dashboard](#dashboard)); Grafana for history.
-- Metrics (OTLP): `kraken_hub_requests_total`, `kraken_hub_request_duration_seconds`,
+- Metrics (OTLP): `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
+  `kraken_hub_acl_reload_errors_total`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
@@ -749,13 +813,17 @@ src/queue.rs      per-instance queue (priority, then age; count and byte caps)
 src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
 src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
-src/cli.rs        --health-check and --topology client modes
+src/cli.rs        --health-check, --topology and `acl hash` modes
+src/auth.rs       auth modes, ACL parsing and lookup, Register and request checks, constant-time compare
+src/reload.rs     mtime polling and SIGHUP for the ACL and the TLS pairs
+src/tls.rs        rustls listeners, reloadable certificate, the mTLS hook (P5c)
+src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
 src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream), security headers
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, tls.rs, dashboard_auth.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```

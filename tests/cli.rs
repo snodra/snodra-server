@@ -93,3 +93,36 @@ async fn acl_hash_prints_the_digest_and_never_the_token() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("acl hash"));
 }
+
+#[tokio::test]
+async fn the_topology_mode_sends_the_dashboard_token_from_its_environment() {
+    let token = "cli-0123456789abcdef0123";
+    let addr = start_hub(Config {
+        otlp_endpoint: None,
+        dashboard_token: Some(kraken_hub::auth::Secret::new(token)),
+        ..Config::default()
+    })
+    .await;
+    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let run = |env: Option<&str>| {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(["--topology", "--address", &addr.to_string()])
+            .env_clear();
+        if let Some(t) = env {
+            cmd.env("KRAKEN_HUB_DASHBOARD_TOKEN", t);
+        }
+        async move { cmd.output().await.unwrap() }
+    };
+    let out = run(Some(token)).await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(None).await;
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(stderr.contains("unauthenticated"), "{stderr}");
+    let out = run(Some("wrong-wrong-wrong-wrong")).await;
+    assert!(!out.status.success());
+}
