@@ -212,24 +212,46 @@ impl FromStr for AuthMode {
 // Secrets
 
 /// A token the hub only compares (the dashboard token). Holds its digest, never the token;
-/// `Debug` shows nothing.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` shows nothing. Clones share one digest cell, so replacing it with [`Secret::set`]
+/// (when the token file changes) reaches every holder, such as the HTTP guard built at startup.
+#[derive(Clone)]
 pub struct Secret {
-    digest: Digest,
+    digest: Arc<RwLock<Digest>>,
 }
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.current() == other.current()
+    }
+}
+
+impl Eq for Secret {}
 
 impl Secret {
     pub fn new(token: &str) -> Self {
         Self {
-            digest: digest_of(token),
+            digest: Arc::new(RwLock::new(digest_of(token))),
         }
+    }
+
+    fn current(&self) -> Digest {
+        *self.digest.read().unwrap()
+    }
+
+    /// Replaces the token (every clone sees the new one). Returns whether it changed.
+    pub fn set(&self, token: &str) -> bool {
+        let new = digest_of(token);
+        let mut current = self.digest.write().unwrap();
+        let changed = !ct::eq(&current, &new);
+        *current = new;
+        changed
     }
 
     /// True when `presented` is the token. Both sides are hashed first, so the comparison time
     /// depends neither on the token's length nor on where it differs, and an absent token costs
     /// the same as a wrong one.
     pub fn matches(&self, presented: Option<&str>) -> bool {
-        let equal = ct::eq(&self.digest, &digest_of(presented.unwrap_or("")));
+        let equal = ct::eq(&self.current(), &digest_of(presented.unwrap_or("")));
         equal & presented.is_some()
     }
 }

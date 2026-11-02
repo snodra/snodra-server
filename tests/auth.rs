@@ -949,3 +949,43 @@ async fn permissive_and_off_leave_the_topology_rpc_open_without_a_dashboard_toke
         );
     }
 }
+
+#[tokio::test]
+async fn a_rotated_dashboard_token_file_applies_without_a_restart() {
+    let dir = TempDir::new();
+    let file = dir.write("dashboard-token", "first-dashboard-token-0123456789\n");
+    let mut config = Config {
+        otlp_endpoint: None,
+        reload_interval: Duration::from_millis(50),
+        dashboard_token_file: Some(file.clone()),
+        ..Config::default()
+    };
+    config.load_token_files().unwrap();
+    let addr = start_hub(config).await;
+    let target = kraken_hub::client::Target::plain(addr);
+    let works = |token: &'static str| {
+        let target = target.clone();
+        async move {
+            kraken_hub::topology_probe_target(&target, Some(token))
+                .await
+                .is_ok()
+        }
+    };
+    assert!(works("first-dashboard-token-0123456789").await);
+    assert!(!works("second-dashboard-token-0123456789").await);
+
+    std::fs::write(&file, "second-dashboard-token-0123456789\n").unwrap();
+    eventually("the new token is accepted", || {
+        works("second-dashboard-token-0123456789")
+    })
+    .await;
+    assert!(
+        !works("first-dashboard-token-0123456789").await,
+        "the old token stops working"
+    );
+
+    // A bad file keeps the token in force.
+    std::fs::write(&file, "x\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(works("second-dashboard-token-0123456789").await);
+}

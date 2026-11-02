@@ -100,7 +100,8 @@ cargo run
 | `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` | `5s` | a TLS handshake that takes longer is dropped; positive |
 | `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
 | `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/topology`, `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
-| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` | none | reserved for the processor controls of roadmap P6; parsed, unused |
+| `KRAKEN_HUB_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `KRAKEN_HUB_DASHBOARD_TOKEN` when both are set (as `KRAKEN_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
+| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | reserved for the processor controls of roadmap P6; parsed (the file variant like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`), unused |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -435,7 +436,9 @@ and the gRPC `Topology` call; the page and its assets stay public. In `enforce` 
 dashboard token set, refuses everything else; the HTTP topology is then still open, and the hub
 warns at startup. The token goes in an
 `Authorization: Bearer` header (the page keeps it in `sessionStorage` and reads the event stream
-with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`. Peers
+with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`. Rotate it by
+rewriting the file behind `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`: the new token applies within one reload
+poll and the old one stops working at once. Peers
 (`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
 
 The Kotlin and Rust libraries do not send the token yet (the P5a client slice); until then only

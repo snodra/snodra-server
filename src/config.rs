@@ -118,6 +118,12 @@ pub struct Config {
     /// Reserved for the processor controls of roadmap P6 (a second, stronger token for mutating
     /// calls); parsed and kept, nothing reads it yet. `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`.
     pub dashboard_write_token: Option<Secret>,
+    /// The files the two tokens above are read from; each is read at startup and again on the
+    /// reload poll, and wins over the variable when both are set (like the client libraries'
+    /// `*_TOKEN_FILE`). `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`,
+    /// `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE`.
+    pub dashboard_token_file: Option<PathBuf>,
+    pub dashboard_write_token_file: Option<PathBuf>,
     /// How often the ACL and the certificates are checked for changes.
     /// `KRAKEN_HUB_RELOAD_INTERVAL`, default 5 s.
     pub reload_interval: Duration,
@@ -166,6 +172,8 @@ impl Default for Config {
             http_tls_key: None,
             dashboard_token: None,
             dashboard_write_token: None,
+            dashboard_token_file: None,
+            dashboard_write_token_file: None,
             reload_interval: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(5),
             tls_handshakes_per_ip: 32,
@@ -305,6 +313,9 @@ impl Config {
                     .map(|()| Secret::new(&t))
             })
             .transpose()?;
+        c.dashboard_token_file = path_var(&var, "KRAKEN_HUB_DASHBOARD_TOKEN_FILE");
+        c.dashboard_write_token_file = path_var(&var, "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE");
+        c.load_token_files()?;
         if let Some(v) = var("KRAKEN_HUB_RELOAD_INTERVAL") {
             c.reload_interval = parse_duration(&v).context("KRAKEN_HUB_RELOAD_INTERVAL")?;
         }
@@ -320,6 +331,72 @@ impl Config {
         }
         c.validate()?;
         Ok(c)
+    }
+
+    /// Reads the token files into the tokens (the file wins over the variable). A file that
+    /// cannot be read, or holds an invalid token, is an error that never echoes its content.
+    pub fn load_token_files(&mut self) -> anyhow::Result<()> {
+        for (var, file, slot) in [
+            (
+                "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+                &self.dashboard_token_file,
+                &mut self.dashboard_token,
+            ),
+            (
+                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+                &self.dashboard_write_token_file,
+                &mut self.dashboard_write_token,
+            ),
+        ] {
+            if let Some(file) = file {
+                *slot = Some(Secret::new(&read_token_file(var, file)?));
+            }
+        }
+        Ok(())
+    }
+
+    /// The token files, for the reload watcher.
+    pub fn token_files(&self) -> Vec<PathBuf> {
+        [&self.dashboard_token_file, &self.dashboard_write_token_file]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Re-reads the token files into the live tokens. A file that cannot be read or holds an
+    /// invalid token keeps the previous token (an error is logged, never the content). Returns
+    /// whether any token changed.
+    pub fn reload_token_files(&self) -> bool {
+        let mut changed = false;
+        for (var, file, slot) in [
+            (
+                "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+                &self.dashboard_token_file,
+                &self.dashboard_token,
+            ),
+            (
+                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+                &self.dashboard_write_token_file,
+                &self.dashboard_write_token,
+            ),
+        ] {
+            let (Some(file), Some(secret)) = (file, slot) else {
+                continue;
+            };
+            match read_token_file(var, file) {
+                Ok(token) => {
+                    if secret.set(&token) {
+                        tracing::info!(file = %file.display(), "{var} reloaded");
+                        changed = true;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "{var} reload failed; keeping the previous token");
+                }
+            }
+        }
+        changed
     }
 
     /// The bounds of the TLS handshakes of each listener.
@@ -544,6 +621,19 @@ fn path_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf
     var(name)
         .map(|v| PathBuf::from(v.trim()))
         .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// The token in `file`, trimmed (a mounted secret ends with a newline) and checked like the
+/// variable. The error names the variable and the file, never the content.
+fn read_token_file(var: &str, file: &Path) -> anyhow::Result<String> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("{var}: read {}", file.display()))?;
+    let token = text.trim().to_string();
+    if token.is_empty() {
+        bail!("{var}: {} is empty", file.display());
+    }
+    check_dashboard_token(var, &token).with_context(|| format!("{}", file.display()))?;
+    Ok(token)
 }
 
 /// The shortest dashboard token accepted; `openssl rand -hex 32` makes 64.
@@ -1284,6 +1374,111 @@ mod tests {
         .unwrap();
         assert_eq!((c.grpc_tls(), c.http_tls().is_some()), (None, true));
         assert_eq!(with_env(&[]).unwrap().http_tls(), None);
+    }
+
+    /// A scratch directory with `files` written into it; removed by the caller.
+    fn scratch(files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kraken-cfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_token_file_is_read_trimmed_and_wins_over_the_variable() {
+        let dir = scratch(&[
+            ("dash", "file-token-0123456789abcdef\n"),
+            ("write", "write-token-0123456789abcdef\n"),
+        ]);
+        let path = |n: &str| dir.join(n).display().to_string();
+        let c = with_env(&[
+            ("KRAKEN_HUB_DASHBOARD_TOKEN", "variable-token-0123456789"),
+            ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
+            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
+        ])
+        .unwrap();
+        let dash = c.dashboard_token.as_ref().unwrap();
+        assert!(dash.matches(Some("file-token-0123456789abcdef")));
+        assert!(
+            !dash.matches(Some("variable-token-0123456789")),
+            "the file wins"
+        );
+        assert!(
+            c.dashboard_write_token
+                .as_ref()
+                .unwrap()
+                .matches(Some("write-token-0123456789abcdef"))
+        );
+        assert_eq!(c.dashboard_token_file, Some(dir.join("dash")));
+        // Without the file variable the plain variable still works.
+        let c = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "variable-token-0123456789")]).unwrap();
+        assert!(
+            c.dashboard_token
+                .unwrap()
+                .matches(Some("variable-token-0123456789"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_bad_token_file_stops_startup_without_echoing_its_content() {
+        let dir = scratch(&[
+            ("short", "tiny\n"),
+            ("spaces", "has a space in it, 16+\n"),
+            ("empty", "\n"),
+        ]);
+        let path = |n: &str| dir.join(n).display().to_string();
+        for name in ["short", "spaces", "empty", "missing"] {
+            let err = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path(name))]).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("KRAKEN_HUB_DASHBOARD_TOKEN_FILE"),
+                "{name}: {text}"
+            );
+            assert!(
+                !text.contains("tiny") && !text.contains("has a space"),
+                "{name}: {text}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_picks_up_a_rotated_token_file_and_keeps_the_old_token_when_the_file_goes_bad() {
+        let dir = scratch(&[("dash", "first-token-0123456789abcdef\n")]);
+        let file = dir.join("dash");
+        let c = with_env(&[(
+            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            &file.display().to_string(),
+        )])
+        .unwrap();
+        // A clone (as the HTTP guard holds) sees the rotation too.
+        let held = c.dashboard_token.clone().unwrap();
+        assert!(held.matches(Some("first-token-0123456789abcdef")));
+
+        std::fs::write(&file, "second-token-0123456789abcdef\n").unwrap();
+        assert!(c.reload_token_files());
+        assert!(held.matches(Some("second-token-0123456789abcdef")));
+        assert!(
+            !held.matches(Some("first-token-0123456789abcdef")),
+            "the old token stops working"
+        );
+        assert!(!c.reload_token_files(), "unchanged");
+
+        for bad in ["", "short", "has a space in it, 16+"] {
+            std::fs::write(&file, bad).unwrap();
+            assert!(!c.reload_token_files(), "{bad:?}");
+            assert!(
+                held.matches(Some("second-token-0123456789abcdef")),
+                "{bad:?} keeps the previous token"
+            );
+        }
+        std::fs::remove_file(&file).unwrap();
+        assert!(!c.reload_token_files());
+        assert!(held.matches(Some("second-token-0123456789abcdef")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

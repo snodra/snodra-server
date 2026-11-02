@@ -134,6 +134,20 @@ pub async fn serve_with_shutdown(
             },
         ));
     }
+    // The dashboard token files are polled like the ACL; the live tokens are shared with the HTTP
+    // guard and the gRPC Topology check, so a rotation applies without a restart.
+    let token_files = config.token_files();
+    if !token_files.is_empty() {
+        let config = Arc::clone(&config);
+        tokio::spawn(reload::watch(
+            token_files,
+            config.reload_interval,
+            stopping.clone(),
+            move || {
+                config.reload_token_files();
+            },
+        ));
+    }
     if let Some(path) = auth.path() {
         let (auth, registry, sessions, router) = (
             Arc::clone(&auth),

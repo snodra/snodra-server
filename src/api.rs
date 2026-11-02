@@ -790,6 +790,20 @@ pub fn settings(c: &Config) -> SettingsView {
             "bearer token the dashboard, its API and /topology require; unset: open",
         ),
         setting(
+            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            path(&c.dashboard_token_file),
+            Some(path(&d.dashboard_token_file)),
+            Plain,
+            "file holding the dashboard token (the path, never its content); wins over KRAKEN_HUB_DASHBOARD_TOKEN and is reloaded when it changes",
+        ),
+        setting(
+            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+            path(&c.dashboard_write_token_file),
+            Some(path(&d.dashboard_write_token_file)),
+            Plain,
+            "file holding the reserved write token; no effect yet",
+        ),
+        setting(
             "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
             String::new(),
             None,
@@ -1171,7 +1185,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 37);
+        assert_eq!(v.settings.len(), 39);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
