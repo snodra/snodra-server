@@ -414,6 +414,11 @@ judged again on a change: a removed token or a registration the file no longer a
 session. Violations are counted in `kraken_hub_auth_violations_total{reason,service}`; logs show a
 token only as the first 8 hex characters of its digest. Roll out with `permissive` first.
 
+Refusals are logged once per refused `Register` (the status sent back lists up to 10 forbidden types,
+then "and N more"), a client-chosen service name or type is cut to 128 characters in logs and
+messages, and each reason logs at most 10 lines per 10 s, then one notice and, when the next window
+opens, how many lines were dropped. The metric counts every refusal regardless.
+
 **TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
 TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
 reloads on change without dropping open connections. Handshakes are bounded: one that takes longer

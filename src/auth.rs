@@ -17,12 +17,13 @@
 //! and P5c a client certificate; both plug into [`Authorizer::admit`] in the place of the token
 //! lookup and produce the same [`Principal`] (service name, handle and send patterns).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -77,6 +78,84 @@ pub fn hash_token(token: &str) -> String {
 /// The 8-hex-character prefix of a digest: the only form of a token's identity that may be logged.
 pub fn short(digest: &Digest) -> String {
     to_hex(digest)[..8].to_string()
+}
+
+/// The longest client-chosen name (a service name, a type) that is logged or sent back.
+pub const MAX_LOGGED_CHARS: usize = 128;
+
+/// `s` cut to [`MAX_LOGGED_CHARS`] characters. A client chooses the service name of a `Register`
+/// before anything is checked, so a log line or an error message never carries it whole.
+pub fn clip(s: &str) -> String {
+    match s.char_indices().nth(MAX_LOGGED_CHARS) {
+        Some((end, _)) => s[..end].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// Refusal lines allowed per reason in one [`LOG_WINDOW`].
+const LOG_BURST: u32 = 10;
+/// The window of the refusal log rate limit.
+const LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// What to do with one refusal log line (see [`LogLimiter::gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Log it.
+    Log,
+    /// The first line over the budget: log one notice instead, then stay quiet.
+    Notice,
+    /// Over the budget, already announced: log nothing.
+    Suppress,
+    /// A new window begins: log a summary of how many lines the last one dropped, then the line.
+    LogAfterSummary(u64),
+}
+
+struct LogWindow {
+    started: Instant,
+    logged: u32,
+    suppressed: u64,
+}
+
+/// At most [`LOG_BURST`] refusal lines per reason per [`LOG_WINDOW`], so a client that retries a
+/// refused `Register` in a loop cannot fill the disk or drown the other lines. The metrics keep
+/// counting every refusal; only the log lines are dropped.
+#[derive(Default)]
+struct LogLimiter {
+    windows: Mutex<HashMap<&'static str, LogWindow>>,
+}
+
+impl LogLimiter {
+    fn gate(&self, reason: &'static str, now: Instant) -> Gate {
+        let mut windows = self.windows.lock().unwrap();
+        let w = windows.entry(reason).or_insert(LogWindow {
+            started: now,
+            logged: 0,
+            suppressed: 0,
+        });
+        if now.saturating_duration_since(w.started) >= LOG_WINDOW {
+            let dropped = w.suppressed;
+            *w = LogWindow {
+                started: now,
+                logged: 1,
+                suppressed: 0,
+            };
+            return if dropped > 0 {
+                Gate::LogAfterSummary(dropped)
+            } else {
+                Gate::Log
+            };
+        }
+        if w.logged < LOG_BURST {
+            w.logged += 1;
+            Gate::Log
+        } else if w.suppressed == 0 {
+            w.suppressed = 1;
+            Gate::Notice
+        } else {
+            w.suppressed += 1;
+            Gate::Suppress
+        }
+    }
 }
 
 fn from_hex(s: &str) -> Option<Digest> {
@@ -438,6 +517,7 @@ pub struct Authorizer {
     generation: AtomicU64,
     path: Option<PathBuf>,
     metrics: Arc<Metrics>,
+    limiter: LogLimiter,
 }
 
 impl Authorizer {
@@ -455,6 +535,7 @@ impl Authorizer {
             generation: AtomicU64::new(1),
             path: None,
             metrics,
+            limiter: LogLimiter::default(),
         })
     }
 
@@ -487,6 +568,7 @@ impl Authorizer {
             generation: AtomicU64::new(1),
             path: Some(path),
             metrics,
+            limiter: LogLimiter::default(),
         }))
     }
 
@@ -544,9 +626,32 @@ impl Authorizer {
     /// client that has not authenticated cannot mint label values.
     fn label_service(acl: &Acl, claimed: &str) -> String {
         if acl.has_service(claimed) {
-            claimed.to_string()
+            clip(claimed)
         } else {
             "unknown".to_string()
+        }
+    }
+
+    /// True when a refusal line for `reason` may be logged now; writes the notice or the summary
+    /// of the rate limit itself when one is due.
+    fn may_log(&self, reason: &'static str) -> bool {
+        match self.limiter.gate(reason, Instant::now()) {
+            Gate::Log => true,
+            Gate::Suppress => false,
+            Gate::Notice => {
+                warn!(
+                    reason,
+                    "refusal log rate limit: more than {LOG_BURST} refusals in {LOG_WINDOW:?}; further lines for this reason are not logged until the window ends (kraken_hub_auth_violations_total still counts them)"
+                );
+                false
+            }
+            Gate::LogAfterSummary(dropped) => {
+                warn!(
+                    reason,
+                    dropped, "refusal lines were not logged in the last window (rate limit)"
+                );
+                true
+            }
         }
     }
 
@@ -610,21 +715,31 @@ impl Authorizer {
         let key = matched.map(|(d, _)| short(&d));
         for d in &denials {
             self.count(&acl, d, service);
+        }
+        // One line per refused `Register`, however many rules it broke; the metric has each.
+        if let Some(first) = denials.first()
+            && self.may_log(first.reason)
+        {
+            let reasons = denials
+                .iter()
+                .map(|d| d.reason)
+                .collect::<Vec<_>>()
+                .join(",");
+            let service = clip(service);
+            let key = key.as_deref().unwrap_or("-");
             if self.mode == AuthMode::Enforce {
                 warn!(
-                    reason = d.reason,
-                    service,
-                    key = key.as_deref().unwrap_or("-"),
-                    "register refused: {}",
-                    d.message
+                    reason = first.reason,
+                    reasons, service, key, "register refused: {}", first.message
                 );
             } else {
                 warn!(
-                    reason = d.reason,
+                    reason = first.reason,
+                    reasons,
                     service,
-                    key = key.as_deref().unwrap_or("-"),
+                    key,
                     "auth violation (permissive, allowed): {}",
-                    d.message
+                    first.message
                 );
             }
         }
@@ -678,10 +793,12 @@ impl Authorizer {
         }
         self.metrics
             .auth_violation("topology_unauthenticated", "unknown");
-        warn!(
-            reason = "topology_unauthenticated",
-            "auth violation (permissive, allowed): Topology without a valid token"
-        );
+        if self.may_log("topology_unauthenticated") {
+            warn!(
+                reason = "topology_unauthenticated",
+                "auth violation (permissive, allowed): Topology without a valid token"
+            );
+        }
         Ok(())
     }
 
@@ -699,6 +816,16 @@ impl Authorizer {
             ),
         );
         self.count(&self.acl(), &denied, service);
+        if self.may_log(denied.reason) {
+            warn!(
+                reason = denied.reason,
+                service = clip(service),
+                instance = instance_id.chars().take(8).collect::<String>(),
+                mode = self.mode.as_str(),
+                "register refused: {}",
+                denied.message
+            );
+        }
         denied
     }
 
@@ -745,29 +872,28 @@ impl Authorizer {
         disposition: Disposition,
     ) {
         let acl = self.acl();
+        let service = clip(service);
         for d in denials {
             let key = principal.map_or_else(|| "-".to_string(), short);
+            if disposition != Disposition::Kept {
+                self.count(&acl, d, &service);
+            }
+            if !self.may_log(d.reason) {
+                continue;
+            }
             match disposition {
-                Disposition::Closed => {
-                    self.count(&acl, d, service);
-                    warn!(
-                        reason = d.reason,
-                        service, key, "session closed: {}", d.message
-                    );
-                }
-                Disposition::Allowed => {
-                    self.count(&acl, d, service);
-                    warn!(
-                        reason = d.reason,
-                        service, key, "auth violation (permissive, allowed): {}", d.message
-                    );
-                }
-                Disposition::Kept => {
-                    warn!(
-                        reason = d.reason,
-                        service, key, "auth violation (permissive, session kept): {}", d.message
-                    );
-                }
+                Disposition::Closed => warn!(
+                    reason = d.reason,
+                    service, key, "session closed: {}", d.message
+                ),
+                Disposition::Allowed => warn!(
+                    reason = d.reason,
+                    service, key, "auth violation (permissive, allowed): {}", d.message
+                ),
+                Disposition::Kept => warn!(
+                    reason = d.reason,
+                    service, key, "auth violation (permissive, session kept): {}", d.message
+                ),
             }
         }
     }
@@ -798,12 +924,19 @@ impl Authorizer {
             Some(entry) if entry.service != sender_service => Some(Denied::new(
                 "wrong_service",
                 DeniedCode::PermissionDenied,
-                format!("token is no longer allowed to act as service {sender_service}"),
+                format!(
+                    "token is no longer allowed to act as service {}",
+                    clip(sender_service)
+                ),
             )),
             Some(entry) if !any_matches(&entry.send, type_name) => Some(Denied::new(
                 "send_denied",
                 DeniedCode::PermissionDenied,
-                format!("service {sender_service} is not allowed to send type {type_name}"),
+                format!(
+                    "service {} is not allowed to send type {}",
+                    clip(sender_service),
+                    clip(type_name)
+                ),
             )),
             Some(_) => None,
         };
@@ -811,27 +944,33 @@ impl Authorizer {
             return Ok(());
         };
         self.count(&acl, &denied, sender_service);
-        if self.mode == AuthMode::Enforce {
-            warn!(
-                reason = denied.reason,
-                service = sender_service,
-                r#type = type_name,
-                key = short(digest),
-                "request refused"
-            );
-            Err(denied)
-        } else {
-            warn!(
-                reason = denied.reason,
-                service = sender_service,
-                r#type = type_name,
-                key = short(digest),
-                "auth violation (permissive, allowed)"
-            );
-            Ok(())
+        let enforce = self.mode == AuthMode::Enforce;
+        if self.may_log(denied.reason) {
+            let (service, r#type) = (clip(sender_service), clip(type_name));
+            if enforce {
+                warn!(
+                    reason = denied.reason,
+                    service,
+                    r#type,
+                    key = short(digest),
+                    "request refused"
+                );
+            } else {
+                warn!(
+                    reason = denied.reason,
+                    service,
+                    r#type,
+                    key = short(digest),
+                    "auth violation (permissive, allowed)"
+                );
+            }
         }
+        if enforce { Err(denied) } else { Ok(()) }
     }
 }
+
+/// Forbidden types a denial names; the rest is "and N more".
+const MAX_LISTED_TYPES: usize = 10;
 
 /// The checks of an entry that matched: the service name, then every handled type.
 fn judge(entry: &AclEntry, digest: &Digest, service: &str, handled: &[String]) -> Vec<Denied> {
@@ -841,8 +980,9 @@ fn judge(entry: &AclEntry, digest: &Digest, service: &str, handled: &[String]) -
             "wrong_service",
             DeniedCode::PermissionDenied,
             format!(
-                "token {} is not allowed to register as service {service}",
-                short(digest)
+                "token {} is not allowed to register as service {}",
+                short(digest),
+                clip(service)
             ),
         ));
     }
@@ -850,16 +990,30 @@ fn judge(entry: &AclEntry, digest: &Digest, service: &str, handled: &[String]) -
         .iter()
         .filter(|t| !any_matches(&entry.handle, t))
         .collect();
-    for (i, type_name) in offending.iter().enumerate() {
-        let more = if i == 0 && offending.len() > 1 {
-            format!(" (and {} more)", offending.len() - 1)
-        } else {
-            String::new()
+    if !offending.is_empty() {
+        // One denial for all of them: a client may offer thousands of types.
+        let shown: Vec<String> = offending
+            .iter()
+            .take(MAX_LISTED_TYPES)
+            .map(|t| clip(t))
+            .collect();
+        let more = match offending.len().saturating_sub(MAX_LISTED_TYPES) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
         };
         out.push(Denied::new(
             "handle_denied",
             DeniedCode::PermissionDenied,
-            format!("service {service} is not allowed to handle type {type_name}{more}"),
+            format!(
+                "service {} is not allowed to handle {} {}{more}",
+                clip(service),
+                if offending.len() == 1 {
+                    "type"
+                } else {
+                    "types"
+                },
+                shown.join(", ")
+            ),
         ));
     }
     out
@@ -987,6 +1141,168 @@ contexts = ["default"]
                 .is_ok()
         );
         assert_eq!(m.counter_total("kraken_hub_auth_violations_total"), None);
+    }
+
+    // ---- refusal logging (review finding 6) ----
+
+    use crate::telemetry::test_support::{LogLine, capture_logs, logged};
+
+    /// The refusal lines logged on this thread (they all carry a `reason`).
+    fn refusals() -> Vec<LogLine> {
+        logged()
+            .into_iter()
+            .filter(|l| l.field("reason").is_some())
+            .collect()
+    }
+
+    #[test]
+    fn clip_cuts_at_128_characters_on_a_char_boundary() {
+        assert_eq!(clip("orders"), "orders");
+        let long = "é".repeat(300);
+        let clipped = clip(&long);
+        assert_eq!(clipped.chars().count(), 128);
+        assert!(long.starts_with(&clipped));
+        assert_eq!(clip(&"x".repeat(128)).len(), 128);
+    }
+
+    #[test]
+    fn an_attacker_chosen_service_name_is_cut_in_the_log_and_the_message_and_never_a_label() {
+        capture_logs();
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let name = "s".repeat(5000);
+        let admission = a.admit(Some(&token("nope")), true, &name, &[]);
+        let denied = admission.refused.unwrap();
+        assert!(denied.message.len() < 200, "{}", denied.message.len());
+        let lines = refusals();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].field("service").unwrap().chars().count(), 128);
+        // The metric label is `unknown`: the ACL does not hold the name.
+        assert_eq!(
+            m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
+            Some(1)
+        );
+        // A wrong-service denial quotes the name too, cut.
+        let admission = a.admit(Some(&token("tok-orders")), true, &name, &[]);
+        let message = admission.refused.unwrap().message;
+        assert!(message.len() < 200, "{}", message.len());
+    }
+
+    #[test]
+    fn a_refused_register_logs_one_line_however_many_rules_it_breaks() {
+        capture_logs();
+        let (a, m) = authorizer(AuthMode::Enforce);
+        // The wrong service and three types outside `handle`: two denials, one line.
+        let admission = a.admit(
+            Some(&token("tok-billing")),
+            true,
+            "orders",
+            &types(&["x.A", "x.B", "x.C"]),
+        );
+        assert!(admission.refused.is_some());
+        let lines = refusals();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].message.contains("register refused"), "{lines:?}");
+        assert_eq!(
+            lines[0].field("reasons"),
+            Some("wrong_service,handle_denied")
+        );
+        // Every rule broken is still counted, once.
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "wrong_service"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "handle_denied"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn many_forbidden_types_collapse_into_one_denial_listing_ten() {
+        let (a, _) = authorizer(AuthMode::Enforce);
+        let many: Vec<String> = (0..25).map(|n| format!("x.T{n:02}")).collect();
+        let denials = a.recheck(Some(&digest_of("tok-orders")), "orders", &many);
+        // tok-orders handles `*`: nothing is denied. tok-billing handles billing.* and shared.Ping.
+        assert!(denials.is_empty());
+        let denials = a.recheck(Some(&digest_of("tok-billing")), "billing", &many);
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        let message = &denials[0].message;
+        assert_eq!(denials[0].reason, "handle_denied");
+        assert!(
+            message.contains("x.T00") && message.contains("x.T09"),
+            "{message}"
+        );
+        assert!(!message.contains("x.T10"), "{message}");
+        assert!(message.ends_with("and 15 more"), "{message}");
+        // One forbidden type reads as before.
+        let one = a.recheck(Some(&digest_of("tok-billing")), "billing", &types(&["x.A"]));
+        assert_eq!(
+            one[0].message,
+            "service billing is not allowed to handle type x.A"
+        );
+        // A long type name is cut too.
+        let long = format!("x.{}", "n".repeat(1000));
+        let cut = a.recheck(Some(&digest_of("tok-billing")), "billing", &[long]);
+        assert!(cut[0].message.len() < 300, "{}", cut[0].message.len());
+    }
+
+    #[test]
+    fn the_log_gate_allows_ten_lines_per_reason_per_window_then_one_notice() {
+        let limiter = LogLimiter::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for n in 0..10 {
+            assert_eq!(limiter.gate("a", at(n)), Gate::Log, "line {n}");
+        }
+        assert_eq!(limiter.gate("a", at(10)), Gate::Notice);
+        for n in 11..50 {
+            assert_eq!(limiter.gate("a", at(n)), Gate::Suppress, "line {n}");
+        }
+        // Another reason has its own budget.
+        assert_eq!(limiter.gate("b", at(50)), Gate::Log);
+        // Window over: the suppressed count is reported with the first line of the next one.
+        assert_eq!(
+            limiter.gate("a", at(10_000)),
+            Gate::LogAfterSummary(40),
+            "1 notice-triggering + 39 suppressed"
+        );
+        assert_eq!(limiter.gate("a", at(10_001)), Gate::Log);
+        // A quiet window leaves no summary.
+        assert_eq!(limiter.gate("b", at(30_000)), Gate::Log);
+    }
+
+    #[test]
+    fn a_flood_of_refused_registers_logs_a_bounded_number_of_lines() {
+        capture_logs();
+        let (a, m) = authorizer(AuthMode::Enforce);
+        for _ in 0..200 {
+            let admission = a.admit(Some(&token("nope")), true, "orders", &[]);
+            assert!(admission.refused.is_some());
+        }
+        let lines = refusals();
+        assert_eq!(lines.len(), 11, "10 lines and one notice: {}", lines.len());
+        assert!(
+            lines[10].message.contains("rate limit"),
+            "{:?}",
+            lines[10].message
+        );
+        // Nothing is lost from the metric.
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "unknown_token"
+            ),
+            Some(200)
+        );
     }
 
     #[test]
@@ -1180,10 +1496,10 @@ contexts = ["default"]
             (d.reason, d.code),
             ("handle_denied", DeniedCode::PermissionDenied)
         );
-        assert!(
-            d.message.contains("orders.Place") && d.message.contains("1 more"),
-            "{}",
-            d.message
+        // The forbidden types are listed in one denial (up to ten, then "and N more").
+        assert_eq!(
+            d.message,
+            "service billing is not allowed to handle types orders.Place, x.Y"
         );
         assert_eq!(d.to_status().code(), tonic::Code::PermissionDenied);
         assert_eq!(

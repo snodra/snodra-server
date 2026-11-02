@@ -6948,71 +6948,19 @@ mod stream_tests {
         assert_eq!(f.messages("a2").len(), 1);
     }
 
-    thread_local! {
-        /// The `request_id` of every "request ended with error" line logged on this thread
-        /// (a test and its current-thread runtime share one thread).
-        static ENDED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
+    use crate::telemetry::test_support::{capture_logs, logged};
 
-    /// Records the "request ended with error" lines into [`ENDED`].
-    struct EndedLog;
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndedLog {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Fields {
-                ended: bool,
-                request_id: Option<String>,
-            }
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    match field.name() {
-                        "message" => {
-                            self.ended = format!("{value:?}") == "request ended with error";
-                        }
-                        "request_id" => {
-                            self.request_id =
-                                Some(format!("{value:?}").trim_matches('"').to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let mut fields = Fields {
-                ended: false,
-                request_id: None,
-            };
-            event.record(&mut fields);
-            if fields.ended
-                && let Some(id) = fields.request_id
-            {
-                ENDED.with_borrow_mut(|lines| lines.push(id));
-            }
-        }
-    }
-
-    /// Installs [`EndedLog`] as the global subscriber (once per test binary: a scoped one is
-    /// racy, as any thread's first hit of a callsite rebuilds the global interest cache and the
-    /// max level against the global default) and clears this thread's lines.
     fn capture_ended_log() {
-        use tracing_subscriber::layer::SubscriberExt;
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            let subscriber = tracing_subscriber::registry().with(EndedLog);
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
-        ENDED.with_borrow_mut(Vec::clear);
+        capture_logs();
     }
 
+    /// The `request_id` of every "request ended with error" line logged on this thread.
     fn ended_log() -> Vec<String> {
-        ENDED.with_borrow(Vec::clone)
+        logged()
+            .into_iter()
+            .filter(|l| l.message == "request ended with error")
+            .filter_map(|l| l.field("request_id").map(str::to_string))
+            .collect()
     }
 
     /// The target `<id>#1` failing hub-side (here: its handler left) ends the stream with that

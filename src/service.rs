@@ -330,9 +330,9 @@ impl StreamCtx {
 }
 
 /// Closes a handshake that failed access control: the status goes to the client and the stream
-/// ends. No session exists yet.
-async fn refuse(tx: &Outbound, instance_id: &str, service: &str, denied: &Denied) {
-    warn!(instance = %instance_id, service = %service, reason = denied.reason, "stream closed: {}", denied.message);
+/// ends. No session exists yet. The authorizer has already logged and counted the refusal (once
+/// per `Register`, rate-limited), so nothing is logged here.
+async fn refuse(tx: &Outbound, denied: &Denied) {
     let _ = tx.send(Err(denied.to_status())).await;
 }
 
@@ -379,7 +379,7 @@ async fn run_stream(
         }
     };
     if first.instance_id.is_empty() || first.service_name.is_empty() {
-        warn!(service = %first.service_name, instance = %first.instance_id, "register with empty identity");
+        warn!(service = %crate::auth::clip(&first.service_name), instance = %crate::auth::clip(&first.instance_id), "register with empty identity");
         let _ = tx
             .send(Err(Status::invalid_argument(
                 "Register.instance_id and Register.service_name must not be empty",
@@ -399,7 +399,7 @@ async fn run_stream(
         .auth
         .admit(first.credentials.as_ref(), v2, &service, &handled);
     if let Some(denied) = &admission.refused {
-        refuse(&tx, &instance_id, &service, denied).await;
+        refuse(&tx, denied).await;
         return;
     }
     let principal = admission.principal;
@@ -463,7 +463,7 @@ async fn run_stream(
             // Nothing was changed: the holder keeps its session, its queue and its pending
             // entries (ADR 0018). Refused in `permissive` too.
             let denied = ctx.auth.instance_takeover(&service, &instance_id);
-            refuse(&tx, &instance_id, &service, &denied).await;
+            refuse(&tx, &denied).await;
             return;
         }
     }
@@ -921,6 +921,35 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn closing_a_refused_handshake_adds_no_log_line_of_its_own() {
+        // The authorizer logged the refusal once (review finding 6); the stream only reports the
+        // status.
+        crate::telemetry::test_support::capture_logs();
+        let m = test_metrics();
+        let auth = Authorizer::with_acl(AuthMode::Enforce, Acl::default(), m.metrics.clone());
+        let denied = auth
+            .admit(None, true, "orders", &[])
+            .refused
+            .expect("refused");
+        let logged_by_admit = crate::telemetry::test_support::logged()
+            .iter()
+            .filter(|l| l.field("reason").is_some())
+            .count();
+        assert_eq!(logged_by_admit, 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        refuse(&tx, &denied).await;
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        let after = crate::telemetry::test_support::logged()
+            .iter()
+            .filter(|l| l.field("reason").is_some())
+            .count();
+        assert_eq!(after, 1, "refuse() logs nothing more");
     }
 
     #[tokio::test]

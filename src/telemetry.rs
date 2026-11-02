@@ -542,6 +542,77 @@ pub(crate) mod test_support {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 
+    /// One log event captured by [`capture_logs`].
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct LogLine {
+        pub message: String,
+        pub fields: Vec<(String, String)>,
+    }
+
+    impl LogLine {
+        pub(crate) fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    thread_local! {
+        /// Every event logged on this thread since [`capture_logs`] (a test and its current-thread
+        /// runtime share one thread).
+        static LINES: std::cell::RefCell<Vec<LogLine>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    impl tracing::field::Visit for LogLine {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "message" => self.message = value.to_string(),
+                name => self.fields.push((name.to_string(), value.to_string())),
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let text = format!("{value:?}");
+            match field.name() {
+                "message" => self.message = text,
+                name => self.fields.push((name.to_string(), text)),
+            }
+        }
+    }
+
+    struct Capture;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = LogLine::default();
+            event.record(&mut line);
+            LINES.with_borrow_mut(|lines| lines.push(line));
+        }
+    }
+
+    /// Installs a recorder as the global subscriber (once per test binary: a scoped one is racy,
+    /// as any thread's first hit of a callsite rebuilds the global interest cache and the max
+    /// level against the global default) and clears this thread's lines.
+    pub(crate) fn capture_logs() {
+        use tracing_subscriber::layer::SubscriberExt;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(Capture);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        LINES.with_borrow_mut(Vec::clear);
+    }
+
+    /// The events logged on this thread since [`capture_logs`].
+    pub(crate) fn logged() -> Vec<LogLine> {
+        LINES.with_borrow(Vec::clone)
+    }
+
     pub(crate) struct TestMetrics {
         pub metrics: Arc<Metrics>,
         exporter: InMemoryMetricExporter,
