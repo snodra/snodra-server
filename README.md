@@ -153,7 +153,8 @@ docker exec kraken-hub /app/kraken-hub --topology --json
   unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
   With nothing connected it prints `no services connected` and a totals line.
 - Without `KRAKEN_HUB_DASHBOARD_TOKEN` the topology has no authentication, like the rest of the
-  port-7000 surface; with it, the gRPC call and `GET /topology` need the token (see [Security](#security)).
+  port-7000 surface, except that with `KRAKEN_HUB_AUTH_MODE=enforce` the gRPC call needs an ACL token;
+  with the token, the gRPC call and `GET /topology` need it (see [Security](#security)).
 - The hub has no gRPC server reflection, hence the `-proto` flags. grpcurl's proto-JSON prints
   int64 as strings and omits default values, so its output differs textually from
   `curl :7001/topology`.
