@@ -538,6 +538,8 @@ pub struct Spec<'a> {
     /// A protocol v1 client: no version, capabilities or credentials field.
     pub v1: bool,
     pub caps: Vec<&'a str>,
+    /// `Register.initial_permits` (needs the "flow-control" capability to take effect).
+    pub initial_permits: u32,
 }
 
 impl Spec<'_> {
@@ -562,6 +564,7 @@ impl Spec<'_> {
                 "fake-client/1.0".into()
             },
             credentials: if self.v1 { None } else { credentials },
+            initial_permits: self.initial_permits,
             ..Register::default()
         }
     }
@@ -571,6 +574,17 @@ impl FakeClient {
     /// Connects and sends the `Register` described by `spec`.
     pub async fn register_spec(addr: SocketAddr, spec: &Spec<'_>) -> Self {
         let client = Self::connect(addr).await;
+        client
+            .send_raw_register(spec.register(&client.instance_id))
+            .await;
+        client
+    }
+
+    /// Like [`FakeClient::register_spec`] for a given instance id: a reconnect of that instance
+    /// (or an attempt to take it over).
+    pub async fn register_spec_as(addr: SocketAddr, instance_id: &str, spec: &Spec<'_>) -> Self {
+        let mut client = Self::connect(addr).await;
+        client.instance_id = instance_id.to_string();
         client
             .send_raw_register(spec.register(&client.instance_id))
             .await;

@@ -606,10 +606,10 @@ mod tests {
             .unwrap();
         connect(&f, "i1", "a");
         let token = f.sessions.token_of(&D, "i1").unwrap();
-        f.router.open_session(&D, "i1", token, "a", Some(4));
+        let _ = f.router.open_session(&D, "i1", token, "a", Some(4));
         connect(&f, "i2", "b");
         let t2 = f.sessions.token_of(&D, "i2").unwrap();
-        f.router.open_session(&D, "i2", t2, "b", None);
+        let _ = f.router.open_session(&D, "i2", t2, "b", None);
         let t = snap(
             &f,
             f.anchor.instant,

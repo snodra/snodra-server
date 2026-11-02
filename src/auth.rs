@@ -643,6 +643,23 @@ impl Authorizer {
         }
     }
 
+    /// The denial for a `Register` that names an instance id held by a session of another
+    /// service. Counted (`instance_takeover`) and logged in `permissive` and `enforce` alike:
+    /// handing one service's queue and pending replies to another is never legitimate, so
+    /// `permissive` refuses it too (the one violation it does not merely observe).
+    pub fn instance_takeover(&self, service: &str, instance_id: &str) -> Denied {
+        let denied = Denied::new(
+            "instance_takeover",
+            DeniedCode::PermissionDenied,
+            format!(
+                "instance id {} belongs to another service",
+                instance_id.chars().take(8).collect::<String>()
+            ),
+        );
+        self.count(&self.acl(), &denied, service);
+        denied
+    }
+
     /// Judges a session that exists against the current ACL, without logging or counting: the
     /// violations (empty when the session is still allowed). Used right after a registration
     /// (a reload may have run between the check and the insert) and when the ACL changes. A

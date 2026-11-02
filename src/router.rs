@@ -51,7 +51,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tonic::Status;
 
-use crate::auth::Authorizer;
+use crate::auth::{AuthMode, Authorizer};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::edges::EdgeStats;
@@ -533,6 +533,15 @@ pub(crate) fn choose(
     pool[rotation % pool.len()]
 }
 
+/// Why [`Router::open_session`] left everything as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRefused {
+    /// A newer stream of the instance id already opened its flow.
+    Superseded,
+    /// The instance id is held by a session of another service (access control is on).
+    OtherService,
+}
+
 pub struct Router {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
@@ -710,8 +719,12 @@ impl Router {
     /// Starts the flow state of a session (replacing an older session's): `permits` `Some` makes
     /// it flow-controlled, `None` unlimited. Call before the session becomes current
     /// ([`Sessions::insert_with_token`]), so a request routed to the session always finds its flow.
-    /// Returns false, and changes nothing, when a newer session of the instance already opened
-    /// its flow (a concurrent, older handshake must give up).
+    /// Refuses, and changes nothing, when a newer session of the instance already opened its flow
+    /// ([`OpenRefused::Superseded`]: a concurrent, older handshake must give up) or, with access
+    /// control on, when the flow state held for the instance id belongs to another service
+    /// ([`OpenRefused::OtherService`]): replacing it would hand that service's queue, and the
+    /// requests pending on it, to the newcomer (ADR 0018, review amendments). The check runs under
+    /// the flows lock, before the queue is touched, so it cannot be raced.
     pub fn open_session(
         &self,
         _ctx: &ContextId,
@@ -719,7 +732,7 @@ impl Router {
         token: u64,
         service: &str,
         permits: Option<u32>,
-    ) -> bool {
+    ) -> Result<(), OpenRefused> {
         let flow = Flow {
             token,
             service: service.to_string(),
@@ -737,8 +750,13 @@ impl Router {
         let mut overflow = Vec::new();
         let replaced = {
             let mut flows = self.flows.lock().unwrap();
-            if flows.get(instance_id).is_some_and(|f| f.token > token) {
-                return false;
+            if let Some(held) = flows.get(instance_id) {
+                if held.token > token {
+                    return Err(OpenRefused::Superseded);
+                }
+                if self.auth.mode() != AuthMode::Off && held.service != service {
+                    return Err(OpenRefused::OtherService);
+                }
             }
             let replaced = flows.remove(instance_id).map(|mut old| {
                 // Requests the replaced session never got wait for this one instead of failing
@@ -773,7 +791,7 @@ impl Router {
         for id in overflow {
             self.reject_busy(&id, "queue full");
         }
-        true
+        Ok(())
     }
 
     /// Forwards what a new session can take of the queue it took over from the session it
@@ -1374,9 +1392,24 @@ impl Router {
         }
     }
 
-    /// Reply from a handler; relays to the recorded sender if the id is pending and `from` is
-    /// the recorded handler. Unknown or mismatched ids are ignored.
-    pub fn on_reply(&self, ctx: &ContextId, from: &str, reply: Reply) {
+    /// True when `token` is the current session of `from`: a stale stream (replaced, or removed)
+    /// is never heard, whatever instance id it carries.
+    fn is_current(&self, ctx: &ContextId, from: &str, token: u64) -> bool {
+        let current = self.sessions.token_of(ctx, from) == Some(token);
+        if !current {
+            tracing::debug!(from, "message from a replaced or removed session ignored");
+        }
+        current
+    }
+
+    /// Reply from the handler session `token`; relays to the recorded sender if the id is pending
+    /// and `from` is the recorded handler, on that very session (a request is bound to the
+    /// session it was forwarded to, not to the instance id alone). Unknown or mismatched ids,
+    /// and replies from a replaced session, are ignored.
+    pub fn on_reply_from(&self, ctx: &ContextId, from: &str, token: u64, reply: Reply) {
+        if !self.is_current(ctx, from, token) {
+            return;
+        }
         let id = reply.request_id.clone();
         let entry = {
             let mut pending = self.pending.lock().unwrap();
@@ -1385,7 +1418,7 @@ impl Router {
                     tracing::debug!(request_id = %id, "reply for unknown request ignored");
                     return;
                 }
-                Some(p) if p.handler != from || p.context != *ctx => {
+                Some(p) if p.handler != from || p.handler_token != token || p.context != *ctx => {
                     tracing::debug!(request_id = %id, from, "reply from non-handler ignored");
                     return;
                 }
@@ -2351,6 +2384,7 @@ impl Router {
         pending: &HashMap<String, Pending>,
         target_id: &str,
         from: &str,
+        token: u64,
         ctx: &ContextId,
         what: &str,
     ) -> Option<String> {
@@ -2358,7 +2392,7 @@ impl Router {
             tracing::debug!(request_id = %target_id, from, "{what} for unknown request ignored");
             return None;
         };
-        if target.handler != from || target.context != *ctx {
+        if target.handler != from || target.handler_token != token || target.context != *ctx {
             tracing::debug!(request_id = %target_id, from, "{what} from non-handler ignored");
             return None;
         }
@@ -2376,13 +2410,17 @@ impl Router {
     /// responder, the handler's `seq`) under the sender's credits. A part beyond the credit, or
     /// one carrying an error, ends the stream; so does the `max_results`-th part. A part for a
     /// subscription's update target is an update ([`Router::on_subscription_part`]).
-    pub fn on_stream_part(&self, ctx: &ContextId, from: &str, part: ReplyPart) {
+    pub fn on_stream_part_from(&self, ctx: &ContextId, from: &str, token: u64, part: ReplyPart) {
+        if !self.is_current(ctx, from, token) {
+            return;
+        }
         let Some(part) = self.on_subscription_part(ctx, from, part) else {
             return;
         };
         let closed = {
             let mut pending = self.pending.lock().unwrap();
-            let Some(id) = Self::stream_of_target(&pending, &part.request_id, from, ctx, "part")
+            let Some(id) =
+                Self::stream_of_target(&pending, &part.request_id, from, token, ctx, "part")
             else {
                 return;
             };
@@ -2452,13 +2490,17 @@ impl Router {
     /// `ReplyEnd` from a handler for a streaming target: the stream ends, with the handler's
     /// error if it carries one. An end for a subscription's update target ends that target
     /// ([`Router::on_subscription_end`]).
-    pub fn on_stream_end(&self, ctx: &ContextId, from: &str, end: ReplyEnd) {
+    pub fn on_stream_end_from(&self, ctx: &ContextId, from: &str, token: u64, end: ReplyEnd) {
+        if !self.is_current(ctx, from, token) {
+            return;
+        }
         let Some(end) = self.on_subscription_end(ctx, from, end) else {
             return;
         };
         let closed = {
             let mut pending = self.pending.lock().unwrap();
-            let Some(id) = Self::stream_of_target(&pending, &end.request_id, from, ctx, "end")
+            let Some(id) =
+                Self::stream_of_target(&pending, &end.request_id, from, token, ctx, "end")
             else {
                 return;
             };
@@ -2489,7 +2531,10 @@ impl Router {
     /// the handler gets `Flow{<id>#1, credits}`. For a subscription the credit grows and the
     /// buffered updates drain ([`Router::on_subscription_flow`]); nothing reaches its targets.
     /// Ignored for an unknown id, from anyone but the sender, and when it grants nothing.
-    pub fn on_flow(&self, ctx: &ContextId, from: &str, flow: FlowMsg) {
+    pub fn on_flow_from(&self, ctx: &ContextId, from: &str, token: u64, flow: FlowMsg) {
+        if !self.is_current(ctx, from, token) {
+            return;
+        }
         let id = flow.request_id;
         if flow.credits == 0 {
             tracing::debug!(request_id = %id, from, "flow without credits ignored");
@@ -2541,7 +2586,10 @@ impl Router {
     /// `ReplyEnd`. For a subscription every target still serving gets `Cancel{<id>#n, reason}`
     /// (and the initial request `<id>#0`, if still forwarded). Ignored for an unknown id and
     /// from anyone but the sender.
-    pub fn on_cancel(&self, ctx: &ContextId, from: &str, cancel: Cancel) {
+    pub fn on_cancel_from(&self, ctx: &ContextId, from: &str, token: u64, cancel: Cancel) {
+        if !self.is_current(ctx, from, token) {
+            return;
+        }
         let id = cancel.request_id;
         let reason = if cancel.reason.is_empty() {
             "cancelled by the sender".to_string()
@@ -3816,6 +3864,35 @@ fn drain(flow: &mut Flow) -> Vec<Queued> {
     ready
 }
 
+/// The message handlers by instance id alone, for the unit tests: they resolve the instance's
+/// current session token, as a live stream task would present it.
+#[cfg(test)]
+impl Router {
+    fn current_token(&self, ctx: &ContextId, from: &str) -> u64 {
+        self.sessions.token_of(ctx, from).unwrap_or(u64::MAX)
+    }
+
+    fn on_reply(&self, ctx: &ContextId, from: &str, reply: Reply) {
+        self.on_reply_from(ctx, from, self.current_token(ctx, from), reply)
+    }
+
+    fn on_stream_part(&self, ctx: &ContextId, from: &str, part: ReplyPart) {
+        self.on_stream_part_from(ctx, from, self.current_token(ctx, from), part)
+    }
+
+    fn on_stream_end(&self, ctx: &ContextId, from: &str, end: ReplyEnd) {
+        self.on_stream_end_from(ctx, from, self.current_token(ctx, from), end)
+    }
+
+    fn on_flow(&self, ctx: &ContextId, from: &str, flow: FlowMsg) {
+        self.on_flow_from(ctx, from, self.current_token(ctx, from), flow)
+    }
+
+    fn on_cancel(&self, ctx: &ContextId, from: &str, cancel: Cancel) {
+        self.on_cancel_from(ctx, from, self.current_token(ctx, from), cancel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4287,7 +4364,7 @@ mod tests {
             Arc::new(config),
             Metrics::noop(),
         );
-        router.open_session(&D, "h1", handler_token, "orders", permits);
+        let _ = router.open_session(&D, "h1", handler_token, "orders", permits);
         FlowFx {
             router,
             sender_rx,
@@ -4507,7 +4584,11 @@ mod tests {
         /// A handler instance connects like the stream task does: flow, session, registration.
         fn join(&mut self, id: &'static str, permits: Option<u32>) {
             let token = self.sessions.allocate_token();
-            assert!(self.router.open_session(&D, id, token, "orders", permits));
+            assert!(
+                self.router
+                    .open_session(&D, id, token, "orders", permits)
+                    .is_ok()
+            );
             let (tx, rx) = mpsc::channel(64);
             let replaced = self
                 .sessions
@@ -4997,7 +5078,7 @@ mod tests {
             Metrics::noop(),
         );
         for (id, (_, token)) in &rxs {
-            router.open_session(&D, id, *token, "orders", None);
+            let _ = router.open_session(&D, id, *token, "orders", None);
         }
         // Six requests nobody answers: round-robin while equal, so three each.
         for i in 0..6 {
@@ -5097,7 +5178,11 @@ mod tests {
             cap: usize,
         ) {
             let token = self.sessions.allocate_token();
-            assert!(self.router.open_session(&D, id, token, service, permits));
+            assert!(
+                self.router
+                    .open_session(&D, id, token, service, permits)
+                    .is_ok()
+            );
             let (tx, rx) = mpsc::channel(cap);
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
@@ -5773,7 +5858,11 @@ mod stream_tests {
             cap: usize,
         ) {
             let token = self.sessions.allocate_token();
-            assert!(self.router.open_session(&D, id, token, service, permits));
+            assert!(
+                self.router
+                    .open_session(&D, id, token, service, permits)
+                    .is_ok()
+            );
             let (tx, rx) = mpsc::channel(cap);
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
@@ -7064,7 +7153,11 @@ mod subscription_tests {
             cap: usize,
         ) {
             let token = self.sessions.allocate_token();
-            assert!(self.router.open_session(&D, id, token, service, permits));
+            assert!(
+                self.router
+                    .open_session(&D, id, token, service, permits)
+                    .is_ok()
+            );
             let (tx, rx) = mpsc::channel(cap);
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
@@ -8582,6 +8675,125 @@ mod auth_tests {
             f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
             None
         );
+    }
+
+    /// A new session of `id` for `service`, flow state first; returns its token and receiver.
+    fn replace(f: &Fx, id: &str, service: &str) -> (u64, Result<(), OpenRefused>, Rx) {
+        let (tx, rx) = mpsc::channel(16);
+        let token = f.router.sessions.allocate_token();
+        let opened = f.router.open_session(&D, id, token, service, None);
+        if opened.is_ok() {
+            f.router
+                .sessions
+                .insert_with_token(
+                    &D,
+                    id,
+                    service,
+                    crate::session::SessionMeta::v1(Duration::from_secs(30)),
+                    tx,
+                    CancellationToken::new(),
+                    token,
+                )
+                .unwrap();
+        }
+        (token, opened, rx)
+    }
+
+    fn payload_reply(id: &str) -> Reply {
+        Reply {
+            request_id: id.into(),
+            result: Some(crate::proto::reply::Result::Payload(b"x".to_vec())),
+        }
+    }
+
+    #[tokio::test]
+    async fn another_services_instance_id_is_refused_before_anything_moves() {
+        for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+            let mut f = fixture(mode);
+            f.router.route(
+                &D,
+                "s1",
+                request("r1", RequestKind::Query, "t.Qry", RequestMode::Unary),
+            );
+            assert!(f.handler.try_recv().is_ok(), "r1 was forwarded to h1");
+            let held = f.router.sessions.token_of(&D, "h1").unwrap();
+
+            let (_, opened, _rx) = replace(&f, "h1", "web");
+            assert_eq!(opened, Err(OpenRefused::OtherService), "{mode:?}");
+            // Nothing changed: the holder keeps its session and still answers its request.
+            assert_eq!(f.router.sessions.token_of(&D, "h1"), Some(held));
+            f.router.on_reply_from(&D, "h1", held, payload_reply("r1"));
+            assert!(
+                matches!(
+                    f.sender
+                        .try_recv()
+                        .expect("the reply is relayed")
+                        .unwrap()
+                        .message,
+                    Some(server_message::Message::Reply(_))
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn off_lets_an_instance_id_change_service() {
+        let f = fixture(AuthMode::Off);
+        let (_, opened, _rx) = replace(&f, "h1", "web");
+        assert_eq!(opened, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn the_takeover_denial_is_counted_in_both_modes() {
+        for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+            let m = test_metrics();
+            let auth = Authorizer::with_acl(mode, Acl::default(), m.metrics.clone());
+            let denied = auth.instance_takeover("web", "0190abcd-1234");
+            assert_eq!(denied.reason, "instance_takeover");
+            assert_eq!(
+                denied.message,
+                "instance id 0190abcd belongs to another service"
+            );
+            assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+            assert_eq!(
+                m.counter(
+                    "kraken_hub_auth_violations_total",
+                    "reason",
+                    "instance_takeover"
+                ),
+                Some(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replaced_session_cannot_answer_and_neither_can_its_successor() {
+        let mut f = fixture(AuthMode::Enforce);
+        f.router.route(
+            &D,
+            "s1",
+            request("r1", RequestKind::Query, "t.Qry", RequestMode::Unary),
+        );
+        assert!(f.handler.try_recv().is_ok());
+        let old = f.router.sessions.token_of(&D, "h1").unwrap();
+        // The same service reconnects. The request stays bound to the old session until its
+        // disconnect sequence runs.
+        let (new, opened, _rx) = replace(&f, "h1", "orders");
+        assert_eq!(opened, Ok(()));
+        // The stale session (still holding the old token) is no longer heard ...
+        f.router.on_reply_from(&D, "h1", old, payload_reply("r1"));
+        assert!(
+            f.sender.try_recv().is_err(),
+            "a replaced session cannot answer"
+        );
+        // ... and the new session cannot answer a request forwarded to the old one.
+        f.router.on_reply_from(&D, "h1", new, payload_reply("r1"));
+        assert!(
+            f.sender.try_recv().is_err(),
+            "the successor cannot answer it either"
+        );
+        assert_eq!(f.router.in_flight(), 1, "the request is still pending");
     }
 
     #[tokio::test]

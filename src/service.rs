@@ -33,7 +33,7 @@ use crate::proto::{
 };
 use crate::protocol;
 use crate::registry::{Placement, RegisterError, RegisteredTypes, Registry, effective_load_factor};
-use crate::router::Router;
+use crate::router::{OpenRefused, Router};
 use crate::session::{SessionMeta, Sessions, Superseded};
 use crate::topology::{ClockAnchor, snapshot};
 
@@ -431,12 +431,22 @@ async fn run_stream(
     // same instance id can never unregister this stream's registration. Tokens grow per stream,
     // so of two concurrent handshakes of one instance id the newer wins in both maps.
     let token = ctx.sessions.allocate_token();
-    if !ctx
+    match ctx
         .router
         .open_session(&ctx.context, &instance_id, token, &service, permits)
     {
-        debug!(instance = %instance_id, "superseded by a newer stream during handshake");
-        return;
+        Ok(()) => {}
+        Err(OpenRefused::Superseded) => {
+            debug!(instance = %instance_id, "superseded by a newer stream during handshake");
+            return;
+        }
+        Err(OpenRefused::OtherService) => {
+            // Nothing was changed: the holder keeps its session, its queue and its pending
+            // entries (ADR 0018). Refused in `permissive` too.
+            let denied = ctx.auth.instance_takeover(&service, &instance_id);
+            refuse(&tx, &instance_id, &service, &denied).await;
+            return;
+        }
     }
     let replaced = match ctx.sessions.insert_with_token(
         &ctx.context,
@@ -600,7 +610,8 @@ async fn run_stream(
                 ctx.router.route(&ctx.context, &instance_id, req)
             }
             Some(client_message::Message::Reply(reply)) => {
-                ctx.router.on_reply(&ctx.context, &instance_id, reply)
+                ctx.router
+                    .on_reply_from(&ctx.context, &instance_id, token, reply)
             }
             Some(client_message::Message::Permits(p)) => {
                 ctx.router
@@ -635,16 +646,20 @@ async fn run_stream(
                 }
                 match m {
                     client_message::Message::Part(part) => {
-                        ctx.router.on_stream_part(&ctx.context, &instance_id, part)
+                        ctx.router
+                            .on_stream_part_from(&ctx.context, &instance_id, token, part)
                     }
                     client_message::Message::End(end) => {
-                        ctx.router.on_stream_end(&ctx.context, &instance_id, end)
+                        ctx.router
+                            .on_stream_end_from(&ctx.context, &instance_id, token, end)
                     }
                     client_message::Message::Flow(flow) => {
-                        ctx.router.on_flow(&ctx.context, &instance_id, flow)
+                        ctx.router
+                            .on_flow_from(&ctx.context, &instance_id, token, flow)
                     }
                     client_message::Message::Cancel(cancel) => {
-                        ctx.router.on_cancel(&ctx.context, &instance_id, cancel)
+                        ctx.router
+                            .on_cancel_from(&ctx.context, &instance_id, token, cancel)
                     }
                     _ => unreachable!("matched above"),
                 }

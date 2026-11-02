@@ -715,3 +715,176 @@ async fn the_topology_rpc_needs_the_dashboard_token_when_one_is_set() {
     // The health service stays public.
     assert!(kraken_hub::health_probe(addr).await.unwrap());
 }
+
+// ---- instance id takeover (review finding 1) ----------------------------------------------
+
+/// A handler of `orders.Place` with one permit, so its second request waits in its queue.
+fn flow_orders<'a>(token: &'a str) -> Spec<'a> {
+    Spec {
+        commands: vec!["orders.Place"],
+        caps: vec!["flow-control"],
+        initial_permits: 1,
+        ..spec("orders", Some(token))
+    }
+}
+
+async fn expect_request(c: &mut FakeClient) -> String {
+    loop {
+        match c.next().await {
+            Some(Ok(ServerMessage {
+                message: Some(server_message::Message::Request(r)),
+            })) => return r.id,
+            Some(Ok(ServerMessage {
+                message: Some(server_message::Message::Heartbeat(_)),
+            })) => continue,
+            other => panic!("expected a Request, got {other:?}"),
+        }
+    }
+}
+
+async fn expect_reply_payload(c: &mut FakeClient) -> Vec<u8> {
+    loop {
+        match c.next().await {
+            Some(Ok(ServerMessage {
+                message: Some(server_message::Message::Reply(r)),
+            })) => match r.result {
+                Some(kraken_hub::proto::reply::Result::Payload(p)) => return p,
+                other => panic!("expected a payload, got {other:?}"),
+            },
+            Some(Ok(ServerMessage {
+                message: Some(server_message::Message::Heartbeat(_)),
+            })) => continue,
+            other => panic!("expected a Reply, got {other:?}"),
+        }
+    }
+}
+
+/// `orders` holds one request and one queued; `ops` (a token for another service) then tries to
+/// register under orders' instance id. The takeover is refused, nothing of orders moves, and
+/// orders still gets its queued request and can answer.
+async fn takeover_is_refused(mode: AuthMode) {
+    let h = hub(mode).await;
+    let mut victim = FakeClient::register_spec(h.addr, &flow_orders("tok-orders")).await;
+    victim.expect_ack().await;
+    let mut sender = web(h.addr).await;
+    for id in ["r1", "r2"] {
+        sender
+            .tx
+            .send(request(
+                id,
+                RequestKind::Command,
+                "orders.Place",
+                RequestMode::Unary,
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(expect_request(&mut victim).await, "r1");
+
+    // The attacker holds a valid token, for `ops`, and names the victim's instance id.
+    let mut attacker =
+        FakeClient::register_spec_as(h.addr, &victim.instance_id, &spec("ops", Some("tok-ops")))
+            .await;
+    let status = attacker.expect_closed().await;
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        format!(
+            "instance id {} belongs to another service",
+            &victim.instance_id[..8]
+        )
+    );
+
+    // A session of its own cannot answer the victim's pending request either.
+    let mut own = FakeClient::register_spec(h.addr, &spec("ops", Some("tok-ops"))).await;
+    own.expect_ack().await;
+    own.tx
+        .send(FakeClient::reply_ok("r1", b"forged"))
+        .await
+        .unwrap();
+    own.tx
+        .send(FakeClient::reply_ok("r2", b"forged"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The victim is untouched: it answers r1, and its queued r2 still comes to it.
+    victim
+        .tx
+        .send(FakeClient::reply_ok("r1", b"real"))
+        .await
+        .unwrap();
+    assert_eq!(expect_reply_payload(&mut sender).await, b"real");
+    victim.permits(1).await;
+    assert_eq!(expect_request(&mut victim).await, "r2");
+    victim
+        .tx
+        .send(FakeClient::reply_ok("r2", b"real2"))
+        .await
+        .unwrap();
+    assert_eq!(expect_reply_payload(&mut sender).await, b"real2");
+    assert!(own.silent_for(Duration::from_millis(100)).await);
+}
+
+#[tokio::test]
+async fn enforce_refuses_a_takeover_of_another_services_instance_id() {
+    takeover_is_refused(AuthMode::Enforce).await;
+}
+
+#[tokio::test]
+async fn permissive_refuses_a_takeover_of_another_services_instance_id_too() {
+    takeover_is_refused(AuthMode::Permissive).await;
+}
+
+#[tokio::test]
+async fn off_keeps_replacing_an_instance_id_whatever_its_service() {
+    let h = hub(AuthMode::Off).await;
+    let mut first = FakeClient::register_spec(h.addr, &spec("orders", None)).await;
+    first.expect_ack().await;
+    let mut second =
+        FakeClient::register_spec_as(h.addr, &first.instance_id, &spec("ops", None)).await;
+    second.expect_ack().await;
+}
+
+#[tokio::test]
+async fn a_same_service_reconnect_still_takes_over_the_session_and_its_queue() {
+    let h = hub(AuthMode::Enforce).await;
+    let mut old = FakeClient::register_spec(h.addr, &flow_orders("tok-orders")).await;
+    old.expect_ack().await;
+    let sender = web(h.addr).await;
+    for id in ["r1", "r2"] {
+        sender
+            .tx
+            .send(request(
+                id,
+                RequestKind::Command,
+                "orders.Place",
+                RequestMode::Unary,
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(expect_request(&mut old).await, "r1");
+    let mut new =
+        FakeClient::register_spec_as(h.addr, &old.instance_id, &flow_orders("tok-orders")).await;
+    new.expect_ack().await;
+    // r2 was queued for the instance id: the new stream gets it.
+    assert_eq!(expect_request(&mut new).await, "r2");
+}
+
+#[tokio::test]
+async fn a_reconnect_with_the_rotated_token_of_the_same_service_is_allowed() {
+    let dir = TempDir::new();
+    let both = [
+        acl_entry("tok-orders", "orders", &["orders.*"], &[]),
+        acl_entry("tok-orders-next", "orders", &["orders.*"], &[]),
+    ]
+    .concat();
+    let file = dir.write("acl.toml", &both);
+    let addr = start_hub(auth_config(AuthMode::Enforce, &file)).await;
+    let mut old = FakeClient::register_spec(addr, &flow_orders("tok-orders")).await;
+    old.expect_ack().await;
+    let mut new =
+        FakeClient::register_spec_as(addr, &old.instance_id, &flow_orders("tok-orders-next")).await;
+    new.expect_ack().await;
+}
