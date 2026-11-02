@@ -2938,6 +2938,9 @@ impl Router {
                 }
             }
             // The per-instance limit, over the targets of every open subscription.
+            // TODO(perf): this scan is O(total targets of all open subscriptions) under the
+            // pending lock on every subscribe; keep a per-instance open-target counter
+            // (bumped at open, dropped wherever a target leaves `Subscription::targets`).
             let max = self.config.max_subscriptions_per_instance;
             let mut open: HashMap<&str, u32> = targets
                 .iter()
