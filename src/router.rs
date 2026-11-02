@@ -1092,6 +1092,23 @@ impl Router {
         // sender's token may not send is answered at once, whatever mode it asked for. The same
         // immediate `Error` as every other gate (a ReplyEnd exists only after a mode was
         // accepted).
+        //
+        // A sender without a session has no principal to judge and nobody to answer, so with
+        // access control on it is refused too (it used to fall through to routing).
+        if sender_info.is_none() && self.auth.mode() != AuthMode::Off {
+            self.record_rejected(None, req_kind, &type_name, Outcome::Denied);
+            record_outcome(&span, Outcome::Denied);
+            log_outcome(
+                &id,
+                &type_name,
+                Some(req_kind),
+                sender,
+                None,
+                Outcome::Denied,
+                false,
+            );
+            return;
+        }
         if let Some(info) = &sender_info
             && let Err(denied) =
                 self.auth
@@ -8794,6 +8811,35 @@ mod auth_tests {
             "the successor cannot answer it either"
         );
         assert_eq!(f.router.in_flight(), 1, "the request is still pending");
+    }
+
+    #[tokio::test]
+    async fn a_request_from_a_sender_without_a_session_is_refused_unless_access_control_is_off() {
+        for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+            let mut f = fixture(mode);
+            // `ghost` never registered (or its session is gone): there is no principal to judge
+            // and nobody to answer.
+            f.router.route(
+                &D,
+                "ghost",
+                request("r1", RequestKind::Query, "t.Qry", RequestMode::Unary),
+            );
+            assert!(f.handler.try_recv().is_err(), "{mode:?}: nothing is routed");
+            assert_eq!(f.router.in_flight(), 0, "{mode:?}");
+            assert_eq!(
+                f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+                Some(1),
+                "{mode:?}"
+            );
+        }
+        // Off judges nothing, as before.
+        let mut f = fixture(AuthMode::Off);
+        f.router.route(
+            &D,
+            "ghost",
+            request("r1", RequestKind::Query, "t.Qry", RequestMode::Unary),
+        );
+        assert!(f.handler.try_recv().is_ok());
     }
 
     #[tokio::test]
