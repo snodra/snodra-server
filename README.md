@@ -562,7 +562,11 @@ umbrella `docs/05-services/hub.md` (Query modes).
   `Request{id = <id>#n, mode = SUBSCRIPTION}` (`n` = 1, 2, ... in target order: service, then
   instance id; `initial_credit` and `max_results` 0) **written directly**: a subscription is
   passive, so it takes no permit, waits in no queue and counts in nobody's `inFlightAsHandler`;
-  a target whose buffer is full at the open is left out. One of the targets, chosen as for a
+  a target whose buffer is full at the open is left out (when none could be written the
+  subscription ends with the last failure's code: `RESOURCE_EXHAUSTED` for a full buffer,
+  `HANDLER_DISCONNECTED` for a session that is gone). Every `<id>#n` is written **before** the
+  `<id>#0` initial request, so on the instance that gets both the library sees the update target
+  first; a close cancels only the targets already written. One of the targets, chosen as for a
   point query (tags, load, round-robin), also gets the **initial request**
   `Request{id = <id>#0, mode = UNARY}` with the sender's `timeout_ms` and priority, through flow
   control, queues and priority like any unary request, holding a permit. Its `Reply{payload}`
