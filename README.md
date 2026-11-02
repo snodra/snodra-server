@@ -430,7 +430,12 @@ flood of half-open connections cannot stall the accept loop. At startup and on e
 the hub warns when the private key file is readable by its group or others (Unix: any of `0o077`
 set); `chmod 600` it. The dev sandbox's key is `0644` on purpose (see `dev-hub-pki.sh`) and warns. `--health-check` and `--topology` take
 `--address` and `--tls-ca <pem>`; inside the hub's own container they pin its certificate, so the
-image `HEALTHCHECK` needs no change. Client certificates (mTLS) are P5c.
+image `HEALTHCHECK` needs no change. The pin is the
+certificate file's content **at the moment of each probe**, not at hub start: while a rotation is
+in flight the file on disk is new before the hub has reloaded it (up to one
+`KRAKEN_HUB_RELOAD_INTERVAL`, 5 s by default, or `kill -HUP` for an immediate reload), so the
+local healthcheck can be red for up to one poll. Let the healthcheck's `retries` cover that, and
+rotate the pair by replacing the key and the certificate together. Client certificates (mTLS) are P5c.
 
 **Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/topology`, `/api/v1/*`, the event stream
 and the gRPC `Topology` call; the page and its assets stay public. In `enforce` mode the gRPC
