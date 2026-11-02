@@ -23,7 +23,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthMode, Authorizer, Denied, Digest, Disposition};
+use crate::auth::{AuthMode, Authorizer, Denied, Disposition, Principal};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::hub_server::Hub;
@@ -99,7 +99,7 @@ pub fn reevaluate_sessions(
     }
     let mut closed = 0;
     for view in sessions.auth_views() {
-        let denials = auth.recheck(view.principal.as_ref(), &view.service, &view.handled);
+        let denials = auth.recheck(view.principal.as_deref(), &view.service, &view.handled);
         let Some(first) = denials.first() else {
             continue;
         };
@@ -107,7 +107,7 @@ pub fn reevaluate_sessions(
             auth.report(
                 &denials,
                 &view.service,
-                view.principal.as_ref(),
+                view.principal.as_deref(),
                 Disposition::Kept,
             );
             continue;
@@ -115,7 +115,7 @@ pub fn reevaluate_sessions(
         auth.report(
             &denials,
             &view.service,
-            view.principal.as_ref(),
+            view.principal.as_deref(),
             Disposition::Closed,
         );
         if let Some(tx) = sessions.sender(&view.context, &view.instance_id) {
@@ -303,7 +303,7 @@ impl StreamCtx {
     /// that records a registration, the first `Register` and each re-register, calls this after.
     fn judge_again(
         &self,
-        principal: Option<&Digest>,
+        principal: Option<&Principal>,
         service: &str,
         handled: &[String],
     ) -> Option<Status> {
@@ -441,7 +441,7 @@ async fn run_stream(
         scatter_gather,
         streaming,
         subscription,
-        principal,
+        principal: principal.clone(),
         auth: admission.status.clone(),
     };
     let permits = meta.permits();
@@ -507,7 +507,7 @@ async fn run_stream(
     }
     // A reload may have run between the check above and the insert, when no session existed for
     // it to re-judge; judge once more now that the session and its types are recorded.
-    if let Some(status) = ctx.judge_again(principal.as_ref(), &service, &handled) {
+    if let Some(status) = ctx.judge_again(principal.as_deref(), &service, &handled) {
         ctx.disconnect(&instance_id, token);
         let _ = tx.try_send(Err(status));
         return;
@@ -556,15 +556,15 @@ async fn run_stream(
                     reg.service_name = service.clone();
                 }
                 // A re-register may add types: they are judged against the current ACL too.
-                let denials = ctx
-                    .auth
-                    .recheck(principal.as_ref(), &service, &handled_types(&reg));
+                let denials =
+                    ctx.auth
+                        .recheck(principal.as_deref(), &service, &handled_types(&reg));
                 if let Some(first) = denials.first() {
                     if ctx.auth.mode() == AuthMode::Enforce {
                         ctx.auth.report(
                             &denials,
                             &service,
-                            principal.as_ref(),
+                            principal.as_deref(),
                             Disposition::Closed,
                         );
                         if let Some(tx) = out.upgrade() {
@@ -572,8 +572,12 @@ async fn run_stream(
                         }
                         break;
                     }
-                    ctx.auth
-                        .report(&denials, &service, principal.as_ref(), Disposition::Allowed);
+                    ctx.auth.report(
+                        &denials,
+                        &service,
+                        principal.as_deref(),
+                        Disposition::Allowed,
+                    );
                 }
                 match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
@@ -581,7 +585,7 @@ async fn run_stream(
                         // have overtaken the check above (the recorded types it judged were the
                         // previous ones).
                         if let Some(status) =
-                            ctx.judge_again(principal.as_ref(), &service, &handled_types(&reg))
+                            ctx.judge_again(principal.as_deref(), &service, &handled_types(&reg))
                         {
                             if let Some(tx) = out.upgrade() {
                                 let _ = tx.try_send(Err(status));
@@ -699,7 +703,7 @@ async fn run_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Acl, AuthStatus, digest_of, hash_token};
+    use crate::auth::{Acl, AuthStatus, Principal, digest_of, hash_token};
     use crate::session::SessionMeta;
     use crate::telemetry::test_support::test_metrics;
 
@@ -716,7 +720,7 @@ mod tests {
         let ctx = ContextId::default();
         let (tx, rx) = mpsc::channel(4);
         let mut meta = SessionMeta::v1(Duration::from_secs(30));
-        meta.principal = Some(digest_of("tok"));
+        meta.principal = Some(Arc::new(Principal::token(digest_of("tok"), "orders")));
         meta.auth = AuthStatus::Authenticated {
             service: "orders".into(),
         };
@@ -852,12 +856,12 @@ mod tests {
             Arc::clone(&auth),
         );
         let ctx = stream_ctx(&auth, &registry, &sessions, &router);
-        let principal = digest_of("tok");
+        let principal = Principal::token(digest_of("tok"), "orders");
 
         // The session registered with orders.Place.
         let (tx, mut rx) = mpsc::channel(4);
         let mut meta = SessionMeta::v1(Duration::from_secs(30));
-        meta.principal = Some(principal);
+        meta.principal = Some(Arc::new(principal.clone()));
         let token = sessions.insert(
             &ctx.context,
             "i1",

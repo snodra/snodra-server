@@ -1112,7 +1112,7 @@ impl Router {
         if let Some(info) = &sender_info
             && let Err(denied) =
                 self.auth
-                    .check_send(info.principal.as_ref(), &info.service, &type_name)
+                    .check_send(info.principal.as_deref(), &info.service, &type_name)
         {
             let mode = mode_label(req.mode);
             self.record_rejected_mode(sender_service, req_kind, &type_name, Outcome::Denied, mode);
@@ -8492,7 +8492,7 @@ mod subscription_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    use crate::auth::{Acl, AuthMode, AuthStatus, digest_of, hash_token};
+    use crate::auth::{Acl, AuthMode, AuthStatus, Principal, digest_of, hash_token};
     use crate::proto::RequestMode;
     use crate::telemetry::test_support::{TestMetrics, test_metrics};
     use tokio::sync::mpsc;
@@ -8533,7 +8533,11 @@ mod auth_tests {
             rx
         };
         let handler = connect("h1", "orders", None);
-        let sender = connect("s1", "web", Some(digest_of("tok-web")));
+        let sender = connect(
+            "s1",
+            "web",
+            Some(Arc::new(Principal::token(digest_of("tok-web"), "web"))),
+        );
         let router = Router::with_auth(
             registry,
             sessions,

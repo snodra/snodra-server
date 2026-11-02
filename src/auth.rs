@@ -13,12 +13,12 @@
 //! * [`Secret`]: a token the hub compares but never keeps (the dashboard token).
 //!
 //! Tokens are never logged and never stored: a token is hashed as soon as it is read, and logs
-//! carry at most [`short`] (the first 8 hex characters of the digest). P5b adds a JWT credential
-//! and P5c a client certificate; both plug into [`Authorizer::admit`] in the place of the token
-//! lookup. P5a has no `Principal` type: a session keeps the digest of its token
-//! ([`crate::session::SessionMeta::principal`]) and every later check looks it up in the ACL. A
-//! `Principal` (service name, handle and send patterns) that every credential kind produces is
-//! deferred to P5b, which will change what a session stores (ADR 0018, "What P5b and P5c add").
+//! carry at most [`short`] (the first 8 hex characters of the digest). Every credential kind
+//! produces a [`Principal`]: who the credential speaks for and the ACL entry it resolves through
+//! (a token's digest, or a service name for a JWT, ADR 0019). A session keeps its principal
+//! ([`crate::session::SessionMeta::principal`]) and every later check looks the entry up again,
+//! so a reload takes effect on live sessions. P5c adds a client certificate; it plugs into
+//! [`Authorizer::admit`] in the place of the token lookup.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -333,6 +333,91 @@ pub struct AclEntry {
     pub label: Option<String>,
 }
 
+impl AclEntry {
+    fn rights(&self) -> Rights<'_> {
+        Rights {
+            service: &self.service,
+            handle: &self.handle,
+            send: &self.send,
+        }
+    }
+}
+
+/// What an ACL entry grants, whichever table it came from.
+#[derive(Debug, Clone, Copy)]
+pub struct Rights<'a> {
+    /// The service the credential may act as.
+    pub service: &'a str,
+    pub handle: &'a [Pattern],
+    pub send: &'a [Pattern],
+}
+
+/// The ACL entry a credential resolves through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclKey {
+    /// A static token: the digest of a `[[token]]` entry.
+    Token(Digest),
+    /// A JWT: the service name of a `[[service]]` entry (the token's `azp`).
+    Service(String),
+}
+
+/// How a credential was presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    Token,
+    Jwt,
+}
+
+impl CredentialKind {
+    /// `token` or `jwt`, as the topology shows it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Jwt => "jwt",
+        }
+    }
+}
+
+/// Who a valid credential speaks for: what every credential kind produces, and what a session
+/// keeps instead of the credential (which the hub never stores).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    /// The service the credential authenticates: the `service` of a token's entry, or a JWT's
+    /// `azp`.
+    pub service: String,
+    /// The entry later checks look up in the current ACL.
+    pub key: AclKey,
+    /// When a JWT expires (`exp`); `None` for a token, which does not.
+    pub expires_at: Option<SystemTime>,
+}
+
+impl Principal {
+    /// The principal of a token whose entry grants `service`.
+    pub fn token(digest: Digest, service: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            key: AclKey::Token(digest),
+            expires_at: None,
+        }
+    }
+
+    pub fn kind(&self) -> CredentialKind {
+        match self.key {
+            AclKey::Token(_) => CredentialKind::Token,
+            AclKey::Service(_) => CredentialKind::Jwt,
+        }
+    }
+
+    /// How logs name the credential: the first 8 hex characters of a token's digest, or the
+    /// service of a JWT's entry (clipped). Never the credential itself.
+    pub fn label(&self) -> String {
+        match &self.key {
+            AclKey::Token(digest) => short(digest),
+            AclKey::Service(name) => clip(name),
+        }
+    }
+}
+
 /// The parsed ACL file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Acl {
@@ -425,6 +510,14 @@ impl Acl {
     /// True when some entry is for `service`.
     pub fn has_service(&self, service: &str) -> bool {
         self.entries.iter().any(|e| e.service == service)
+    }
+
+    /// What the entry `key` names grants now, `None` when the file no longer has it.
+    pub fn rights(&self, key: &AclKey) -> Option<Rights<'_>> {
+        match key {
+            AclKey::Token(digest) => self.lookup(digest).map(AclEntry::rights),
+            AclKey::Service(_) => None,
+        }
     }
 }
 
@@ -526,8 +619,9 @@ impl AuthStatus {
 /// The result of [`Authorizer::admit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
-    /// The digest of the token when it is in the ACL; what later request checks look up.
-    pub principal: Option<Digest>,
+    /// Who the credentials speak for when their entry is in the ACL; what later request checks
+    /// look up.
+    pub principal: Option<Arc<Principal>>,
     pub status: AuthStatus,
     /// Set only in mode `enforce`: close the stream with it.
     pub refused: Option<Denied>,
@@ -706,12 +800,14 @@ impl Authorizer {
         }
         let acl = self.acl();
         let mut denials = Vec::new();
-        let mut matched: Option<(Digest, &AclEntry)> = None;
+        let mut matched: Option<(Principal, Rights<'_>)> = None;
         match credentials.and_then(|c| c.kind.as_ref()) {
             Some(credentials::Kind::Token(token)) if !token.is_empty() => {
                 let digest = digest_of(token);
                 match acl.lookup(&digest) {
-                    Some(entry) => matched = Some((digest, entry)),
+                    Some(entry) => {
+                        matched = Some((Principal::token(digest, &entry.service), entry.rights()));
+                    }
                     None => denials.push(Denied::new(
                         "unknown_token",
                         DeniedCode::Unauthenticated,
@@ -734,10 +830,10 @@ impl Authorizer {
                 },
             )),
         }
-        if let Some((digest, entry)) = matched {
-            denials.extend(judge(entry, &digest, service, handled));
+        if let Some((principal, rights)) = &matched {
+            denials.extend(judge(*rights, &principal.key, service, handled));
         }
-        let key = matched.map(|(d, _)| short(&d));
+        let key = matched.as_ref().map(|(p, _)| p.label());
         for d in &denials {
             self.count(&acl, d, service);
         }
@@ -768,14 +864,14 @@ impl Authorizer {
                 );
             }
         }
-        let status = match matched {
-            Some((_, entry)) => AuthStatus::Authenticated {
-                service: entry.service.clone(),
+        let status = match &matched {
+            Some((_, rights)) => AuthStatus::Authenticated {
+                service: rights.service.to_string(),
             },
             None => AuthStatus::UnauthenticatedPermissive,
         };
         Admission {
-            principal: matched.map(|(d, _)| d),
+            principal: matched.map(|(p, _)| Arc::new(p)),
             status,
             refused: (self.mode == AuthMode::Enforce)
                 .then(|| denials.into_iter().next())
@@ -860,14 +956,14 @@ impl Authorizer {
     /// session without a principal is only judged in `enforce` (it cannot exist there).
     pub fn recheck(
         &self,
-        principal: Option<&Digest>,
+        principal: Option<&Principal>,
         service: &str,
         handled: &[String],
     ) -> Vec<Denied> {
         if self.mode == AuthMode::Off {
             return Vec::new();
         }
-        let Some(digest) = principal else {
+        let Some(principal) = principal else {
             return if self.mode == AuthMode::Enforce {
                 vec![Denied::new(
                     "no_credentials",
@@ -878,13 +974,9 @@ impl Authorizer {
                 Vec::new()
             };
         };
-        match self.acl().lookup(digest) {
-            None => vec![Denied::new(
-                "token_revoked",
-                DeniedCode::Unauthenticated,
-                "token no longer accepted",
-            )],
-            Some(entry) => judge(entry, digest, service, handled),
+        match self.acl().rights(&principal.key) {
+            None => vec![entry_gone(&principal.key)],
+            Some(rights) => judge(rights, &principal.key, service, handled),
         }
     }
 
@@ -893,13 +985,13 @@ impl Authorizer {
         &self,
         denials: &[Denied],
         service: &str,
-        principal: Option<&Digest>,
+        principal: Option<&Principal>,
         disposition: Disposition,
     ) {
         let acl = self.acl();
         let service = clip(service);
         for d in denials {
-            let key = principal.map_or_else(|| "-".to_string(), short);
+            let key = principal.map_or_else(|| "-".to_string(), Principal::label);
             if disposition != Disposition::Kept {
                 self.count(&acl, d, &service);
             }
@@ -929,24 +1021,20 @@ impl Authorizer {
     /// without a principal is not judged here: its `Register` was already reported.
     pub fn check_send(
         &self,
-        principal: Option<&Digest>,
+        principal: Option<&Principal>,
         sender_service: &str,
         type_name: &str,
     ) -> Result<(), Denied> {
         if self.mode == AuthMode::Off {
             return Ok(());
         }
-        let Some(digest) = principal else {
+        let Some(principal) = principal else {
             return Ok(());
         };
         let acl = self.acl();
-        let denied = match acl.lookup(digest) {
-            None => Some(Denied::new(
-                "token_revoked",
-                DeniedCode::Unauthenticated,
-                "token no longer accepted",
-            )),
-            Some(entry) if entry.service != sender_service => Some(Denied::new(
+        let denied = match acl.rights(&principal.key) {
+            None => Some(entry_gone(&principal.key)),
+            Some(rights) if rights.service != sender_service => Some(Denied::new(
                 "wrong_service",
                 DeniedCode::PermissionDenied,
                 format!(
@@ -954,7 +1042,7 @@ impl Authorizer {
                     clip(sender_service)
                 ),
             )),
-            Some(entry) if !any_matches(&entry.send, type_name) => Some(Denied::new(
+            Some(rights) if !any_matches(rights.send, type_name) => Some(Denied::new(
                 "send_denied",
                 DeniedCode::PermissionDenied,
                 format!(
@@ -977,7 +1065,7 @@ impl Authorizer {
                     reason = denied.reason,
                     service,
                     r#type,
-                    key = short(digest),
+                    key = principal.label(),
                     "request refused"
                 );
             } else {
@@ -985,7 +1073,7 @@ impl Authorizer {
                     reason = denied.reason,
                     service,
                     r#type,
-                    key = short(digest),
+                    key = principal.label(),
                     "auth violation (permissive, allowed)"
                 );
             }
@@ -997,23 +1085,45 @@ impl Authorizer {
 /// Forbidden types a denial names; the rest is "and N more".
 const MAX_LISTED_TYPES: usize = 10;
 
+/// The denial for a principal whose ACL entry is gone: the token was removed from the file, or
+/// the service's table was.
+fn entry_gone(key: &AclKey) -> Denied {
+    match key {
+        AclKey::Token(_) => Denied::new(
+            "token_revoked",
+            DeniedCode::Unauthenticated,
+            "token no longer accepted",
+        ),
+        AclKey::Service(name) => Denied::new(
+            "no_acl_entry",
+            DeniedCode::PermissionDenied,
+            format!("no ACL entry for service {}", clip(name)),
+        ),
+    }
+}
+
 /// The checks of an entry that matched: the service name, then every handled type.
-fn judge(entry: &AclEntry, digest: &Digest, service: &str, handled: &[String]) -> Vec<Denied> {
+fn judge(rights: Rights<'_>, key: &AclKey, service: &str, handled: &[String]) -> Vec<Denied> {
     let mut out = Vec::new();
-    if entry.service != service {
+    if rights.service != service {
         out.push(Denied::new(
             "wrong_service",
             DeniedCode::PermissionDenied,
-            format!(
-                "token {} is not allowed to register as service {}",
-                short(digest),
-                clip(service)
-            ),
+            match key {
+                AclKey::Token(digest) => format!(
+                    "token {} is not allowed to register as service {}",
+                    short(digest),
+                    clip(service)
+                ),
+                AclKey::Service(azp) => {
+                    format!("token azp {} is not service {}", clip(azp), clip(service))
+                }
+            },
         ));
     }
     let offending: Vec<&String> = handled
         .iter()
-        .filter(|t| !any_matches(&entry.handle, t))
+        .filter(|t| !any_matches(rights.handle, t))
         .collect();
     if !offending.is_empty() {
         // One denial for all of them: a client may offer thousands of types.
@@ -1091,6 +1201,11 @@ contexts = ["default"]
 
     fn types(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The principal of the test token `t` (granted `service`).
+    fn tok(t: &str, service: &str) -> Principal {
+        Principal::token(digest_of(t), service)
     }
 
     // ---- gRPC Topology (review finding 2) ----
@@ -1254,10 +1369,10 @@ contexts = ["default"]
     fn many_forbidden_types_collapse_into_one_denial_listing_ten() {
         let (a, _) = authorizer(AuthMode::Enforce);
         let many: Vec<String> = (0..25).map(|n| format!("x.T{n:02}")).collect();
-        let denials = a.recheck(Some(&digest_of("tok-orders")), "orders", &many);
+        let denials = a.recheck(Some(&tok("tok-orders", "orders")), "orders", &many);
         // tok-orders handles `*`: nothing is denied. tok-billing handles billing.* and shared.Ping.
         assert!(denials.is_empty());
-        let denials = a.recheck(Some(&digest_of("tok-billing")), "billing", &many);
+        let denials = a.recheck(Some(&tok("tok-billing", "billing")), "billing", &many);
         assert_eq!(denials.len(), 1, "{denials:?}");
         let message = &denials[0].message;
         assert_eq!(denials[0].reason, "handle_denied");
@@ -1268,14 +1383,18 @@ contexts = ["default"]
         assert!(!message.contains("x.T10"), "{message}");
         assert!(message.ends_with("and 15 more"), "{message}");
         // One forbidden type reads as before.
-        let one = a.recheck(Some(&digest_of("tok-billing")), "billing", &types(&["x.A"]));
+        let one = a.recheck(
+            Some(&tok("tok-billing", "billing")),
+            "billing",
+            &types(&["x.A"]),
+        );
         assert_eq!(
             one[0].message,
             "service billing is not allowed to handle type x.A"
         );
         // A long type name is cut too.
         let long = format!("x.{}", "n".repeat(1000));
-        let cut = a.recheck(Some(&digest_of("tok-billing")), "billing", &[long]);
+        let cut = a.recheck(Some(&tok("tok-billing", "billing")), "billing", &[long]);
         assert!(cut[0].message.len() < 300, "{}", cut[0].message.len());
     }
 
@@ -1465,7 +1584,10 @@ contexts = ["default"]
             &types(&["billing.Pay", "shared.Ping"]),
         );
         assert_eq!(adm.refused, None);
-        assert_eq!(adm.principal, Some(digest_of("tok-billing")));
+        assert_eq!(
+            adm.principal.as_deref(),
+            Some(&tok("tok-billing", "billing"))
+        );
         assert_eq!(
             adm.status,
             AuthStatus::Authenticated {
@@ -1597,7 +1719,7 @@ contexts = ["default"]
     #[test]
     fn requests_are_checked_against_send_patterns() {
         let (a, m) = authorizer(AuthMode::Enforce);
-        let d = digest_of("tok-billing");
+        let d = tok("tok-billing", "billing");
         assert!(a.check_send(Some(&d), "billing", "orders.Place").is_ok());
         let denied = a.check_send(Some(&d), "billing", "admin.Wipe").unwrap_err();
         assert_eq!(
@@ -1610,7 +1732,7 @@ contexts = ["default"]
             Some(1)
         );
         // A token the ACL no longer holds is unauthenticated; a changed service is denied.
-        let gone = digest_of("tok-gone");
+        let gone = tok("tok-gone", "billing");
         assert_eq!(
             a.check_send(Some(&gone), "billing", "x.Y")
                 .unwrap_err()
@@ -1628,7 +1750,7 @@ contexts = ["default"]
     #[test]
     fn permissive_request_violations_are_counted_and_allowed() {
         let (a, m) = authorizer(AuthMode::Permissive);
-        let d = digest_of("tok-billing");
+        let d = tok("tok-billing", "billing");
         assert!(a.check_send(Some(&d), "billing", "admin.Wipe").is_ok());
         assert_eq!(
             m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
@@ -1645,7 +1767,7 @@ contexts = ["default"]
     #[test]
     fn recheck_finds_revoked_tokens_and_narrowed_handles() {
         let (a, _m) = authorizer(AuthMode::Enforce);
-        let d = digest_of("tok-billing");
+        let d = tok("tok-billing", "billing");
         assert!(
             a.recheck(Some(&d), "billing", &types(&["billing.Pay"]))
                 .is_empty()
@@ -1655,12 +1777,32 @@ contexts = ["default"]
             "handle_denied"
         );
         assert_eq!(
-            a.recheck(Some(&digest_of("x")), "billing", &[])[0].reason,
+            a.recheck(Some(&tok("x", "billing")), "billing", &[])[0].reason,
             "token_revoked"
         );
         assert_eq!(a.recheck(None, "billing", &[])[0].reason, "no_credentials");
         let (p, _m) = authorizer(AuthMode::Permissive);
         assert!(p.recheck(None, "billing", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_principal_names_its_entry_and_never_the_credential() {
+        let t = tok("tok-billing", "billing");
+        assert_eq!(t.kind(), CredentialKind::Token);
+        assert_eq!(t.label(), short(&digest_of("tok-billing")));
+        assert_eq!(t.expires_at, None);
+        let j = Principal {
+            service: "billing".into(),
+            key: AclKey::Service("billing".into()),
+            expires_at: Some(SystemTime::UNIX_EPOCH),
+        };
+        assert_eq!(j.kind(), CredentialKind::Jwt);
+        assert_eq!(j.label(), "billing");
+        assert_eq!(CredentialKind::Jwt.as_str(), "jwt");
+        // The entry of a token resolves through the digest, not through the service name.
+        let acl = Acl::parse(&acl_text()).unwrap();
+        assert_eq!(acl.rights(&t.key).unwrap().service, "billing");
+        assert!(acl.rights(&tok("nope", "billing").key).is_none());
     }
 
     #[test]

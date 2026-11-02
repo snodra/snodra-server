@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tracing::info;
 
-use crate::auth::{AuthStatus, Digest};
+use crate::auth::{AuthStatus, Principal};
 use crate::context::ContextId;
 use crate::proto::{InstanceStatus, ServerMessage};
 use crate::registry::{InstanceId, Placement};
@@ -111,9 +111,9 @@ pub struct SessionMeta {
     /// mode SUBSCRIPTION, is a target for them, and sends and receives the multi-part messages
     /// (ADR 0017, P4c).
     pub subscription: bool,
-    /// The digest of the token the session registered with, when it is in the ACL (ADR 0018);
-    /// every later request is judged against the current ACL entry of this digest.
-    pub principal: Option<Digest>,
+    /// Who the session's credentials speak for, when their ACL entry existed (ADR 0018, 0019);
+    /// every later request is judged against the current ACL entry this names.
+    pub principal: Option<Arc<Principal>>,
     /// How the session authenticated, for the topology and the dashboard.
     pub auth: AuthStatus,
 }
@@ -181,7 +181,7 @@ pub struct SenderInfo {
     /// The session shares "subscription".
     pub subscription: bool,
     /// See [`SessionMeta::principal`].
-    pub principal: Option<Digest>,
+    pub principal: Option<Arc<Principal>>,
 }
 
 /// Read-only copy of one session's observable state, for the topology view.
@@ -208,7 +208,7 @@ pub struct AuthView {
     pub instance_id: InstanceId,
     pub token: u64,
     pub service: String,
-    pub principal: Option<Digest>,
+    pub principal: Option<Arc<Principal>>,
     pub handled: Vec<String>,
 }
 
@@ -328,7 +328,7 @@ impl Sessions {
                 scatter_gather: s.meta.scatter_gather,
                 streaming: s.meta.streaming,
                 subscription: s.meta.subscription,
-                principal: s.meta.principal,
+                principal: s.meta.principal.clone(),
             })
     }
 
@@ -363,7 +363,7 @@ impl Sessions {
                 instance_id: id.clone(),
                 token: s.token,
                 service: s.service.clone(),
-                principal: s.meta.principal,
+                principal: s.meta.principal.clone(),
                 handled: s.handled.clone(),
             })
             .collect()
