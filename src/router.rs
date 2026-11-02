@@ -7845,6 +7845,48 @@ mod subscription_tests {
         assert_eq!(f.router.in_flight(), 0);
     }
 
+    /// A library registers a subscription when it reads `<id>#n` and buffers emits until the
+    /// initial request is answered, relying on the hub writing `<id>#n` to an instance's stream
+    /// BEFORE `<id>#0` to that same instance (ADR 0017, P4c rulings). The order on the stream of
+    /// the instance that gets the initial request, whichever instance that is.
+    #[tokio::test]
+    async fn every_target_request_is_written_before_the_initial_request_to_the_same_instance() {
+        let mut f = Subs::new();
+        let mut initial_handlers = Vec::new();
+        for id in ["w1", "w2", "w3"] {
+            f.router.route(&D, "s1", subscribe(id, "q.Watch", 0, 0, 0));
+            let mut mine = Vec::new();
+            for h in ["a1", "b1"] {
+                let ids: Vec<String> = f
+                    .requests(h)
+                    .into_iter()
+                    .map(|r| r.id)
+                    .filter(|r| r.starts_with(&format!("{id}#")))
+                    .collect();
+                if ids.contains(&format!("{id}#0")) {
+                    mine.push((h, ids));
+                }
+            }
+            let [(h, ids)]: [(&str, Vec<String>); 1] =
+                mine.try_into().expect("one instance got the initial");
+            assert_eq!(
+                ids.len(),
+                2,
+                "{h} got both its target and the initial request: {ids:?}"
+            );
+            assert_ne!(ids[0], format!("{id}#0"), "{h}: #n before #0: {ids:?}");
+            assert_eq!(ids[1], format!("{id}#0"), "{h}: {ids:?}");
+            initial_handlers.push(h);
+        }
+        initial_handlers.sort();
+        initial_handlers.dedup();
+        assert_eq!(
+            initial_handlers,
+            ["a1", "b1"],
+            "both instances were tried as the initial target"
+        );
+    }
+
     #[tokio::test]
     async fn a_sender_that_leaves_cancels_every_target() {
         let mut f = Subs::new();
