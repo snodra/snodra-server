@@ -734,6 +734,55 @@ pub fn settings(c: &Config) -> SettingsView {
             "ACL (token SHA-256 to service, handle and send patterns); reloaded when it changes",
         ),
         setting(
+            "KRAKEN_HUB_JWT_ISSUER",
+            url(&c.jwt_issuer),
+            Some(url(&d.jwt_issuer)),
+            Plain,
+            "the iss a JWT credential must carry, exact match; unset: JWT credentials are refused",
+        ),
+        setting(
+            "KRAKEN_HUB_JWT_JWKS_URI",
+            url(&c.jwt_jwks_uri),
+            Some(url(&d.jwt_jwks_uri)),
+            Plain,
+            "where the signing keys are fetched from (default: <issuer>/protocol/openid-connect/certs)",
+        ),
+        setting(
+            "KRAKEN_HUB_JWT_AUDIENCE",
+            c.jwt_audience.clone().unwrap_or_default(),
+            Some(String::new()),
+            Plain,
+            "when set, a JWT's aud must contain it",
+        ),
+        setting(
+            "KRAKEN_HUB_JWT_LEEWAY",
+            fmt_duration(c.jwt_leeway),
+            Some(fmt_duration(d.jwt_leeway)),
+            Plain,
+            "clock skew tolerated on exp, nbf and iat",
+        ),
+        setting(
+            "KRAKEN_HUB_JWT_EXPIRY_GRACE",
+            fmt_duration(c.jwt_expiry_grace),
+            Some(fmt_duration(d.jwt_expiry_grace)),
+            Plain,
+            "how long after exp a JWT session stays open without a refresh",
+        ),
+        setting(
+            "KRAKEN_HUB_JWKS_REFRESH",
+            fmt_duration(c.jwks_refresh),
+            Some(fmt_duration(d.jwks_refresh)),
+            Plain,
+            "how often the signing keys are fetched again",
+        ),
+        setting(
+            "KRAKEN_HUB_JWT_JWKS_CA",
+            path(&c.jwt_jwks_ca),
+            Some(path(&d.jwt_jwks_ca)),
+            Plain,
+            "extra CA (PEM) trusted for the key fetch, on top of the platform roots",
+        ),
+        setting(
             "KRAKEN_HUB_TLS_CERT",
             path(&c.tls_cert),
             Some(path(&d.tls_cert)),
@@ -1185,7 +1234,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 39);
+        assert_eq!(v.settings.len(), 46);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
@@ -1254,6 +1303,43 @@ mod tests {
                 .all(|s| s.value.is_none())
         );
         assert_eq!(get("KRAKEN_HUB_AUTH_MODE").value.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn the_jwt_settings_are_listed_with_their_effective_values() {
+        let c = Config {
+            jwt_issuer: Some("https://sso.example/realms/kraken".into()),
+            jwt_jwks_uri: Some("http://keycloak:8080/certs".into()),
+            jwt_audience: Some("kraken-hub".into()),
+            jwt_leeway: Duration::from_secs(5),
+            ..Config::default()
+        };
+        let v = settings(&c);
+        let get = |name: &str| v.settings.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            get("KRAKEN_HUB_JWT_ISSUER").value.as_deref(),
+            Some("https://sso.example/realms/kraken")
+        );
+        assert_eq!(
+            get("KRAKEN_HUB_JWT_JWKS_URI").value.as_deref(),
+            Some("http://keycloak:8080/certs")
+        );
+        assert_eq!(
+            get("KRAKEN_HUB_JWT_AUDIENCE").value.as_deref(),
+            Some("kraken-hub")
+        );
+        let leeway = get("KRAKEN_HUB_JWT_LEEWAY");
+        assert_eq!(
+            (leeway.value.as_deref(), leeway.default.as_deref()),
+            (Some("5s"), Some("30s"))
+        );
+        assert_eq!(
+            get("KRAKEN_HUB_JWT_EXPIRY_GRACE").value.as_deref(),
+            Some("30s")
+        );
+        assert_eq!(get("KRAKEN_HUB_JWKS_REFRESH").value.as_deref(), Some("5m"));
+        assert_eq!(get("KRAKEN_HUB_JWT_JWKS_CA").value.as_deref(), Some(""));
+        assert!(!get("KRAKEN_HUB_JWT_ISSUER").secret);
     }
 
     #[test]

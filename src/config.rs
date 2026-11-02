@@ -133,6 +133,32 @@ pub struct Config {
     /// TLS handshakes in progress at once from one peer IP; more are dropped at once. `0`
     /// disables the cap. `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`, default 32.
     pub tls_handshakes_per_ip: usize,
+    /// The `iss` a JWT credential must carry, compared as an exact string (ADR 0019). Unset: JWT
+    /// credentials are refused as "not configured". `KRAKEN_HUB_JWT_ISSUER`.
+    pub jwt_issuer: Option<String>,
+    /// Where the issuer's signing keys are fetched from; `None` exactly when [`Config::jwt_issuer`]
+    /// is. Default `<issuer>/protocol/openid-connect/certs` (Keycloak). Separate from the issuer
+    /// so a hub can fetch from an internal address and validate the public issuer.
+    /// `KRAKEN_HUB_JWT_JWKS_URI`.
+    pub jwt_jwks_uri: Option<String>,
+    /// When set, a JWT's `aud` (a string or an array) must contain it. `KRAKEN_HUB_JWT_AUDIENCE`.
+    pub jwt_audience: Option<String>,
+    /// Clock skew tolerated on `exp`, `nbf` and `iat`. `KRAKEN_HUB_JWT_LEEWAY`, default 30 s.
+    pub jwt_leeway: Duration,
+    /// How long after `exp` a session stays open without a refresh. `KRAKEN_HUB_JWT_EXPIRY_GRACE`,
+    /// default 30 s.
+    pub jwt_expiry_grace: Duration,
+    /// How often the signing keys are fetched again. `KRAKEN_HUB_JWKS_REFRESH`, default 5 m.
+    pub jwks_refresh: Duration,
+    /// An extra CA (PEM) trusted for the JWKS fetch, on top of the platform roots.
+    /// `KRAKEN_HUB_JWT_JWKS_CA`.
+    pub jwt_jwks_ca: Option<PathBuf>,
+    /// At most one key-set fetch per this long is made because a token names an unknown `kid`.
+    /// Not an environment variable: 30 s, shortened by tests.
+    pub jwks_refetch_interval: Duration,
+    /// A key-set fetch that takes longer fails. Not an environment variable: 10 s, shortened by
+    /// tests.
+    pub jwks_fetch_timeout: Duration,
 }
 
 impl Default for Config {
@@ -177,6 +203,15 @@ impl Default for Config {
             reload_interval: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(5),
             tls_handshakes_per_ip: 32,
+            jwt_issuer: None,
+            jwt_jwks_uri: None,
+            jwt_audience: None,
+            jwt_leeway: Duration::from_secs(30),
+            jwt_expiry_grace: Duration::from_secs(30),
+            jwks_refresh: Duration::from_secs(300),
+            jwt_jwks_ca: None,
+            jwks_refetch_interval: Duration::from_secs(30),
+            jwks_fetch_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -329,8 +364,58 @@ impl Config {
                 .parse()
                 .context("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP")?;
         }
+        c.jwt_issuer = secret("KRAKEN_HUB_JWT_ISSUER");
+        let explicit_uri = secret("KRAKEN_HUB_JWT_JWKS_URI");
+        c.jwt_audience = secret("KRAKEN_HUB_JWT_AUDIENCE");
+        c.jwt_jwks_ca = path_var(&var, "KRAKEN_HUB_JWT_JWKS_CA");
+        if let Some(v) = var("KRAKEN_HUB_JWT_LEEWAY") {
+            c.jwt_leeway = parse_duration(&v).context("KRAKEN_HUB_JWT_LEEWAY")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_JWT_EXPIRY_GRACE") {
+            c.jwt_expiry_grace = parse_duration(&v).context("KRAKEN_HUB_JWT_EXPIRY_GRACE")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_JWKS_REFRESH") {
+            c.jwks_refresh = parse_duration(&v).context("KRAKEN_HUB_JWKS_REFRESH")?;
+        }
+        c.resolve_jwt(explicit_uri)?;
         c.validate()?;
         Ok(c)
+    }
+
+    /// Settles the JWKS URI: the explicit one, else Keycloak's path under the issuer. The JWT
+    /// settings that only mean something with an issuer are an error without one, so a hub whose
+    /// operator thinks JWT is on does not quietly refuse every JWT as "not configured".
+    fn resolve_jwt(&mut self, explicit_uri: Option<String>) -> anyhow::Result<()> {
+        let Some(issuer) = &self.jwt_issuer else {
+            for (name, set) in [
+                ("KRAKEN_HUB_JWT_JWKS_URI", explicit_uri.is_some()),
+                ("KRAKEN_HUB_JWT_AUDIENCE", self.jwt_audience.is_some()),
+                ("KRAKEN_HUB_JWT_JWKS_CA", self.jwt_jwks_ca.is_some()),
+            ] {
+                if set {
+                    bail!(
+                        "{name} needs KRAKEN_HUB_JWT_ISSUER (without an issuer JWT credentials are off)"
+                    );
+                }
+            }
+            return Ok(());
+        };
+        let uri = match explicit_uri {
+            Some(uri) => uri,
+            None => {
+                if jwks_uri_host(issuer).is_err() {
+                    bail!(
+                        "KRAKEN_HUB_JWT_ISSUER is not an http(s) URL, so the JWKS URI cannot be derived from it; set KRAKEN_HUB_JWT_JWKS_URI"
+                    );
+                }
+                format!(
+                    "{}/protocol/openid-connect/certs",
+                    issuer.trim_end_matches('/')
+                )
+            }
+        };
+        self.jwt_jwks_uri = Some(uri);
+        Ok(())
     }
 
     /// Reads the token files into the tokens (the file wins over the variable). A file that
@@ -449,6 +534,12 @@ impl Config {
                 self.auth_mode.as_str()
             );
         }
+        if self.jwks_refresh.is_zero() {
+            bail!("KRAKEN_HUB_JWKS_REFRESH must be positive");
+        }
+        if let Some(uri) = &self.jwt_jwks_uri {
+            jwks_uri_host(uri).context("KRAKEN_HUB_JWT_JWKS_URI")?;
+        }
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             bail!("KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY must be set together");
         }
@@ -537,6 +628,23 @@ impl Config {
                 out.push("the dashboard token is set but the HTTP port has no TLS: the token travels in clear text".to_string());
             }
         }
+        // The key set decides who may register as what: over plain HTTP anyone on the path can
+        // swap it. Loopback and a single-label name (a compose service) stay on the host or the
+        // private network, so they are not worth a line.
+        if let Some(uri) = &self.jwt_jwks_uri
+            && let Ok((false, host)) = jwks_uri_host(uri)
+            && !(host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+                || !host.contains(['.', ':']))
+        {
+            out.push(format!(
+                "KRAKEN_HUB_JWT_JWKS_URI uses plain http to {host}: whoever can alter that traffic can mint tokens the hub accepts; use https (KRAKEN_HUB_JWT_JWKS_CA adds a private CA)"
+            ));
+        }
         if self.dashboard_write_token.is_some() {
             out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is reserved for the processor controls of roadmap P6 and has no effect yet".to_string());
         }
@@ -617,6 +725,27 @@ fn check_link_url(url: &str) -> anyhow::Result<()> {
 }
 
 /// A path variable: unset or empty is `None`.
+/// `(is_https, host)` of an http(s) URL with no user info. The error never echoes the URL (it
+/// may hold credentials).
+fn jwks_uri_host(url: &str) -> anyhow::Result<(bool, String)> {
+    let uri: tonic::codegen::http::Uri = url
+        .parse()
+        .map_err(|_| anyhow::anyhow!("not a valid URL"))?;
+    let https = match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => false,
+        _ => bail!("must be an http:// or https:// URL"),
+    };
+    let authority = uri.authority().map(|a| a.as_str()).unwrap_or_default();
+    if authority.contains('@') {
+        bail!("must not carry user info");
+    }
+    match uri.host() {
+        Some(host) if !host.is_empty() => Ok((https, host.to_string())),
+        _ => bail!("has no host"),
+    }
+}
+
 fn path_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf> {
     var(name)
         .map(|v| PathBuf::from(v.trim()))
@@ -1321,6 +1450,155 @@ mod tests {
             Some("127.0.0.1:9".parse().unwrap())
         );
         assert!(with(Some("nonsense")).is_err());
+    }
+
+    #[test]
+    fn jwt_is_off_by_default() {
+        let c = with_env(&[]).unwrap();
+        assert_eq!(c.jwt_issuer, None);
+        assert_eq!(c.jwt_jwks_uri, None);
+        assert_eq!(c.jwt_audience, None);
+        assert_eq!(c.jwt_leeway, Duration::from_secs(30));
+        assert_eq!(c.jwt_expiry_grace, Duration::from_secs(30));
+        assert_eq!(c.jwks_refresh, Duration::from_secs(300));
+        assert_eq!(c.jwt_jwks_ca, None);
+        assert_eq!(c.jwks_refetch_interval, Duration::from_secs(30));
+        assert_eq!(c.jwks_fetch_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_jwks_uri_defaults_to_keycloaks_certs_path_under_the_issuer() {
+        let c =
+            with_env(&[("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken")]).unwrap();
+        assert_eq!(
+            c.jwt_issuer.as_deref(),
+            Some("https://sso.example/realms/kraken")
+        );
+        assert_eq!(
+            c.jwt_jwks_uri.as_deref(),
+            Some("https://sso.example/realms/kraken/protocol/openid-connect/certs")
+        );
+        // A trailing slash does not double up in the derived URI; the issuer itself is kept exact.
+        let c = with_env(&[(
+            "KRAKEN_HUB_JWT_ISSUER",
+            "https://sso.example/realms/kraken/",
+        )])
+        .unwrap();
+        assert_eq!(
+            c.jwt_issuer.as_deref(),
+            Some("https://sso.example/realms/kraken/")
+        );
+        assert_eq!(
+            c.jwt_jwks_uri.as_deref(),
+            Some("https://sso.example/realms/kraken/protocol/openid-connect/certs")
+        );
+    }
+
+    #[test]
+    fn the_jwt_settings_are_read_from_the_environment() {
+        let c = with_env(&[
+            ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken"),
+            (
+                "KRAKEN_HUB_JWT_JWKS_URI",
+                "http://keycloak:8080/realms/kraken/certs",
+            ),
+            ("KRAKEN_HUB_JWT_AUDIENCE", "kraken-hub"),
+            ("KRAKEN_HUB_JWT_LEEWAY", "5s"),
+            ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "0"),
+            ("KRAKEN_HUB_JWKS_REFRESH", "10m"),
+            ("KRAKEN_HUB_JWT_JWKS_CA", "/etc/hub/ca.pem"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.jwt_jwks_uri.as_deref(),
+            Some("http://keycloak:8080/realms/kraken/certs")
+        );
+        assert_eq!(c.jwt_audience.as_deref(), Some("kraken-hub"));
+        assert_eq!(c.jwt_leeway, Duration::from_secs(5));
+        assert_eq!(c.jwt_expiry_grace, Duration::ZERO);
+        assert_eq!(c.jwks_refresh, Duration::from_secs(600));
+        assert_eq!(c.jwt_jwks_ca.as_deref(), Some(Path::new("/etc/hub/ca.pem")));
+    }
+
+    #[test]
+    fn jwt_settings_without_an_issuer_are_a_startup_error() {
+        for (name, value) in [
+            ("KRAKEN_HUB_JWT_JWKS_URI", "https://sso.example/certs"),
+            ("KRAKEN_HUB_JWT_AUDIENCE", "kraken-hub"),
+            ("KRAKEN_HUB_JWT_JWKS_CA", "/etc/hub/ca.pem"),
+        ] {
+            let err = with_env(&[(name, value)]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("KRAKEN_HUB_JWT_ISSUER"),
+                "{name}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_jwt_settings_are_startup_errors() {
+        let issuer = ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken");
+        // The derived JWKS URI needs an http(s) issuer; an explicit one lifts that.
+        assert!(with_env(&[("KRAKEN_HUB_JWT_ISSUER", "kraken-sso")]).is_err());
+        assert!(
+            with_env(&[
+                ("KRAKEN_HUB_JWT_ISSUER", "kraken-sso"),
+                ("KRAKEN_HUB_JWT_JWKS_URI", "https://sso.example/certs")
+            ])
+            .is_ok()
+        );
+        for uri in [
+            "ftp://sso.example/certs",
+            "sso.example/certs",
+            "https://user:secret@sso.example/certs",
+            "https:///certs",
+        ] {
+            let err = with_env(&[issuer, ("KRAKEN_HUB_JWT_JWKS_URI", uri)]).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("KRAKEN_HUB_JWT_JWKS_URI"), "{uri}: {text}");
+            assert!(!text.contains("secret"), "never echo user info: {text}");
+        }
+        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWKS_REFRESH", "0")]).is_err());
+        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_LEEWAY", "soon")]).is_err());
+        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "-1")]).is_err());
+    }
+
+    #[test]
+    fn a_plain_http_jwks_warns_unless_it_stays_on_the_host() {
+        let warns = |uri: &str| {
+            let c = with_env(&[
+                ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken"),
+                ("KRAKEN_HUB_JWT_JWKS_URI", uri),
+            ])
+            .unwrap();
+            c.security_warnings()
+                .into_iter()
+                .filter(|w| w.contains("KRAKEN_HUB_JWT_JWKS_URI"))
+                .count()
+        };
+        assert_eq!(warns("http://sso.example/certs"), 1);
+        assert_eq!(warns("http://10.0.0.7:8080/certs"), 1);
+        assert_eq!(warns("http://[2001:db8::1]/certs"), 1);
+        // Loopback and a single-label name (a compose service) are not worth a warning.
+        for quiet in [
+            "http://localhost:8180/certs",
+            "http://127.0.0.1:8180/certs",
+            "http://[::1]:8180/certs",
+            "http://keycloak:8080/certs",
+            "https://sso.example/certs",
+        ] {
+            assert_eq!(warns(quiet), 0, "{quiet}");
+        }
+        // One warning, however many times the hub asks.
+        let c = with_env(&[("KRAKEN_HUB_JWT_ISSUER", "http://sso.example/realms/kraken")]).unwrap();
+        assert_eq!(
+            c.security_warnings()
+                .iter()
+                .filter(|w| w.contains("KRAKEN_HUB_JWT_JWKS_URI"))
+                .count(),
+            1,
+            "a derived plain-http URI warns too"
+        );
     }
 
     #[test]
