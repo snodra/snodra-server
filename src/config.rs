@@ -407,13 +407,25 @@ impl Config {
                     .to_string(),
             );
         }
+        // Enforce protects the gRPC topology with ACL tokens, but the HTTP one only with the
+        // dashboard token: without it, enforce leaves the same data open on the HTTP port.
+        let enforce_open_http = self.auth_mode == AuthMode::Enforce
+            && self.dashboard_token.is_none()
+            && self.http_listen.is_some();
+        if let (true, Some(http)) = (enforce_open_http, self.http_listen) {
+            out.push(format!(
+                "access control is enforced but KRAKEN_HUB_DASHBOARD_TOKEN is not set: GET /topology and the dashboard API on {http} are open to any peer that can reach it (only the gRPC Topology needs a token); set KRAKEN_HUB_DASHBOARD_TOKEN or KRAKEN_HUB_DASHBOARD_TOKEN_FILE"
+            ));
+        }
         if let Some(http) = self.http_listen
             && open(http)
         {
             if self.dashboard_token.is_none() {
-                out.push(format!(
-                    "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: /topology and the dashboard API are open to any peer"
-                ));
+                if !enforce_open_http {
+                    out.push(format!(
+                        "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: /topology and the dashboard API are open to any peer"
+                    ));
+                }
             } else if self.http_tls().is_none() {
                 out.push("the dashboard token is set but the HTTP port has no TLS: the token travels in clear text".to_string());
             }
@@ -1306,6 +1318,41 @@ mod tests {
         let w = enforced.security_warnings();
         assert!(!w.iter().any(|m| m.contains("AUTH_MODE")), "{w:?}");
         assert!(w.iter().any(|m| m.contains("no TLS")), "{w:?}");
+    }
+
+    #[test]
+    fn enforce_without_a_dashboard_token_warns_that_the_http_topology_is_open() {
+        // Even on loopback: enforce is meant to protect the topology, and HTTP does not use ACL tokens.
+        let enforced = Config {
+            auth_mode: AuthMode::Enforce,
+            acl_file: Some("/acl".into()),
+            listen: "127.0.0.1:7000".parse().unwrap(),
+            http_listen: Some("127.0.0.1:7001".parse().unwrap()),
+            ..Config::default()
+        };
+        let w = enforced.security_warnings();
+        assert_eq!(
+            w.iter()
+                .filter(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN"))
+                .count(),
+            1,
+            "{w:?}"
+        );
+        assert!(
+            w.iter()
+                .any(|m| m.contains("127.0.0.1:7001") && m.contains("enforce")),
+            "{w:?}"
+        );
+        let with_token = Config {
+            dashboard_token: Some(crate::auth::Secret::new("0123456789abcdef0123")),
+            ..enforced
+        };
+        assert!(
+            !with_token
+                .security_warnings()
+                .iter()
+                .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
+        );
     }
 
     #[test]

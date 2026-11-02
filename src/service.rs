@@ -199,17 +199,15 @@ impl Hub for HubService {
         &self,
         request: Request<TopologyRequest>,
     ) -> Result<Response<TopologyResponse>, Status> {
-        // The same data as `GET /topology`, so the same token (the CLI sends it as metadata).
-        if let Some(token) = &self.config.dashboard_token {
-            let presented = request
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::auth::bearer);
-            if !token.matches(presented) {
-                return Err(Status::unauthenticated("unauthenticated"));
-            }
-        }
+        // The same data as `GET /topology`, so the same dashboard token (the CLI sends it as
+        // metadata); in permissive and enforce mode an ACL token reads it too (ADR 0018).
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::auth::bearer);
+        self.auth
+            .check_topology(presented, self.config.dashboard_token.as_ref())?;
         debug!("topology requested");
         let topology = snapshot(
             &self.registry,

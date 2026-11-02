@@ -643,6 +643,48 @@ impl Authorizer {
         }
     }
 
+    /// Judges a gRPC `Topology` call carrying `presented` (the bearer token, if any) against the
+    /// dashboard token `dashboard` (if one is set) and the ACL. The topology lists every service,
+    /// type and instance id, so:
+    ///
+    /// * `enforce`: the dashboard token or any ACL token; with neither configured, or neither
+    ///   presented, the call is `UNAUTHENTICATED`.
+    /// * `permissive`: the same, except that an unauthenticated call is allowed when no dashboard
+    ///   token is set (it is logged and counted as `topology_unauthenticated`). A dashboard token
+    ///   that is set stays required, as before access control existed.
+    /// * `off`: only the dashboard token, when set.
+    pub fn check_topology(
+        &self,
+        presented: Option<&str>,
+        dashboard: Option<&Secret>,
+    ) -> Result<(), Status> {
+        let unauthenticated = || Status::unauthenticated("unauthenticated");
+        let dashboard_ok = dashboard.is_some_and(|d| d.matches(presented));
+        if self.mode == AuthMode::Off {
+            return if dashboard.is_none() || dashboard_ok {
+                Ok(())
+            } else {
+                Err(unauthenticated())
+            };
+        }
+        // Looked up even when the dashboard token matched, so the time does not tell which
+        // of the two the caller presented.
+        let acl_ok = presented.is_some_and(|t| self.acl().lookup(&digest_of(t)).is_some());
+        if dashboard_ok || acl_ok {
+            return Ok(());
+        }
+        if self.mode == AuthMode::Enforce || dashboard.is_some() {
+            return Err(unauthenticated());
+        }
+        self.metrics
+            .auth_violation("topology_unauthenticated", "unknown");
+        warn!(
+            reason = "topology_unauthenticated",
+            "auth violation (permissive, allowed): Topology without a valid token"
+        );
+        Ok(())
+    }
+
     /// The denial for a `Register` that names an instance id held by a session of another
     /// service. Counted (`instance_takeover`) and logged in `permissive` and `enforce` alike:
     /// handing one service's queue and pending replies to another is never legitimate, so
@@ -870,6 +912,81 @@ contexts = ["default"]
 
     fn types(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- gRPC Topology (review finding 2) ----
+
+    #[test]
+    fn enforce_topology_needs_the_dashboard_token_or_an_acl_token() {
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let dash = Secret::new("dash-token-0123456789");
+        let refused =
+            |r: Result<(), Status>| assert_eq!(r.unwrap_err().code(), tonic::Code::Unauthenticated);
+        // Neither configured nor presented, or a token that is neither.
+        refused(a.check_topology(None, None));
+        refused(a.check_topology(Some("not-a-token"), None));
+        refused(a.check_topology(None, Some(&dash)));
+        refused(a.check_topology(Some("not-a-token"), Some(&dash)));
+        // The dashboard token, or any ACL token.
+        assert!(
+            a.check_topology(Some("dash-token-0123456789"), Some(&dash))
+                .is_ok()
+        );
+        assert!(a.check_topology(Some("tok-billing"), None).is_ok());
+        assert!(a.check_topology(Some("tok-orders"), Some(&dash)).is_ok());
+        // Enforce refuses; it does not count a violation of its own.
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "topology_unauthenticated"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn permissive_topology_allows_and_counts_an_unauthenticated_call() {
+        let (a, m) = authorizer(AuthMode::Permissive);
+        assert!(a.check_topology(None, None).is_ok());
+        assert!(a.check_topology(Some("nope"), None).is_ok());
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "topology_unauthenticated"
+            ),
+            Some(2)
+        );
+        // An authenticated call is not a violation.
+        assert!(a.check_topology(Some("tok-orders"), None).is_ok());
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "topology_unauthenticated"
+            ),
+            Some(2)
+        );
+        // A dashboard token that is set keeps being required, as before the ACL existed.
+        let dash = Secret::new("dash-token-0123456789");
+        assert_eq!(
+            a.check_topology(None, Some(&dash)).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn off_topology_is_open_unless_a_dashboard_token_is_set() {
+        let (a, m) = authorizer(AuthMode::Off);
+        assert!(a.check_topology(None, None).is_ok());
+        let dash = Secret::new("dash-token-0123456789");
+        assert!(a.check_topology(None, Some(&dash)).is_err());
+        assert!(
+            a.check_topology(Some("dash-token-0123456789"), Some(&dash))
+                .is_ok()
+        );
+        assert_eq!(m.counter_total("kraken_hub_auth_violations_total"), None);
     }
 
     #[test]

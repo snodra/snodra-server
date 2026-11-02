@@ -888,3 +888,64 @@ async fn a_reconnect_with_the_rotated_token_of_the_same_service_is_allowed() {
         FakeClient::register_spec_as(addr, &old.instance_id, &flow_orders("tok-orders-next")).await;
     new.expect_ack().await;
 }
+
+#[tokio::test]
+async fn enforce_refuses_the_topology_rpc_without_a_dashboard_token_or_an_acl_token() {
+    let h = hub(AuthMode::Enforce).await;
+    let target = kraken_hub::client::Target::plain(h.addr);
+    for presented in [None, Some("not-a-token")] {
+        let denied = kraken_hub::topology_probe_target(&target, presented)
+            .await
+            .unwrap_err();
+        let status = denied
+            .downcast_ref::<tonic::Status>()
+            .expect("a gRPC status");
+        assert_eq!(status.code(), Code::Unauthenticated, "{presented:?}");
+    }
+    // Any ACL token reads it.
+    let t = kraken_hub::topology_probe_target(&target, Some("tok-web"))
+        .await
+        .unwrap();
+    assert_eq!(t.totals.instances, 0);
+    assert!(kraken_hub::health_probe(h.addr).await.unwrap());
+}
+
+#[tokio::test]
+async fn enforce_with_a_dashboard_token_accepts_it_and_acl_tokens() {
+    let dir = TempDir::new();
+    let file = dir.write("acl.toml", &acl());
+    let dash = "0123456789abcdef0123";
+    let addr = start_hub(Config {
+        dashboard_token: Some(kraken_hub::auth::Secret::new(dash)),
+        ..auth_config(AuthMode::Enforce, &file)
+    })
+    .await;
+    let target = kraken_hub::client::Target::plain(addr);
+    assert!(
+        kraken_hub::topology_probe_target(&target, None)
+            .await
+            .is_err()
+    );
+    for token in [dash, "tok-ops"] {
+        assert!(
+            kraken_hub::topology_probe_target(&target, Some(token))
+                .await
+                .is_ok(),
+            "{token}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn permissive_and_off_leave_the_topology_rpc_open_without_a_dashboard_token() {
+    for mode in [AuthMode::Permissive, AuthMode::Off] {
+        let h = hub(mode).await;
+        let target = kraken_hub::client::Target::plain(h.addr);
+        assert!(
+            kraken_hub::topology_probe_target(&target, None)
+                .await
+                .is_ok(),
+            "{mode:?}"
+        );
+    }
+}
