@@ -644,3 +644,37 @@ fn path_resolution_handles_dot_segments() {
         ["./a.js", "../b.js", "./c.js"]
     );
 }
+
+/// With a dashboard token the page loads, finds out from the first 401 that it needs one, and
+/// shows the sign-in form instead of data (ADR 0018). The console shows the failed request; the
+/// page itself must not break.
+#[tokio::test]
+async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (_grpc, http) = common::start_hub_with_http(Config {
+        dashboard_token: Some(kraken_hub::auth::Secret::new("dash-0123456789abcdef0123")),
+        ..config()
+    })
+    .await;
+    let http: SocketAddr = http.unwrap();
+    let profile = std::env::temp_dir().join(format!("kraken-hub-ui-login-{}", std::process::id()));
+    let url = format!("http://{http}/ui/");
+    let mut last = String::new();
+    for _ in 0..8 {
+        let (dom, _console) = load(&browser, &url, &profile).await;
+        if dom.contains("id=\"login-token\"") {
+            assert!(dom.contains("type=\"password\""), "{dom}");
+            assert!(dom.contains("Dashboard token"), "{dom}");
+            // No data page rendered behind the form.
+            assert!(!dom.contains("Traffic graph"), "{dom}");
+            let _ = std::fs::remove_dir_all(&profile);
+            return;
+        }
+        last = dom;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("the sign-in form never appeared: {last}");
+}

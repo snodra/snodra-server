@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use kraken_hub::config::Config;
@@ -463,4 +464,311 @@ impl MessageOrStatus for Streaming<ServerMessage> {
             Err(s) => Some(Err(s)),
         }
     }
+}
+
+// ---- access control and TLS (P5a) ---------------------------------------------------------
+
+/// A scratch directory under the system temp dir, removed on drop.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("kraken-hub-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
+    pub fn write(&self, name: &str, content: &str) -> PathBuf {
+        let path = self.path(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One `[[token]]` entry of an ACL file for `token` (hashed here, like `acl hash` does).
+pub fn acl_entry(token: &str, service: &str, handle: &[&str], send: &[&str]) -> String {
+    let list = |items: &[&str]| {
+        items
+            .iter()
+            .map(|i| format!("\"{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"{service}\"\nhandle = [{}]\nsend = [{}]\n\n",
+        kraken_hub::auth::hash_token(token),
+        list(handle),
+        list(send)
+    )
+}
+
+/// A config with access control `mode` over the ACL file `acl`, polling for changes every 50 ms.
+pub fn auth_config(mode: kraken_hub::auth::AuthMode, acl: &std::path::Path) -> Config {
+    Config {
+        otlp_endpoint: None,
+        auth_mode: mode,
+        acl_file: Some(acl.to_path_buf()),
+        reload_interval: Duration::from_millis(50),
+        ..Config::default()
+    }
+}
+
+/// Every capability a test sender may need.
+pub const ALL_CAPS: &[&str] = &["scatter-gather", "streaming", "subscription"];
+
+/// What a test `Register` carries.
+#[derive(Default, Clone)]
+pub struct Spec<'a> {
+    pub service: &'a str,
+    pub commands: Vec<&'a str>,
+    pub queries: Vec<&'a str>,
+    pub shared: Vec<&'a str>,
+    pub token: Option<&'a str>,
+    pub jwt: Option<&'a str>,
+    /// A protocol v1 client: no version, capabilities or credentials field.
+    pub v1: bool,
+    pub caps: Vec<&'a str>,
+}
+
+impl Spec<'_> {
+    pub fn register(&self, instance_id: &str) -> Register {
+        let credentials = match (self.token, self.jwt) {
+            (Some(t), _) => Some(credentials::Kind::Token(t.to_string())),
+            (None, Some(j)) => Some(credentials::Kind::Jwt(j.to_string())),
+            (None, None) => None,
+        }
+        .map(|kind| Credentials { kind: Some(kind) });
+        Register {
+            service_name: self.service.to_string(),
+            instance_id: instance_id.to_string(),
+            command_types: self.commands.iter().map(|s| s.to_string()).collect(),
+            query_types: self.queries.iter().map(|s| s.to_string()).collect(),
+            shared_query_types: self.shared.iter().map(|s| s.to_string()).collect(),
+            protocol_version: if self.v1 { 0 } else { 2 },
+            capabilities: self.caps.iter().map(|c| c.to_string()).collect(),
+            client_version: if self.v1 {
+                String::new()
+            } else {
+                "fake-client/1.0".into()
+            },
+            credentials: if self.v1 { None } else { credentials },
+            ..Register::default()
+        }
+    }
+}
+
+impl FakeClient {
+    /// Connects and sends the `Register` described by `spec`.
+    pub async fn register_spec(addr: SocketAddr, spec: &Spec<'_>) -> Self {
+        let client = Self::connect(addr).await;
+        client
+            .send_raw_register(spec.register(&client.instance_id))
+            .await;
+        client
+    }
+
+    /// Like [`FakeClient::connect`] over TLS, trusting the CA in `ca_pem`.
+    pub async fn connect_tls(addr: SocketAddr, ca_pem: &std::path::Path) -> Self {
+        let target = kraken_hub::client::Target {
+            address: addr.to_string(),
+            tls: Some(kraken_hub::client::Trust::Ca(ca_pem.to_path_buf())),
+        };
+        let channel = target.connect().await.unwrap();
+        let mut client = HubClient::new(channel);
+        let (tx, rx) = mpsc::channel(64);
+        let rx = client
+            .connect(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        Self {
+            tx,
+            rx,
+            instance_id: uuid::Uuid::now_v7().to_string(),
+        }
+    }
+
+    /// The next message, which must be a `RegisterAck` (the session was accepted).
+    pub async fn expect_ack(&mut self) -> kraken_hub::proto::RegisterAck {
+        match self.next().await {
+            Some(Ok(ServerMessage {
+                message: Some(kraken_hub::proto::server_message::Message::RegisterAck(ack)),
+            })) => ack,
+            other => panic!("expected a RegisterAck, got {other:?}"),
+        }
+    }
+
+    /// Waits for the stream to end with a status (the hub closed it) and returns it.
+    pub async fn expect_closed(&mut self) -> Status {
+        loop {
+            match self.next().await {
+                Some(Err(status)) => return status,
+                Some(Ok(_)) => continue,
+                None => panic!("the stream ended without a status"),
+            }
+        }
+    }
+
+    /// The next message, which must be an `Error`.
+    pub async fn expect_error(&mut self) -> Error {
+        loop {
+            match self.next().await {
+                Some(Ok(ServerMessage {
+                    message: Some(kraken_hub::proto::server_message::Message::Error(e)),
+                })) => return e,
+                Some(Ok(ServerMessage {
+                    message: Some(kraken_hub::proto::server_message::Message::Heartbeat(_)),
+                })) => continue,
+                other => panic!("expected an Error, got {other:?}"),
+            }
+        }
+    }
+
+    /// True when no message arrives within `d` (heartbeat echoes aside).
+    pub async fn silent_for(&mut self, d: Duration) -> bool {
+        tokio::time::timeout(d, async {
+            loop {
+                match self.rx.message().await {
+                    Ok(Some(ServerMessage {
+                        message: Some(kraken_hub::proto::server_message::Message::Heartbeat(_)),
+                    })) => continue,
+                    _ => return,
+                }
+            }
+        })
+        .await
+        .is_err()
+    }
+}
+
+/// A throwaway CA that signs server certificates, generated at test time (nothing is checked in).
+pub struct Pki {
+    ca_params: rcgen::CertificateParams,
+    ca_key: rcgen::KeyPair,
+    pub ca_pem: String,
+}
+
+impl Pki {
+    pub fn new(name: &str) -> Self {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        Self {
+            ca_pem: ca.pem(),
+            ca_params,
+            ca_key,
+        }
+    }
+
+    /// `(certificate PEM, private key PEM)` for a server reachable as `localhost` and `127.0.0.1`.
+    pub fn server(&self) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ));
+        let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// Writes `ca.pem`, `cert.pem` and `key.pem` named with `prefix` into `dir`; returns the
+    /// paths `(ca, cert, key)`.
+    pub fn write(&self, dir: &TempDir, prefix: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (cert, key) = self.server();
+        (
+            dir.write(&format!("{prefix}-ca.pem"), &self.ca_pem),
+            dir.write(&format!("{prefix}-cert.pem"), &cert),
+            dir.write(&format!("{prefix}-key.pem"), &key),
+        )
+    }
+}
+
+/// One HTTP/1.1 request over TLS (trusting `ca_pem`, server name `localhost`), bounded to 3 s.
+pub async fn https_request(
+    addr: SocketAddr,
+    ca_pem: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<HttpResponse, String> {
+    use rustls::pki_types::{ServerName, pem::PemObject};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let extra: String = headers
+        .iter()
+        .map(|(n, v)| format!("{n}: {v}\r\n"))
+        .collect();
+    let fut = async move {
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut raw = Vec::new();
+        // A close without close_notify is how this server ends a `Connection: close` exchange.
+        let _ = stream.read_to_end(&mut raw).await;
+        Ok::<_, String>(String::from_utf8_lossy(&raw).into_owned())
+    };
+    let raw = tokio::time::timeout(Duration::from_secs(3), fut)
+        .await
+        .map_err(|_| "timed out".to_string())??;
+    let (head, body) = raw.split_once("\r\n\r\n").ok_or("no HTTP response")?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or("malformed status line")?;
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let chunked = headers
+        .iter()
+        .any(|(n, v)| n == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    let body = if chunked {
+        dechunk(body)
+    } else {
+        body.to_string()
+    };
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }

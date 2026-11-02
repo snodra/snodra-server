@@ -274,7 +274,11 @@ async fn types_topology_settings_and_version_have_their_shape() {
     let window = find(&s["settings"], "name", "KRAKEN_HUB_EDGE_STATS_WINDOW");
     assert_eq!(window["value"], "5m");
     for entry in s["settings"].as_array().unwrap() {
-        assert_eq!(entry["secret"], false, "{entry}");
+        let secret = entry["name"].as_str().unwrap().ends_with("_TOKEN");
+        assert_eq!(entry["secret"], secret, "{entry}");
+        if secret {
+            assert!(entry["value"].is_null(), "{entry}");
+        }
         assert!(entry["description"].as_str().is_some_and(|d| !d.is_empty()));
     }
 
