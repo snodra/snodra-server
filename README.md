@@ -97,6 +97,8 @@ cargo run
 | `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
 | `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
 | `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
+| `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` | `5s` | a TLS handshake that takes longer is dropped; positive |
+| `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
 | `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/topology`, `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
 | `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` | none | reserved for the processor controls of roadmap P6; parsed, unused |
 
@@ -400,6 +402,11 @@ accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it 
 | `jwt` credentials | `UNAUTHENTICATED` "jwt credentials are not supported by this hub yet" (P5b) | same |
 | a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription) | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
+| a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
+| the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
+
+A reconnect of the **same** service takes over its instance id as before (also between two ACL
+entries of one service, as in a token rotation). With `off` an instance id may change service.
 
 The ACL reloads when the file changes (5 s poll, or SIGHUP); a file that does not parse keeps the
 previous ACL (`kraken_hub_acl_generation`, `kraken_hub_acl_reload_errors_total`). Live sessions are
@@ -409,12 +416,19 @@ token only as the first 8 hex characters of its digest. Roll out with `permissiv
 
 **TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
 TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
-reloads on change without dropping open connections. `--health-check` and `--topology` take
+reloads on change without dropping open connections. Handshakes are bounded: one that takes longer
+than `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` is dropped, and when every slot (512 per listener) or the
+peer IP's share (`KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`) is busy a new connection is dropped at once
+and counted in `kraken_hub_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
+flood of half-open connections cannot stall the accept loop. `--health-check` and `--topology` take
 `--address` and `--tls-ca <pem>`; inside the hub's own container they pin its certificate, so the
 image `HEALTHCHECK` needs no change. Client certificates (mTLS) are P5c.
 
 **Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/topology`, `/api/v1/*`, the event stream
-and the gRPC `Topology` call; the page and its assets stay public. The token goes in an
+and the gRPC `Topology` call; the page and its assets stay public. In `enforce` mode the gRPC
+`Topology` call also accepts any ACL token (`authorization: Bearer <token>` metadata) and, with no
+dashboard token set, refuses everything else; the HTTP topology is then still open, and the hub
+warns at startup. The token goes in an
 `Authorization: Bearer` header (the page keeps it in `sessionStorage` and reads the event stream
 with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`. Peers
 (`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.

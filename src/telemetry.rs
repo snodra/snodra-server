@@ -192,6 +192,7 @@ pub struct Metrics {
     auth_violations: Counter<u64>,
     acl_generation: Gauge<u64>,
     acl_reload_errors: Counter<u64>,
+    tls_handshakes_shed: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -290,6 +291,10 @@ impl Metrics {
                 .u64_counter("kraken_hub_acl_reload_errors_total")
                 .with_description("ACL reloads that failed to read or parse; the previous ACL stays in force")
                 .build(),
+            tls_handshakes_shed: meter
+                .u64_counter("kraken_hub_tls_handshakes_shed_total")
+                .with_description("TCP connections dropped before their TLS handshake because every handshake slot was busy (reason `slots`) or the peer IP already held its share (reason `per_ip`), per listener")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -307,6 +312,17 @@ impl Metrics {
 
     pub fn acl_generation_set(&self, generation: u64) {
         self.acl_generation.record(generation, &[]);
+    }
+
+    /// A connection dropped unhandshaken because the handshake limits were reached.
+    pub fn tls_handshake_shed(&self, listener: &'static str, reason: &'static str) {
+        self.tls_handshakes_shed.add(
+            1,
+            &[
+                KeyValue::new("listener", listener),
+                KeyValue::new("reason", reason),
+            ],
+        );
     }
 
     pub fn acl_reload_failed(&self) {

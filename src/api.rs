@@ -769,6 +769,20 @@ pub fn settings(c: &Config) -> SettingsView {
             "how often the ACL and the certificates are checked for changes",
         ),
         setting(
+            "KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT",
+            fmt_duration(c.tls_handshake_timeout),
+            Some(fmt_duration(d.tls_handshake_timeout)),
+            Plain,
+            "a TLS handshake that takes longer is dropped",
+        ),
+        setting(
+            "KRAKEN_HUB_TLS_HANDSHAKES_PER_IP",
+            c.tls_handshakes_per_ip.to_string(),
+            Some(d.tls_handshakes_per_ip.to_string()),
+            Plain,
+            "TLS handshakes in progress at once from one peer IP; more are dropped at once; 0: no cap",
+        ),
+        setting(
             "KRAKEN_HUB_DASHBOARD_TOKEN",
             String::new(),
             None,
@@ -1157,7 +1171,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 35);
+        assert_eq!(v.settings.len(), 37);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),

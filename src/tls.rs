@@ -9,14 +9,15 @@
 //!   task per connection (a slow or plain-text client never holds up the accept loop), for the
 //!   gRPC server ([`TlsConn`]) and for axum ([`TlsListener`]).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use rustls::ServerConfig;
@@ -34,10 +35,71 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// A TLS handshake that takes longer than this is dropped.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Handshakes in progress at once, per listener; further connections wait in the accept queue.
-const MAX_HANDSHAKES: usize = 512;
+use crate::telemetry::Metrics;
+
+/// Handshakes in progress at once, per listener.
+pub const MAX_HANDSHAKES: usize = 512;
+
+/// What bounds the TLS handshakes of one listener: a connection that cannot get a slot is shed
+/// (dropped at once), so a flood of half-open connections can neither stall the accept loop nor
+/// keep honest clients out for longer than one handshake timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeLimits {
+    /// A handshake that takes longer is dropped. `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT`, default 5 s.
+    pub timeout: Duration,
+    /// Handshakes in progress at once, over all peers.
+    pub slots: usize,
+    /// Handshakes in progress at once from one peer IP; 0 means no cap.
+    /// `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`, default 32.
+    pub per_ip: usize,
+}
+
+impl Default for HandshakeLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(5),
+            slots: MAX_HANDSHAKES,
+            per_ip: 32,
+        }
+    }
+}
+
+/// Handshakes in progress per peer IP; a guard counts one handshake and releases it on drop.
+#[derive(Default)]
+struct PerIp(std::sync::Mutex<HashMap<IpAddr, usize>>);
+
+struct IpGuard {
+    ips: Arc<PerIp>,
+    ip: IpAddr,
+}
+
+impl PerIp {
+    /// A guard for `ip`, or `None` when it already has `cap` handshakes in progress.
+    fn acquire(self: &Arc<Self>, ip: IpAddr, cap: usize) -> Option<IpGuard> {
+        let mut map = self.0.lock().unwrap();
+        let n = map.entry(ip).or_insert(0);
+        if cap > 0 && *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(IpGuard {
+            ips: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut map = self.ips.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Reads the PEM certificate chain and private key into a `CertifiedKey`, checking that the key
 /// belongs to the leaf.
@@ -152,21 +214,32 @@ pub fn server_config(
 }
 
 /// Completed TLS handshakes from a stream of accepted TCP connections. Each connection
-/// handshakes in its own task, bounded by [`HANDSHAKE_TIMEOUT`]; a client that does not speak
-/// TLS (plain text, a port scan) is dropped and logged at debug level. The accept task ends,
-/// and with it the listening socket, when the returned receiver is dropped or `stopping` fires.
+/// handshakes in its own task, bounded by `limits.timeout`; a client that does not speak TLS
+/// (plain text, a port scan) is dropped and logged at debug level. The accept loop never waits
+/// for a slot: a connection that finds every slot busy (or its peer IP at its cap) is dropped at
+/// once and counted in `kraken_hub_tls_handshakes_shed_total`. The accept task ends, and with it
+/// the listening socket, when the returned receiver is dropped or `stopping` fires; pending
+/// handshakes end with it. `listener` (`grpc` or `http`) labels the counter.
 pub fn accept<S>(
     mut incoming: S,
     config: Arc<ServerConfig>,
     stopping: CancellationToken,
+    limits: HandshakeLimits,
+    listener: &'static str,
+    metrics: Arc<Metrics>,
 ) -> mpsc::Receiver<TlsStream<TcpStream>>
 where
     S: Stream<Item = io::Result<TcpStream>> + Unpin + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(64);
     let acceptor = TlsAcceptor::from(config);
-    let slots = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    let slots = Arc::new(Semaphore::new(limits.slots));
+    let per_ip = Arc::new(PerIp::default());
     tokio::spawn(async move {
+        // Shed connections are logged once per window, not once per connection: during a flood
+        // they arrive at line rate.
+        let mut shed_logged: Option<Instant> = None;
+        let mut shed_since_log = 0u64;
         loop {
             let tcp = tokio::select! {
                 biased;
@@ -178,21 +251,53 @@ where
                 None => break,
                 Some(Err(e)) => {
                     warn!(error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::select! {
+                        biased;
+                        _ = stopping.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
                     continue;
                 }
                 Some(Ok(tcp)) => tcp,
             };
-            let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
-                break;
+            let peer = tcp.peer_addr().ok();
+            let shed = |reason: &'static str| {
+                metrics.tls_handshake_shed(listener, reason);
             };
-            let (acceptor, tx) = (acceptor.clone(), tx.clone());
+            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                shed("slots");
+                shed_since_log += 1;
+                log_shed(&mut shed_logged, &mut shed_since_log, listener);
+                continue;
+            };
+            let guard = match peer {
+                Some(peer) => match per_ip.acquire(peer.ip(), limits.per_ip) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        shed("per_ip");
+                        shed_since_log += 1;
+                        log_shed(&mut shed_logged, &mut shed_since_log, listener);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let (acceptor, tx, stopping) = (acceptor.clone(), tx.clone(), stopping.clone());
             tokio::spawn(async move {
-                let peer = tcp.peer_addr().ok();
-                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                let handshake = tokio::time::timeout(limits.timeout, acceptor.accept(tcp));
+                let result = tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => return,
+                    result = handshake => result,
+                };
+                match result {
                     Ok(Ok(stream)) => {
-                        drop(permit);
-                        let _ = tx.send(stream).await;
+                        drop((permit, guard));
+                        tokio::select! {
+                            biased;
+                            _ = stopping.cancelled() => {}
+                            _ = tx.send(stream) => {}
+                        }
                     }
                     Ok(Err(e)) => debug!(?peer, error = %e, "tls handshake failed"),
                     Err(_) => debug!(?peer, "tls handshake timed out"),
@@ -201,6 +306,21 @@ where
         }
     });
     rx
+}
+
+/// At most one "shedding" line per this long.
+const SHED_LOG_EVERY: Duration = Duration::from_secs(10);
+
+fn log_shed(last: &mut Option<Instant>, count: &mut u64, listener: &'static str) {
+    if last.is_none_or(|at| at.elapsed() >= SHED_LOG_EVERY) {
+        warn!(
+            listener,
+            shed = *count,
+            "TLS handshake limit reached: connections dropped without a handshake"
+        );
+        *last = Some(Instant::now());
+        *count = 0;
+    }
 }
 
 /// A TLS connection as tonic's server wants it.
@@ -272,5 +392,182 @@ impl axum::serve::Listener for TlsListener {
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
         Ok(self.local)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::test_support::{TestMetrics, test_metrics};
+    use rustls::pki_types::ServerName;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    struct Fx {
+        addr: SocketAddr,
+        rx: mpsc::Receiver<TlsStream<TcpStream>>,
+        stopping: CancellationToken,
+        connector: tokio_rustls::TlsConnector,
+        m: TestMetrics,
+    }
+
+    /// An `accept` loop over a loopback listener, with a throwaway self-signed certificate.
+    async fn fixture(limits: HandshakeLimits) -> Fx {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("kraken-hub-tls-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert_path, key.cert.pem()).unwrap();
+        std::fs::write(&key_path, key.signing_key.serialize_pem()).unwrap();
+        let store = CertStore::load(&cert_path, &key_path, "test").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = server_config(store, &[b"h2"], ClientAuth::None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp_tx, tcp_rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                if tcp_tx.send(Ok(tcp)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let stopping = CancellationToken::new();
+        let m = test_metrics();
+        let rx = accept(
+            ReceiverStream::new(tcp_rx),
+            config,
+            stopping.clone(),
+            limits,
+            "test",
+            Arc::clone(&m.metrics),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(key.cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Fx {
+            addr,
+            rx,
+            stopping,
+            connector: tokio_rustls::TlsConnector::from(Arc::new(client)),
+            m,
+        }
+    }
+
+    fn limits(slots: usize, per_ip: usize) -> HandshakeLimits {
+        HandshakeLimits {
+            timeout: Duration::from_secs(30),
+            slots,
+            per_ip,
+        }
+    }
+
+    /// True when the server closes `tcp` within `within` (a shed connection is dropped at once).
+    async fn closed_by_server(tcp: &mut TcpStream, within: Duration) -> bool {
+        let mut buf = [0u8; 16];
+        matches!(
+            tokio::time::timeout(within, tcp.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn filling_the_slots_sheds_new_connections_and_a_later_client_still_connects() {
+        let mut f = fixture(limits(2, 0)).await;
+        // Two clients that connect and say nothing hold both slots.
+        let silent = [
+            TcpStream::connect(f.addr).await.unwrap(),
+            TcpStream::connect(f.addr).await.unwrap(),
+        ];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A third is dropped at once; the accept loop never waits for a slot.
+        let mut third = TcpStream::connect(f.addr).await.unwrap();
+        assert!(
+            closed_by_server(&mut third, Duration::from_secs(2)).await,
+            "the connection must be shed, not left waiting for a slot"
+        );
+        assert_eq!(
+            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "slots"),
+            Some(1)
+        );
+        // The silent clients leave: slots free up and a real client completes its handshake.
+        drop(silent);
+        let connector = f.connector.clone();
+        let addr = f.addr;
+        let connected = tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                if let Ok(tcp) = TcpStream::connect(addr).await
+                    && let Ok(tls) = connector
+                        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                        .await
+                {
+                    return tls;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a client connects once slots are free");
+        let accepted = tokio::time::timeout(Duration::from_secs(2), f.rx.recv()).await;
+        assert!(matches!(accepted, Ok(Some(_))));
+        drop(connected);
+    }
+
+    #[tokio::test]
+    async fn a_peer_ip_cannot_hold_more_than_its_share_of_the_handshakes() {
+        let f = fixture(limits(100, 2)).await;
+        let held = [
+            TcpStream::connect(f.addr).await.unwrap(),
+            TcpStream::connect(f.addr).await.unwrap(),
+        ];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut third = TcpStream::connect(f.addr).await.unwrap();
+        assert!(closed_by_server(&mut third, Duration::from_secs(2)).await);
+        assert_eq!(
+            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "per_ip"),
+            Some(1)
+        );
+        assert_eq!(
+            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "slots"),
+            None
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_pending_handshakes() {
+        // A 30 s handshake timeout and every slot taken: only `stopping` can end things.
+        let mut f = fixture(limits(2, 0)).await;
+        let _silent = [
+            TcpStream::connect(f.addr).await.unwrap(),
+            TcpStream::connect(f.addr).await.unwrap(),
+        ];
+        let _shed = TcpStream::connect(f.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        f.stopping.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(1), f.rx.recv()).await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "the accept loop and the pending handshakes must end on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_never_finishes_is_dropped_at_the_timeout() {
+        let mut f = fixture(HandshakeLimits {
+            timeout: Duration::from_millis(100),
+            slots: 1,
+            per_ip: 0,
+        })
+        .await;
+        let mut silent = TcpStream::connect(f.addr).await.unwrap();
+        assert!(closed_by_server(&mut silent, Duration::from_secs(2)).await);
+        let _ = &mut f;
     }
 }

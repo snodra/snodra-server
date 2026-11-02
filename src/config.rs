@@ -121,6 +121,12 @@ pub struct Config {
     /// How often the ACL and the certificates are checked for changes.
     /// `KRAKEN_HUB_RELOAD_INTERVAL`, default 5 s.
     pub reload_interval: Duration,
+    /// A TLS handshake that takes longer is dropped. `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT`, default
+    /// 5 s, positive.
+    pub tls_handshake_timeout: Duration,
+    /// TLS handshakes in progress at once from one peer IP; more are dropped at once. `0`
+    /// disables the cap. `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`, default 32.
+    pub tls_handshakes_per_ip: usize,
 }
 
 impl Default for Config {
@@ -161,6 +167,8 @@ impl Default for Config {
             dashboard_token: None,
             dashboard_write_token: None,
             reload_interval: Duration::from_secs(5),
+            tls_handshake_timeout: Duration::from_secs(5),
+            tls_handshakes_per_ip: 32,
         }
     }
 }
@@ -300,8 +308,27 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_RELOAD_INTERVAL") {
             c.reload_interval = parse_duration(&v).context("KRAKEN_HUB_RELOAD_INTERVAL")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT") {
+            c.tls_handshake_timeout =
+                parse_duration(&v).context("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP") {
+            c.tls_handshakes_per_ip = v
+                .trim()
+                .parse()
+                .context("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP")?;
+        }
         c.validate()?;
         Ok(c)
+    }
+
+    /// The bounds of the TLS handshakes of each listener.
+    pub fn handshake_limits(&self) -> crate::tls::HandshakeLimits {
+        crate::tls::HandshakeLimits {
+            timeout: self.tls_handshake_timeout,
+            per_ip: self.tls_handshakes_per_ip,
+            ..Default::default()
+        }
     }
 
     /// The gRPC listener's certificate and key, when it serves TLS.
@@ -332,6 +359,9 @@ impl Config {
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
+        }
+        if self.tls_handshake_timeout.is_zero() {
+            bail!("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT must be positive");
         }
         if self.reload_interval.is_zero() {
             bail!("KRAKEN_HUB_RELOAD_INTERVAL must be positive");
@@ -1353,6 +1383,26 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
         );
+    }
+
+    #[test]
+    fn the_tls_handshake_bounds_default_parse_and_validate() {
+        let d = with_env(&[]).unwrap();
+        assert_eq!(d.tls_handshake_timeout, Duration::from_secs(5));
+        assert_eq!(d.tls_handshakes_per_ip, 32);
+        let c = with_env(&[
+            ("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT", "750ms"),
+            ("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP", "0"),
+        ])
+        .unwrap();
+        assert_eq!(c.tls_handshake_timeout, Duration::from_millis(750));
+        assert_eq!(c.tls_handshakes_per_ip, 0);
+        let limits = c.handshake_limits();
+        assert_eq!(limits.timeout, Duration::from_millis(750));
+        assert_eq!(limits.per_ip, 0);
+        assert_eq!(limits.slots, crate::tls::MAX_HANDSHAKES);
+        assert!(with_env(&[("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT", "0")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP", "many")]).is_err());
     }
 
     #[test]

@@ -101,7 +101,7 @@ pub async fn serve_with_shutdown(
         Arc::clone(&registry),
         Arc::clone(&sessions),
         Arc::clone(&config),
-        metrics,
+        Arc::clone(&metrics),
         Arc::clone(&auth),
     );
 
@@ -154,7 +154,9 @@ pub async fn serve_with_shutdown(
     }
     // Set once, when shutdown begins; the gRPC drain and the HTTP join share one deadline from it.
     let stop_began: Arc<std::sync::OnceLock<Instant>> = Arc::default();
+    let handshake_limits = config.handshake_limits();
     let http_task = http.map(|listener| {
+        let http_metrics = Arc::clone(&metrics);
         let app = http::app(http::HttpState {
             registry: Arc::clone(&registry),
             sessions: Arc::clone(&sessions),
@@ -183,7 +185,14 @@ pub async fn serve_with_shutdown(
             let result = match (tls_config, local) {
                 (Some(config), Ok(local)) => {
                     let incoming = TcpIncoming::from(listener).with_keepalive(Some(TCP_KEEPALIVE));
-                    let rx = tls::accept(incoming, config, stopping.clone());
+                    let rx = tls::accept(
+                        incoming,
+                        config,
+                        stopping.clone(),
+                        handshake_limits,
+                        "http",
+                        http_metrics,
+                    );
                     axum::serve(tls::TlsListener::new(rx, local), app)
                         .with_graceful_shutdown(shutdown)
                         .await
@@ -265,8 +274,15 @@ pub async fn serve_with_shutdown(
     let server: Served = match &grpc_tls {
         Some(store) => {
             let config = tls::server_config(Arc::clone(store), &[b"h2"], tls::ClientAuth::None);
-            let accepted = ReceiverStream::new(tls::accept(incoming, config, stopping.clone()))
-                .map(|stream| Ok::<_, std::io::Error>(tls::TlsConn(stream)));
+            let accepted = ReceiverStream::new(tls::accept(
+                incoming,
+                config,
+                stopping.clone(),
+                handshake_limits,
+                "grpc",
+                Arc::clone(&metrics),
+            ))
+            .map(|stream| Ok::<_, std::io::Error>(tls::TlsConn(stream)));
             Box::pin(routes.serve_with_incoming_shutdown(accepted, signal))
         }
         None => Box::pin(routes.serve_with_incoming_shutdown(incoming, signal)),
