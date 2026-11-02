@@ -3,7 +3,9 @@
 
 pub mod api;
 pub mod assets;
+pub mod auth;
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod context;
 pub mod edges;
@@ -11,10 +13,12 @@ pub mod http;
 pub mod protocol;
 pub mod queue;
 pub mod registry;
+pub mod reload;
 pub mod router;
 pub mod service;
 pub mod session;
 pub mod telemetry;
+pub mod tls;
 pub mod topology;
 
 pub mod proto {
@@ -27,6 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use auth::Authorizer;
+use client::Target;
 use config::Config;
 use proto::hub_server::HubServer;
 use registry::Registry;
@@ -35,6 +41,8 @@ use service::HubService;
 use session::Sessions;
 use telemetry::Metrics;
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::ServingStatus;
@@ -87,14 +95,63 @@ pub async fn serve_with_shutdown(
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
     let metrics = Metrics::new(opentelemetry::global::meter("kraken-hub"));
-    let router = Router::new(
+    let auth = Authorizer::from_config(&config, Arc::clone(&metrics))?;
+    info!(auth_mode = config.auth_mode.as_str(), "auth mode");
+    let router = Router::with_auth(
         Arc::clone(&registry),
         Arc::clone(&sessions),
         Arc::clone(&config),
         metrics,
+        Arc::clone(&auth),
     );
 
     let stopping = CancellationToken::new();
+    // TLS and reloads (ADR 0018): load the certificates now (a bad pair is fatal), then watch
+    // them and the ACL for changes until shutdown.
+    let grpc_tls = config
+        .grpc_tls()
+        .map(|(cert, key)| tls::CertStore::load(cert, key, "grpc"))
+        .transpose()?;
+    let http_tls = match (config.http_tls(), config.grpc_tls(), &grpc_tls) {
+        (Some(pair), Some(grpc_pair), Some(store)) if pair == grpc_pair => Some(Arc::clone(store)),
+        (Some((cert, key)), ..) => Some(tls::CertStore::load(cert, key, "http")?),
+        (None, ..) => None,
+    };
+    // One watcher per distinct store (the HTTP port shares the gRPC store by default).
+    let mut stores: Vec<Arc<tls::CertStore>> = Vec::new();
+    for store in [&grpc_tls, &http_tls].into_iter().flatten() {
+        if !stores.iter().any(|known| Arc::ptr_eq(known, store)) {
+            stores.push(Arc::clone(store));
+        }
+    }
+    for store in stores {
+        tokio::spawn(reload::watch(
+            store.paths(),
+            config.reload_interval,
+            stopping.clone(),
+            move || {
+                store.reload();
+            },
+        ));
+    }
+    if let Some(path) = auth.path() {
+        let (auth, registry, sessions, router) = (
+            Arc::clone(&auth),
+            Arc::clone(&registry),
+            Arc::clone(&sessions),
+            Arc::clone(&router),
+        );
+        tokio::spawn(reload::watch(
+            vec![path.to_path_buf()],
+            config.reload_interval,
+            stopping.clone(),
+            move || {
+                if auth.reload() {
+                    service::reevaluate_sessions(&auth, &registry, &sessions, &router);
+                }
+            },
+        ));
+    }
     // Set once, when shutdown begins; the gRPC drain and the HTTP join share one deadline from it.
     let stop_began: Arc<std::sync::OnceLock<Instant>> = Arc::default();
     let http_task = http.map(|listener| {
@@ -111,12 +168,32 @@ pub async fn serve_with_shutdown(
             summaries: Arc::default(),
         });
         let stopping = stopping.clone();
-        info!(addr = ?listener.local_addr().ok(), "http listening");
+        let local = listener.local_addr();
+        info!(addr = ?local.as_ref().ok(), tls = http_tls.is_some(), "http listening");
+        let tls_config = http_tls.as_ref().map(|store| {
+            tls::server_config(
+                Arc::clone(store),
+                &[b"h2", b"http/1.1"],
+                tls::ClientAuth::None,
+            )
+        });
         tokio::spawn(async move {
             let token = stopping.clone();
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move { token.cancelled().await })
-                .await;
+            let shutdown = async move { token.cancelled().await };
+            let result = match (tls_config, local) {
+                (Some(config), Ok(local)) => {
+                    let incoming = TcpIncoming::from(listener).with_keepalive(Some(TCP_KEEPALIVE));
+                    let rx = tls::accept(incoming, config, stopping.clone());
+                    axum::serve(tls::TlsListener::new(rx, local), app)
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+                _ => {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+            };
             if !stopping.is_cancelled() {
                 warn!("http server stopped before shutdown was requested");
             }
@@ -133,6 +210,7 @@ pub async fn serve_with_shutdown(
         sessions: Arc::clone(&sessions),
         router: Arc::clone(&router),
         config: Arc::clone(&config),
+        auth: Arc::clone(&auth),
         anchor,
         started: anchor.instant,
         heartbeat_timeout: config.heartbeat_timeout,
@@ -176,13 +254,23 @@ pub async fn serve_with_shutdown(
     };
 
     let incoming = TcpIncoming::from(listener).with_keepalive(Some(TCP_KEEPALIVE));
-    info!(addr = ?incoming.local_addr().ok(), "hub listening");
-    let server = tonic::transport::Server::builder()
+    info!(addr = ?incoming.local_addr().ok(), tls = grpc_tls.is_some(), "hub listening");
+    let routes = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
         .add_service(health_service)
-        .add_service(HubServer::new(hub))
-        .serve_with_incoming_shutdown(incoming, signal);
+        .add_service(HubServer::new(hub));
+    type Served =
+        std::pin::Pin<Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>>;
+    let server: Served = match &grpc_tls {
+        Some(store) => {
+            let config = tls::server_config(Arc::clone(store), &[b"h2"], tls::ClientAuth::None);
+            let accepted = ReceiverStream::new(tls::accept(incoming, config, stopping.clone()))
+                .map(|stream| Ok::<_, std::io::Error>(tls::TlsConn(stream)));
+            Box::pin(routes.serve_with_incoming_shutdown(accepted, signal))
+        }
+        None => Box::pin(routes.serve_with_incoming_shutdown(incoming, signal)),
+    };
     let result = tokio::select! {
         result = server => result,
         _ = async {
@@ -244,17 +332,38 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Makes SIGHUP reload the ACL and the TLS certificates at once, instead of at the next poll
+/// (`KRAKEN_HUB_RELOAD_INTERVAL`). The binary calls it; in-process hubs (tests) do not, so they
+/// never replace the process's SIGHUP disposition.
+pub fn reload_on_sighup() {
+    #[cfg(unix)]
+    tokio::spawn(async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(mut hangup) => {
+                while hangup.recv().await.is_some() {
+                    info!("SIGHUP: reloading the ACL and the TLS certificates");
+                    reload::request_reload();
+                }
+            }
+            Err(e) => warn!(error = %e, "cannot listen for SIGHUP"),
+        }
+    });
+}
+
 /// Calls `grpc.health.v1.Health/Check` for [`HEALTH_SERVICE`] on `addr`. `Ok(true)` when the
 /// hub answers `SERVING`, `Ok(false)` for any other status; connection and RPC failures are
 /// errors. The caller bounds the time (the `--health-check` mode uses 3 s).
 pub async fn health_probe(addr: SocketAddr) -> anyhow::Result<bool> {
+    health_probe_target(&Target::plain(addr)).await
+}
+
+/// Like [`health_probe`] against any [`Target`] (TLS included).
+pub async fn health_probe_target(target: &Target) -> anyhow::Result<bool> {
     use tonic_health::pb::HealthCheckRequest;
     use tonic_health::pb::health_check_response::ServingStatus as PbStatus;
     use tonic_health::pb::health_client::HealthClient;
 
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
+    let channel = target.connect().await?;
     let response = HealthClient::new(channel)
         .check(HealthCheckRequest {
             service: HEALTH_SERVICE.to_string(),
@@ -267,11 +376,24 @@ pub async fn health_probe(addr: SocketAddr) -> anyhow::Result<bool> {
 /// Calls the `Topology` RPC on `addr` and converts the response. The caller bounds the time
 /// (the `--topology` mode uses 3 s).
 pub async fn topology_probe(addr: SocketAddr) -> anyhow::Result<topology::Topology> {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
+    topology_probe_target(&Target::plain(addr), None).await
+}
+
+/// Like [`topology_probe`] against any [`Target`]; `token` is the hub's dashboard token, when it
+/// has one (sent as `authorization: Bearer ...` metadata).
+pub async fn topology_probe_target(
+    target: &Target,
+    token: Option<&str>,
+) -> anyhow::Result<topology::Topology> {
+    let channel = target.connect().await?;
+    let mut request = tonic::Request::new(proto::TopologyRequest {});
+    if let Some(token) = token {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse()?);
+    }
     let response = proto::hub_client::HubClient::new(channel)
-        .topology(proto::TopologyRequest {})
+        .topology(request)
         .await?
         .into_inner();
     Ok(topology::Topology::from_proto(&response))

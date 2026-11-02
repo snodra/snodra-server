@@ -1,16 +1,33 @@
 //! Command-line modes of the binary: argument parsing and the `--topology` table renderer.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::topology::{InstanceTopology, Topology};
 
-pub const USAGE: &str = "usage:\n  kraken-hub                     run the hub\n  kraken-hub --health-check      probe the local hub's gRPC health service\n  kraken-hub --topology [--json] print the local hub's topology (table, or JSON with --json)";
+pub const USAGE: &str = "usage:\n  kraken-hub                     run the hub\n  kraken-hub --health-check [REMOTE]      probe the hub's gRPC health service\n  kraken-hub --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  kraken-hub acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n\nA hub with KRAKEN_HUB_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// Which hub a probe talks to; see [`crate::client::Target::resolve`].
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Remote {
+    /// `--address`: `host:port`, `http://host:port` or `https://host:port`. `None`: the local hub.
+    pub address: Option<String>,
+    /// `--tls-ca`: PEM file with the CA(s) to trust; turns TLS on.
+    pub tls_ca: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Mode {
     Serve,
-    HealthCheck,
-    Topology { json: bool },
+    HealthCheck(Remote),
+    Topology {
+        json: bool,
+        remote: Remote,
+    },
+    /// `acl hash`: the token is the argument, or read from stdin when it is `-`.
+    AclHash {
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,12 +43,29 @@ impl std::error::Error for UsageError {}
 
 /// Parses the arguments after the program name.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.first().map(String::as_str) == Some("acl") {
+        return match &args[1..] {
+            [sub, token] if sub == "hash" => Ok(Mode::AclHash {
+                token: (token != "-").then(|| token.clone()),
+            }),
+            _ => Err(UsageError("usage: kraken-hub acl hash <token|->".into())),
+        };
+    }
     let (mut health, mut topology, mut json) = (false, false, false);
-    for arg in args {
+    let mut remote = Remote::default();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        let value = |name: &str, it: &mut dyn Iterator<Item = String>| {
+            it.next()
+                .ok_or_else(|| UsageError(format!("{name} needs a value")))
+        };
         match arg.as_str() {
             "--health-check" => health = true,
             "--topology" => topology = true,
             "--json" => json = true,
+            "--address" => remote.address = Some(value("--address", &mut it)?),
+            "--tls-ca" => remote.tls_ca = Some(value("--tls-ca", &mut it)?.into()),
             _ => return Err(UsageError(format!("unknown argument: {arg}"))),
         }
     }
@@ -43,10 +77,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
     if json && !topology {
         return Err(UsageError("--json requires --topology".into()));
     }
+    if remote != Remote::default() && !topology && !health {
+        return Err(UsageError(
+            "--address and --tls-ca need --topology or --health-check".into(),
+        ));
+    }
     Ok(if topology {
-        Mode::Topology { json }
+        Mode::Topology { json, remote }
     } else if health {
-        Mode::HealthCheck
+        Mode::HealthCheck(remote)
     } else {
         Mode::Serve
     })
@@ -180,15 +219,28 @@ mod tests {
     #[test]
     fn parse_modes_and_usage_errors() {
         assert_eq!(args(&[]), Ok(Mode::Serve));
-        assert_eq!(args(&["--health-check"]), Ok(Mode::HealthCheck));
-        assert_eq!(args(&["--topology"]), Ok(Mode::Topology { json: false }));
+        let local = Remote::default;
+        assert_eq!(args(&["--health-check"]), Ok(Mode::HealthCheck(local())));
+        assert_eq!(
+            args(&["--topology"]),
+            Ok(Mode::Topology {
+                json: false,
+                remote: local()
+            })
+        );
         assert_eq!(
             args(&["--topology", "--json"]),
-            Ok(Mode::Topology { json: true })
+            Ok(Mode::Topology {
+                json: true,
+                remote: local()
+            })
         );
         assert_eq!(
             args(&["--json", "--topology"]),
-            Ok(Mode::Topology { json: true })
+            Ok(Mode::Topology {
+                json: true,
+                remote: local()
+            })
         );
         assert_eq!(err(&["--json"]), "--json requires --topology");
         assert_eq!(
@@ -202,6 +254,51 @@ mod tests {
         assert_eq!(err(&["--bogus"]), "unknown argument: --bogus");
         assert_eq!(err(&["--topology", "extra"]), "unknown argument: extra");
         assert!(USAGE.contains("--topology [--json]") && USAGE.contains("--health-check"));
+    }
+
+    #[test]
+    fn parse_remote_options_and_acl_hash() {
+        assert_eq!(
+            args(&[
+                "--topology",
+                "--address",
+                "https://hub:7000",
+                "--tls-ca",
+                "/ca.pem"
+            ]),
+            Ok(Mode::Topology {
+                json: false,
+                remote: Remote {
+                    address: Some("https://hub:7000".into()),
+                    tls_ca: Some("/ca.pem".into()),
+                },
+            })
+        );
+        assert_eq!(
+            args(&["--health-check", "--tls-ca", "/ca.pem"]),
+            Ok(Mode::HealthCheck(Remote {
+                address: None,
+                tls_ca: Some("/ca.pem".into()),
+            }))
+        );
+        assert_eq!(err(&["--topology", "--address"]), "--address needs a value");
+        assert_eq!(
+            err(&["--address", "hub:7000"]),
+            "--address and --tls-ca need --topology or --health-check"
+        );
+        assert_eq!(
+            args(&["acl", "hash", "abc"]),
+            Ok(Mode::AclHash {
+                token: Some("abc".into())
+            })
+        );
+        assert_eq!(
+            args(&["acl", "hash", "-"]),
+            Ok(Mode::AclHash { token: None })
+        );
+        assert!(err(&["acl"]).contains("acl hash"));
+        assert!(err(&["acl", "hash"]).contains("acl hash"));
+        assert!(err(&["acl", "hash", "a", "b"]).contains("acl hash"));
     }
 
     #[test]
@@ -252,6 +349,8 @@ mod tests {
             connected_hub_ids: vec![],
             status_age_ms: -1,
             shared_query_types: vec![],
+            auth: None,
+            authenticated_service: None,
         }
     }
 

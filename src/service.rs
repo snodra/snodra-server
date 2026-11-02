@@ -23,6 +23,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
+use crate::auth::{AuthMode, Authorizer, Denied, Disposition};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::hub_server::Hub;
@@ -41,6 +42,8 @@ pub struct HubService {
     pub sessions: Arc<Sessions>,
     pub router: Arc<Router>,
     pub config: Arc<Config>,
+    /// Access control for `Register` (ADR 0018); the router holds the same one for requests.
+    pub auth: Arc<Authorizer>,
     /// Anchor for converting monotonic instants to wall-clock time in topology snapshots.
     pub anchor: ClockAnchor,
     /// When this hub started serving (monotonic).
@@ -81,6 +84,67 @@ pub fn disconnect(
     true
 }
 
+/// Re-judges every session against the current ACL after a reload (ADR 0018). In `enforce`, a
+/// session whose token is gone or whose registration is no longer allowed is closed with the
+/// matching status (`UNAUTHENTICATED` or `PERMISSION_DENIED`) and its pending requests end as on
+/// any disconnect; in `permissive` the violation is only logged. Returns the sessions closed.
+pub fn reevaluate_sessions(
+    auth: &Authorizer,
+    registry: &Registry,
+    sessions: &Sessions,
+    router: &Router,
+) -> usize {
+    if auth.mode() == AuthMode::Off {
+        return 0;
+    }
+    let mut closed = 0;
+    for view in sessions.auth_views() {
+        let denials = auth.recheck(view.principal.as_ref(), &view.service, &view.handled);
+        let Some(first) = denials.first() else {
+            continue;
+        };
+        if auth.mode() != AuthMode::Enforce {
+            auth.report(
+                &denials,
+                &view.service,
+                view.principal.as_ref(),
+                Disposition::Kept,
+            );
+            continue;
+        }
+        auth.report(
+            &denials,
+            &view.service,
+            view.principal.as_ref(),
+            Disposition::Closed,
+        );
+        if let Some(tx) = sessions.sender(&view.context, &view.instance_id) {
+            let _ = tx.try_send(Err(first.to_status()));
+        }
+        if disconnect(
+            registry,
+            sessions,
+            router,
+            &view.context,
+            &view.instance_id,
+            view.token,
+        ) {
+            closed += 1;
+        }
+    }
+    closed
+}
+
+/// Every type a `Register` handles: commands, queries and shared queries.
+fn handled_types(reg: &Register) -> Vec<String> {
+    reg.command_types
+        .iter()
+        .chain(&reg.query_types)
+        .chain(&reg.shared_query_types)
+        .cloned()
+        .collect()
+}
+
 /// Response stream; dropping it (the client went away, or hyper finished the body) cancels the
 /// stream task.
 struct ResponseStream {
@@ -119,6 +183,7 @@ impl Hub for HubService {
             sessions: Arc::clone(&self.sessions),
             router: Arc::clone(&self.router),
             config: Arc::clone(&self.config),
+            auth: Arc::clone(&self.auth),
             context: ContextId::default(),
         };
         tokio::spawn(run_stream(ctx, inbound, tx, cancel.clone()));
@@ -132,8 +197,19 @@ impl Hub for HubService {
 
     async fn topology(
         &self,
-        _request: Request<TopologyRequest>,
+        request: Request<TopologyRequest>,
     ) -> Result<Response<TopologyResponse>, Status> {
+        // The same data as `GET /topology`, so the same token (the CLI sends it as metadata).
+        if let Some(token) = &self.config.dashboard_token {
+            let presented = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::auth::bearer);
+            if !token.matches(presented) {
+                return Err(Status::unauthenticated("unauthenticated"));
+            }
+        }
         debug!("topology requested");
         let topology = snapshot(
             &self.registry,
@@ -154,6 +230,7 @@ struct StreamCtx {
     sessions: Arc<Sessions>,
     router: Arc<Router>,
     config: Arc<Config>,
+    auth: Arc<Authorizer>,
     /// Every stream lives in the default context (contexts are deferred; the API keeps the door open).
     context: ContextId,
 }
@@ -185,6 +262,12 @@ impl StreamCtx {
             })?;
         Some(match result {
             Ok(()) => {
+                self.sessions.set_handled(
+                    &self.context,
+                    &reg.instance_id,
+                    token,
+                    handled_types(reg),
+                );
                 // Never log `reg` itself: it may carry credentials.
                 info!(
                     service = %reg.service_name,
@@ -225,6 +308,13 @@ impl StreamCtx {
             token,
         )
     }
+}
+
+/// Closes a handshake that failed access control: the status goes to the client and the stream
+/// ends. No session exists yet.
+async fn refuse(tx: &Outbound, instance_id: &str, service: &str, denied: &Denied) {
+    warn!(instance = %instance_id, service = %service, reason = denied.reason, "stream closed: {}", denied.message);
+    let _ = tx.send(Err(denied.to_status())).await;
 }
 
 async fn run_stream(
@@ -282,6 +372,18 @@ async fn run_stream(
     let service = first.service_name.clone();
     // Version, capabilities and client version are fixed by the first Register (ADR 0013).
     let v2 = protocol::is_v2(first.protocol_version);
+    // Access control (ADR 0018): the credentials and the claimed service and types are judged
+    // before any session state exists. Like the version, the credentials are read from the
+    // first Register only; a later one cannot change who the session is.
+    let handled = handled_types(&first);
+    let admission = ctx
+        .auth
+        .admit(first.credentials.as_ref(), v2, &service, &handled);
+    if let Some(denied) = &admission.refused {
+        refuse(&tx, &instance_id, &service, denied).await;
+        return;
+    }
+    let principal = admission.principal;
     let ack = v2.then(|| {
         protocol::register_ack(
             &ctx.config,
@@ -320,6 +422,8 @@ async fn run_stream(
         scatter_gather,
         streaming,
         subscription,
+        principal,
+        auth: admission.status.clone(),
     };
     let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed
@@ -372,6 +476,18 @@ async fn run_stream(
             return;
         }
     }
+    // A reload may have run between the check above and the insert, when no session existed for
+    // it to re-judge; judge once more now that the session and its types are recorded.
+    if ctx.auth.mode() == AuthMode::Enforce {
+        let late = ctx.auth.recheck(principal.as_ref(), &service, &handled);
+        if let Some(first) = late.first() {
+            ctx.auth
+                .report(&late, &service, principal.as_ref(), Disposition::Closed);
+            ctx.disconnect(&instance_id, token);
+            let _ = tx.try_send(Err(first.to_status()));
+            return;
+        }
+    }
     // The ack is queued before this task reads the next inbound message, so it precedes the echo
     // of the heartbeat that follows the Register (the stream's messages are handled in order).
     // Requests routed to this instance meanwhile may come first; clients handle them anyway.
@@ -414,6 +530,26 @@ async fn run_stream(
                     warn!(instance = %instance_id, "re-register changed identity; keeping original");
                     reg.instance_id = instance_id.clone();
                     reg.service_name = service.clone();
+                }
+                // A re-register may add types: they are judged against the current ACL too.
+                let denials = ctx
+                    .auth
+                    .recheck(principal.as_ref(), &service, &handled_types(&reg));
+                if let Some(first) = denials.first() {
+                    if ctx.auth.mode() == AuthMode::Enforce {
+                        ctx.auth.report(
+                            &denials,
+                            &service,
+                            principal.as_ref(),
+                            Disposition::Closed,
+                        );
+                        if let Some(tx) = out.upgrade() {
+                            let _ = tx.try_send(Err(first.to_status()));
+                        }
+                        break;
+                    }
+                    ctx.auth
+                        .report(&denials, &service, principal.as_ref(), Disposition::Allowed);
                 }
                 match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
@@ -517,4 +653,130 @@ async fn run_stream(
         }
     }
     ctx.disconnect(&instance_id, token);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Acl, AuthStatus, digest_of, hash_token};
+    use crate::session::SessionMeta;
+    use crate::telemetry::test_support::test_metrics;
+
+    fn acl(service: &str, handle: &str) -> Acl {
+        Acl::parse(&format!(
+            "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"{service}\"\nhandle = [\"{handle}\"]\n",
+            hash_token("tok")
+        ))
+        .unwrap()
+    }
+
+    /// One session of `orders` handling `orders.Place`, registered with the token `tok`.
+    fn session(sessions: &Sessions) -> mpsc::Receiver<Result<ServerMessage, Status>> {
+        let ctx = ContextId::default();
+        let (tx, rx) = mpsc::channel(4);
+        let mut meta = SessionMeta::v1(Duration::from_secs(30));
+        meta.principal = Some(digest_of("tok"));
+        meta.auth = AuthStatus::Authenticated {
+            service: "orders".into(),
+        };
+        let token = sessions.insert(&ctx, "i1", "orders", meta, tx, CancellationToken::new());
+        sessions.set_handled(&ctx, "i1", token, vec!["orders.Place".into()]);
+        rx
+    }
+
+    fn parts(
+        mode: AuthMode,
+        acl: Acl,
+    ) -> (
+        Arc<Authorizer>,
+        Arc<Registry>,
+        Arc<Sessions>,
+        Arc<Router>,
+        crate::telemetry::test_support::TestMetrics,
+    ) {
+        let m = test_metrics();
+        let auth = Authorizer::with_acl(mode, acl, m.metrics.clone());
+        let registry = Arc::new(Registry::new(Duration::from_secs(60)));
+        let sessions = Arc::new(Sessions::new());
+        let router = Router::with_auth(
+            Arc::clone(&registry),
+            Arc::clone(&sessions),
+            Arc::new(Config::default()),
+            m.metrics.clone(),
+            Arc::clone(&auth),
+        );
+        (auth, registry, sessions, router, m)
+    }
+
+    #[tokio::test]
+    async fn a_reload_closes_sessions_the_acl_no_longer_allows_and_counts_them() {
+        let (auth, registry, sessions, router, m) =
+            parts(AuthMode::Enforce, acl("orders", "orders.*"));
+        let mut rx = session(&sessions);
+        // Unchanged rules: nothing is closed.
+        assert_eq!(reevaluate_sessions(&auth, &registry, &sessions, &router), 0);
+        assert!(rx.try_recv().is_err());
+
+        // The reload narrows `handle`: the session is closed with PERMISSION_DENIED.
+        let narrowed = Authorizer::with_acl(
+            AuthMode::Enforce,
+            acl("orders", "orders.Get"),
+            m.metrics.clone(),
+        );
+        assert_eq!(
+            reevaluate_sessions(&narrowed, &registry, &sessions, &router),
+            1
+        );
+        let status = rx.try_recv().expect("a closing status").unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("orders.Place"));
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "handle_denied"
+            ),
+            Some(1)
+        );
+        assert!(sessions.auth_views().is_empty(), "the session is gone");
+
+        // A removed token: UNAUTHENTICATED, counted as token_revoked.
+        let mut rx = session(&sessions);
+        let empty = Authorizer::with_acl(AuthMode::Enforce, Acl::default(), m.metrics.clone());
+        assert_eq!(
+            reevaluate_sessions(&empty, &registry, &sessions, &router),
+            1
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "token_revoked"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_and_off_never_close_a_session_on_reload() {
+        for mode in [AuthMode::Permissive, AuthMode::Off] {
+            let (auth, registry, sessions, router, m) = parts(mode, Acl::default());
+            let mut rx = session(&sessions);
+            assert_eq!(reevaluate_sessions(&auth, &registry, &sessions, &router), 0);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(sessions.auth_views().len(), 1);
+            assert_eq!(
+                m.counter(
+                    "kraken_hub_auth_violations_total",
+                    "reason",
+                    "token_revoked"
+                ),
+                None
+            );
+        }
+    }
 }

@@ -51,6 +51,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tonic::Status;
 
+use crate::auth::Authorizer;
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::edges::EdgeStats;
@@ -541,6 +542,8 @@ pub struct Router {
     queued_bytes: Arc<TotalBytes>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
+    /// Access control (ADR 0018): judges every request against the sender's token.
+    auth: Arc<Authorizer>,
     /// `(sender service, type)` statistics for the dashboard; `None` with the dashboard off.
     edges: Option<EdgeStats>,
 }
@@ -636,6 +639,18 @@ impl Router {
         config: Arc<Config>,
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
+        let auth = Authorizer::off(Arc::clone(&metrics));
+        Self::with_auth(registry, sessions, config, metrics, auth)
+    }
+
+    /// Like [`Router::new`], judging requests with `auth`.
+    pub fn with_auth(
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        auth: Arc<Authorizer>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             sessions,
@@ -647,6 +662,7 @@ impl Router {
                 .then(|| EdgeStats::new(config.edge_stats_window, config.edge_stats_max_edges)),
             config,
             metrics,
+            auth,
         })
     }
 
@@ -1054,6 +1070,34 @@ impl Router {
             );
             return;
         };
+        // Access control (ADR 0018), before anything is routed and for every mode: a type the
+        // sender's token may not send is answered at once, whatever mode it asked for. The same
+        // immediate `Error` as every other gate (a ReplyEnd exists only after a mode was
+        // accepted).
+        if let Some(info) = &sender_info
+            && let Err(denied) =
+                self.auth
+                    .check_send(info.principal.as_ref(), &info.service, &type_name)
+        {
+            let mode = mode_label(req.mode);
+            self.record_rejected_mode(sender_service, req_kind, &type_name, Outcome::Denied, mode);
+            record_outcome(&span, Outcome::Denied);
+            log_outcome(
+                &id,
+                &type_name,
+                Some(req_kind),
+                sender,
+                None,
+                Outcome::Denied,
+                false,
+            );
+            self.send_to(
+                ctx,
+                sender,
+                error_message(&id, denied.error_code(), denied.message),
+            );
+            return;
+        }
         if req.mode != RequestMode::Unary as i32 {
             self.route_mode(ctx, sender, req, req_kind, sender_info, span);
             return;
@@ -8381,6 +8425,177 @@ mod subscription_tests {
             m.histogram_sum("kraken_hub_request_duration_seconds")
                 .map(|(n, _)| n),
             Some(3)
+        );
+    }
+}
+
+/// Access control at the router (ADR 0018): a request outside the sender token's `send` patterns
+/// is answered before anything is routed, in every mode, and is counted.
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::auth::{Acl, AuthMode, AuthStatus, digest_of, hash_token};
+    use crate::proto::RequestMode;
+    use crate::telemetry::test_support::{TestMetrics, test_metrics};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use tonic::Status;
+
+    static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
+    type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
+
+    struct Fx {
+        router: Arc<Router>,
+        sender: Rx,
+        handler: Rx,
+        m: TestMetrics,
+    }
+
+    fn fixture(mode: AuthMode) -> Fx {
+        let m = test_metrics();
+        let acl = Acl::parse(&format!(
+            "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"web\"\nsend = [\"t.Qry\"]\n",
+            hash_token("tok-web")
+        ))
+        .unwrap();
+        let auth = Authorizer::with_acl(mode, acl, m.metrics.clone());
+        let registry = Arc::new(Registry::new(Duration::from_secs(60)));
+        registry
+            .register(&D, "h1", "orders", &["t.Cmd".into()], &["t.Qry".into()])
+            .unwrap();
+        let sessions = Arc::new(Sessions::new());
+        let connect = |id: &str, service: &str, principal| {
+            let (tx, rx) = mpsc::channel(16);
+            let mut meta = crate::session::SessionMeta::v1(Duration::from_secs(30));
+            meta.protocol_version = 2;
+            meta.streaming = true;
+            meta.principal = principal;
+            meta.auth = AuthStatus::Off;
+            sessions.insert(&D, id, service, meta, tx, CancellationToken::new());
+            rx
+        };
+        let handler = connect("h1", "orders", None);
+        let sender = connect("s1", "web", Some(digest_of("tok-web")));
+        let router = Router::with_auth(
+            registry,
+            sessions,
+            Arc::new(Config::default()),
+            m.metrics.clone(),
+            auth,
+        );
+        for (id, service) in [("h1", "orders"), ("s1", "web")] {
+            let token = router.sessions.token_of(&D, id).unwrap();
+            let _ = router.open_session(&D, id, token, service, None);
+        }
+        Fx {
+            router,
+            sender,
+            handler,
+            m,
+        }
+    }
+
+    fn request(id: &str, kind: RequestKind, type_name: &str, mode: RequestMode) -> Request {
+        Request {
+            id: id.into(),
+            kind: kind as i32,
+            r#type: type_name.into(),
+            mode: mode as i32,
+            ..Request::default()
+        }
+    }
+
+    fn error_of(rx: &mut Rx) -> crate::proto::Error {
+        match rx.try_recv().expect("an error").unwrap().message {
+            Some(server_message::Message::Error(e)) => e,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_refuses_a_type_outside_send_before_routing_in_every_mode() {
+        let mut f = fixture(AuthMode::Enforce);
+        // The command t.Cmd is registered and live, yet the sender may not send it.
+        for (n, mode) in [
+            RequestMode::Unary,
+            RequestMode::ScatterGather,
+            RequestMode::Streaming,
+            RequestMode::Subscription,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("r{n}");
+            f.router
+                .route(&D, "s1", request(&id, RequestKind::Command, "t.Cmd", mode));
+            let e = error_of(&mut f.sender);
+            assert_eq!(
+                (e.request_id.as_str(), e.code()),
+                (id.as_str(), ErrorCode::PermissionDenied)
+            );
+            assert!(e.message.contains("t.Cmd"), "{}", e.message);
+            assert!(f.handler.try_recv().is_err(), "nothing reaches the handler");
+        }
+        assert_eq!(f.router.in_flight(), 0);
+        assert_eq!(
+            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            Some(4)
+        );
+        assert_eq!(
+            f.m.counter("kraken_hub_auth_violations_total", "service", "web"),
+            Some(4)
+        );
+        assert_eq!(
+            f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+            Some(4)
+        );
+        // An allowed type is routed as usual.
+        f.router.route(
+            &D,
+            "s1",
+            request("ok", RequestKind::Query, "t.Qry", RequestMode::Unary),
+        );
+        match f.handler.try_recv().expect("forwarded").unwrap().message {
+            Some(server_message::Message::Request(r)) => assert_eq!(r.id, "ok"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn permissive_counts_the_violation_and_routes_the_request() {
+        let mut f = fixture(AuthMode::Permissive);
+        f.router.route(
+            &D,
+            "s1",
+            request("r1", RequestKind::Command, "t.Cmd", RequestMode::Unary),
+        );
+        assert!(f.sender.try_recv().is_err(), "no error to the sender");
+        match f.handler.try_recv().expect("forwarded").unwrap().message {
+            Some(server_message::Message::Request(r)) => assert_eq!(r.id, "r1"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            Some(1)
+        );
+        assert_eq!(
+            f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn off_judges_nothing() {
+        let mut f = fixture(AuthMode::Off);
+        f.router.route(
+            &D,
+            "s1",
+            request("r1", RequestKind::Command, "t.Cmd", RequestMode::Unary),
+        );
+        assert!(f.handler.try_recv().is_ok());
+        assert_eq!(
+            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            None
         );
     }
 }

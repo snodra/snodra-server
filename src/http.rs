@@ -1,8 +1,9 @@
 //! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): `GET /topology` for the CLI and the
 //! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the read-only dashboard
 //! (`/ui/`, see [`crate::assets`]) and its API under `/api/v1/` (roadmap P2). Every route is
-//! read-only and unauthenticated in this phase; the port belongs on the private network (P5a
-//! adds a dashboard token).
+//! read-only. With `KRAKEN_HUB_DASHBOARD_TOKEN` set (ADR 0018), `/topology` and everything under
+//! `/api/v1/` (the event stream included) need `Authorization: Bearer <token>`; the page and its
+//! assets stay public, because the page is what asks for the token.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::{self, Secret};
 use crate::config::Config;
 use crate::edges::{EdgeSnapshot, WindowTotals};
 use crate::registry::Registry;
@@ -112,20 +114,36 @@ impl HttpState {
 /// The HTTP routes: `/topology` always; the dashboard (`/`, `/ui` redirect to `/ui/`) and its
 /// API when enabled. Unknown paths are 404. The API answers CORS for the peer origins only.
 pub fn app(state: HttpState) -> axum::Router {
+    let guard: Option<Arc<Secret>> = state.config.dashboard_token.clone().map(Arc::new);
     let mut app = axum::Router::new().route("/topology", get(get_topology));
+    if let Some(secret) = &guard {
+        app = app.route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(secret),
+            require_token,
+        ));
+    }
     if state.config.dashboard_enabled {
         // Peer origins are validated at startup (no control characters), so the header is valid.
         let csp = HeaderValue::from_str(&csp(&state.config.peers))
             .expect("the CSP is a valid header value");
         let peers: Arc<[String]> = state.config.peers.clone().into();
-        let api = axum::Router::new()
+        let mut api = axum::Router::new()
             .route("/api/v1/topology", get(api_topology))
             .route("/api/v1/types", get(api_types))
             .route("/api/v1/graph", get(api_graph))
             .route("/api/v1/settings", get(api_settings))
             .route("/api/v1/version", get(api_version))
-            .route("/api/v1/stream", get(api_stream))
-            .layer(axum::middleware::from_fn_with_state(peers, cors));
+            .route("/api/v1/stream", get(api_stream));
+        // The token check sits inside the CORS layer: a peer's preflight carries no
+        // `Authorization` header and must be answered, and a 401 must still carry the CORS
+        // headers or the peer's page could not tell a wrong token from a network error.
+        if let Some(secret) = &guard {
+            api = api.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(secret),
+                require_token,
+            ));
+        }
+        let api = api.layer(axum::middleware::from_fn_with_state(peers, cors));
         let site = axum::Router::new()
             .route("/", get(assets::to_index))
             .route("/ui", get(assets::to_index))
@@ -153,6 +171,33 @@ pub fn security_headers(mut response: Response, csp: HeaderValue) -> Response {
     set(h, header::REFERRER_POLICY, "no-referrer");
     set(h, header::X_FRAME_OPTIONS, "DENY");
     response
+}
+
+/// The dashboard token check (ADR 0018). A missing, malformed or wrong token is the same bare
+/// 401: no detail in the body, and the same work done (both sides are hashed and compared in
+/// constant time), so the answer does not tell which.
+async fn require_token(
+    State(secret): State<Arc<Secret>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(auth::bearer);
+    if secret.matches(presented) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+        )
+            .into_response()
+    }
 }
 
 /// CORS for `/api/v1/*` (ADR 0016): a request whose `Origin` is exactly one of the peer origins
@@ -191,7 +236,8 @@ async fn cors(
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("accept"),
+            // `authorization`: the page forwards the dashboard token to its peers (ADR 0018).
+            HeaderValue::from_static("accept, authorization"),
         );
         h.insert(
             header::ACCESS_CONTROL_MAX_AGE,
@@ -464,6 +510,52 @@ mod tests {
         assert!(computed(&s) > idle);
         drop(again);
         server.abort();
+    }
+
+    /// The token check goes through the constant-time comparison (a missing, a wrong and a right
+    /// token each cost exactly one), not a `==` on strings.
+    #[tokio::test]
+    async fn the_dashboard_token_check_uses_the_constant_time_compare() {
+        use tower::ServiceExt;
+        let mut s = state();
+        s.config = Arc::new(Config {
+            otlp_endpoint: None,
+            dashboard_token: Some(Secret::new("a-dashboard-token-0123456789")),
+            ..Config::default()
+        });
+        let app = app(s);
+        let get = |auth: Option<&str>| {
+            let mut r = axum::http::Request::builder().uri("/topology");
+            if let Some(a) = auth {
+                r = r.header(header::AUTHORIZATION, a);
+            }
+            r.body(axum::body::Body::empty()).unwrap()
+        };
+        let before = auth::ct::COMPARISONS.with(|c| c.get());
+        let status = |r: Response| r.status();
+        assert_eq!(
+            status(app.clone().oneshot(get(None)).await.unwrap()),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                app.clone()
+                    .oneshot(get(Some("Bearer wrong")))
+                    .await
+                    .unwrap()
+            ),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                app.clone()
+                    .oneshot(get(Some("Bearer a-dashboard-token-0123456789")))
+                    .await
+                    .unwrap()
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(auth::ct::COMPARISONS.with(|c| c.get()) - before, 3);
     }
 
     #[test]

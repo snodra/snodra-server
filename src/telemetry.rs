@@ -140,6 +140,9 @@ pub enum Outcome {
     /// A streaming query ended before its handler did: the sender cancelled it, or it outlived
     /// `KRAKEN_HUB_MAX_STREAM_DURATION` (CANCELLED).
     Cancelled,
+    /// The hub refused the request because the sender's token may not send its type (ADR 0018,
+    /// PERMISSION_DENIED or UNAUTHENTICATED, mode `enforce` only).
+    Denied,
 }
 
 impl Outcome {
@@ -155,6 +158,7 @@ impl Outcome {
             Outcome::ResourceExhausted => "resource_exhausted",
             Outcome::Unsupported => "unsupported",
             Outcome::Cancelled => "cancelled",
+            Outcome::Denied => "denied",
         }
     }
 }
@@ -185,6 +189,9 @@ pub struct Metrics {
     stream_parts: Counter<u64>,
     subscriptions_open: UpDownCounter<i64>,
     subscription_updates: Counter<u64>,
+    auth_violations: Counter<u64>,
+    acl_generation: Gauge<u64>,
+    acl_reload_errors: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -271,8 +278,39 @@ impl Metrics {
                 .u64_counter("kraken_hub_subscription_updates_total")
                 .with_description("Updates of subscription queries relayed, per handler service and type")
                 .build(),
+            auth_violations: meter
+                .u64_counter("kraken_hub_auth_violations_total")
+                .with_description("Access-control violations (ADR 0018), refused in enforce mode and allowed in permissive mode, per reason and service (`unknown` for a service name the ACL does not hold)")
+                .build(),
+            acl_generation: meter
+                .u64_gauge("kraken_hub_acl_generation")
+                .with_description("Generation of the loaded ACL: 1 at startup, plus one per reload that changed it")
+                .build(),
+            acl_reload_errors: meter
+                .u64_counter("kraken_hub_acl_reload_errors_total")
+                .with_description("ACL reloads that failed to read or parse; the previous ACL stays in force")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
+    }
+
+    /// A violation of the access-control rules (refused or, in permissive mode, allowed).
+    pub fn auth_violation(&self, reason: &'static str, service: &str) {
+        self.auth_violations.add(
+            1,
+            &[
+                KeyValue::new("reason", reason),
+                KeyValue::new("service", service.to_string()),
+            ],
+        );
+    }
+
+    pub fn acl_generation_set(&self, generation: u64) {
+        self.acl_generation.record(generation, &[]);
+    }
+
+    pub fn acl_reload_failed(&self) {
+        self.acl_reload_errors.add(1, &[]);
     }
 
     /// Queue depth and permits left per service (flow-controlled instances summed); services
@@ -529,6 +567,38 @@ pub(crate) mod test_support {
                 .map(|p| p.value())
                 .collect();
             (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// The sum of the u64 counter `name` over all its points.
+        pub(crate) fn counter_total(&self, name: &str) -> Option<u64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                panic!("{name} is not a u64 counter");
+            };
+            Some(sum.data_points().map(|p| p.value()).sum())
+        }
+
+        /// The last value of the u64 gauge `name` that has no attributes.
+        pub(crate) fn gauge_plain(&self, name: &str) -> Option<u64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::U64(MetricData::Gauge(g)) = metric.data() else {
+                panic!("{name} is not a u64 gauge");
+            };
+            g.data_points().next().map(|p| p.value())
         }
 
         /// The sum of the i64 up-down counter `name` over the points whose attribute `key` is

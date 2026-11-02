@@ -105,6 +105,14 @@ pub struct InstanceTopology {
     /// The query types (of `query_types`) registered as shared (ADR 0017).
     #[serde(default)]
     pub shared_query_types: Vec<String>,
+    /// How the session authenticated (ADR 0018): `authenticated` or `unauthenticated
+    /// (permissive)`. Absent when access control is off. JSON only: the gRPC response has no
+    /// field for it, so a topology read over gRPC never carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// The service the instance's token is granted in the ACL, when it authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_service: Option<String>,
 }
 
 fn never_reported() -> i64 {
@@ -222,6 +230,8 @@ pub fn snapshot(
                 connected_hub_ids,
                 status_age_ms,
                 shared_query_types: shared_queries,
+                auth: d.auth.label().map(str::to_string),
+                authenticated_service: d.auth.service().map(str::to_string),
                 instance_id: d.instance_id,
             });
     }
@@ -384,6 +394,8 @@ impl Topology {
                             connected_hub_ids: i.connected_hub_ids.clone(),
                             status_age_ms: i.status_age_ms,
                             shared_query_types: i.shared_query_types.clone(),
+                            auth: None,
+                            authenticated_service: None,
                         })
                         .collect(),
                 })

@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 
+use crate::auth::{AuthMode, Secret};
 use crate::protocol;
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,31 @@ pub struct Config {
     /// [`MAX_PEERS`]. The list may include this hub (the page skips it by hub id). The dashboard
     /// merges the peers in the browser; each peer answers CORS for these origins only.
     pub peers: Vec<String>,
+    /// Access control for `Connect` (ADR 0018): `off` (default, no checks), `permissive`
+    /// (evaluate, log and count violations, allow everything) or `enforce` (refuse violations).
+    /// `KRAKEN_HUB_AUTH_MODE`.
+    pub auth_mode: AuthMode,
+    /// The ACL (TOML, token SHA-256 -> service, handle and send patterns); required unless the
+    /// mode is `off`. Reloaded when it changes. `KRAKEN_HUB_ACL_FILE`.
+    pub acl_file: Option<PathBuf>,
+    /// PEM certificate chain and private key of the gRPC listener; when set it only accepts TLS.
+    /// `KRAKEN_HUB_TLS_CERT` and `KRAKEN_HUB_TLS_KEY`, both or neither. Reloaded when they change.
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    /// The HTTP listener's own pair; default the gRPC pair. `KRAKEN_HUB_HTTP_TLS_CERT` and
+    /// `KRAKEN_HUB_HTTP_TLS_KEY`, both or neither.
+    pub http_tls_cert: Option<PathBuf>,
+    pub http_tls_key: Option<PathBuf>,
+    /// When set, `/api/*`, `/topology`, the event stream and the gRPC `Topology` call need
+    /// `Authorization: Bearer <token>`. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_TOKEN`,
+    /// at least 16 characters. Unrelated to the ACL tokens.
+    pub dashboard_token: Option<Secret>,
+    /// Reserved for the processor controls of roadmap P6 (a second, stronger token for mutating
+    /// calls); parsed and kept, nothing reads it yet. `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`.
+    pub dashboard_write_token: Option<Secret>,
+    /// How often the ACL and the certificates are checked for changes.
+    /// `KRAKEN_HUB_RELOAD_INTERVAL`, default 5 s.
+    pub reload_interval: Duration,
 }
 
 impl Default for Config {
@@ -125,6 +152,15 @@ impl Default for Config {
             edge_stats_max_edges: 10_000,
             edge_stats_window: Duration::from_secs(300),
             peers: Vec::new(),
+            auth_mode: AuthMode::Off,
+            acl_file: None,
+            tls_cert: None,
+            tls_key: None,
+            http_tls_cert: None,
+            http_tls_key: None,
+            dashboard_token: None,
+            dashboard_write_token: None,
+            reload_interval: Duration::from_secs(5),
         }
     }
 }
@@ -236,8 +272,49 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_PEERS") {
             c.peers = parse_peers(&v).context("KRAKEN_HUB_PEERS")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_AUTH_MODE") {
+            c.auth_mode = v.parse().context("KRAKEN_HUB_AUTH_MODE")?;
+        }
+        c.acl_file = path_var(&var, "KRAKEN_HUB_ACL_FILE");
+        c.tls_cert = path_var(&var, "KRAKEN_HUB_TLS_CERT");
+        c.tls_key = path_var(&var, "KRAKEN_HUB_TLS_KEY");
+        c.http_tls_cert = path_var(&var, "KRAKEN_HUB_HTTP_TLS_CERT");
+        c.http_tls_key = path_var(&var, "KRAKEN_HUB_HTTP_TLS_KEY");
+        // Secrets are trimmed (a mounted secret file ends with a newline) and kept as digests.
+        let secret = |name: &str| {
+            var(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        c.dashboard_token = secret("KRAKEN_HUB_DASHBOARD_TOKEN")
+            .map(|t| {
+                check_dashboard_token("KRAKEN_HUB_DASHBOARD_TOKEN", &t).map(|()| Secret::new(&t))
+            })
+            .transpose()?;
+        c.dashboard_write_token = secret("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")
+            .map(|t| {
+                check_dashboard_token("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", &t)
+                    .map(|()| Secret::new(&t))
+            })
+            .transpose()?;
+        if let Some(v) = var("KRAKEN_HUB_RELOAD_INTERVAL") {
+            c.reload_interval = parse_duration(&v).context("KRAKEN_HUB_RELOAD_INTERVAL")?;
+        }
         c.validate()?;
         Ok(c)
+    }
+
+    /// The gRPC listener's certificate and key, when it serves TLS.
+    pub fn grpc_tls(&self) -> Option<(&Path, &Path)> {
+        self.tls_cert.as_deref().zip(self.tls_key.as_deref())
+    }
+
+    /// The HTTP listener's certificate and key: its own pair, else the gRPC pair.
+    pub fn http_tls(&self) -> Option<(&Path, &Path)> {
+        self.http_tls_cert
+            .as_deref()
+            .zip(self.http_tls_key.as_deref())
+            .or_else(|| self.grpc_tls())
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -255,6 +332,21 @@ impl Config {
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
+        }
+        if self.reload_interval.is_zero() {
+            bail!("KRAKEN_HUB_RELOAD_INTERVAL must be positive");
+        }
+        if self.auth_mode != AuthMode::Off && self.acl_file.is_none() {
+            bail!(
+                "KRAKEN_HUB_AUTH_MODE={} needs KRAKEN_HUB_ACL_FILE",
+                self.auth_mode.as_str()
+            );
+        }
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            bail!("KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY must be set together");
+        }
+        if self.http_tls_cert.is_some() != self.http_tls_key.is_some() {
+            bail!("KRAKEN_HUB_HTTP_TLS_CERT and KRAKEN_HUB_HTTP_TLS_KEY must be set together");
         }
         if self.edge_stats_max_edges == 0 {
             bail!("KRAKEN_HUB_EDGE_STATS_MAX_EDGES must be positive");
@@ -296,6 +388,40 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// Security posture worth shouting about, logged at startup. Every line is a `warn`.
+    pub fn security_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let open = |a: SocketAddr| !a.ip().is_loopback();
+        if self.auth_mode != AuthMode::Enforce && open(self.listen) {
+            out.push(format!(
+                "KRAKEN_HUB_AUTH_MODE={} while the gRPC port listens on {}: any peer that can reach it may register as any service and send any type; set KRAKEN_HUB_AUTH_MODE=enforce (ADR 0018) or keep the port on a private network",
+                self.auth_mode.as_str(),
+                self.listen
+            ));
+        }
+        if self.auth_mode != AuthMode::Off && self.grpc_tls().is_none() && open(self.listen) {
+            out.push(
+                "access control is on but the gRPC port has no TLS (KRAKEN_HUB_TLS_CERT): tokens travel in clear text"
+                    .to_string(),
+            );
+        }
+        if let Some(http) = self.http_listen
+            && open(http)
+        {
+            if self.dashboard_token.is_none() {
+                out.push(format!(
+                    "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: /topology and the dashboard API are open to any peer"
+                ));
+            } else if self.http_tls().is_none() {
+                out.push("the dashboard token is set but the HTTP port has no TLS: the token travels in clear text".to_string());
+            }
+        }
+        if self.dashboard_write_token.is_some() {
+            out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is reserved for the processor controls of roadmap P6 and has no effect yet".to_string());
+        }
+        out
     }
 
     /// Settings that are valid but probably wrong; `main` logs them once telemetry is up.
@@ -367,6 +493,29 @@ fn check_link_url(url: &str) -> anyhow::Result<()> {
     }
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         bail!("{url:?} contains whitespace or control characters");
+    }
+    Ok(())
+}
+
+/// A path variable: unset or empty is `None`.
+fn path_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf> {
+    var(name)
+        .map(|v| PathBuf::from(v.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// The shortest dashboard token accepted; `openssl rand -hex 32` makes 64.
+const MIN_DASHBOARD_TOKEN: usize = 16;
+
+fn check_dashboard_token(name: &str, token: &str) -> anyhow::Result<()> {
+    // Never echo the value.
+    if token.chars().count() < MIN_DASHBOARD_TOKEN {
+        bail!(
+            "{name} must be at least {MIN_DASHBOARD_TOKEN} characters (try `openssl rand -hex 32`)"
+        );
+    }
+    if token.chars().any(char::is_whitespace) {
+        bail!("{name} must not contain whitespace");
     }
     Ok(())
 }
@@ -1040,5 +1189,137 @@ mod tests {
             Some("127.0.0.1:9".parse().unwrap())
         );
         assert!(with(Some("nonsense")).is_err());
+    }
+
+    #[test]
+    fn auth_mode_needs_an_acl_file_unless_off() {
+        assert_eq!(with_env(&[]).unwrap().auth_mode, AuthMode::Off);
+        for mode in ["permissive", "enforce"] {
+            let err = with_env(&[("KRAKEN_HUB_AUTH_MODE", mode)]).unwrap_err();
+            assert!(err.to_string().contains("KRAKEN_HUB_ACL_FILE"), "{err:#}");
+            let c = with_env(&[
+                ("KRAKEN_HUB_AUTH_MODE", mode),
+                ("KRAKEN_HUB_ACL_FILE", "/etc/hub/acl.toml"),
+            ])
+            .unwrap();
+            assert_eq!(c.auth_mode.as_str(), mode);
+            assert_eq!(c.acl_file.as_deref(), Some(Path::new("/etc/hub/acl.toml")));
+        }
+        assert!(with_env(&[("KRAKEN_HUB_AUTH_MODE", "strict")]).is_err());
+        // Off ignores a file that is named.
+        assert!(with_env(&[("KRAKEN_HUB_ACL_FILE", "/x")]).is_ok());
+    }
+
+    #[test]
+    fn tls_files_come_in_pairs_and_the_http_pair_defaults_to_the_grpc_pair() {
+        assert!(with_env(&[("KRAKEN_HUB_TLS_CERT", "/c.pem")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_TLS_KEY", "/k.pem")]).is_err());
+        assert!(with_env(&[("KRAKEN_HUB_HTTP_TLS_CERT", "/c.pem")]).is_err());
+        let c = with_env(&[
+            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
+            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
+        ])
+        .unwrap();
+        let pair = Some((Path::new("/c.pem"), Path::new("/k.pem")));
+        assert_eq!(c.grpc_tls(), pair);
+        assert_eq!(c.http_tls(), pair);
+        let c = with_env(&[
+            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
+            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
+            ("KRAKEN_HUB_HTTP_TLS_CERT", "/h.pem"),
+            ("KRAKEN_HUB_HTTP_TLS_KEY", "/hk.pem"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.http_tls(),
+            Some((Path::new("/h.pem"), Path::new("/hk.pem")))
+        );
+        // HTTP only.
+        let c = with_env(&[
+            ("KRAKEN_HUB_HTTP_TLS_CERT", "/h.pem"),
+            ("KRAKEN_HUB_HTTP_TLS_KEY", "/hk.pem"),
+        ])
+        .unwrap();
+        assert_eq!((c.grpc_tls(), c.http_tls().is_some()), (None, true));
+        assert_eq!(with_env(&[]).unwrap().http_tls(), None);
+    }
+
+    #[test]
+    fn the_dashboard_tokens_are_trimmed_checked_and_never_shown() {
+        let token = "0123456789abcdef-token\n";
+        let c = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", token)]).unwrap();
+        let secret = c.dashboard_token.as_ref().unwrap();
+        assert!(secret.matches(Some("0123456789abcdef-token")));
+        assert!(!secret.matches(Some("0123456789abcdef-token\n")));
+        assert!(!format!("{c:?}").contains("0123456789abcdef"));
+        let err = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "short")]).unwrap_err();
+        assert!(err.to_string().contains("at least 16"), "{err:#}");
+        assert!(!format!("{err:#}").contains("short\""));
+        assert!(with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "has a space in it, 16+")]).is_err());
+        // The write token is parsed and kept; nothing reads it yet.
+        let c = with_env(&[
+            ("KRAKEN_HUB_DASHBOARD_TOKEN", token),
+            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", "fedcba9876543210-write"),
+        ])
+        .unwrap();
+        assert!(
+            c.dashboard_write_token
+                .unwrap()
+                .matches(Some("fedcba9876543210-write"))
+        );
+        assert!(with_env(&[]).unwrap().dashboard_token.is_none());
+    }
+
+    #[test]
+    fn open_ports_without_protection_are_security_warnings() {
+        let open = Config::default();
+        let w = open.security_warnings();
+        assert!(
+            w.iter().any(|m| m.contains("KRAKEN_HUB_AUTH_MODE=off")),
+            "{w:?}"
+        );
+        assert!(
+            w.iter().any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
+            "{w:?}"
+        );
+        let permissive = Config {
+            auth_mode: AuthMode::Permissive,
+            ..Config::default()
+        };
+        assert!(
+            permissive
+                .security_warnings()
+                .iter()
+                .any(|m| m.contains("KRAKEN_HUB_AUTH_MODE=permissive"))
+        );
+        let local = Config {
+            listen: "127.0.0.1:7000".parse().unwrap(),
+            http_listen: Some("127.0.0.1:7001".parse().unwrap()),
+            ..Config::default()
+        };
+        assert!(local.security_warnings().is_empty());
+        let enforced = Config {
+            auth_mode: AuthMode::Enforce,
+            acl_file: Some("/acl".into()),
+            ..Config::default()
+        };
+        let w = enforced.security_warnings();
+        assert!(!w.iter().any(|m| m.contains("AUTH_MODE")), "{w:?}");
+        assert!(w.iter().any(|m| m.contains("no TLS")), "{w:?}");
+    }
+
+    #[test]
+    fn the_reload_interval_defaults_to_five_seconds_and_must_be_positive() {
+        assert_eq!(
+            with_env(&[]).unwrap().reload_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            with_env(&[("KRAKEN_HUB_RELOAD_INTERVAL", "250ms")])
+                .unwrap()
+                .reload_interval,
+            Duration::from_millis(250)
+        );
+        assert!(with_env(&[("KRAKEN_HUB_RELOAD_INTERVAL", "0")]).is_err());
     }
 }

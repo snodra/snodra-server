@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tracing::info;
 
+use crate::auth::{AuthStatus, Digest};
 use crate::context::ContextId;
 use crate::proto::{InstanceStatus, ServerMessage};
 use crate::registry::{InstanceId, Placement};
@@ -110,6 +111,11 @@ pub struct SessionMeta {
     /// mode SUBSCRIPTION, is a target for them, and sends and receives the multi-part messages
     /// (ADR 0017, P4c).
     pub subscription: bool,
+    /// The digest of the token the session registered with, when it is in the ACL (ADR 0018);
+    /// every later request is judged against the current ACL entry of this digest.
+    pub principal: Option<Digest>,
+    /// How the session authenticated, for the topology and the dashboard.
+    pub auth: AuthStatus,
 }
 
 impl SessionMeta {
@@ -127,6 +133,8 @@ impl SessionMeta {
             scatter_gather: false,
             streaming: false,
             subscription: false,
+            principal: None,
+            auth: AuthStatus::Off,
         }
     }
 
@@ -153,6 +161,9 @@ pub struct Session {
     pub cancel: CancellationToken,
     /// The latest `InstanceStatus`, if the session reported one (ADR 0016).
     pub status: Option<StatusDetail>,
+    /// Every type of the latest accepted `Register` (commands, queries, shared queries), for
+    /// re-checking the registration when the ACL changes.
+    pub handled: Vec<String>,
 }
 
 /// What the router needs to know about the sender of a request.
@@ -169,6 +180,8 @@ pub struct SenderInfo {
     pub streaming: bool,
     /// The session shares "subscription".
     pub subscription: bool,
+    /// See [`SessionMeta::principal`].
+    pub principal: Option<Digest>,
 }
 
 /// Read-only copy of one session's observable state, for the topology view.
@@ -184,6 +197,19 @@ pub struct SessionDetail {
     pub last_heartbeat: Instant,
     /// The latest `InstanceStatus`, `None` when never reported.
     pub status: Option<StatusDetail>,
+    /// How the session authenticated (ADR 0018).
+    pub auth: AuthStatus,
+}
+
+/// What the ACL check of a reload needs to know about a session.
+#[derive(Debug, Clone)]
+pub struct AuthView {
+    pub context: ContextId,
+    pub instance_id: InstanceId,
+    pub token: u64,
+    pub service: String,
+    pub principal: Option<Digest>,
+    pub handled: Vec<String>,
 }
 
 /// Instance id -> session. Every lookup also matches the session's [`ContextId`], so a session is
@@ -252,6 +278,7 @@ impl Sessions {
             token,
             cancel,
             status: None,
+            handled: Vec::new(),
         };
         let old = inner.insert(instance_id.to_string(), session);
         drop(inner);
@@ -301,7 +328,45 @@ impl Sessions {
                 scatter_gather: s.meta.scatter_gather,
                 streaming: s.meta.streaming,
                 subscription: s.meta.subscription,
+                principal: s.meta.principal,
             })
+    }
+
+    /// Records the types of the session's latest accepted `Register`; ignored unless `token` is
+    /// still the current session of `instance_id`.
+    pub fn set_handled(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        handled: Vec<String>,
+    ) {
+        if let Some(s) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(instance_id)
+            .filter(|s| s.context == *ctx && s.token == token)
+        {
+            s.handled = handled;
+        }
+    }
+
+    /// Every session's identity and registration, for the ACL check of a reload.
+    pub fn auth_views(&self) -> Vec<AuthView> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, s)| AuthView {
+                context: s.context.clone(),
+                instance_id: id.clone(),
+                token: s.token,
+                service: s.service.clone(),
+                principal: s.meta.principal,
+                handled: s.handled.clone(),
+            })
+            .collect()
     }
 
     /// True when the current session of `instance_id` negotiated the "streaming" capability
@@ -441,6 +506,7 @@ impl Sessions {
                 connected_since: s.connected_since,
                 last_heartbeat: s.last_heartbeat,
                 status: s.status.clone(),
+                auth: s.meta.auth.clone(),
             })
             .collect()
     }

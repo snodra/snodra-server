@@ -515,6 +515,11 @@ pub fn strip_userinfo(url: &str) -> String {
     }
 }
 
+fn path(p: &Option<std::path::PathBuf>) -> String {
+    p.as_deref()
+        .map_or_else(String::new, |p| p.display().to_string())
+}
+
 fn overrides(c: &Config) -> String {
     c.timeout_overrides
         .iter()
@@ -714,6 +719,69 @@ pub fn settings(c: &Config) -> SettingsView {
             Plain,
             "other hubs' dashboard URLs the page merges (CORS and CSP allow exactly these)",
         ),
+        setting(
+            "KRAKEN_HUB_AUTH_MODE",
+            c.auth_mode.as_str().to_string(),
+            Some(d.auth_mode.as_str().to_string()),
+            Plain,
+            "access control for Connect: off, permissive (log and count violations) or enforce (refuse them)",
+        ),
+        setting(
+            "KRAKEN_HUB_ACL_FILE",
+            path(&c.acl_file),
+            Some(path(&d.acl_file)),
+            Plain,
+            "ACL (token SHA-256 to service, handle and send patterns); reloaded when it changes",
+        ),
+        setting(
+            "KRAKEN_HUB_TLS_CERT",
+            path(&c.tls_cert),
+            Some(path(&d.tls_cert)),
+            Plain,
+            "PEM certificate chain of the gRPC listener; with the key, the listener accepts TLS only",
+        ),
+        setting(
+            "KRAKEN_HUB_TLS_KEY",
+            path(&c.tls_key),
+            Some(path(&d.tls_key)),
+            Plain,
+            "PEM private key of the gRPC listener (the file's path, never its content)",
+        ),
+        setting(
+            "KRAKEN_HUB_HTTP_TLS_CERT",
+            path(&c.http_tls_cert),
+            Some(path(&d.http_tls_cert)),
+            Plain,
+            "PEM certificate chain of the HTTP listener; default the gRPC pair",
+        ),
+        setting(
+            "KRAKEN_HUB_HTTP_TLS_KEY",
+            path(&c.http_tls_key),
+            Some(path(&d.http_tls_key)),
+            Plain,
+            "PEM private key of the HTTP listener; default the gRPC pair",
+        ),
+        setting(
+            "KRAKEN_HUB_RELOAD_INTERVAL",
+            fmt_duration(c.reload_interval),
+            Some(fmt_duration(d.reload_interval)),
+            Plain,
+            "how often the ACL and the certificates are checked for changes",
+        ),
+        setting(
+            "KRAKEN_HUB_DASHBOARD_TOKEN",
+            String::new(),
+            None,
+            Sensitivity::Secret,
+            "bearer token the dashboard, its API and /topology require; unset: open",
+        ),
+        setting(
+            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
+            String::new(),
+            None,
+            Sensitivity::Secret,
+            "reserved for the processor controls of roadmap P6; no effect yet",
+        ),
     ];
     SettingsView { settings: s }
 }
@@ -812,6 +880,8 @@ mod tests {
             connected_hub_ids: vec![],
             status_age_ms: -1,
             shared_query_types: vec![],
+            auth: None,
+            authenticated_service: None,
         }
     }
 
@@ -1087,7 +1157,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 26);
+        assert_eq!(v.settings.len(), 35);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
@@ -1135,7 +1205,27 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert!(!json.contains("hunter2"), "{json}");
         assert!(json.contains("https://***@grafana.example/d/hub"), "{json}");
-        assert!(v.settings.iter().all(|s| !s.secret));
+        // Only the two dashboard tokens are secret, and they carry no value.
+        let secrets: Vec<&str> = v
+            .settings
+            .iter()
+            .filter(|s| s.secret)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            secrets,
+            [
+                "KRAKEN_HUB_DASHBOARD_TOKEN",
+                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN"
+            ]
+        );
+        assert!(
+            v.settings
+                .iter()
+                .filter(|s| s.secret)
+                .all(|s| s.value.is_none())
+        );
+        assert_eq!(get("KRAKEN_HUB_AUTH_MODE").value.as_deref(), Some("off"));
     }
 
     #[test]
