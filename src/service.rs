@@ -689,6 +689,7 @@ async fn run_stream(
                     _ => unreachable!("matched above"),
                 }
             }
+            Some(client_message::Message::Credentials(_)) => {}
             None => {}
         }
     }

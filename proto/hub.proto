@@ -47,6 +47,11 @@ message ClientMessage {
     // Multi-hub HA (capability "instance-status"): what this instance sees, every 5 s. Sent only
     // to a hub whose RegisterAck lists "instance-status"; the hub keeps the latest per session.
     InstanceStatus status = 10;
+    // Credential refresh (capability "credentials-refresh", P5b, ADR 0019): a new credential for
+    // this session, for the same service as its Register. The hub validates it as it validates the
+    // Register's and, for a JWT, moves the session's expiry; a refused refresh closes the stream in
+    // enforce. Sent only to a hub whose RegisterAck lists "credentials-refresh".
+    Credentials credentials = 11;
   }
 }
 
@@ -108,8 +113,8 @@ message Register {
   uint32 protocol_version = 5;
   // Optional protocol features this client supports; unknown names are ignored by the hub.
   // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED),
-  // "instance-status" (ClientMessage.status) and "scatter-gather" (Request.mode SCATTER_GATHER,
-  // ReplyPart, ReplyEnd).
+  // "instance-status" (ClientMessage.status), "scatter-gather" (Request.mode SCATTER_GATHER,
+  // ReplyPart, ReplyEnd) and "credentials-refresh" (ClientMessage.credentials).
   repeated string capabilities = 6;
   // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
@@ -165,13 +170,14 @@ message InstanceStatus {
   reserved 3;
 }
 
-// How a client authenticates itself to the hub. Carried on Register (ADR 0018): token since
-// P5a; jwt is refused with UNAUTHENTICATED until P5b.
+// How a client authenticates itself to the hub. Carried on Register (ADR 0018) and on
+// ClientMessage.credentials: token since P5a; jwt since P5b (ADR 0019), refused with
+// UNAUTHENTICATED by a hub that has no JWT issuer configured.
 message Credentials {
   oneof kind {
     // Static pre-shared token.
     string token = 1;
-    // Client-credentials access token (JWT) issued by Keycloak.
+    // Client-credentials access token (JWT) issued by Keycloak; its azp claim names the service.
     string jwt = 2;
   }
 }
