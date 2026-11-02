@@ -23,7 +23,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthMode, Authorizer, Denied, Disposition};
+use crate::auth::{AuthMode, Authorizer, Denied, Digest, Disposition};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::hub_server::Hub;
@@ -296,6 +296,27 @@ impl StreamCtx {
         })
     }
 
+    /// Judges a registration once more after it was recorded, in `enforce` mode: the status to
+    /// close the session with when the current ACL no longer allows it, already reported and
+    /// counted. A reload that ran between the first judgement and the recording could not judge
+    /// types that were not recorded yet (it uses the session's recorded types), so every path
+    /// that records a registration, the first `Register` and each re-register, calls this after.
+    fn judge_again(
+        &self,
+        principal: Option<&Digest>,
+        service: &str,
+        handled: &[String],
+    ) -> Option<Status> {
+        if self.auth.mode() != AuthMode::Enforce {
+            return None;
+        }
+        let late = self.auth.recheck(principal, service, handled);
+        let first = late.first()?;
+        self.auth
+            .report(&late, service, principal, Disposition::Closed);
+        Some(first.to_status())
+    }
+
     fn disconnect(&self, instance_id: &str, token: u64) -> bool {
         disconnect(
             &self.registry,
@@ -486,15 +507,10 @@ async fn run_stream(
     }
     // A reload may have run between the check above and the insert, when no session existed for
     // it to re-judge; judge once more now that the session and its types are recorded.
-    if ctx.auth.mode() == AuthMode::Enforce {
-        let late = ctx.auth.recheck(principal.as_ref(), &service, &handled);
-        if let Some(first) = late.first() {
-            ctx.auth
-                .report(&late, &service, principal.as_ref(), Disposition::Closed);
-            ctx.disconnect(&instance_id, token);
-            let _ = tx.try_send(Err(first.to_status()));
-            return;
-        }
+    if let Some(status) = ctx.judge_again(principal.as_ref(), &service, &handled) {
+        ctx.disconnect(&instance_id, token);
+        let _ = tx.try_send(Err(status));
+        return;
     }
     // The ack is queued before this task reads the next inbound message, so it precedes the echo
     // of the heartbeat that follows the Register (the stream's messages are handled in order).
@@ -561,6 +577,17 @@ async fn run_stream(
                 }
                 match ctx.register(token, &reg, &placement) {
                     Some(Ok(())) => {
+                        // The same late judgement as after the first `Register`: a reload may
+                        // have overtaken the check above (the recorded types it judged were the
+                        // previous ones).
+                        if let Some(status) =
+                            ctx.judge_again(principal.as_ref(), &service, &handled_types(&reg))
+                        {
+                            if let Some(tx) = out.upgrade() {
+                                let _ = tx.try_send(Err(status));
+                            }
+                            break;
+                        }
                         // No types left: a graceful stop. Its queue goes to other instances.
                         if reg.command_types.is_empty()
                             && reg.query_types.is_empty()
@@ -772,6 +799,128 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    /// A `StreamCtx` over `parts`-like state, for the registration interleaving tests.
+    fn stream_ctx(
+        auth: &Arc<Authorizer>,
+        registry: &Arc<Registry>,
+        sessions: &Arc<Sessions>,
+        router: &Arc<Router>,
+    ) -> StreamCtx {
+        StreamCtx {
+            registry: Arc::clone(registry),
+            sessions: Arc::clone(sessions),
+            router: Arc::clone(router),
+            config: Arc::new(Config::default()),
+            auth: Arc::clone(auth),
+            context: ContextId::default(),
+        }
+    }
+
+    /// The re-register of review finding 4, step by step. The stream judges the new types against
+    /// the ACL, a reload then narrows the ACL, and only afterwards does the stream record the
+    /// registration. The reload judged the session by its old types (the new ones were not
+    /// recorded yet), so it kept the session; the late judgement after `register` must close it.
+    #[tokio::test]
+    async fn a_re_register_that_a_reload_overtook_is_judged_again_once_recorded() {
+        let dir = std::env::temp_dir().join(format!("kraken-hub-race-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("acl.toml");
+        let entry = |handle: &str| {
+            format!(
+                "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"orders\"\nhandle = [{handle}]\n",
+                hash_token("tok")
+            )
+        };
+        std::fs::write(&file, entry("\"orders.*\"")).unwrap();
+        let m = test_metrics();
+        let config = Config {
+            auth_mode: AuthMode::Enforce,
+            acl_file: Some(file.clone()),
+            ..Config::default()
+        };
+        let auth = Authorizer::from_config(&config, m.metrics.clone()).unwrap();
+        let registry = Arc::new(Registry::new(Duration::from_secs(60)));
+        let sessions = Arc::new(Sessions::new());
+        let router = Router::with_auth(
+            Arc::clone(&registry),
+            Arc::clone(&sessions),
+            Arc::new(Config::default()),
+            m.metrics.clone(),
+            Arc::clone(&auth),
+        );
+        let ctx = stream_ctx(&auth, &registry, &sessions, &router);
+        let principal = digest_of("tok");
+
+        // The session registered with orders.Place.
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut meta = SessionMeta::v1(Duration::from_secs(30));
+        meta.principal = Some(principal);
+        let token = sessions.insert(
+            &ctx.context,
+            "i1",
+            "orders",
+            meta,
+            tx,
+            CancellationToken::new(),
+        );
+        let first = Register {
+            instance_id: "i1".into(),
+            service_name: "orders".into(),
+            command_types: vec!["orders.Place".into()],
+            ..Register::default()
+        };
+        assert!(matches!(
+            ctx.register(token, &first, &Placement::default()),
+            Some(Ok(()))
+        ));
+
+        // Step 1: a re-register adds orders.Cancel; the ACL of the moment allows it.
+        let second = Register {
+            command_types: vec!["orders.Place".into(), "orders.Cancel".into()],
+            ..first.clone()
+        };
+        assert!(
+            auth.recheck(Some(&principal), "orders", &handled_types(&second))
+                .is_empty(),
+            "allowed by the ACL as it is"
+        );
+        // Step 2: the ACL is narrowed and reloaded; the reload judges the session by the types
+        // it has recorded so far (orders.Place), which are still allowed.
+        std::fs::write(&file, entry("\"orders.Place\"")).unwrap();
+        assert!(auth.reload());
+        assert_eq!(reevaluate_sessions(&auth, &registry, &sessions, &router), 0);
+        assert!(rx.try_recv().is_err());
+        // Step 3: the stream records the registration it judged in step 1.
+        assert!(matches!(
+            ctx.register(token, &second, &Placement::default()),
+            Some(Ok(()))
+        ));
+        // Step 4: the late judgement sees what the reload could not.
+        let status = ctx
+            .judge_again(Some(&principal), "orders", &handled_types(&second))
+            .expect("the registration is no longer allowed");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status.message().contains("orders.Cancel"),
+            "{}",
+            status.message()
+        );
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "handle_denied"
+            ),
+            Some(1)
+        );
+        // And what the ACL allows is not judged at all.
+        assert!(
+            ctx.judge_again(Some(&principal), "orders", &handled_types(&first))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
