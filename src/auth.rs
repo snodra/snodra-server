@@ -15,7 +15,10 @@
 //! Tokens are never logged and never stored: a token is hashed as soon as it is read, and logs
 //! carry at most [`short`] (the first 8 hex characters of the digest). P5b adds a JWT credential
 //! and P5c a client certificate; both plug into [`Authorizer::admit`] in the place of the token
-//! lookup and produce the same [`Principal`] (service name, handle and send patterns).
+//! lookup. P5a has no `Principal` type: a session keeps the digest of its token
+//! ([`crate::session::SessionMeta::principal`]) and every later check looks it up in the ACL. A
+//! `Principal` (service name, handle and send patterns) that every credential kind produces is
+//! deferred to P5b, which will change what a session stores (ADR 0018, "What P5b and P5c add").
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
