@@ -193,6 +193,10 @@ pub struct Metrics {
     acl_generation: Gauge<u64>,
     acl_reload_errors: Counter<u64>,
     tls_handshakes_shed: Counter<u64>,
+    jwt_validations: Counter<u64>,
+    jwks_fetches: Counter<u64>,
+    jwks_keys: Gauge<u64>,
+    credentials_refreshes: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -295,6 +299,22 @@ impl Metrics {
                 .u64_counter("kraken_hub_tls_handshakes_shed_total")
                 .with_description("TCP connections dropped before their TLS handshake because every handshake slot was busy (reason `slots`) or the peer IP already held its share (reason `per_ip`), per listener")
                 .build(),
+            jwt_validations: meter
+                .u64_counter("kraken_hub_jwt_validations_total")
+                .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
+                .build(),
+            jwks_fetches: meter
+                .u64_counter("kraken_hub_jwks_fetches_total")
+                .with_description("Signing-key set fetches, per result: ok, network, timeout, status, too_large, invalid (a failed fetch keeps the last good key set)")
+                .build(),
+            jwks_keys: meter
+                .u64_gauge("kraken_hub_jwks_keys")
+                .with_description("Signing keys in the loaded key set; absent until the first successful fetch")
+                .build(),
+            credentials_refreshes: meter
+                .u64_counter("kraken_hub_credentials_refreshes_total")
+                .with_description("ClientMessage.credentials refreshes, per result: ok, refused, wrong_service, throttled")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -323,6 +343,28 @@ impl Metrics {
                 KeyValue::new("reason", reason),
             ],
         );
+    }
+
+    /// One JWT validated (or refused): `result` is one of a fixed set of labels, never text a
+    /// client chose.
+    pub fn jwt_validation(&self, result: &'static str) {
+        self.jwt_validations
+            .add(1, &[KeyValue::new("result", result)]);
+    }
+
+    /// One signing-key set fetch finished.
+    pub fn jwks_fetch(&self, result: &'static str) {
+        self.jwks_fetches.add(1, &[KeyValue::new("result", result)]);
+    }
+
+    pub fn jwks_keys_set(&self, keys: u64) {
+        self.jwks_keys.record(keys, &[]);
+    }
+
+    /// One `ClientMessage.credentials` handled.
+    pub fn credentials_refresh(&self, result: &'static str) {
+        self.credentials_refreshes
+            .add(1, &[KeyValue::new("result", result)]);
     }
 
     pub fn acl_reload_failed(&self) {

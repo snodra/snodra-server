@@ -10,6 +10,7 @@ pub mod config;
 pub mod context;
 pub mod edges;
 pub mod http;
+pub mod jwt;
 pub mod protocol;
 pub mod queue;
 pub mod registry;
