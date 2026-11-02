@@ -232,8 +232,8 @@ struct Subscription {
     /// the edge and the in-flight counts; updates may flow.
     initial_done: bool,
     /// The update targets by target id (`<id>#n`, n >= 1): every capable instance at the open.
-    /// Each was written the subscription request; each still here is owed a `Cancel` when the
-    /// subscription ends before it did.
+    /// Each is written the subscription request after the entry exists (`SubTarget::written`);
+    /// each still here is owed a `Cancel` when the subscription ends before it did.
     targets: BTreeMap<String, SubTarget>,
     /// Parts the sender may still be sent: the initial credit plus every `Flow`, less the
     /// parts relayed.
@@ -254,12 +254,31 @@ struct Subscription {
     relay: Relay,
 }
 
+/// A subscription entered in the map, its targets not written yet.
+struct OpenedSubscription {
+    id: String,
+    /// The update targets `(<id>#n, target)`, in target order.
+    targets: Vec<(String, SubTarget)>,
+    /// The sender's request, the template of every target's request.
+    request: Request,
+    initial_id: String,
+    initial_handler: InstanceId,
+    initial_token: u64,
+    /// The initial request `<id>#0`, to dispatch once the targets are written.
+    initial: Request,
+}
+
 /// One update target of a subscription: the handler session that was written `<id>#n`.
 struct SubTarget {
     handler: InstanceId,
     handler_token: u64,
     /// The handler's service, for `ReplyPart.responder_service`.
     service: String,
+    /// The request `<id>#n` was written to the session (set under the pending lock right
+    /// after the write, as `Unary::forwarded` is). A close owes a `Cancel` only to a target
+    /// written: one not yet is cancelled by [`Router::note_target_written`] once it is, so a
+    /// `Cancel` never reaches a handler before the `Request` it refers to.
+    written: bool,
 }
 
 /// An update a target pushed, waiting for the sender's credit.
@@ -2740,6 +2759,38 @@ impl Router {
         info: SenderInfo,
         span: tracing::Span,
     ) {
+        let Some(opened) = self.open_subscription(ctx, sender, req, req_kind, info, span) else {
+            return;
+        };
+        // The update targets: written directly, outside flow control (a subscription is
+        // passive: no permit, no queue), every one BEFORE the initial request, so a library
+        // sees each `<id>#n` ahead of `<id>#0` on the stream of the instance that gets both.
+        for (target_id, target) in &opened.targets {
+            self.write_subscription_target(ctx, &opened.id, target_id, target, &opened.request);
+        }
+        // The initial result: an ordinary unary request through flow control, queues and
+        // priority, with its handler permit; the hub enforces `max_results` itself.
+        self.dispatch(
+            ctx,
+            &opened.initial_id,
+            &opened.initial_handler,
+            opened.initial_token,
+            opened.initial,
+        );
+    }
+
+    /// Validates subscription request `req`, picks the initial target and the update targets
+    /// and enters the subscription (and its initial request) in the map; nothing is written to
+    /// a handler yet. `None` when it was refused (the sender was told) or the sender left.
+    fn open_subscription(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        sender: &str,
+        req: Request,
+        req_kind: Kind,
+        info: SenderInfo,
+        span: tracing::Span,
+    ) -> Option<OpenedSubscription> {
         let id = req.id.clone();
         let type_name = req.r#type.clone();
         let mode = mode_label(req.mode);
@@ -2757,26 +2808,38 @@ impl Router {
                 "request mode {mode} needs the \"{}\" capability, not declared by this session",
                 protocol::SUBSCRIPTION
             );
-            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+            {
+                self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+                return None;
+            }
         }
         let for_queries = |type_name: &str| {
             format!("invalid request: {type_name} is a command; {mode} is for queries")
         };
         if req_kind == Kind::Command {
             let message = for_queries(&type_name);
-            return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
+            {
+                self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
+                return None;
+            }
         }
         let pool = match self.registry.stream_candidates(ctx, &type_name) {
             Ok(pool) => pool,
             Err(e) => {
                 let message = no_handler_message(&type_name, e);
-                return self.reject_mode(&m, req_kind, ErrorCode::NoHandler, message);
+                {
+                    self.reject_mode(&m, req_kind, ErrorCode::NoHandler, message);
+                    return None;
+                }
             }
         };
         let kind = pool.kind;
         if kind == Kind::Command {
             let message = for_queries(&type_name);
-            return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+            {
+                self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+                return None;
+            }
         }
         // Only an instance that negotiated "subscription" serves one.
         let (capable, incapable): (Vec<Candidate>, Vec<Candidate>) = pool
@@ -2795,7 +2858,10 @@ impl Router {
                 services.join(", "),
                 protocol::SUBSCRIPTION
             );
-            return self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
+            {
+                self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
+                return None;
+            }
         }
         // The initial result comes from one of them, chosen as a point query is.
         let sender_tags = self
@@ -2830,6 +2896,7 @@ impl Router {
                         handler,
                         handler_token,
                         service,
+                        written: false,
                     },
                 )
             })
@@ -2843,7 +2910,7 @@ impl Router {
             .sessions
             .weak_sender_if_current(ctx, sender, info.token)
         else {
-            return; // the sender left meanwhile: nobody to answer
+            return None; // the sender left meanwhile: nobody to answer
         };
         // `None`: the handler's session vanished since the pick; the dispatch reports it Gone.
         let initial_token = self
@@ -2865,7 +2932,10 @@ impl Router {
             {
                 drop(pending);
                 let message = "invalid request: duplicate id".to_string();
-                return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+                {
+                    self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+                    return None;
+                }
             }
             // The per-instance limit, over the targets of every open subscription.
             let max = self.config.max_subscriptions_per_instance;
@@ -2888,7 +2958,10 @@ impl Router {
                     if max == 1 { "" } else { "s" }
                 );
                 drop(pending);
-                return self.reject_mode(&m, kind, ErrorCode::ResourceExhausted, message);
+                {
+                    self.reject_mode(&m, kind, ErrorCode::ResourceExhausted, message);
+                    return None;
+                }
             }
             self.metrics.request_started(kind);
             for (_, t) in &targets {
@@ -2952,6 +3025,7 @@ impl Router {
                                 handler: target.handler.clone(),
                                 handler_token: target.handler_token,
                                 service: target.service.clone(),
+                                written: false,
                             },
                         )
                     })
@@ -2967,52 +3041,96 @@ impl Router {
             };
             pending.insert(id.clone(), Pending::Subscription(sub));
         }
-        // The update targets: written directly, outside flow control (a subscription is
-        // passive: no permit, no queue). One whose session cannot take the request is left out.
-        for (target_id, target) in &targets {
-            let msg = ServerMessage {
-                message: Some(server_message::Message::Request(Request {
-                    id: target_id.clone(),
-                    mode: RequestMode::Subscription as i32,
-                    initial_credit: 0,
-                    max_results: 0,
-                    ..req.clone()
-                })),
-            };
-            let written =
-                self.sessions
-                    .send_if_current(ctx, &target.handler, target.handler_token, msg);
-            let (code, message) = match written {
-                Ok(()) => continue,
-                Err(SendError::Busy) => {
-                    self.metrics.buffer_full(&target.service);
-                    self.metrics.rejected(&target.service, "buffer_full");
-                    (
-                        ErrorCode::ResourceExhausted,
-                        format!(
-                            "handler instance {} busy: outbound buffer full",
-                            target.handler
-                        ),
-                    )
-                }
-                Err(SendError::Gone) => (
-                    ErrorCode::HandlerDisconnected,
-                    format!("handler instance {} disconnected", target.handler),
-                ),
-            };
-            tracing::debug!(request_id = %target_id, handler = %target.handler, "subscription target not written: {message}");
-            self.drop_subscription_target(&id, target_id, code, message);
-        }
-        // The initial result: an ordinary unary request through flow control, queues and
-        // priority, with its handler permit; the hub enforces `max_results` itself.
         let initial = Request {
             id: initial_id.clone(),
             mode: RequestMode::Unary as i32,
             initial_credit: 0,
             max_results: 0,
-            ..req
+            ..req.clone()
         };
-        self.dispatch(ctx, &initial_id, &initial_handler, initial_token, initial);
+        Some(OpenedSubscription {
+            id,
+            targets,
+            request: req,
+            initial_id,
+            initial_handler,
+            initial_token,
+            initial,
+        })
+    }
+
+    /// The request to update target `target_id` was just written: it is marked written (a
+    /// close now owes it a `Cancel`). If subscription `id` ended since it was entered, the close
+    /// found the target not written and sent it no `Cancel`: it gets
+    /// `Cancel{target_id, "closed before forward"}` here, after its `Request`. A target no longer
+    /// listed while the subscription lives ended or left by itself: nothing to cancel.
+    fn note_target_written(&self, ctx: &ContextId, id: &str, target_id: &str, target: &SubTarget) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if let Some(Pending::Subscription(sub)) = pending.get_mut(id) {
+                if let Some(t) = sub.targets.get_mut(target_id) {
+                    t.written = true;
+                }
+                return;
+            }
+        }
+        let msg = ServerMessage {
+            message: Some(server_message::Message::Cancel(Cancel {
+                request_id: target_id.to_string(),
+                reason: "closed before forward".to_string(),
+            })),
+        };
+        self.send_to_handler(
+            ctx,
+            &target.handler,
+            target.handler_token,
+            &target.service,
+            msg,
+        );
+    }
+
+    /// Writes the subscription request `req` to update target `target_id`, outside flow
+    /// control. One whose session cannot take the request is left out of the subscription.
+    fn write_subscription_target(
+        &self,
+        ctx: &ContextId,
+        id: &str,
+        target_id: &str,
+        target: &SubTarget,
+        req: &Request,
+    ) {
+        let msg = ServerMessage {
+            message: Some(server_message::Message::Request(Request {
+                id: target_id.to_string(),
+                mode: RequestMode::Subscription as i32,
+                initial_credit: 0,
+                max_results: 0,
+                ..req.clone()
+            })),
+        };
+        let written =
+            self.sessions
+                .send_if_current(ctx, &target.handler, target.handler_token, msg);
+        let (code, message) = match written {
+            Ok(()) => return self.note_target_written(ctx, id, target_id, target),
+            Err(SendError::Busy) => {
+                self.metrics.buffer_full(&target.service);
+                self.metrics.rejected(&target.service, "buffer_full");
+                (
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "handler instance {} busy: outbound buffer full",
+                        target.handler
+                    ),
+                )
+            }
+            Err(SendError::Gone) => (
+                ErrorCode::HandlerDisconnected,
+                format!("handler instance {} disconnected", target.handler),
+            ),
+        };
+        tracing::debug!(request_id = %target_id, handler = %target.handler, "subscription target not written: {message}");
+        self.drop_subscription_target(id, target_id, code, message);
     }
 
     /// The answer (or hub-side failure) of the initial request of subscription `id` (its
@@ -3465,11 +3583,14 @@ impl Router {
         }
     }
 
-    /// `Cancel{<id>#n, reason}` to every update target still serving `sub`, each closing on
-    /// the gauge. (Every target was written the request and negotiated "subscription".)
+    /// `Cancel{<id>#n, reason}` to every update target still serving `sub` and already written
+    /// its request, each closing on the gauge. (Every target negotiated "subscription".)
     fn cancel_subscription_targets(&self, sub: &Subscription, reason: &str) {
         for (target_id, t) in &sub.targets {
             self.metrics.subscription_closed(&t.service, &t.handler);
+            if !t.written {
+                continue; // `note_target_written` cancels it once its request is written
+            }
             let msg = ServerMessage {
                 message: Some(server_message::Message::Cancel(Cancel {
                     request_id: target_id.clone(),
@@ -7623,6 +7744,105 @@ mod subscription_tests {
             (2, 0),
             "counted once, at the initial"
         );
+    }
+
+    impl Subs {
+        /// Opens subscription `req` as `route_subscription` does, but writes nothing: the
+        /// caller interleaves the target writes with other events.
+        fn open_only(&self, req: Request) -> OpenedSubscription {
+            let info = self.sessions.sender_info(&D, "s1").unwrap();
+            self.router
+                .open_subscription(&D, "s1", req, Kind::Query, info, tracing::Span::none())
+                .expect("opened")
+        }
+
+        fn write_target(&self, opened: &OpenedSubscription, n: usize) {
+            let (target_id, target) = &opened.targets[n];
+            self.router.write_subscription_target(
+                &D,
+                &opened.id,
+                target_id,
+                target,
+                &opened.request,
+            );
+        }
+    }
+
+    /// An early target fails the subscription (a fast handler-side error end) while the hub is
+    /// still writing the targets: the targets not written yet are not cancelled (their `Cancel`
+    /// would reach the handler before their `Request`, which it would then serve for a
+    /// subscription the hub forgot). Each gets the `Request` and then one `Cancel`.
+    #[tokio::test]
+    async fn a_subscription_closed_between_two_target_writes_cancels_the_later_target_after_its_request()
+     {
+        let mut f = Subs::new();
+        let opened = f.open_only(subscribe("w1", "q.Watch", 0, 0, 0));
+        let ids: Vec<(&str, &str)> = opened
+            .targets
+            .iter()
+            .map(|(t, s)| (t.as_str(), s.handler.as_str()))
+            .collect();
+        assert_eq!(ids, [("w1#1", "a1"), ("w1#2", "b1")]);
+        f.write_target(&opened, 0);
+        // The first target ends with RESOURCE_EXHAUSTED before the second is written.
+        f.end("a1", "w1#1", Some(ErrorCode::ResourceExhausted));
+        let got = f.messages("s1");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            end_error(end(&got[0])).0,
+            ErrorCode::ResourceExhausted,
+            "the sender got the target's error"
+        );
+        let got = f.messages("b1");
+        assert!(got.is_empty(), "no Cancel before the Request: {got:?}");
+        f.write_target(&opened, 1);
+        let got = f.messages("b1");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            matches!(&got[0], server_message::Message::Request(r) if r.id == "w1#2"),
+            "{got:?}"
+        );
+        match &got[1] {
+            server_message::Message::Cancel(c) => assert_eq!(
+                (c.request_id.as_str(), c.reason.as_str()),
+                ("w1#2", "closed before forward")
+            ),
+            other => panic!("expected a Cancel, got {other:?}"),
+        }
+        let got = f.messages("a1");
+        assert_eq!(
+            got.len(),
+            1,
+            "a1 ended its own target: just the Request, no Cancel: {got:?}"
+        );
+        assert!(matches!(&got[0], server_message::Message::Request(r) if r.id == "w1#1"));
+        assert_eq!(f.router.in_flight(), 0);
+    }
+
+    /// The sender cancels after the subscription is entered and before any target is written:
+    /// every target gets its `Request`, then exactly one `Cancel`; the written ones are
+    /// cancelled by the close, the later ones when written.
+    #[tokio::test]
+    async fn a_subscription_closed_before_its_first_target_write_cancels_every_target_once() {
+        let mut f = Subs::new();
+        let opened = f.open_only(subscribe("w1", "q.Watch", 0, 0, 0));
+        f.write_target(&opened, 0);
+        f.cancel("s1", "w1", "enough");
+        let got = f.messages("a1");
+        assert_eq!(got.len(), 2, "Request#1 then Cancel#1: {got:?}");
+        assert!(matches!(&got[0], server_message::Message::Request(r) if r.id == "w1#1"));
+        assert!(
+            matches!(&got[1], server_message::Message::Cancel(c) if c.request_id == "w1#1" && c.reason == "enough")
+        );
+        assert!(f.messages("b1").is_empty(), "nothing before the Request");
+        f.write_target(&opened, 1);
+        let got = f.messages("b1");
+        assert_eq!(got.len(), 2, "Request#2 then Cancel#2: {got:?}");
+        assert!(matches!(&got[0], server_message::Message::Request(r) if r.id == "w1#2"));
+        assert!(
+            matches!(&got[1], server_message::Message::Cancel(c) if c.request_id == "w1#2" && c.reason == "closed before forward")
+        );
+        assert_eq!(f.router.in_flight(), 0);
     }
 
     #[tokio::test]
