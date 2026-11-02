@@ -122,6 +122,33 @@ pub fn load_certified(cert: &Path, key: &Path) -> anyhow::Result<CertifiedKey> {
     Ok(certified)
 }
 
+/// A warning when the private key file can be read by its group or by others (Unix only; the
+/// mode is the one `stat` shows after following symlinks). `None` for a tight key, and for a key
+/// whose metadata cannot be read (loading it reports that). A key that others can read is a key
+/// that others may already have.
+pub fn key_permission_warning(key: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(key).ok()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "tls private key {} is readable by its group or others (mode {mode:o}); run `chmod 600` on it (the hub's own user must still be able to read it)",
+                key.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = key;
+    None
+}
+
+fn warn_if_key_is_loose(listener: &str, key: &Path) {
+    if let Some(warning) = key_permission_warning(key) {
+        warn!(listener, "{warning}");
+    }
+}
+
 /// The certificate a listener presents, replaced by [`CertStore::reload`].
 pub struct CertStore {
     current: RwLock<Arc<CertifiedKey>>,
@@ -143,6 +170,7 @@ impl CertStore {
     /// Loads the pair; a bad pair is fatal at startup. `name` (`grpc` or `http`) labels logs.
     pub fn load(cert: &Path, key: &Path, name: &'static str) -> anyhow::Result<Arc<Self>> {
         let certified = load_certified(cert, key)?;
+        warn_if_key_is_loose(name, key);
         info!(listener = name, cert = %cert.display(), "tls certificate loaded");
         Ok(Arc::new(Self {
             current: RwLock::new(Arc::new(certified)),
@@ -162,6 +190,7 @@ impl CertStore {
     pub fn reload(&self) -> bool {
         match load_certified(&self.cert, &self.key) {
             Ok(certified) => {
+                warn_if_key_is_loose(self.name, &self.key);
                 *self.current.write().unwrap() = Arc::new(certified);
                 info!(listener = self.name, cert = %self.cert.display(), "tls certificate reloaded");
                 true
@@ -475,6 +504,65 @@ mod tests {
             tokio::time::timeout(within, tcp.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         )
+    }
+
+    fn scratch_pair() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("kraken-hub-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, key.cert.pem()).unwrap();
+        std::fs::write(&key_path, key.signing_key.serialize_pem()).unwrap();
+        (dir, cert, key_path)
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_readable_by_group_or_others_is_a_warning() {
+        let (dir, _, key) = scratch_pair();
+        chmod(&key, 0o600);
+        assert_eq!(key_permission_warning(&key), None);
+        chmod(&key, 0o400);
+        assert_eq!(key_permission_warning(&key), None);
+        for mode in [0o640, 0o604, 0o644, 0o660, 0o666] {
+            chmod(&key, mode);
+            let warning = key_permission_warning(&key).unwrap_or_else(|| panic!("{mode:o}"));
+            assert!(warning.contains(&format!("{mode:o}")), "{warning}");
+            assert!(warning.contains("chmod 600"), "{warning}");
+        }
+        // A key that cannot be read says nothing here (loading reports that).
+        assert_eq!(key_permission_warning(&dir.join("missing.pem")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_and_reloading_warn_about_a_loose_key() {
+        use crate::telemetry::test_support::{capture_logs, logged};
+        let (dir, cert, key) = scratch_pair();
+        chmod(&key, 0o644);
+        capture_logs();
+        let store = CertStore::load(&cert, &key, "test").unwrap();
+        let warned = |lines: &[crate::telemetry::test_support::LogLine]| {
+            lines
+                .iter()
+                .filter(|l| l.message.contains("private key") && l.message.contains("readable"))
+                .count()
+        };
+        assert_eq!(warned(&logged()), 1, "at startup");
+        assert!(store.reload());
+        assert_eq!(warned(&logged()), 2, "and again on a reload");
+        chmod(&key, 0o600);
+        capture_logs();
+        assert!(store.reload());
+        assert_eq!(warned(&logged()), 0, "a tight key is not warned about");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

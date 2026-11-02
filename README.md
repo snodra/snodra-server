@@ -426,7 +426,9 @@ reloads on change without dropping open connections. Handshakes are bounded: one
 than `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` is dropped, and when every slot (512 per listener) or the
 peer IP's share (`KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`) is busy a new connection is dropped at once
 and counted in `kraken_hub_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
-flood of half-open connections cannot stall the accept loop. `--health-check` and `--topology` take
+flood of half-open connections cannot stall the accept loop. At startup and on each reload
+the hub warns when the private key file is readable by its group or others (Unix: any of `0o077`
+set); `chmod 600` it. The dev sandbox's key is `0644` on purpose (see `dev-hub-pki.sh`) and warns. `--health-check` and `--topology` take
 `--address` and `--tls-ca <pem>`; inside the hub's own container they pin its certificate, so the
 image `HEALTHCHECK` needs no change. Client certificates (mTLS) are P5c.
 
