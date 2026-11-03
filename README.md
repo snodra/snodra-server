@@ -100,7 +100,7 @@ cargo run
 | `KRAKEN_HUB_JWT_LEEWAY` | `30s` | clock skew tolerated on `exp`, `nbf` and `iat` |
 | `KRAKEN_HUB_JWT_EXPIRY_GRACE` | `30s` | how long after `exp` a JWT session stays open without a refresh |
 | `KRAKEN_HUB_JWKS_REFRESH` | `5m` | how often the signing keys are fetched again (an unknown `kid` fetches at most once per 30 s on top); positive |
-| `KRAKEN_HUB_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots |
+| `KRAKEN_HUB_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots; an unreadable file is a startup error whatever the URI scheme (unused, with a warning, over `http://`) |
 | `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
 | `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
 | `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
@@ -413,6 +413,7 @@ accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it 
 | an invalid JWT (expired, wrong issuer or audience, bad signature, `none`/`HS*`, an ID or refresh token) | `UNAUTHENTICATED` with a short reason, never the token | logged, counted (`jwt_invalid`), allowed as unauthenticated |
 | a JWT for another service (`azp` differs), or for a service with no `[[service]]` table | `PERMISSION_DENIED` "token azp `<a>` is not service `<b>`" / "no ACL entry for service `<a>`" | logged, counted, allowed |
 | a JWT before the first fetch of the signing keys | `UNAVAILABLE` "jwks not loaded yet" (clients retry) | the same, counted (`jwks_unavailable`) |
+| a JWT whose `kid` is not in the key set and no fetch made for it has looked yet (a rotation) | `UNAVAILABLE` "signing key not known yet" (clients retry at the normal backoff); `UNAUTHENTICATED` "unknown signing key" once a fetch made for it found it missing | the same, counted (`jwks_unavailable` / `jwt_invalid`) |
 | a JWT session past `exp` + `KRAKEN_HUB_JWT_EXPIRY_GRACE` without a refresh | stream closed with `UNAUTHENTICATED` "credentials expired" | counted once (`expired`), logged once, session kept |
 | a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription) | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
@@ -455,7 +456,10 @@ send   = ["orders.*"]
 A JWT session expires at `exp` plus the grace unless the client sends `ClientMessage.credentials`
 with a fresh credential for the same service (a token session may move to a JWT and back; handled
 types are judged again against the new entry; one refresh per second per session is looked at, the
-rest are counted as `throttled`; no reply on success; `off` ignores it). A reload that removes the
+rest are counted as `throttled` and dropped silently, so send at most one per renewal; a refresh whose
+`kid` is not known yet is waited for at most 1.5 s and then, if still not judgeable, counted as
+`unavailable` and dropped while the session keeps its old credentials; no reply on success; `off`
+ignores it). A reload that removes the
 service's table closes its session in `enforce`. The topology and the dashboard show each
 instance's `authKind` (`token`, `jwt`, `none`) and a JWT's `expiresAt`. In Keycloak, give each
 service a confidential client with service accounts only and client id = service name, add an
@@ -491,8 +495,11 @@ rewriting the file behind `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`: the new token appli
 poll and the old one stops working at once. Peers
 (`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
 
-The Kotlin and Rust libraries do not send the token yet (the P5a client slice); until then only
-`off` and `permissive` work with them, and a refused service reconnects every 0.5 to 5 s.
+Both libraries send the token (P5a) or, with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
+`KRAKEN_HUB_OAUTH2_*`), fetch, cache, renew and send a Keycloak client-credentials JWT (P5b), so
+`enforce` works with every service that has a `[[token]]` entry or a `[[service]]` table; a refused
+service waits the reconnect backoff cap between attempts. The JWT sandbox is the umbrella's
+`infra/compose.jwt.yaml`.
 
 ## Protocol summary
 
@@ -821,7 +828,7 @@ without any client change; v1 clients always send a timeout, so for them an over
   [Dashboard](#dashboard)); Grafana for history.
 - Metrics (OTLP): `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
   `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
-  `kraken_hub_jwks_fetches_total{result}`, `kraken_hub_jwks_keys`,
+  `kraken_hub_jwks_fetches_total{result}` (`ok`, `network`, `tls`, `timeout`, `status`, `too_large`, `invalid`), `kraken_hub_jwks_keys`,
   `kraken_hub_credentials_refreshes_total{result}`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
