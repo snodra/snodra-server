@@ -525,11 +525,13 @@ rewriting the file behind `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`: the new token appli
 poll and the old one stops working at once. Peers
 (`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
 
-Both libraries send the token (P5a) or, with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
-`KRAKEN_HUB_OAUTH2_*`), fetch, cache, renew and send a Keycloak client-credentials JWT (P5b), so
-`enforce` works with every service that has a `[[token]]` entry or a `[[service]]` table; a refused
-service waits the reconnect backoff cap between attempts. The JWT sandbox is the umbrella's
-`infra/compose.jwt.yaml`.
+Both libraries send the token (P5a), with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
+`KRAKEN_HUB_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT (P5b), or present a
+client certificate (P5c: Kotlin `kraken.messaging.hub.tls.client-cert-file` and `client-key-file`, Rust
+`KRAKEN_HUB_TLS_CLIENT_CERT` and `KRAKEN_HUB_TLS_CLIENT_KEY`; they read the files again and roll their
+connections over to a renewed pair without a restart), so `enforce` works with every service that has a
+`[[token]]` entry or a `[[service]]` table; a refused service waits the reconnect backoff cap between
+attempts. The JWT and mTLS sandboxes are the umbrella's `infra/compose.jwt.yaml` and `infra/compose.mtls.yaml`.
 
 ## Protocol summary
 
