@@ -305,7 +305,7 @@ impl Metrics {
                 .build(),
             jwks_fetches: meter
                 .u64_counter("kraken_hub_jwks_fetches_total")
-                .with_description("Signing-key set fetches, per result: ok, network, timeout, status, too_large, invalid (a failed fetch keeps the last good key set)")
+                .with_description("Signing-key set fetches, per result: ok, network, tls, timeout, status, too_large, invalid (a failed fetch keeps the last good key set)")
                 .build(),
             jwks_keys: meter
                 .u64_gauge("kraken_hub_jwks_keys")

@@ -272,23 +272,42 @@ struct Claims {
 // ---------------------------------------------------------------------------------------------
 // Fetching
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FetchError {
-    Network,
+    /// Connecting, or the HTTP exchange, failed (the I/O error's text).
+    Network(String),
+    /// The TLS handshake failed: the certificate is not trusted or does not match, or the peer
+    /// does not speak TLS (rustls's text).
+    Tls(String),
     Timeout,
-    Status,
+    /// Anything but 200.
+    Status(u16),
     TooLarge,
     Invalid,
 }
 
 impl FetchError {
-    fn label(self) -> &'static str {
+    /// The `result` label of `kraken_hub_jwks_fetches_total`: fixed strings.
+    fn label(&self) -> &'static str {
         match self {
-            Self::Network => "network",
+            Self::Network(_) => "network",
+            Self::Tls(_) => "tls",
             Self::Timeout => "timeout",
-            Self::Status => "status",
+            Self::Status(_) => "status",
             Self::TooLarge => "too_large",
             Self::Invalid => "invalid",
+        }
+    }
+
+    /// What the log line adds to the label: the OS or rustls error text, the status code. None of
+    /// it is secret (the response body, which is not logged, is the only thing the peer chose).
+    fn detail(&self) -> String {
+        match self {
+            Self::Network(why) | Self::Tls(why) => why.clone(),
+            Self::Status(code) => format!("HTTP status {code}"),
+            Self::Timeout => "no complete response in time".into(),
+            Self::TooLarge => "response over the size cap".into(),
+            Self::Invalid => "not a JWKS document with a signing key".into(),
         }
     }
 }
@@ -347,15 +366,19 @@ impl Fetcher {
     async fn exchange(&self) -> Result<Vec<u8>, FetchError> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port))
             .await
-            .map_err(|_| FetchError::Network)?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         match &self.tls {
             Some(connector) if self.https => {
-                let name =
-                    ServerName::try_from(self.host.clone()).map_err(|_| FetchError::Network)?;
-                let tls = connector
-                    .connect(name, tcp)
-                    .await
-                    .map_err(|_| FetchError::Network)?;
+                let name = ServerName::try_from(self.host.clone())
+                    .map_err(|e| FetchError::Network(format!("server name: {e}")))?;
+                let tls = connector.connect(name, tcp).await.map_err(|e| {
+                    // rustls errors travel inside the io::Error; a reset in the middle of the
+                    // handshake is the network's.
+                    match e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
+                        Some(tls) => FetchError::Tls(tls.to_string()),
+                        None => FetchError::Network(e.to_string()),
+                    }
+                })?;
                 self.request(tls).await
             }
             _ => self.request(tcp).await,
@@ -368,7 +391,7 @@ impl Fetcher {
     {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io))
             .await
-            .map_err(|_| FetchError::Network)?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -384,14 +407,14 @@ impl Fetcher {
             .header(ACCEPT, "application/json")
             .header(CONNECTION, "close")
             .body(Empty::<Bytes>::new())
-            .map_err(|_| FetchError::Network)?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         let outcome = async {
             let response = sender
                 .send_request(request)
                 .await
-                .map_err(|_| FetchError::Network)?;
+                .map_err(|e| FetchError::Network(e.to_string()))?;
             if response.status() != StatusCode::OK {
-                return Err(FetchError::Status);
+                return Err(FetchError::Status(response.status().as_u16()));
             }
             let body = Limited::new(response.into_body(), MAX_JWKS_BYTES)
                 .collect()
@@ -402,7 +425,7 @@ impl Fetcher {
                     {
                         FetchError::TooLarge
                     } else {
-                        FetchError::Network
+                        FetchError::Network(e.to_string())
                     }
                 })?;
             Ok(body.to_bytes().to_vec())
@@ -654,6 +677,7 @@ impl Jwt {
                 if first_failure {
                     warn!(
                         reason = e.label(),
+                        detail = %e.detail(),
                         uri = %self.fetcher.uri,
                         loaded = self.is_loaded(),
                         "jwks fetch failed; keeping the last good keys (further failures are counted, not logged, until one succeeds)"
@@ -1320,6 +1344,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_status_is_logged_with_its_code() {
+        crate::telemetry::test_support::capture_logs();
+        let key = Signer::es256("k1");
+        let server = JwksServer::start(&[&key]).await;
+        server.set_status(503);
+        let fx = started(server, |_| {});
+        eventually("the 503 is counted", || fx.fetches("status").is_some()).await;
+        let warn = crate::telemetry::test_support::logged()
+            .into_iter()
+            .find(|l| l.message.contains("jwks fetch failed"))
+            .expect("the failure is logged");
+        assert_eq!(warn.field("reason"), Some("status"));
+        assert!(
+            warn.field("detail").is_some_and(|d| d.contains("503")),
+            "{warn:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_oversized_or_slow_response_is_a_failed_fetch() {
         let key = Signer::es256("k1");
         let fx = loaded_with(&[&key], |c| {
@@ -1357,10 +1400,27 @@ mod tests {
             JwksServer::unbound(server.addr).with_scheme("https"),
             |_| {},
         );
+        crate::telemetry::test_support::capture_logs();
         eventually("an untrusted certificate fails", || {
-            untrusted.fetches("network").is_some()
+            untrusted.fetches("tls").is_some()
         })
         .await;
+        assert_eq!(
+            untrusted.fetches("network"),
+            None,
+            "a trust failure is not the network"
+        );
+        let warn = crate::telemetry::test_support::logged()
+            .into_iter()
+            .find(|l| l.message.contains("jwks fetch failed"))
+            .expect("the failure is logged");
+        assert_eq!(warn.field("reason"), Some("tls"));
+        // The rustls error says why (an unknown issuer here), and the URI is in the line.
+        assert!(
+            warn.field("detail")
+                .is_some_and(|d| d.contains("UnknownIssuer")),
+            "{warn:?}"
+        );
         assert!(!untrusted.jwt.is_loaded());
         let trusted = started(JwksServer::unbound(server.addr).with_scheme("https"), |c| {
             c.jwt_jwks_ca = Some(ca_file.clone());
