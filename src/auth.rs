@@ -836,13 +836,28 @@ impl Authorizer {
         if acl.entries().is_empty() {
             warn!("the ACL has no tokens: in enforce mode no service can register");
         }
+        let jwt = Jwt::from_config(config, Arc::clone(&metrics))?;
+        if jwt.is_some() {
+            info!(
+                issuer = config.jwt_issuer.as_deref().unwrap_or_default(),
+                jwks_uri = config.jwt_jwks_uri.as_deref().unwrap_or_default(),
+                audience = config.jwt_audience.as_deref().unwrap_or("-"),
+                services = acl.services().len(),
+                "jwt credentials"
+            );
+            if acl.services().is_empty() {
+                warn!(
+                    "JWT credentials are configured but the ACL has no [[service]] tables: no JWT can register until one is added"
+                );
+            }
+        }
         metrics.acl_generation_set(1);
         Ok(Arc::new(Self {
             mode: config.auth_mode,
             acl: RwLock::new(Arc::new(acl)),
             generation: AtomicU64::new(1),
             path: Some(path),
-            jwt: Jwt::from_config(config, Arc::clone(&metrics))?,
+            jwt,
             metrics,
             limiter: LogLimiter::default(),
         }))

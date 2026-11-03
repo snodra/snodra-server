@@ -628,6 +628,12 @@ impl Config {
                 out.push("the dashboard token is set but the HTTP port has no TLS: the token travels in clear text".to_string());
             }
         }
+        if self.jwt_issuer.is_some() && self.auth_mode == AuthMode::Off {
+            out.push(
+                "KRAKEN_HUB_JWT_ISSUER is set but KRAKEN_HUB_AUTH_MODE=off: no credentials are checked, JWT or token; set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
+                    .to_string(),
+            );
+        }
         // The key set decides who may register as what: over plain HTTP anyone on the path can
         // swap it. Loopback and a single-label name (a compose service) stay on the host or the
         // private network, so they are not worth a line.
@@ -1561,6 +1567,35 @@ mod tests {
         assert!(with_env(&[issuer, ("KRAKEN_HUB_JWKS_REFRESH", "0")]).is_err());
         assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_LEEWAY", "soon")]).is_err());
         assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "-1")]).is_err());
+    }
+
+    #[test]
+    fn an_issuer_with_access_control_off_warns_that_nothing_is_checked() {
+        let jwt_off = |mode: &str| {
+            let mut env = vec![("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken")];
+            if mode != "off" {
+                env.extend([
+                    ("KRAKEN_HUB_AUTH_MODE", mode),
+                    ("KRAKEN_HUB_ACL_FILE", "/acl"),
+                ]);
+            }
+            with_env(&env)
+                .unwrap()
+                .security_warnings()
+                .iter()
+                .filter(|w| w.contains("KRAKEN_HUB_JWT_ISSUER"))
+                .count()
+        };
+        assert_eq!(jwt_off("off"), 1);
+        assert_eq!(jwt_off("permissive"), 0);
+        assert_eq!(jwt_off("enforce"), 0);
+        assert!(
+            with_env(&[])
+                .unwrap()
+                .security_warnings()
+                .iter()
+                .all(|w| !w.contains("KRAKEN_HUB_JWT_ISSUER"))
+        );
     }
 
     #[test]
