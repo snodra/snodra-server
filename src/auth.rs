@@ -37,6 +37,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::jwt::{Jwt, JwtError};
+use crate::mtls::{CertError, ClientCert};
 use crate::proto::{Credentials, credentials};
 use crate::telemetry::Metrics;
 
@@ -368,14 +369,17 @@ pub enum AclKey {
 pub enum CredentialKind {
     Token,
     Jwt,
+    /// A client certificate presented in the TLS handshake (ADR 0020).
+    Certificate,
 }
 
 impl CredentialKind {
-    /// `token` or `jwt`, as the topology shows it.
+    /// `token`, `jwt` or `certificate`, as the topology shows it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Token => "token",
             Self::Jwt => "jwt",
+            Self::Certificate => "certificate",
         }
     }
 }
@@ -389,8 +393,13 @@ pub struct Principal {
     pub service: String,
     /// The entry later checks look up in the current ACL.
     pub key: AclKey,
-    /// When a JWT expires (`exp`); `None` for a token, which does not.
+    /// When a JWT expires (`exp`) or a certificate ends (`notAfter`); `None` for a token, which
+    /// does not.
     pub expires_at: Option<SystemTime>,
+    /// How the credential was presented.
+    kind: CredentialKind,
+    /// The first 8 hex characters of a certificate's SHA-256 fingerprint.
+    pub fingerprint: Option<String>,
 }
 
 impl Principal {
@@ -400,22 +409,46 @@ impl Principal {
             service: service.to_string(),
             key: AclKey::Token(digest),
             expires_at: None,
+            kind: CredentialKind::Token,
+            fingerprint: None,
+        }
+    }
+
+    /// The principal of a JWT whose `azp` is `service`, valid until `expires_at`.
+    pub fn jwt(service: &str, expires_at: SystemTime) -> Self {
+        Self {
+            service: service.to_string(),
+            key: AclKey::Service(service.to_string()),
+            expires_at: Some(expires_at),
+            kind: CredentialKind::Jwt,
+            fingerprint: None,
+        }
+    }
+
+    /// The principal of a client certificate (ADR 0020): its service's `[[service]]` table is
+    /// its entry, and it ends at `notAfter`.
+    pub fn certificate(cert: &ClientCert) -> Self {
+        Self {
+            service: cert.service.clone(),
+            key: AclKey::Service(cert.service.clone()),
+            expires_at: Some(cert.not_after),
+            kind: CredentialKind::Certificate,
+            fingerprint: Some(cert.short()),
         }
     }
 
     pub fn kind(&self) -> CredentialKind {
-        match self.key {
-            AclKey::Token(_) => CredentialKind::Token,
-            AclKey::Service(_) => CredentialKind::Jwt,
-        }
+        self.kind
     }
 
-    /// How logs name the credential: the first 8 hex characters of a token's digest, or the
-    /// service of a JWT's entry (clipped). Never the credential itself.
+    /// How logs name the credential: the first 8 hex characters of a token's digest, the service
+    /// of a JWT's entry (clipped), or `cert:` and the first 8 hex characters of a certificate's
+    /// fingerprint. Never the credential itself.
     pub fn label(&self) -> String {
-        match &self.key {
-            AclKey::Token(digest) => short(digest),
-            AclKey::Service(name) => clip(name),
+        match (&self.key, &self.fingerprint) {
+            (AclKey::Token(digest), _) => short(digest),
+            (AclKey::Service(_), Some(fingerprint)) => format!("cert:{fingerprint}"),
+            (AclKey::Service(name), None) => clip(name),
         }
     }
 }
@@ -710,6 +743,15 @@ pub enum Disposition {
     Kept,
 }
 
+/// True when `credentials` carries a token or a JWT (an empty token is none).
+fn credentials_present(credentials: Option<&Credentials>) -> bool {
+    match credentials.and_then(|c| c.kind.as_ref()) {
+        Some(credentials::Kind::Token(token)) => !token.is_empty(),
+        Some(credentials::Kind::Jwt(_)) => true,
+        None => false,
+    }
+}
+
 /// Three non-empty dot-separated segments: worth verifying as a JWT. Anything else is a static
 /// token, which is not counted as a malformed JWT.
 fn looks_like_jwt(token: &str) -> bool {
@@ -898,6 +940,13 @@ impl Authorizer {
             .is_ok()
     }
 
+    /// A credentials refresh was ignored because the session's principal is its client
+    /// certificate, which no message can replace (ADR 0020).
+    pub fn refresh_ignored_for_certificate(&self) {
+        self.metrics
+            .credentials_refresh("ignored_certificate_session");
+    }
+
     /// A refresh was ignored because it came less than a second after the last one looked at.
     pub fn refresh_throttled(&self) {
         self.metrics.credentials_refresh("throttled");
@@ -1006,6 +1055,52 @@ impl Authorizer {
         service: &str,
         handled: &[String],
     ) -> Admission {
+        self.admit_with(None, credentials, v2, service, handled)
+    }
+
+    /// [`Authorizer::admit`] for a stream whose TLS peer presented a client certificate (`peer`:
+    /// its DER encoding; `None` when it presented none). The certificate, when there is one, is
+    /// the session's principal; see [`Authorizer::admit_identified`].
+    pub fn admit_peer(
+        &self,
+        peer: Option<&[u8]>,
+        credentials: Option<&Credentials>,
+        v2: bool,
+        service: &str,
+        handled: &[String],
+    ) -> Admission {
+        let identified = match self.mode {
+            AuthMode::Off => None,
+            _ => peer.map(crate::mtls::identify),
+        };
+        self.admit_with(identified, credentials, v2, service, handled)
+    }
+
+    /// [`Authorizer::admit`] for a certificate already read. A certificate that names exactly one
+    /// service is the principal (rights come from that service's `[[service]]` table, and the
+    /// service must be the one registered); `credentials`, when present, must resolve to the same
+    /// service (`cert_mismatch`) and add nothing else. A certificate that cannot be used (it names
+    /// no service or several, or it ended) is a violation of its own and, where the mode lets the
+    /// session go on, the credentials are judged as if there were no certificate.
+    pub fn admit_identified(
+        &self,
+        cert: Result<ClientCert, CertError>,
+        credentials: Option<&Credentials>,
+        v2: bool,
+        service: &str,
+        handled: &[String],
+    ) -> Admission {
+        self.admit_with(Some(cert), credentials, v2, service, handled)
+    }
+
+    fn admit_with(
+        &self,
+        cert: Option<Result<ClientCert, CertError>>,
+        credentials: Option<&Credentials>,
+        v2: bool,
+        service: &str,
+        handled: &[String],
+    ) -> Admission {
         if self.mode == AuthMode::Off {
             return Admission {
                 principal: None,
@@ -1014,13 +1109,10 @@ impl Authorizer {
             };
         }
         let acl = self.acl();
-        let (denials, matched) = match self.resolve_credential(&acl, credentials, v2, service) {
-            Ok((principal, rights)) => (
-                judge(rights, &principal.key, service, handled),
-                Some((principal, rights)),
-            ),
-            Err(denials) => (denials, None),
-        };
+        let (matched, mut denials) = self.resolve_principal(&acl, cert, credentials, v2, service);
+        if let Some((principal, rights)) = &matched {
+            denials.extend(judge(*rights, principal, service, handled));
+        }
         let key = matched.as_ref().map(|(p, _)| p.label());
         for d in &denials {
             self.count(&acl, d, service);
@@ -1064,6 +1156,83 @@ impl Authorizer {
             refused: (self.mode == AuthMode::Enforce)
                 .then(|| denials.into_iter().next())
                 .flatten(),
+        }
+    }
+
+    /// Who a `Register` speaks for: the principal and what its entry grants (`None` when nothing
+    /// resolved), and the denials found on the way, in the order they are reported. A usable
+    /// certificate wins over `credentials`; see [`Authorizer::admit_identified`].
+    fn resolve_principal<'a>(
+        &self,
+        acl: &'a Acl,
+        cert: Option<Result<ClientCert, CertError>>,
+        credentials: Option<&Credentials>,
+        v2: bool,
+        service: &str,
+    ) -> (Option<(Principal, Rights<'a>)>, Vec<Denied>) {
+        let from_credentials =
+            |side: Vec<Denied>| match self.resolve_credential(acl, credentials, v2, service) {
+                Ok(found) => (Some(found), side),
+                Err(denials) => (None, [side, denials].concat()),
+            };
+        let Some(cert) = cert else {
+            return from_credentials(Vec::new());
+        };
+        let cert = match cert {
+            Err(e) => {
+                self.metrics.client_certificate(e.result());
+                return from_credentials(vec![Denied::new(
+                    e.reason(),
+                    DeniedCode::PermissionDenied,
+                    e.message(),
+                )]);
+            }
+            Ok(c) if c.not_after <= SystemTime::now() => {
+                self.metrics.client_certificate("expired");
+                return from_credentials(vec![Denied::new(
+                    "expired",
+                    DeniedCode::Unauthenticated,
+                    "certificate expired",
+                )]);
+            }
+            Ok(c) => c,
+        };
+        let principal = Principal::certificate(&cert);
+        let mut side = Vec::new();
+        let mut result = "ok";
+        if credentials_present(credentials) {
+            match self.resolve_credential(acl, credentials, v2, service) {
+                Ok((other, _)) if other.service != cert.service => {
+                    result = "mismatch";
+                    side.push(Denied::new(
+                        "cert_mismatch",
+                        DeniedCode::PermissionDenied,
+                        "credentials and certificate name different services",
+                    ));
+                }
+                Ok(_) => {}
+                // A credential that does not resolve is refused as it always is.
+                Err(denials) => side.extend(denials),
+            }
+        }
+        self.metrics.client_certificate(result);
+        match acl.rights(&principal.key) {
+            Some(rights) => (Some((principal, rights)), side),
+            None => {
+                if cert.service != service {
+                    side.push(Denied::new(
+                        "wrong_service",
+                        DeniedCode::PermissionDenied,
+                        format!(
+                            "certificate service {} is not service {}",
+                            clip(&cert.service),
+                            clip(service)
+                        ),
+                    ));
+                }
+                side.push(entry_gone(&principal.key));
+                (None, side)
+            }
         }
     }
 
@@ -1127,11 +1296,7 @@ impl Authorizer {
                 _ => Denied::new("jwt_invalid", DeniedCode::Unauthenticated, e.message()),
             }]
         })?;
-        let principal = Principal {
-            key: AclKey::Service(verified.azp.clone()),
-            service: verified.azp,
-            expires_at: Some(verified.expires_at),
-        };
+        let principal = Principal::jwt(&verified.azp, verified.expires_at);
         match acl.rights(&principal.key) {
             Some(rights) => Ok((principal, rights)),
             None => {
@@ -1195,7 +1360,7 @@ impl Authorizer {
                 };
             }
         };
-        let denials = judge(rights, &principal.key, service, handled);
+        let denials = judge(rights, &principal, service, handled);
         let Some(first) = denials.first() else {
             self.metrics.credentials_refresh("ok");
             return Refresh::Accepted {
@@ -1244,10 +1409,18 @@ impl Authorizer {
         if self.mode == AuthMode::Off {
             return Expiry::Keep;
         }
+        let certificate = principal.kind() == CredentialKind::Certificate;
+        if certificate {
+            self.metrics.client_certificate("expired");
+        }
         let denied = Denied::new(
             "expired",
             DeniedCode::Unauthenticated,
-            "credentials expired",
+            if certificate {
+                "certificate expired"
+            } else {
+                "credentials expired"
+            },
         );
         if self.mode == AuthMode::Enforce {
             self.report(
@@ -1274,11 +1447,16 @@ impl Authorizer {
         if self.mode == AuthMode::Off {
             return None;
         }
-        let exp = principal?.expires_at?;
-        let grace = self
-            .jwt
-            .as_ref()
-            .map_or(Duration::ZERO, |j| j.expiry_grace());
+        let principal = principal?;
+        let exp = principal.expires_at?;
+        // A TLS session cannot be refreshed on a live stream: a certificate ends at `notAfter`.
+        let grace = match principal.kind() {
+            CredentialKind::Certificate => Duration::ZERO,
+            _ => self
+                .jwt
+                .as_ref()
+                .map_or(Duration::ZERO, |j| j.expiry_grace()),
+        };
         let remaining = exp
             .checked_add(grace)?
             .duration_since(SystemTime::now())
@@ -1297,6 +1475,15 @@ impl Authorizer {
                 .is_ok_and(|v| self.acl().rights(&AclKey::Service(v.azp)).is_some())
     }
 
+    /// True when `der` is a client certificate that names a service with a `[[service]]` table and
+    /// has not ended.
+    fn certificate_has_entry(&self, der: &[u8]) -> bool {
+        crate::mtls::identify(der).is_ok_and(|cert| {
+            cert.not_after > SystemTime::now()
+                && self.acl().rights(&AclKey::Service(cert.service)).is_some()
+        })
+    }
+
     /// Judges a gRPC `Topology` call carrying `presented` (the bearer token, if any) against the
     /// dashboard token `dashboard` (if one is set) and the ACL. The topology lists every service,
     /// type and instance id, so:
@@ -1312,6 +1499,19 @@ impl Authorizer {
         presented: Option<&str>,
         dashboard: Option<&Secret>,
     ) -> Result<(), Status> {
+        self.check_topology_peer(presented, None, dashboard)
+    }
+
+    /// [`Authorizer::check_topology`] for a call that came over a TLS connection whose peer
+    /// presented the client certificate `peer` (DER): in `permissive` and `enforce` a certificate
+    /// that names a service with a `[[service]]` table, and has not ended, is accepted like an ACL
+    /// token (ADR 0020).
+    pub fn check_topology_peer(
+        &self,
+        presented: Option<&str>,
+        peer: Option<&[u8]>,
+        dashboard: Option<&Secret>,
+    ) -> Result<(), Status> {
         let unauthenticated = || Status::unauthenticated("unauthenticated");
         let dashboard_ok = dashboard.is_some_and(|d| d.matches(presented));
         if self.mode == AuthMode::Off {
@@ -1324,7 +1524,11 @@ impl Authorizer {
         // Looked up even when the dashboard token matched, so the time does not tell which
         // of the two the caller presented.
         let acl_ok = presented.is_some_and(|t| self.acl().lookup(&digest_of(t)).is_some());
-        if dashboard_ok || acl_ok || presented.is_some_and(|t| self.jwt_has_entry(t)) {
+        if dashboard_ok
+            || acl_ok
+            || presented.is_some_and(|t| self.jwt_has_entry(t))
+            || peer.is_some_and(|der| self.certificate_has_entry(der))
+        {
             return Ok(());
         }
         if self.mode == AuthMode::Enforce || dashboard.is_some() {
@@ -1394,7 +1598,7 @@ impl Authorizer {
         };
         match self.acl().rights(&principal.key) {
             None => vec![entry_gone(&principal.key)],
-            Some(rights) => judge(rights, &principal.key, service, handled),
+            Some(rights) => judge(rights, principal, service, handled),
         }
     }
 
@@ -1521,19 +1725,29 @@ fn entry_gone(key: &AclKey) -> Denied {
 }
 
 /// The checks of an entry that matched: the service name, then every handled type.
-fn judge(rights: Rights<'_>, key: &AclKey, service: &str, handled: &[String]) -> Vec<Denied> {
+fn judge(
+    rights: Rights<'_>,
+    principal: &Principal,
+    service: &str,
+    handled: &[String],
+) -> Vec<Denied> {
     let mut out = Vec::new();
     if rights.service != service {
         out.push(Denied::new(
             "wrong_service",
             DeniedCode::PermissionDenied,
-            match key {
-                AclKey::Token(digest) => format!(
+            match (&principal.key, principal.kind()) {
+                (AclKey::Token(digest), _) => format!(
                     "token {} is not allowed to register as service {}",
                     short(digest),
                     clip(service)
                 ),
-                AclKey::Service(azp) => {
+                (AclKey::Service(name), CredentialKind::Certificate) => format!(
+                    "certificate service {} is not service {}",
+                    clip(name),
+                    clip(service)
+                ),
+                (AclKey::Service(azp), _) => {
                     format!("token azp {} is not service {}", clip(azp), clip(service))
                 }
             },
@@ -2209,11 +2423,7 @@ contexts = ["default"]
         assert_eq!(t.kind(), CredentialKind::Token);
         assert_eq!(t.label(), short(&digest_of("tok-billing")));
         assert_eq!(t.expires_at, None);
-        let j = Principal {
-            service: "billing".into(),
-            key: AclKey::Service("billing".into()),
-            expires_at: Some(SystemTime::UNIX_EPOCH),
-        };
+        let j = Principal::jwt("billing", SystemTime::UNIX_EPOCH);
         assert_eq!(j.kind(), CredentialKind::Jwt);
         assert_eq!(j.label(), "billing");
         assert_eq!(CredentialKind::Jwt.as_str(), "jwt");
@@ -2997,15 +3207,12 @@ handle = ["*"]
     async fn the_expiry_deadline_is_exp_plus_the_grace() {
         let fx = jwt_fx(AuthMode::Enforce).await;
         let in_secs = |exp_in: i64| {
-            let p = Principal {
-                service: "billing".into(),
-                key: AclKey::Service("billing".into()),
-                expires_at: Some(
-                    SystemTime::now()
-                        .checked_add(Duration::from_secs(exp_in as u64))
-                        .unwrap(),
-                ),
-            };
+            let p = Principal::jwt(
+                "billing",
+                SystemTime::now()
+                    .checked_add(Duration::from_secs(exp_in as u64))
+                    .unwrap(),
+            );
             fx.auth.expiry_deadline(Some(&p))
         };
         // The default grace is 30 s.
@@ -3016,11 +3223,7 @@ handle = ["*"]
             "{left:?}"
         );
         // Already past: due now.
-        let past = Principal {
-            service: "billing".into(),
-            key: AclKey::Service("billing".into()),
-            expires_at: Some(SystemTime::UNIX_EPOCH),
-        };
+        let past = Principal::jwt("billing", SystemTime::UNIX_EPOCH);
         assert!(fx.auth.expiry_deadline(Some(&past)).unwrap() <= tokio::time::Instant::now());
         // A token never expires; neither does a JWT whose exp is beyond any process's life.
         assert_eq!(
@@ -3032,11 +3235,7 @@ handle = ["*"]
         assert_eq!(in_secs(60 * 60 * 24 * 365 * 50), None);
         // Mode off never looks.
         let off = jwt_fx(AuthMode::Off).await;
-        let p = Principal {
-            service: "billing".into(),
-            key: AclKey::Service("billing".into()),
-            expires_at: Some(SystemTime::UNIX_EPOCH),
-        };
+        let p = Principal::jwt("billing", SystemTime::UNIX_EPOCH);
         assert_eq!(off.auth.expiry_deadline(Some(&p)), None);
     }
 
@@ -3052,5 +3251,441 @@ handle = ["*"]
         assert!(gate.allow(t0 + Duration::from_millis(1001)));
         assert!(!gate.allow(t0 + Duration::from_millis(1500)));
         assert!(gate.allow(t0 + Duration::from_millis(2002)));
+    }
+}
+
+/// Client certificates as credentials (roadmap P5c, ADR 0020).
+#[cfg(test)]
+mod cert_tests {
+    use super::*;
+    use crate::pki_test_support::{ClientSpec, Pki};
+    use crate::telemetry::test_support::{TestMetrics, capture_logs, logged, test_metrics};
+
+    fn acl_text() -> String {
+        format!(
+            r#"
+[[token]]
+token_sha256 = "{orders}"
+service = "orders"
+handle = ["*"]
+send = ["*"]
+
+[[token]]
+token_sha256 = "{billing}"
+service = "billing"
+handle = ["billing.*"]
+
+[[service]]
+name = "orders"
+handle = ["orders.*"]
+send = ["billing.Charge"]
+
+[[service]]
+name = "billing"
+handle = ["billing.*"]
+"#,
+            orders = hash_token("tok-orders"),
+            billing = hash_token("tok-billing"),
+        )
+    }
+
+    fn authorizer(mode: AuthMode) -> (Arc<Authorizer>, TestMetrics) {
+        let m = test_metrics();
+        let a = Authorizer::with_acl(mode, Acl::parse(&acl_text()).unwrap(), m.metrics.clone());
+        (a, m)
+    }
+
+    fn der(spec: &ClientSpec) -> Vec<u8> {
+        Pki::new("test CA").client_der(spec).0
+    }
+
+    fn svc(name: &str) -> Vec<u8> {
+        der(&ClientSpec::service(name))
+    }
+
+    fn token(t: &str) -> Credentials {
+        Credentials {
+            kind: Some(credentials::Kind::Token(t.to_string())),
+        }
+    }
+
+    fn types(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn results(m: &TestMetrics, result: &str) -> Option<u64> {
+        m.counter("kraken_hub_client_certificates_total", "result", result)
+    }
+
+    fn violations(m: &TestMetrics, reason: &str) -> Option<u64> {
+        m.counter("kraken_hub_auth_violations_total", "reason", reason)
+    }
+
+    #[test]
+    fn enforce_admits_a_certificate_whose_service_has_a_table() {
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let bytes = svc("orders");
+        let adm = a.admit_peer(
+            Some(&bytes),
+            None,
+            true,
+            "orders",
+            &types(&["orders.Place"]),
+        );
+        assert_eq!(adm.refused, None);
+        let p = adm.principal.expect("a principal");
+        assert_eq!(p.kind(), CredentialKind::Certificate);
+        assert_eq!(p.service, "orders");
+        assert_eq!(p.key, AclKey::Service("orders".into()));
+        assert!(p.expires_at.is_some_and(|t| t > SystemTime::now()));
+        assert_eq!(p.fingerprint.as_deref().map(str::len), Some(8));
+        assert_eq!(
+            adm.status,
+            AuthStatus::Authenticated {
+                service: "orders".into()
+            }
+        );
+        assert_eq!(results(&m, "ok"), Some(1));
+        assert_eq!(CredentialKind::Certificate.as_str(), "certificate");
+    }
+
+    #[test]
+    fn a_certificate_that_names_no_service_is_refused_with_permission_denied() {
+        let (a, m) = authorizer(AuthMode::Enforce);
+        for (spec, result, reason, text) in [
+            (
+                ClientSpec::default(),
+                "no_service",
+                "cert_no_service",
+                "certificate names no service",
+            ),
+            (
+                ClientSpec {
+                    uris: vec!["kraken://service/a".into(), "kraken://service/b".into()],
+                    ..ClientSpec::default()
+                },
+                "multiple_services",
+                "cert_multiple_services",
+                "certificate names more than one service",
+            ),
+        ] {
+            let adm = a.admit_peer(Some(&der(&spec)), None, true, "orders", &[]);
+            let denied = adm.refused.expect("refused");
+            assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+            assert_eq!(denied.message, text);
+            assert_eq!(denied.reason, reason);
+            assert!(adm.principal.is_none());
+            assert_eq!(results(&m, result), Some(1), "{result}");
+            assert_eq!(violations(&m, reason), Some(1), "{reason}");
+        }
+        assert_eq!(results(&m, "ok"), None);
+    }
+
+    #[test]
+    fn permissive_counts_a_certificate_that_names_no_service_and_falls_back_to_the_credentials() {
+        let (a, m) = authorizer(AuthMode::Permissive);
+        let bytes = der(&ClientSpec::default());
+        let adm = a.admit_peer(Some(&bytes), None, true, "orders", &[]);
+        assert_eq!(adm.refused, None);
+        assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
+        assert_eq!(results(&m, "no_service"), Some(1));
+        // With a valid token next to it, the token is the principal.
+        let adm = a.admit_peer(
+            Some(&bytes),
+            Some(&token("tok-orders")),
+            true,
+            "orders",
+            &[],
+        );
+        assert_eq!(adm.principal.unwrap().kind(), CredentialKind::Token);
+        assert_eq!(results(&m, "no_service"), Some(2));
+    }
+
+    #[test]
+    fn a_certificate_for_another_service_than_the_one_registered_is_refused() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let denied = a
+            .admit_peer(Some(&svc("billing")), None, true, "orders", &[])
+            .refused
+            .unwrap();
+        assert_eq!(denied.reason, "wrong_service");
+        assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+        assert!(denied.message.contains("certificate"), "{}", denied.message);
+        assert!(denied.message.contains("billing") && denied.message.contains("orders"));
+    }
+
+    #[test]
+    fn a_certificate_whose_service_has_no_table_is_refused_and_a_token_entry_does_not_count() {
+        let m = test_metrics();
+        // `orders` has a [[token]] entry only.
+        let acl = format!(
+            "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"orders\"\nhandle = [\"*\"]\n",
+            hash_token("tok-orders")
+        );
+        let a = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse(&acl).unwrap(),
+            m.metrics.clone(),
+        );
+        let denied = a
+            .admit_peer(Some(&svc("orders")), None, true, "orders", &[])
+            .refused
+            .unwrap();
+        assert_eq!(denied.reason, "no_acl_entry");
+        assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+        // The certificate itself was fine: the ACL refused it.
+        assert_eq!(results(&m, "ok"), Some(1));
+    }
+
+    #[test]
+    fn the_rights_come_from_the_service_table() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let bytes = svc("orders");
+        // The service table allows orders.*; the token entry of the same service allows * but
+        // is not consulted.
+        assert_eq!(
+            a.admit_peer(
+                Some(&bytes),
+                None,
+                true,
+                "orders",
+                &types(&["orders.Place"])
+            )
+            .refused,
+            None
+        );
+        let denied = a
+            .admit_peer(
+                Some(&bytes),
+                None,
+                true,
+                "orders",
+                &types(&["billing.Charge"]),
+            )
+            .refused
+            .unwrap();
+        assert_eq!(denied.reason, "handle_denied");
+        let p = Principal::certificate(&crate::mtls::identify(&bytes).unwrap());
+        assert!(a.check_send(Some(&p), "orders", "billing.Charge").is_ok());
+        assert_eq!(
+            a.check_send(Some(&p), "orders", "other.Thing")
+                .unwrap_err()
+                .reason,
+            "send_denied"
+        );
+    }
+
+    #[test]
+    fn credentials_next_to_a_certificate_must_name_the_same_service() {
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let bytes = svc("orders");
+        // The same service: the certificate is the principal, and the token adds nothing.
+        let adm = a.admit_peer(
+            Some(&bytes),
+            Some(&token("tok-orders")),
+            true,
+            "orders",
+            &[],
+        );
+        assert_eq!(adm.refused, None);
+        assert_eq!(adm.principal.unwrap().kind(), CredentialKind::Certificate);
+        assert_eq!(results(&m, "ok"), Some(1));
+        // Another service: PERMISSION_DENIED.
+        let adm = a.admit_peer(
+            Some(&bytes),
+            Some(&token("tok-billing")),
+            true,
+            "orders",
+            &[],
+        );
+        let denied = adm.refused.unwrap();
+        assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            denied.message,
+            "credentials and certificate name different services"
+        );
+        assert_eq!(denied.reason, "cert_mismatch");
+        assert_eq!(results(&m, "mismatch"), Some(1));
+        assert_eq!(violations(&m, "cert_mismatch"), Some(1));
+        // A credential that does not resolve at all is refused as it always is.
+        let denied = a
+            .admit_peer(Some(&bytes), Some(&token("nope")), true, "orders", &[])
+            .refused
+            .unwrap();
+        assert_eq!(denied.reason, "unknown_token");
+        assert_eq!(denied.to_status().code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn permissive_counts_a_mismatch_allows_it_and_the_certificate_wins() {
+        let (a, m) = authorizer(AuthMode::Permissive);
+        let adm = a.admit_peer(
+            Some(&svc("orders")),
+            Some(&token("tok-billing")),
+            true,
+            "orders",
+            &[],
+        );
+        assert_eq!(adm.refused, None);
+        let p = adm.principal.unwrap();
+        assert_eq!(
+            (p.kind(), p.service.as_str()),
+            (CredentialKind::Certificate, "orders")
+        );
+        assert_eq!(results(&m, "mismatch"), Some(1));
+        assert_eq!(violations(&m, "cert_mismatch"), Some(1));
+    }
+
+    #[test]
+    fn off_ignores_a_certificate() {
+        let (a, m) = authorizer(AuthMode::Off);
+        let adm = a.admit_peer(Some(&svc("billing")), None, true, "orders", &[]);
+        assert_eq!(adm.principal, None);
+        assert_eq!(adm.status, AuthStatus::Off);
+        assert_eq!(adm.refused, None);
+        assert_eq!(
+            m.counter_total("kraken_hub_client_certificates_total"),
+            None
+        );
+        assert_eq!(a.expiry_deadline(None), None);
+    }
+
+    #[test]
+    fn a_certificate_expires_at_not_after_with_no_grace() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let bytes = der(&ClientSpec::service("orders").valid_for(Duration::from_secs(100)));
+        let p = Principal::certificate(&crate::mtls::identify(&bytes).unwrap());
+        let left = a
+            .expiry_deadline(Some(&p))
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            left > Duration::from_secs(95) && left <= Duration::from_secs(100),
+            "{left:?}"
+        );
+        let off = authorizer(AuthMode::Off).0;
+        assert_eq!(off.expiry_deadline(Some(&p)), None);
+    }
+
+    #[test]
+    fn an_already_expired_certificate_is_refused_at_register() {
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let mut p = crate::mtls::identify(&svc("orders")).unwrap();
+        p.not_after = SystemTime::now() - Duration::from_secs(1);
+        let adm = a.admit_identified(Ok(p), None, true, "orders", &[]);
+        let denied = adm.refused.unwrap();
+        assert_eq!(denied.reason, "expired");
+        assert_eq!(denied.to_status().code(), tonic::Code::Unauthenticated);
+        assert_eq!(denied.message, "certificate expired");
+        assert_eq!(results(&m, "expired"), Some(1));
+    }
+
+    #[test]
+    fn the_expiry_of_a_certificate_session_closes_in_enforce_and_counts_once_in_permissive() {
+        let p = Principal::certificate(&crate::mtls::identify(&svc("orders")).unwrap());
+        let (a, m) = authorizer(AuthMode::Enforce);
+        let Expiry::Close(denied) = a.expired(&p, "orders") else {
+            panic!("enforce closes")
+        };
+        assert_eq!(denied.to_status().code(), tonic::Code::Unauthenticated);
+        assert_eq!(denied.message, "certificate expired");
+        assert_eq!(results(&m, "expired"), Some(1));
+        assert_eq!(violations(&m, "expired"), Some(1));
+
+        let (a, m) = authorizer(AuthMode::Permissive);
+        assert!(matches!(a.expired(&p, "orders"), Expiry::Keep));
+        assert_eq!(results(&m, "expired"), Some(1));
+        let (a, m) = authorizer(AuthMode::Off);
+        assert!(matches!(a.expired(&p, "orders"), Expiry::Keep));
+        assert_eq!(results(&m, "expired"), None);
+    }
+
+    #[test]
+    fn a_reload_that_removes_the_service_table_denies_the_certificate_session() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let p = Principal::certificate(&crate::mtls::identify(&svc("orders")).unwrap());
+        assert!(
+            a.recheck(Some(&p), "orders", &types(&["orders.Place"]))
+                .is_empty()
+        );
+        let m = test_metrics();
+        let without = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse("[[service]]\nname = \"billing\"\n").unwrap(),
+            m.metrics.clone(),
+        );
+        let denials = without.recheck(Some(&p), "orders", &[]);
+        assert_eq!(denials[0].reason, "no_acl_entry");
+        let narrowed = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse("[[service]]\nname = \"orders\"\nhandle = [\"orders.Get\"]\n").unwrap(),
+            m.metrics.clone(),
+        );
+        assert_eq!(
+            narrowed.recheck(Some(&p), "orders", &types(&["orders.Place"]))[0].reason,
+            "handle_denied"
+        );
+    }
+
+    #[test]
+    fn the_grpc_topology_accepts_a_certificate_whose_service_has_a_table() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let refused =
+            |r: Result<(), Status>| assert_eq!(r.unwrap_err().code(), tonic::Code::Unauthenticated);
+        assert!(
+            a.check_topology_peer(None, Some(&svc("orders")), None)
+                .is_ok()
+        );
+        // No service, an unknown service, an expired certificate: refused.
+        refused(a.check_topology_peer(None, Some(&der(&ClientSpec::default())), None));
+        refused(a.check_topology_peer(None, Some(&svc("nobody")), None));
+        refused(a.check_topology_peer(None, Some(b"junk"), None));
+        refused(a.check_topology_peer(None, None, None));
+        // Permissive allows an unauthenticated call (counted) but a good certificate is no violation.
+        let (p, pm) = authorizer(AuthMode::Permissive);
+        assert!(
+            p.check_topology_peer(None, Some(&svc("orders")), None)
+                .is_ok()
+        );
+        assert_eq!(violations(&pm, "topology_unauthenticated"), None);
+        // Off: a certificate means nothing; the dashboard token decides.
+        let (o, _) = authorizer(AuthMode::Off);
+        let dash = Secret::new("dash-token-0123456789");
+        refused(o.check_topology_peer(None, Some(&svc("orders")), Some(&dash)));
+        assert!(
+            o.check_topology_peer(Some("dash-token-0123456789"), None, Some(&dash))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn logs_name_a_certificate_by_the_fingerprint_prefix_only() {
+        capture_logs();
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let bytes = svc("orders");
+        let adm = a.admit_peer(
+            Some(&bytes),
+            None,
+            true,
+            "orders",
+            &types(&["billing.Charge"]),
+        );
+        assert!(adm.refused.is_some());
+        let cert = crate::mtls::identify(&bytes).unwrap();
+        let full: String = cert
+            .fingerprint
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let lines = logged();
+        let text = format!("{lines:?}");
+        assert!(text.contains(&format!("cert:{}", cert.short())), "{text}");
+        assert!(
+            !text.contains(&full),
+            "the whole fingerprint is never logged"
+        );
+        assert!(!text.contains("BEGIN"), "no certificate material");
+        let p = Principal::certificate(&cert);
+        assert_eq!(p.label(), format!("cert:{}", cert.short()));
     }
 }

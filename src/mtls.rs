@@ -35,6 +35,14 @@ impl CertError {
         }
     }
 
+    /// The `reason` label of `kraken_hub_auth_violations_total`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoService => "cert_no_service",
+            Self::MultipleServices => "cert_multiple_services",
+        }
+    }
+
     /// What a refused `Register` tells the client.
     pub fn message(self) -> &'static str {
         match self {

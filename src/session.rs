@@ -693,11 +693,7 @@ mod tests {
             service: "svc".into(),
         };
         let token = sessions.insert(&D, "a", "svc", meta, tx, CancellationToken::new());
-        let jwt = Arc::new(Principal {
-            service: "svc".into(),
-            key: crate::auth::AclKey::Service("svc".into()),
-            expires_at: Some(std::time::SystemTime::UNIX_EPOCH),
-        });
+        let jwt = Arc::new(Principal::jwt("svc", std::time::SystemTime::UNIX_EPOCH));
         let status = AuthStatus::Authenticated {
             service: "svc".into(),
         };
