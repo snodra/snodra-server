@@ -482,7 +482,7 @@ the `[[service]]` table of that name (the same tables JWTs use), `Register.servi
 name, and `Register.credentials`, when also sent, must resolve to the same service
 (`PERMISSION_DENIED` "credentials and certificate name different services"; `permissive` counts it and
 the certificate wins; nothing is merged). The session is closed at the certificate's `notAfter` with
-`UNAUTHENTICATED` "certificate expired", with no grace (a TLS session cannot be refreshed; a
+`UNAUTHENTICATED` "certificate expired", with no grace (the libraries treat it as a normal reconnect, not a registration rejection; a TLS session cannot be refreshed; a
 `ClientMessage.credentials` on it is ignored and counted as `ignored_certificate_session`), so a client
 reloads its certificate and reconnects before `notAfter`; `permissive` counts the expiry once, `off`
 never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
@@ -492,10 +492,13 @@ SHA-256 fingerprint. Metrics: `kraken_hub_client_certificates_total{result}` (`o
 (`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
 `kraken_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
 certificates and remove the service's table to cut it off. `--health-check` and `--topology` take
-`--tls-client-cert <pem>` and `--tls-client-key <pem>`; the local `--health-check` of a `required` hub
-presents the hub's own certificate and key when no flags are given (works when the hub's certificate
-is issued by the client CA with the client usage; otherwise add the flags to the healthcheck). With
-`AUTH_MODE=off` the certificate is only a handshake gate and the hub warns.
+`--tls-client-cert <pem>` and `--tls-client-key <pem>` (an error with a plain-text target). Give the
+healthcheck a dedicated probe pair, a client certificate from the client CA naming a service with no
+`[[service]]` table. As a convenience the local `--health-check` of a `required` hub presents the hub's
+own certificate and key when no flags are given (it works when the client CA issued the hub's certificate
+with the client usage, but then every server certificate of that CA passes the TLS layer; use a client CA
+that signs nothing else). With `AUTH_MODE=off` the certificate is only a handshake gate and the hub warns.
+Session resumption is off on a listener with a client CA, so a CA reload applies to every new handshake.
 
 **TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
 TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
