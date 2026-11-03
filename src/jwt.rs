@@ -307,9 +307,13 @@ impl Fetcher {
     fn new(uri: &str, ca: Option<&Path>, timeout: Duration) -> anyhow::Result<Self> {
         let uri: Uri = uri.parse().context("KRAKEN_HUB_JWT_JWKS_URI")?;
         let https = uri.scheme_str() == Some("https");
+        // `Uri::host` keeps the brackets of an IPv6 literal; neither connecting nor a TLS server
+        // name takes them.
         let host = uri
             .host()
             .context("KRAKEN_HUB_JWT_JWKS_URI has no host")?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_string();
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         let tls = if https {
@@ -1365,6 +1369,37 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_keys_can_be_fetched_from_an_ipv6_literal() {
+        let key = Signer::es256("k1");
+        let Some(server) = JwksServer::start_ipv6(&[&key]).await else {
+            eprintln!("no IPv6 loopback on this host: skipped");
+            return;
+        };
+        assert!(server.url().contains("[::1]"), "{}", server.url());
+        let fx = started(server, |_| {});
+        eventually("the keys load from [::1]", || fx.jwt.is_loaded()).await;
+        assert_eq!(fx.fetches("ok"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_keys_can_be_fetched_over_tls_from_an_ipv6_literal() {
+        let key = Signer::es256("k1");
+        let (ca, cert, private) = tls_pair();
+        let Some(server) = JwksServer::start_tls_on("[::1]:0", &cert, &private, &[&key]).await
+        else {
+            eprintln!("no IPv6 loopback on this host: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kraken-jwks-ca-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_file = dir.join("ca.pem");
+        std::fs::write(&ca_file, ca).unwrap();
+        let fx = started(server, |c| c.jwt_jwks_ca = Some(ca_file.clone()));
+        eventually("the keys load over TLS from [::1]", || fx.jwt.is_loaded()).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -233,6 +233,14 @@ impl JwksServer {
         server
     }
 
+    /// Like [`JwksServer::start`] on the IPv6 loopback, `None` when the host has none.
+    pub async fn start_ipv6(signers: &[&Signer]) -> Option<Self> {
+        let listener = TcpListener::bind("[::1]:0").await.ok()?;
+        let server = Self::on(listener, "http");
+        server.serve(signers);
+        Some(server)
+    }
+
     /// A free address nobody listens on yet; pass it to [`JwksServer::start_at`] later.
     pub async fn reserve() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -277,6 +285,18 @@ impl JwksServer {
 
     /// Serves `keys` over TLS with `cert_pem` and `key_pem`.
     pub async fn start_tls(cert_pem: &str, key_pem: &str, signers: &[&Signer]) -> Self {
+        Self::start_tls_on("127.0.0.1:0", cert_pem, key_pem, signers)
+            .await
+            .unwrap()
+    }
+
+    /// Like [`JwksServer::start_tls`], bound to `bind`; `None` when it cannot be bound.
+    pub async fn start_tls_on(
+        bind: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        signers: &[&Signer],
+    ) -> Option<Self> {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         let certs: Vec<CertificateDer<'static>> =
@@ -293,7 +313,7 @@ impl JwksServer {
         .with_single_cert(certs, key)
         .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind(bind).await.ok()?;
         let addr = tcp.local_addr().unwrap();
         let state = fresh_state();
         let app = router(Arc::clone(&state));
@@ -308,10 +328,10 @@ impl JwksServer {
             state,
         };
         server.serve(signers);
-        server
+        Some(server)
     }
 
-    /// `http(s)://127.0.0.1:<port>/certs`.
+    /// `http(s)://<addr>/certs`.
     pub fn url(&self) -> String {
         format!("{}://{}/certs", self.scheme, self.addr)
     }
@@ -366,7 +386,8 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
-/// `(ca PEM, server certificate PEM, server key PEM)` for a server reached as `127.0.0.1`.
+/// `(ca PEM, server certificate PEM, server key PEM)` for a server reached as `127.0.0.1` or
+/// `[::1]`.
 pub fn tls_pair() -> (String, String, String) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -377,9 +398,12 @@ pub fn tls_pair() -> (String, String, String) {
     let ca = ca_params.self_signed(&ca_key).unwrap();
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.subject_alt_names.push(rcgen::SanType::IpAddress(
-        std::net::Ipv4Addr::LOCALHOST.into(),
-    ));
+    for ip in [
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+    }
     let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     let cert = params.signed_by(&key, &issuer).unwrap();
     (ca.pem(), cert.pem(), key.serialize_pem())
