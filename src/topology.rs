@@ -121,6 +121,10 @@ pub struct InstanceTopology {
     /// token or no credentials. Never any token material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// The first 8 hex characters of the SHA-256 of a certificate session's client certificate
+    /// (ADR 0020); absent otherwise. Never the certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
 }
 
 fn never_reported() -> i64 {
@@ -252,6 +256,7 @@ pub fn snapshot(
                     .and_then(|p| p.expires_at)
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+                cert_fingerprint: d.principal.as_deref().and_then(|p| p.fingerprint.clone()),
                 instance_id: d.instance_id,
             });
     }
@@ -418,6 +423,7 @@ impl Topology {
                             authenticated_service: None,
                             auth_kind: None,
                             expires_at: None,
+                            cert_fingerprint: None,
                         })
                         .collect(),
                 })

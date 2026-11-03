@@ -24,10 +24,12 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use crate::auth::{
-    AuthMode, Authorizer, Denied, Disposition, Expiry, Principal, Refresh, RefreshGate,
+    AuthMode, Authorizer, CredentialKind, Denied, Disposition, Expiry, Principal, Refresh,
+    RefreshGate,
 };
 use crate::config::Config;
 use crate::context::ContextId;
+use crate::mtls::PeerCertificate;
 use crate::proto::hub_server::Hub;
 use crate::proto::{
     ClientMessage, Heartbeat, Register, ServerMessage, TopologyRequest, TopologyResponse,
@@ -174,6 +176,11 @@ impl Hub for HubService {
         &self,
         request: Request<Streaming<ClientMessage>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
+        // The client certificate of the connection, when there is one (ADR 0020).
+        let peer = request
+            .extensions()
+            .get::<PeerCertificate>()
+            .and_then(|p| p.0.clone());
         let inbound = request.into_inner();
         let mut buffer = self.config.session_buffer;
         if buffer == 0 {
@@ -192,7 +199,7 @@ impl Hub for HubService {
             auth: Arc::clone(&self.auth),
             context: ContextId::default(),
         };
-        tokio::spawn(run_stream(ctx, inbound, tx, cancel.clone()));
+        tokio::spawn(run_stream(ctx, inbound, peer, tx, cancel.clone()));
 
         let stream = ResponseStream {
             inner: ReceiverStream::new(rx),
@@ -214,8 +221,13 @@ impl Hub for HubService {
             .and_then(crate::auth::bearer);
         // A service's JWT reads it like an ACL token; its rotated key is fetched first.
         self.auth.prepare_bearer(presented).await;
-        self.auth
-            .check_topology(presented, self.config.dashboard_token.as_ref())?;
+        // A client certificate of the connection counts too (ADR 0020).
+        let peer = request.extensions().get::<PeerCertificate>();
+        self.auth.check_topology_peer(
+            presented,
+            peer.and_then(PeerCertificate::der),
+            self.config.dashboard_token.as_ref(),
+        )?;
         debug!("topology requested");
         let topology = snapshot(
             &self.registry,
@@ -363,6 +375,7 @@ async fn refuse(tx: &Outbound, denied: &Denied) {
 async fn run_stream(
     ctx: StreamCtx,
     mut inbound: Streaming<ClientMessage>,
+    peer: Option<Arc<[u8]>>,
     tx: Outbound,
     cancel: CancellationToken,
 ) {
@@ -421,9 +434,13 @@ async fn run_stream(
     let mut handled = handled_types(&first);
     // A rotated signing key is fetched before the credentials are judged (ADR 0019).
     ctx.auth.prepare(first.credentials.as_ref()).await;
-    let admission = ctx
-        .auth
-        .admit(first.credentials.as_ref(), v2, &service, &handled);
+    let admission = ctx.auth.admit_peer(
+        peer.as_deref(),
+        first.credentials.as_ref(),
+        v2,
+        &service,
+        &handled,
+    );
     if let Some(denied) = &admission.refused {
         refuse(&tx, denied).await;
         return;
@@ -745,6 +762,17 @@ async fn run_stream(
                 // `off` checks nothing, so there is nothing to refresh.
                 if ctx.auth.mode() == AuthMode::Off {
                     debug!(instance = %instance_id, "credentials refresh ignored: access control is off");
+                    continue;
+                }
+                // A TLS session cannot be refreshed on a live stream: the certificate is the
+                // principal until the connection ends, and no message replaces it (ADR 0020). It
+                // costs no verification, so it needs no throttle.
+                if principal
+                    .as_deref()
+                    .is_some_and(|p| p.kind() == CredentialKind::Certificate)
+                {
+                    ctx.auth.refresh_ignored_for_certificate();
+                    debug!(instance = %instance_id, "credentials refresh ignored: the session is authenticated by its certificate");
                     continue;
                 }
                 // One refresh per second is looked at: verifying a signature is work a client

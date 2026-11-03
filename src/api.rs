@@ -961,6 +961,7 @@ mod tests {
             authenticated_service: None,
             auth_kind: None,
             expires_at: None,
+            cert_fingerprint: None,
         }
     }
 

@@ -5,6 +5,7 @@
 //! period when this runs; this module only reads what the certificate says. Parsing is pure Rust
 //! (`x509-parser`), so the image still needs no C toolchain.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
@@ -49,6 +50,19 @@ impl CertError {
             Self::NoService => "certificate names no service",
             Self::MultipleServices => "certificate names more than one service",
         }
+    }
+}
+
+/// The certificate a connection's TLS peer presented: the DER of its leaf, or none. It travels as
+/// the connection info of the gRPC server, so every request on the connection can read it from
+/// its extensions.
+#[derive(Debug, Clone, Default)]
+pub struct PeerCertificate(pub Option<Arc<[u8]>>);
+
+impl PeerCertificate {
+    /// The leaf DER, when the peer presented a certificate.
+    pub fn der(&self) -> Option<&[u8]> {
+        self.0.as_deref()
     }
 }
 

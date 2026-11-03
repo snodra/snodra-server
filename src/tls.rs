@@ -581,8 +581,18 @@ fn log_shed(last: &mut Option<Instant>, count: &mut u64, listener: &'static str)
 pub struct TlsConn(pub TlsStream<TcpStream>);
 
 impl tonic::transport::server::Connected for TlsConn {
-    type ConnectInfo = ();
-    fn connect_info(&self) -> Self::ConnectInfo {}
+    /// The client certificate the peer presented, for the requests on this connection (ADR 0020).
+    type ConnectInfo = crate::mtls::PeerCertificate;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        crate::mtls::PeerCertificate(
+            self.0
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|leaf| Arc::from(leaf.as_ref())),
+        )
+    }
 }
 
 impl AsyncRead for TlsConn {
