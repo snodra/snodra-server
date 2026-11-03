@@ -214,6 +214,37 @@ impl ResolvesServerCert for CertStore {
     }
 }
 
+/// `KRAKEN_HUB_TLS_CLIENT_AUTH`: whether a client must present a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientAuthMode {
+    /// A client may present one (it must then verify) or none (token or JWT, as before).
+    #[default]
+    Optional,
+    /// A client without a valid certificate fails the handshake.
+    Required,
+}
+
+impl ClientAuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+impl std::str::FromStr for ClientAuthMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            other => anyhow::bail!("unknown client auth mode {other:?} (expected optional or required)"),
+        }
+    }
+}
+
 /// Whether and how clients must present certificates. Roadmap P5c adds a variant that holds the
 /// client CA and maps a certificate's SAN `kraken://service/<name>` to a service; until then
 /// the listeners authenticate the server only.

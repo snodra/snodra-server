@@ -10,6 +10,7 @@ use anyhow::{Context, bail};
 
 use crate::auth::{AuthMode, Secret};
 use crate::protocol;
+use crate::tls::ClientAuthMode;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -111,6 +112,14 @@ pub struct Config {
     /// `KRAKEN_HUB_HTTP_TLS_KEY`, both or neither.
     pub http_tls_cert: Option<PathBuf>,
     pub http_tls_key: Option<PathBuf>,
+    /// PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS,
+    /// ADR 0020); needs the gRPC pair. Reloaded when it changes. The HTTP listener never asks for
+    /// a client certificate. `KRAKEN_HUB_TLS_CLIENT_CA`.
+    pub tls_client_ca: Option<PathBuf>,
+    /// Whether a client must present a certificate: `optional` (default when the CA is set) or
+    /// `required`. `None` when `KRAKEN_HUB_TLS_CLIENT_AUTH` is unset; setting it without the CA is
+    /// an error. Read it through [`Config::client_auth`].
+    pub tls_client_auth: Option<ClientAuthMode>,
     /// When set, `/api/*`, `/topology`, the event stream and the gRPC `Topology` call need
     /// `Authorization: Bearer <token>`. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_TOKEN`,
     /// at least 16 characters. Unrelated to the ACL tokens.
@@ -196,6 +205,8 @@ impl Default for Config {
             tls_key: None,
             http_tls_cert: None,
             http_tls_key: None,
+            tls_client_ca: None,
+            tls_client_auth: None,
             dashboard_token: None,
             dashboard_write_token: None,
             dashboard_token_file: None,
@@ -331,6 +342,10 @@ impl Config {
         c.tls_key = path_var(&var, "KRAKEN_HUB_TLS_KEY");
         c.http_tls_cert = path_var(&var, "KRAKEN_HUB_HTTP_TLS_CERT");
         c.http_tls_key = path_var(&var, "KRAKEN_HUB_HTTP_TLS_KEY");
+        c.tls_client_ca = path_var(&var, "KRAKEN_HUB_TLS_CLIENT_CA");
+        if let Some(v) = var("KRAKEN_HUB_TLS_CLIENT_AUTH").filter(|v| !v.trim().is_empty()) {
+            c.tls_client_auth = Some(v.parse().context("KRAKEN_HUB_TLS_CLIENT_AUTH")?);
+        }
         // Secrets are trimmed (a mounted secret file ends with a newline) and kept as digests.
         let secret = |name: &str| {
             var(name)
@@ -498,6 +513,14 @@ impl Config {
         self.tls_cert.as_deref().zip(self.tls_key.as_deref())
     }
 
+    /// How the gRPC listener treats client certificates: `None` without a client CA, else the
+    /// configured mode, `optional` by default.
+    pub fn client_auth(&self) -> Option<ClientAuthMode> {
+        self.tls_client_ca
+            .as_ref()
+            .map(|_| self.tls_client_auth.unwrap_or_default())
+    }
+
     /// The HTTP listener's certificate and key: its own pair, else the gRPC pair.
     pub fn http_tls(&self) -> Option<(&Path, &Path)> {
         self.http_tls_cert
@@ -545,6 +568,12 @@ impl Config {
         }
         if self.http_tls_cert.is_some() != self.http_tls_key.is_some() {
             bail!("KRAKEN_HUB_HTTP_TLS_CERT and KRAKEN_HUB_HTTP_TLS_KEY must be set together");
+        }
+        if self.tls_client_auth.is_some() && self.tls_client_ca.is_none() {
+            bail!("KRAKEN_HUB_TLS_CLIENT_AUTH needs KRAKEN_HUB_TLS_CLIENT_CA");
+        }
+        if self.tls_client_ca.is_some() && self.grpc_tls().is_none() {
+            bail!("KRAKEN_HUB_TLS_CLIENT_CA needs KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY");
         }
         if self.edge_stats_max_edges == 0 {
             bail!("KRAKEN_HUB_EDGE_STATS_MAX_EDGES must be positive");
@@ -650,6 +679,12 @@ impl Config {
             out.push(format!(
                 "KRAKEN_HUB_JWT_JWKS_URI uses plain http to {host}: whoever can alter that traffic can mint tokens the hub accepts; use https (KRAKEN_HUB_JWT_JWKS_CA adds a private CA)"
             ));
+        }
+        if self.tls_client_ca.is_some() && self.auth_mode == AuthMode::Off {
+            out.push(
+                "KRAKEN_HUB_TLS_CLIENT_CA is set but KRAKEN_HUB_AUTH_MODE=off: the client certificate is checked in the TLS handshake and authenticates nothing beyond it (no service, no ACL); set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
+                    .to_string(),
+            );
         }
         if self.dashboard_write_token.is_some() {
             out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is reserved for the processor controls of roadmap P6 and has no effect yet".to_string());
@@ -1891,6 +1926,77 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
         );
+    }
+
+    #[test]
+    fn the_client_ca_needs_the_server_pair_and_defaults_to_optional() {
+        let pair = [
+            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
+            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
+        ];
+        let d = Config::default();
+        assert_eq!((d.tls_client_ca.as_ref(), d.client_auth()), (None, None));
+        let with = |extra: &[(&str, &str)]| {
+            let mut vars = pair.to_vec();
+            vars.extend_from_slice(extra);
+            with_env(&vars)
+        };
+        let c = with(&[("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem")]).unwrap();
+        assert_eq!(c.tls_client_ca.as_deref(), Some(Path::new("/ca.pem")));
+        assert_eq!(c.client_auth(), Some(ClientAuthMode::Optional));
+        for (value, expected) in [
+            ("optional", ClientAuthMode::Optional),
+            ("required", ClientAuthMode::Required),
+            (" Required ", ClientAuthMode::Required),
+        ] {
+            let c = with(&[
+                ("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem"),
+                ("KRAKEN_HUB_TLS_CLIENT_AUTH", value),
+            ])
+            .unwrap();
+            assert_eq!(c.client_auth(), Some(expected), "{value}");
+        }
+        // A value that is not a mode is a startup error naming the variable.
+        let e = with(&[
+            ("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem"),
+            ("KRAKEN_HUB_TLS_CLIENT_AUTH", "sometimes"),
+        ])
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_AUTH"), "{e:#}");
+        // The mode without the CA, and the CA without the server pair, are startup errors.
+        let e = with(&[("KRAKEN_HUB_TLS_CLIENT_AUTH", "required")]).unwrap_err();
+        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"), "{e:#}");
+        let e = with_env(&[("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem")]).unwrap_err();
+        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CERT"), "{e:#}");
+        // An empty value is unset, like every path variable.
+        let c = with(&[("KRAKEN_HUB_TLS_CLIENT_CA", " ")]).unwrap();
+        assert_eq!(c.tls_client_ca, None);
+    }
+
+    #[test]
+    fn a_client_ca_with_auth_mode_off_warns_that_it_authenticates_nothing_beyond_the_handshake() {
+        let base = Config {
+            tls_cert: Some("/c.pem".into()),
+            tls_key: Some("/k.pem".into()),
+            tls_client_ca: Some("/ca.pem".into()),
+            listen: "127.0.0.1:7000".parse().unwrap(),
+            http_listen: None,
+            ..Config::default()
+        };
+        let w = base.security_warnings();
+        assert!(
+            w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")
+                && m.contains("AUTH_MODE=off")
+                && m.contains("handshake")),
+            "{w:?}"
+        );
+        let enforced = Config {
+            auth_mode: AuthMode::Enforce,
+            acl_file: Some("/acl".into()),
+            ..base
+        };
+        let w = enforced.security_warnings();
+        assert!(!w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")), "{w:?}");
     }
 
     #[test]
