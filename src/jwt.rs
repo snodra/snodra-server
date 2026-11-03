@@ -322,6 +322,9 @@ impl Fetcher {
             None
         };
         if !https && ca.is_some() {
+            // Unused, but still checked: a CA that cannot be read is a mistake the operator
+            // must hear about now, not when the URI later becomes https.
+            tls_config(ca)?;
             warn!("KRAKEN_HUB_JWT_JWKS_CA is set but the JWKS URI is plain http: the CA is unused");
         }
         Ok(Self {
@@ -1416,6 +1419,24 @@ mod tests {
             format!("{err:#}").contains("KRAKEN_HUB_JWT_JWKS_CA"),
             "{err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_ca_file_is_a_startup_error_even_with_an_http_uri() {
+        // hub.md: "an unreadable file is a startup error"; the scheme must not hide it.
+        for ca in ["/nonexistent/ca.pem", "/dev/null"] {
+            let config = Config {
+                jwt_jwks_ca: Some(ca.into()),
+                ..config("http://keycloak:8080/certs")
+            };
+            let err = Jwt::from_config(&config, test_metrics().metrics.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{ca}: an unusable CA over http is accepted"));
+            assert!(
+                format!("{err:#}").contains("KRAKEN_HUB_JWT_JWKS_CA"),
+                "{err:#}"
+            );
+        }
     }
 
     #[tokio::test]
