@@ -8,7 +8,7 @@ mod keys;
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{ALL_CAPS, FakeClient, Spec, TempDir, acl_entry, auth_config};
 use keys::{JwksServer, Signer, claims, forge_hs256, forge_none, now};
@@ -481,31 +481,43 @@ async fn a_jwks_that_is_down_at_startup_refuses_with_unavailable_until_it_is_up(
 
 // ---- expiry -------------------------------------------------------------------------------
 
+/// Sleeps until `at` (wall clock); returns at once when it has passed.
+async fn sleep_until_wall(at: SystemTime) {
+    if let Ok(left) = at.duration_since(SystemTime::now()) {
+        tokio::time::sleep(left).await;
+    }
+}
+
 #[tokio::test]
 async fn enforce_closes_the_session_at_exp_plus_the_grace_and_not_before() {
+    let grace = Duration::from_secs(3);
     let hub = Hub::start(Opts {
-        grace: Duration::from_secs(2),
+        grace,
         ..Opts::default()
     })
     .await;
-    // exp is whole seconds: 1 to 2 s from now; the deadline is 2 s later, 3 to 4 s from now.
-    let t = hub.jwt("orders", 2);
-    let t0 = Instant::now();
-    let mut c = registered(&hub, &orders_spec(&t)).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(works(&mut c).await, "before exp");
-    tokio::time::sleep(Duration::from_millis(1700)).await;
+    // Everything is measured against the token's own `exp` (whole seconds on the wall clock),
+    // so a loaded machine can only slow the test down, never change what it asserts: the
+    // checks sit 1 s or more from each edge and the close is compared with an absolute time.
+    let c = claims(ISS, "orders", 4);
+    let exp = UNIX_EPOCH + Duration::from_secs(c["exp"].as_u64().unwrap());
+    let deadline = exp + grace;
+    let mut client = registered(&hub, &orders_spec(&hub.key.sign(&c))).await;
+    assert!(works(&mut client).await, "before exp");
+    sleep_until_wall(exp + Duration::from_secs(1)).await;
     assert!(
-        works(&mut c).await,
+        works(&mut client).await,
         "between exp and exp + grace requests are still allowed"
     );
-    let status = closed_within(&mut c, Duration::from_secs(4)).await;
+    let status = closed_within(&mut client, Duration::from_secs(10)).await;
     assert_eq!(status.code(), Code::Unauthenticated);
     assert_eq!(status.message(), "credentials expired");
+    // Not at exp, and not before exp + grace (a little less for the clock conversion).
+    let closed_at = SystemTime::now();
     assert!(
-        t0.elapsed() >= Duration::from_millis(2900),
-        "closed too early: {:?}",
-        t0.elapsed()
+        closed_at + Duration::from_millis(100) >= deadline,
+        "closed {:?} before exp + grace",
+        deadline.duration_since(closed_at).unwrap_or_default()
     );
 }
 
@@ -524,7 +536,8 @@ async fn permissive_keeps_an_expired_session() {
         "jwt",
         "the session is timed"
     );
-    tokio::time::sleep(Duration::from_millis(2300)).await;
+    // exp is at most 1 s away; 3.5 s is well past it.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
     assert!(works(&mut c).await, "still open after exp + grace");
     assert!(works(&mut c).await);
 }
@@ -558,14 +571,15 @@ async fn a_refresh_moves_the_expiry() {
         ..Opts::default()
     })
     .await;
-    let t = hub.jwt("orders", 2);
+    // exp is 2 to 3 s away, so the first token's deadline is 4 to 5 s away.
+    let t = hub.jwt("orders", 3);
     let mut c = registered(&hub, &orders_spec(&t)).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     c.tx.send(refresh_jwt(&hub.jwt("orders", 600)))
         .await
         .unwrap();
-    // Well past the first token's deadline (3 to 4 s).
-    tokio::time::sleep(Duration::from_millis(4200)).await;
+    // 1.5 s or more past the first token's deadline.
+    tokio::time::sleep(Duration::from_millis(6500)).await;
     assert!(works(&mut c).await, "the refresh moved the deadline");
 }
 
@@ -690,13 +704,14 @@ async fn a_token_session_may_move_to_a_jwt_and_back() {
     let mut c = registered(&hub, &token_spec).await;
     assert!(works(&mut c).await);
     c.tx.send(refresh_jwt(&hub.jwt("orders", 1))).await.unwrap();
-    let status = closed_within(&mut c, Duration::from_secs(5)).await;
+    let status = closed_within(&mut c, Duration::from_secs(10)).await;
     assert_eq!(status.message(), "credentials expired");
     // jwt -> token: the session no longer expires.
     let t = hub.jwt("orders", 1);
     let mut c = registered(&hub, &orders_spec(&t)).await;
     c.tx.send(refresh_token("tok-orders")).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(3200)).await;
+    // The JWT's deadline (exp 1 s, grace 1 s) is at most 2 s away; 4.5 s is far past it.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
     assert!(works(&mut c).await, "a token does not expire");
 }
 
