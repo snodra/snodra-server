@@ -301,7 +301,7 @@ impl Metrics {
                 .build(),
             jwt_validations: meter
                 .u64_counter("kraken_hub_jwt_validations_total")
-                .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
+                .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, key_pending, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
                 .build(),
             jwks_fetches: meter
                 .u64_counter("kraken_hub_jwks_fetches_total")

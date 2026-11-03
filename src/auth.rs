@@ -1112,7 +1112,7 @@ impl Authorizer {
         };
         let verified = jwt.verify(token).map_err(|e| {
             vec![match e {
-                JwtError::NotLoaded => {
+                JwtError::NotLoaded | JwtError::KeyPending => {
                     Denied::new("jwks_unavailable", DeniedCode::Unavailable, e.message())
                 }
                 _ => Denied::new("jwt_invalid", DeniedCode::Unauthenticated, e.message()),
@@ -2607,15 +2607,15 @@ handle = ["*"]
         let rotated = Signer::es256("k2");
         fx.server.serve(&[&rotated]);
         let creds = jwt_creds(rotated.sign(&claims(ISS, "billing", 300)));
-        // Without the async step the sync check cannot know the key.
-        assert_eq!(
-            fx.auth
-                .admit(Some(&creds), true, "billing", &[])
-                .refused
-                .unwrap()
-                .message,
-            "unknown signing key"
-        );
+        // Without the async step the sync check cannot know the key: the client is told to
+        // retry (UNAVAILABLE), not that its registration is rejected.
+        let d = fx
+            .auth
+            .admit(Some(&creds), true, "billing", &[])
+            .refused
+            .unwrap();
+        assert_eq!(d.message, "signing key not known yet");
+        assert_eq!(d.code, DeniedCode::Unavailable);
         tokio::time::sleep(Duration::from_millis(150)).await;
         fx.auth.prepare(Some(&creds)).await;
         assert_eq!(

@@ -411,12 +411,36 @@ async fn a_rotated_signing_key_is_picked_up_on_the_first_unknown_kid() {
     hub.jwks.serve(&[&rotated]);
     let t = rotated.sign(&claims(ISS, "orders", 300));
     registered(&hub, &orders_spec(&t)).await;
-    // The retired key is no longer accepted.
+    // The retired key: the fetch above was made for another kid and is inside the throttle
+    // window, so the hub cannot say yet that the key is gone. A client retries at its normal
+    // backoff on UNAVAILABLE; it must not read a registration rejection.
     let old = hub.jwt("orders", 300);
+    let mut c = FakeClient::register_spec(hub.addr, &spec("orders", &old)).await;
+    let status = c.expect_closed().await;
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "signing key not known yet");
+    // Once a fetch has looked for the key and not found it, it is rejected for good.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let mut c = FakeClient::register_spec(hub.addr, &spec("orders", &old)).await;
     let status = c.expect_closed().await;
     assert_eq!(status.code(), Code::Unauthenticated);
     assert_eq!(status.message(), "unknown signing key");
+}
+
+#[tokio::test]
+async fn an_unknown_kid_is_unavailable_while_the_jwks_cannot_be_refetched() {
+    let hub = Hub::start(Opts::default()).await;
+    hub.jwks.set_status(500);
+    let rotated = Signer::es256("k2");
+    let t = rotated.sign(&claims(ISS, "orders", 300));
+    let mut c = FakeClient::register_spec(hub.addr, &spec("orders", &t)).await;
+    let status = c.expect_closed().await;
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "signing key not known yet");
+    // The route recovers with the rotated key: the retry registers.
+    hub.jwks.serve(&[&rotated]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    registered(&hub, &orders_spec(&t)).await;
 }
 
 #[tokio::test]

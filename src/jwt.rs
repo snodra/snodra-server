@@ -78,6 +78,8 @@ pub enum JwtError {
     Malformed,
     BadAlg,
     UnknownKid,
+    /// The `kid` is not in the key set, and the hub cannot yet say whether it ever will be.
+    KeyPending,
     BadSignature,
     Expired,
     NotYetValid,
@@ -95,6 +97,7 @@ impl JwtError {
             Self::Malformed => "malformed",
             Self::BadAlg => "bad_alg",
             Self::UnknownKid => "unknown_kid",
+            Self::KeyPending => "key_pending",
             Self::BadSignature => "bad_signature",
             Self::Expired => "expired",
             Self::NotYetValid => "not_yet_valid",
@@ -112,6 +115,7 @@ impl JwtError {
             Self::Malformed => "malformed token",
             Self::BadAlg => "unsupported token algorithm",
             Self::UnknownKid => "unknown signing key",
+            Self::KeyPending => "signing key not known yet",
             Self::BadSignature => "invalid token signature",
             Self::Expired => "token expired",
             Self::NotYetValid => "token not valid yet",
@@ -441,7 +445,15 @@ struct State {
     loaded: bool,
     /// When an unknown `kid` last forced a fetch.
     last_forced: Option<Instant>,
+    /// `kid`s that a fetch made for them found missing from the key set (bounded; cleared when
+    /// the set is replaced by a fetch nobody asked for). Only these are `UnknownKid`: any other
+    /// `kid` the set lacks is [`JwtError::KeyPending`], because no fetch has looked for it yet.
+    absent: Vec<String>,
 }
+
+/// How many `kid`s [`State::absent`] remembers: only the one a forced fetch (at most one per
+/// refetch interval) was made for gets in, so this is a bound, not a working size.
+const MAX_ABSENT: usize = 8;
 
 /// What [`Jwt`] needs from the configuration.
 struct Settings {
@@ -495,6 +507,7 @@ impl Jwt {
                 keys: Arc::default(),
                 loaded: false,
                 last_forced: None,
+                absent: Vec::new(),
             }),
             fetching: tokio::sync::Mutex::new(()),
             failing: Mutex::new(false),
@@ -581,7 +594,13 @@ impl Jwt {
             state.last_forced = Some(now);
         }
         debug!(kid = %clip(&kid), "unknown kid: fetching the key set");
-        self.fetch_once().await;
+        if self.fetch_once().await && !self.has_kid(&kid) {
+            let mut state = self.state.write().unwrap();
+            if state.absent.len() >= MAX_ABSENT {
+                state.absent.remove(0);
+            }
+            state.absent.push(kid);
+        }
     }
 
     /// One fetch; true when it replaced the key set. A failure keeps the last good set (logged
@@ -597,6 +616,7 @@ impl Jwt {
                 let first = !state.loaded;
                 state.keys = Arc::new(keys);
                 state.loaded = true;
+                state.absent.clear();
                 drop(state);
                 let recovered = std::mem::take(&mut *self.failing.lock().unwrap());
                 if first || recovered {
@@ -641,9 +661,13 @@ impl Jwt {
 
     fn validate(&self, token: &str) -> Result<Verified, JwtError> {
         let header = read_header(token)?;
-        let (keys, loaded) = {
+        let (keys, loaded, absent) = {
             let state = self.state.read().unwrap();
-            (Arc::clone(&state.keys), state.loaded)
+            let absent = header
+                .kid
+                .as_ref()
+                .is_some_and(|kid| state.absent.contains(kid));
+            (Arc::clone(&state.keys), state.loaded, absent)
         };
         if !loaded {
             return Err(JwtError::NotLoaded);
@@ -655,7 +679,13 @@ impl Jwt {
                     .filter(|k| k.kid.as_deref() == Some(kid.as_str()))
                     .collect();
                 if named.is_empty() {
-                    return Err(JwtError::UnknownKid);
+                    // Missing for sure only when a fetch made for this `kid` has found it
+                    // missing; otherwise the set may predate a rotation (ADR 0019, amendment 1).
+                    return Err(if absent {
+                        JwtError::UnknownKid
+                    } else {
+                        JwtError::KeyPending
+                    });
                 }
                 named
             }
@@ -1126,13 +1156,15 @@ mod tests {
         let t = new.sign(&claims(ISS, "orders", 60));
         assert!(fx.check(&t).await.is_ok());
         assert_eq!(fx.server.hits(), 2, "one extra fetch");
-        // The old key left with the rotation.
-        assert_eq!(
-            fx.check(&old.sign(&claims(ISS, "orders", 60))).await,
-            Err(JwtError::UnknownKid)
-        );
+        // The old key left with the rotation. The fetch above was for another kid and is
+        // inside the throttle window, so it is not known to be gone yet...
+        let gone = old.sign(&claims(ISS, "orders", 60));
+        assert_eq!(fx.check(&gone).await, Err(JwtError::KeyPending));
+        // ...until a fetch made for it has looked.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(fx.check(&gone).await, Err(JwtError::UnknownKid));
         assert_eq!(fx.validations("unknown_kid"), Some(1));
-        assert_eq!(fx.fetches("ok"), Some(2));
+        assert_eq!(fx.fetches("ok"), Some(3));
     }
 
     #[tokio::test]
@@ -1155,6 +1187,35 @@ mod tests {
             assert_eq!(fx.check(&t).await, Err(JwtError::UnknownKid));
         }
         assert_eq!(fx.server.hits(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_is_pending_until_a_refetch_has_looked_for_it() {
+        let key = Signer::es256("k1");
+        let fx = loaded(&[&key]).await;
+        let signer = |kid: &str| Signer::es256(kid).sign(&claims(ISS, "orders", 60));
+        // This call's own refetch succeeded and the key is still not there: definitive.
+        assert_eq!(fx.check(&signer("first")).await, Err(JwtError::UnknownKid));
+        // Another kid inside the throttle window: no refetch looked for it, so it may be a
+        // rotation that the last fetch (made for another kid) predates.
+        assert_eq!(fx.check(&signer("second")).await, Err(JwtError::KeyPending));
+        assert_eq!(fx.validations("key_pending"), Some(1));
+        // Once the window has passed, its own refetch settles it.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(fx.check(&signer("second")).await, Err(JwtError::UnknownKid));
+        // A refetch that fails settles nothing.
+        fx.server.set_status(500);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(fx.check(&signer("third")).await, Err(JwtError::KeyPending));
+        // Nor does one a refetch already answered stay definitive for a kid that then appears.
+        let third = Signer::es256("third");
+        fx.server.serve(&[&key, &third]);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(
+            fx.check(&third.sign(&claims(ISS, "orders", 60)))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
