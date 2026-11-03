@@ -448,6 +448,7 @@ struct Settings {
     issuer: String,
     audience: Option<String>,
     leeway: Duration,
+    expiry_grace: Duration,
     refresh: Duration,
     refetch_interval: Duration,
 }
@@ -484,6 +485,7 @@ impl Jwt {
                 issuer: issuer.clone(),
                 audience: config.jwt_audience.clone(),
                 leeway: config.jwt_leeway,
+                expiry_grace: config.jwt_expiry_grace,
                 refresh: config.jwks_refresh,
                 refetch_interval: config.jwks_refetch_interval,
             },
@@ -527,6 +529,11 @@ impl Jwt {
                 }
             }
         })
+    }
+
+    /// How long after `exp` a session stays open without a refresh.
+    pub fn expiry_grace(&self) -> Duration {
+        self.settings.expiry_grace
     }
 
     /// True once a fetch has succeeded.

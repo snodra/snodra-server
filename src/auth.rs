@@ -646,6 +646,59 @@ impl Denied {
     }
 }
 
+/// What [`Authorizer::refresh`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// Adopt the new principal and status; the session's expiry moves with it.
+    Accepted {
+        principal: Arc<Principal>,
+        status: AuthStatus,
+    },
+    /// Permissive mode: the refresh was refused, counted and logged; the session keeps what it
+    /// had.
+    Kept,
+    /// Enforce mode: close the stream with it (already counted and logged).
+    Close(Denied),
+}
+
+/// What [`Authorizer::expired`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expiry {
+    /// Enforce mode: close the stream with it (already counted and logged).
+    Close(Denied),
+    /// Permissive mode: counted and logged, the session stays; ask once.
+    Keep,
+}
+
+/// At most one refresh in [`REFRESH_MIN_INTERVAL`] is looked at per session, so a client cannot
+/// make the hub verify signatures in a loop.
+#[derive(Debug, Default)]
+pub struct RefreshGate {
+    last: Option<Instant>,
+}
+
+/// A JWT whose expiry is further away than this is never timed (nothing runs that long, and
+/// the timer's arithmetic stays far from overflow).
+const MAX_EXPIRY_WAIT: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// The shortest time between two refreshes of one session that are both looked at.
+pub const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+impl RefreshGate {
+    /// True when a refresh arriving at `now` is to be looked at; a throttled one does not count
+    /// as the previous one.
+    pub fn allow(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < REFRESH_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
 /// What [`Authorizer::report`] did about a session's violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
@@ -912,39 +965,13 @@ impl Authorizer {
             };
         }
         let acl = self.acl();
-        let mut denials = Vec::new();
-        let mut matched: Option<(Principal, Rights<'_>)> = None;
-        match credentials.and_then(|c| c.kind.as_ref()) {
-            Some(credentials::Kind::Token(token)) if !token.is_empty() => {
-                let digest = digest_of(token);
-                match acl.lookup(&digest) {
-                    Some(entry) => {
-                        matched = Some((Principal::token(digest, &entry.service), entry.rights()));
-                    }
-                    None => denials.push(Denied::new(
-                        "unknown_token",
-                        DeniedCode::Unauthenticated,
-                        "unknown token",
-                    )),
-                }
-            }
-            Some(credentials::Kind::Jwt(token)) => match self.resolve_jwt(&acl, token, service) {
-                Ok(found) => matched = Some(found),
-                Err(found) => denials.extend(found),
-            },
-            Some(credentials::Kind::Token(_)) | None => denials.push(Denied::new(
-                "no_credentials",
-                DeniedCode::Unauthenticated,
-                if v2 {
-                    "credentials required: Register.credentials.token is missing"
-                } else {
-                    "credentials required: this client speaks protocol v1 and sends none"
-                },
-            )),
-        }
-        if let Some((principal, rights)) = &matched {
-            denials.extend(judge(*rights, &principal.key, service, handled));
-        }
+        let (denials, matched) = match self.resolve_credential(&acl, credentials, v2, service) {
+            Ok((principal, rights)) => (
+                judge(rights, &principal.key, service, handled),
+                Some((principal, rights)),
+            ),
+            Err(denials) => (denials, None),
+        };
         let key = matched.as_ref().map(|(p, _)| p.label());
         for d in &denials {
             self.count(&acl, d, service);
@@ -988,6 +1015,41 @@ impl Authorizer {
             refused: (self.mode == AuthMode::Enforce)
                 .then(|| denials.into_iter().next())
                 .flatten(),
+        }
+    }
+
+    /// What `credentials` resolve to: the principal and what its entry grants, or the denials
+    /// (one for a missing, unknown or invalid credential; a JWT for another service names both
+    /// services). The entry's own checks (service name, handled types) are [`judge`]'s.
+    fn resolve_credential<'a>(
+        &self,
+        acl: &'a Acl,
+        credentials: Option<&Credentials>,
+        v2: bool,
+        service: &str,
+    ) -> Result<(Principal, Rights<'a>), Vec<Denied>> {
+        match credentials.and_then(|c| c.kind.as_ref()) {
+            Some(credentials::Kind::Token(token)) if !token.is_empty() => {
+                let digest = digest_of(token);
+                match acl.lookup(&digest) {
+                    Some(entry) => Ok((Principal::token(digest, &entry.service), entry.rights())),
+                    None => Err(vec![Denied::new(
+                        "unknown_token",
+                        DeniedCode::Unauthenticated,
+                        "unknown token",
+                    )]),
+                }
+            }
+            Some(credentials::Kind::Jwt(token)) => self.resolve_jwt(acl, token, service),
+            Some(credentials::Kind::Token(_)) | None => Err(vec![Denied::new(
+                "no_credentials",
+                DeniedCode::Unauthenticated,
+                if v2 {
+                    "credentials required: Register.credentials.token is missing"
+                } else {
+                    "credentials required: this client speaks protocol v1 and sends none"
+                },
+            )]),
         }
     }
 
@@ -1040,6 +1102,124 @@ impl Authorizer {
                 Err(denials)
             }
         }
+    }
+
+    /// Judges a `ClientMessage.credentials`: the new credential must resolve to the session's own
+    /// `service`, and the session's `handled` types are judged against its entry. See [`Refresh`].
+    pub fn refresh(
+        &self,
+        credentials: Option<&Credentials>,
+        service: &str,
+        handled: &[String],
+    ) -> Refresh {
+        let acl = self.acl();
+        let enforce = self.mode == AuthMode::Enforce;
+        let disposition = if enforce {
+            Disposition::Closed
+        } else {
+            Disposition::Allowed
+        };
+        let (principal, rights) = match self.resolve_credential(&acl, credentials, true, service) {
+            Ok(found) => found,
+            Err(denials) => {
+                // A credential that does not resolve is never adopted.
+                self.refresh_refused(&denials, service, None, disposition);
+                return if enforce {
+                    Refresh::Close(denials[0].clone())
+                } else {
+                    Refresh::Kept
+                };
+            }
+        };
+        let denials = judge(rights, &principal.key, service, handled);
+        let Some(first) = denials.first() else {
+            self.metrics.credentials_refresh("ok");
+            return Refresh::Accepted {
+                status: AuthStatus::Authenticated {
+                    service: rights.service.to_string(),
+                },
+                principal: Arc::new(principal),
+            };
+        };
+        self.refresh_refused(&denials, service, Some(&principal), disposition);
+        if enforce {
+            Refresh::Close(first.clone())
+        } else if first.reason == "wrong_service" {
+            // Permissive counts a credential for another service and keeps the old one; a type
+            // the new entry does not grant is counted too, and the new credential is adopted
+            // (a reload would keep the session in the same way).
+            Refresh::Kept
+        } else {
+            Refresh::Accepted {
+                status: AuthStatus::Authenticated {
+                    service: rights.service.to_string(),
+                },
+                principal: Arc::new(principal),
+            }
+        }
+    }
+
+    /// Counts and logs a refresh that broke rules: `result` tells a credential for another
+    /// service from one that is simply refused.
+    fn refresh_refused(
+        &self,
+        denials: &[Denied],
+        service: &str,
+        principal: Option<&Principal>,
+        disposition: Disposition,
+    ) {
+        let wrong = denials.first().is_some_and(|d| d.reason == "wrong_service");
+        self.metrics
+            .credentials_refresh(if wrong { "wrong_service" } else { "refused" });
+        self.report(denials, service, principal, disposition);
+    }
+
+    /// What to do with a session whose JWT passed `exp` plus the grace without a refresh. Counted
+    /// and logged here; the caller asks once per session.
+    pub fn expired(&self, principal: &Principal, service: &str) -> Expiry {
+        if self.mode == AuthMode::Off {
+            return Expiry::Keep;
+        }
+        let denied = Denied::new(
+            "expired",
+            DeniedCode::Unauthenticated,
+            "credentials expired",
+        );
+        if self.mode == AuthMode::Enforce {
+            self.report(
+                std::slice::from_ref(&denied),
+                service,
+                Some(principal),
+                Disposition::Closed,
+            );
+            Expiry::Close(denied)
+        } else {
+            self.report(
+                std::slice::from_ref(&denied),
+                service,
+                Some(principal),
+                Disposition::Allowed,
+            );
+            Expiry::Keep
+        }
+    }
+
+    /// When a session holding `principal` is to be judged expired: `exp` plus the grace. `None`
+    /// when it never is (mode `off`, a token, an expiry beyond any process's life).
+    pub fn expiry_deadline(&self, principal: Option<&Principal>) -> Option<tokio::time::Instant> {
+        if self.mode == AuthMode::Off {
+            return None;
+        }
+        let exp = principal?.expires_at?;
+        let grace = self
+            .jwt
+            .as_ref()
+            .map_or(Duration::ZERO, |j| j.expiry_grace());
+        let remaining = exp
+            .checked_add(grace)?
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        (remaining <= MAX_EXPIRY_WAIT).then(|| tokio::time::Instant::now() + remaining)
     }
 
     /// Judges a gRPC `Topology` call carrying `presented` (the bearer token, if any) against the
@@ -2480,5 +2660,283 @@ handle = ["*"]
             fx.m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
             Some(1)
         );
+    }
+
+    // ---- refresh and expiry ----
+
+    fn token_for(creds: &str) -> Credentials {
+        token(creds)
+    }
+
+    fn adopted(r: Refresh) -> Arc<Principal> {
+        match r {
+            Refresh::Accepted { principal, .. } => principal,
+            other => panic!("expected an accepted refresh, got {other:?}"),
+        }
+    }
+
+    fn closed(r: Refresh) -> Denied {
+        match r {
+            Refresh::Close(d) => d,
+            other => panic!("expected a close, got {other:?}"),
+        }
+    }
+
+    fn refreshes(fx: &JwtFx, result: &str) -> Option<u64> {
+        fx.m.counter("kraken_hub_credentials_refreshes_total", "result", result)
+    }
+
+    #[tokio::test]
+    async fn a_refresh_with_a_jwt_for_the_same_service_is_accepted() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let r = fx.auth.refresh(
+            Some(&fx.token("billing", 900)),
+            "billing",
+            &types(&["billing.Pay"]),
+        );
+        let Refresh::Accepted { principal, status } = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(principal.key, AclKey::Service("billing".into()));
+        assert!(principal.expires_at.unwrap() > SystemTime::now() + Duration::from_secs(800));
+        assert_eq!(
+            status,
+            AuthStatus::Authenticated {
+                service: "billing".into()
+            }
+        );
+        assert_eq!(refreshes(&fx, "ok"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_may_change_the_credential_kind_of_the_same_service() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let p = adopted(
+            fx.auth
+                .refresh(Some(&token_for("tok-billing")), "billing", &[]),
+        );
+        assert_eq!(p.kind(), CredentialKind::Token);
+        assert_eq!(p.expires_at, None);
+        let p = adopted(
+            fx.auth
+                .refresh(Some(&fx.token("billing", 60)), "billing", &[]),
+        );
+        assert_eq!(p.kind(), CredentialKind::Jwt);
+        assert_eq!(refreshes(&fx, "ok"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_for_another_service_closes_in_enforce_and_is_counted_in_permissive() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        for creds in [fx.token("orders", 60), token_for("tok-orders")] {
+            let d = closed(fx.auth.refresh(Some(&creds), "billing", &[]));
+            assert_eq!(
+                (d.reason, d.code),
+                ("wrong_service", DeniedCode::PermissionDenied)
+            );
+        }
+        assert_eq!(refreshes(&fx, "wrong_service"), Some(2));
+        assert_eq!(refreshes(&fx, "ok"), None);
+
+        let fx = jwt_fx(AuthMode::Permissive).await;
+        let r = fx
+            .auth
+            .refresh(Some(&fx.token("orders", 60)), "billing", &[]);
+        assert_eq!(r, Refresh::Kept, "the old principal stays");
+        assert_eq!(refreshes(&fx, "wrong_service"), Some(1));
+        assert_eq!(
+            fx.m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "wrong_service"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_refresh_closes_in_enforce_and_keeps_the_old_principal_in_permissive() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        for (creds, reason, code) in [
+            (
+                fx.token("billing", -120),
+                "jwt_invalid",
+                DeniedCode::Unauthenticated,
+            ),
+            (
+                token_for("nope"),
+                "unknown_token",
+                DeniedCode::Unauthenticated,
+            ),
+            (token_for(""), "no_credentials", DeniedCode::Unauthenticated),
+            (
+                fx.token("ghost", 60),
+                "wrong_service",
+                DeniedCode::PermissionDenied,
+            ),
+        ] {
+            let d = closed(fx.auth.refresh(Some(&creds), "billing", &[]));
+            assert_eq!((d.reason, d.code), (reason, code));
+        }
+        assert!(matches!(
+            fx.auth.refresh(None, "billing", &[]),
+            Refresh::Close(_)
+        ));
+        assert_eq!(refreshes(&fx, "refused"), Some(4));
+        assert_eq!(refreshes(&fx, "wrong_service"), Some(1));
+        let fx = jwt_fx(AuthMode::Permissive).await;
+        assert_eq!(
+            fx.auth
+                .refresh(Some(&fx.token("billing", -120)), "billing", &[]),
+            Refresh::Kept
+        );
+        assert_eq!(refreshes(&fx, "refused"), Some(1));
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_judges_the_handled_types_against_the_new_entry() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        // `orders` handles `*` as a token and as a service; `billing`'s service table does not
+        // grant x.Only.
+        let d = closed(fx.auth.refresh(
+            Some(&fx.token("billing", 60)),
+            "billing",
+            &types(&["x.Only"]),
+        ));
+        assert_eq!(d.reason, "handle_denied");
+        assert_eq!(refreshes(&fx, "refused"), Some(1));
+        let fx = jwt_fx(AuthMode::Permissive).await;
+        let p = adopted(fx.auth.refresh(
+            Some(&fx.token("billing", 60)),
+            "billing",
+            &types(&["x.Only"]),
+        ));
+        assert_eq!(
+            p.kind(),
+            CredentialKind::Jwt,
+            "permissive adopts it and counts"
+        );
+        assert_eq!(
+            fx.m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "handle_denied"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_where_jwt_is_not_configured_is_refused() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let jwt = jwt_creds("a.b.c".into());
+        let d = closed(a.refresh(Some(&jwt), "billing", &[]));
+        assert_eq!(d.reason, "jwt_not_configured");
+        assert_eq!(d.message, "jwt credentials are not configured on this hub");
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_closed_in_enforce_and_counted_once_in_permissive() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let p = fx
+            .auth
+            .admit(Some(&fx.token("billing", 60)), true, "billing", &[])
+            .principal
+            .unwrap();
+        let Expiry::Close(d) = fx.auth.expired(&p, "billing") else {
+            panic!("enforce closes")
+        };
+        assert_eq!(
+            (d.reason, d.code, d.message.as_str()),
+            (
+                "expired",
+                DeniedCode::Unauthenticated,
+                "credentials expired"
+            )
+        );
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "reason", "expired"),
+            Some(1)
+        );
+        let fx = jwt_fx(AuthMode::Permissive).await;
+        let p = fx
+            .auth
+            .admit(Some(&fx.token("billing", 60)), true, "billing", &[])
+            .principal
+            .unwrap();
+        assert_eq!(fx.auth.expired(&p, "billing"), Expiry::Keep);
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "reason", "expired"),
+            Some(1)
+        );
+        assert_eq!(
+            fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_expiry_deadline_is_exp_plus_the_grace() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let in_secs = |exp_in: i64| {
+            let p = Principal {
+                service: "billing".into(),
+                key: AclKey::Service("billing".into()),
+                expires_at: Some(
+                    SystemTime::now()
+                        .checked_add(Duration::from_secs(exp_in as u64))
+                        .unwrap(),
+                ),
+            };
+            fx.auth.expiry_deadline(Some(&p))
+        };
+        // The default grace is 30 s.
+        let d = in_secs(100).expect("a deadline");
+        let left = d.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            left > Duration::from_secs(125) && left <= Duration::from_secs(130),
+            "{left:?}"
+        );
+        // Already past: due now.
+        let past = Principal {
+            service: "billing".into(),
+            key: AclKey::Service("billing".into()),
+            expires_at: Some(SystemTime::UNIX_EPOCH),
+        };
+        assert!(fx.auth.expiry_deadline(Some(&past)).unwrap() <= tokio::time::Instant::now());
+        // A token never expires; neither does a JWT whose exp is beyond any process's life.
+        assert_eq!(
+            fx.auth
+                .expiry_deadline(Some(&tok("tok-billing", "billing"))),
+            None
+        );
+        assert_eq!(fx.auth.expiry_deadline(None), None);
+        assert_eq!(in_secs(60 * 60 * 24 * 365 * 50), None);
+        // Mode off never looks.
+        let off = jwt_fx(AuthMode::Off).await;
+        let p = Principal {
+            service: "billing".into(),
+            key: AclKey::Service("billing".into()),
+            expires_at: Some(SystemTime::UNIX_EPOCH),
+        };
+        assert_eq!(off.auth.expiry_deadline(Some(&p)), None);
+    }
+
+    #[test]
+    fn refreshes_less_than_a_second_apart_are_throttled() {
+        let mut gate = RefreshGate::default();
+        let t0 = Instant::now();
+        assert!(gate.allow(t0));
+        assert!(!gate.allow(t0 + Duration::from_millis(100)));
+        // A throttled refresh does not restart the wait: one is looked at per second even
+        // when the client keeps sending.
+        assert!(!gate.allow(t0 + Duration::from_millis(900)));
+        assert!(gate.allow(t0 + Duration::from_millis(1001)));
+        assert!(!gate.allow(t0 + Duration::from_millis(1500)));
+        assert!(gate.allow(t0 + Duration::from_millis(2002)));
     }
 }
