@@ -11,8 +11,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use kraken_hub::cli::{self, Mode, Remote};
-use kraken_hub::client::Target;
+use kraken_hub::client::{ClientIdentity, Target};
 use kraken_hub::config::Config;
+use kraken_hub::tls::ClientAuthMode;
 use tokio::net::TcpListener;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -77,12 +78,22 @@ fn acl_hash(token: Option<String>) -> ExitCode {
 /// The hub to probe: `--address` or the local hub, with TLS as `--tls-ca`, the address scheme or
 /// the environment says.
 fn target(config: &Config, remote: &Remote) -> Target {
+    let identity = ClientIdentity::resolve(
+        remote
+            .tls_client_cert
+            .as_deref()
+            .zip(remote.tls_client_key.as_deref()),
+        remote.address.is_none(),
+        config.grpc_tls(),
+        config.client_auth() == Some(ClientAuthMode::Required),
+    );
     Target::resolve(
         remote.address.as_deref(),
         remote.tls_ca.as_deref(),
         config.listen.port(),
         config.grpc_tls().map(|(cert, _key)| cert),
     )
+    .with_identity(identity)
 }
 
 async fn health_check(config: &Config, remote: &Remote) -> ExitCode {

@@ -26,6 +26,7 @@ fn ca_target(addr: SocketAddr, ca: &Path) -> Target {
     Target {
         address: addr.to_string(),
         tls: Some(Trust::Ca(ca.to_path_buf())),
+        identity: None,
     }
 }
 

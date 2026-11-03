@@ -35,12 +35,63 @@ pub enum Trust {
     System,
 }
 
+/// The client certificate and key (PEM files) a probe presents to a hub that asks for one
+/// (ADR 0020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+impl ClientIdentity {
+    pub fn new(cert: PathBuf, key: PathBuf) -> Self {
+        Self { cert, key }
+    }
+
+    /// What a probe presents: the `--tls-client-cert/--tls-client-key` pair when given;
+    /// otherwise, for the local hub (no `--address`) that requires client certificates, the hub's
+    /// own certificate and key (`hub_pair`), which works when that certificate is issued by the
+    /// client CA and may be used by a client; otherwise nothing. A hub that only allows
+    /// certificates (`optional`) is probed without one: a certificate that is not from its client
+    /// CA would fail the handshake.
+    pub fn resolve(
+        flags: Option<(&Path, &Path)>,
+        local: bool,
+        hub_pair: Option<(&Path, &Path)>,
+        required: bool,
+    ) -> Option<Self> {
+        flags
+            .or(hub_pair.filter(|_| local && required))
+            .map(|(cert, key)| Self::new(cert.to_path_buf(), key.to_path_buf()))
+    }
+
+    fn load(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )> {
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&self.cert)
+            .with_context(|| format!("read client certificate {}", self.cert.display()))?
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("parse client certificate {}", self.cert.display()))?;
+        if chain.is_empty() {
+            anyhow::bail!("no certificate in {}", self.cert.display());
+        }
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&self.key)
+            .with_context(|| format!("read client key {}", self.key.display()))?;
+        Ok((chain, key))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// `host:port`.
     pub address: String,
     /// `None`: plain text.
     pub tls: Option<Trust>,
+    /// The client certificate to present; `None`: none (needs `tls`).
+    pub identity: Option<ClientIdentity>,
 }
 
 impl Target {
@@ -49,7 +100,14 @@ impl Target {
         Self {
             address: addr.to_string(),
             tls: None,
+            identity: None,
         }
+    }
+
+    /// This target presenting `identity` (when there is one) to the server.
+    pub fn with_identity(mut self, identity: Option<ClientIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Resolves the CLI's `--address` and `--tls-ca`. `local_port` and `local_cert` describe the
@@ -80,7 +138,11 @@ impl Target {
             (None, _, _, true) => Some(Trust::System),
             _ => None,
         };
-        Self { address, tls }
+        Self {
+            address,
+            tls,
+            identity: None,
+        }
     }
 
     fn host(&self) -> &str {
@@ -97,7 +159,7 @@ impl Target {
                 .connect()
                 .await?);
         };
-        let connector = TlsConnector::from(client_config(trust)?);
+        let connector = TlsConnector::from(client_config(trust, self.identity.as_ref())?);
         let name = ServerName::try_from(self.host().to_string())
             .with_context(|| format!("{} is not a valid server name", self.host()))?;
         let address = self.address.clone();
@@ -115,15 +177,29 @@ impl Target {
     }
 }
 
-/// The rustls client configuration for `trust`; HTTP/2 only (this is for gRPC).
-pub fn client_config(trust: &Trust) -> anyhow::Result<Arc<ClientConfig>> {
+/// The rustls client configuration for `trust`, presenting `identity` when there is one; HTTP/2
+/// only (this is for gRPC).
+pub fn client_config(
+    trust: &Trust,
+    identity: Option<&ClientIdentity>,
+) -> anyhow::Result<Arc<ClientConfig>> {
     let provider = Arc::new(default_provider());
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?;
+    let identity = identity.map(ClientIdentity::load).transpose()?;
+    // Finishes a builder that already knows whom to trust.
+    macro_rules! finish {
+        ($builder:expr) => {
+            match identity {
+                Some((chain, key)) => $builder
+                    .with_client_auth_cert(chain, key)
+                    .context("client certificate and key")?,
+                None => $builder.with_no_client_auth(),
+            }
+        };
+    }
     let mut config = match trust {
-        Trust::Ca(path) => builder
-            .with_root_certificates(roots_from_pem(path)?)
-            .with_no_client_auth(),
+        Trust::Ca(path) => finish!(builder.with_root_certificates(roots_from_pem(path)?)),
         Trust::System => {
             let mut roots = RootCertStore::empty();
             let native = rustls_native_certs::load_native_certs();
@@ -131,7 +207,7 @@ pub fn client_config(trust: &Trust) -> anyhow::Result<Arc<ClientConfig>> {
             if added == 0 {
                 anyhow::bail!("no system root certificates found; pass --tls-ca <pem>");
             }
-            builder.with_root_certificates(roots).with_no_client_auth()
+            finish!(builder.with_root_certificates(roots))
         }
         Trust::Pinned(path) => {
             let leaf = CertificateDer::pem_file_iter(path)
@@ -139,13 +215,14 @@ pub fn client_config(trust: &Trust) -> anyhow::Result<Arc<ClientConfig>> {
                 .next()
                 .with_context(|| format!("no certificate in {}", path.display()))?
                 .with_context(|| format!("parse {}", path.display()))?;
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(Pinned {
-                    leaf,
-                    algs: provider.signature_verification_algorithms,
-                }))
-                .with_no_client_auth()
+            finish!(
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(Pinned {
+                        leaf,
+                        algs: provider.signature_verification_algorithms,
+                    }))
+            )
         }
     };
     config.alpn_protocols = vec![b"h2".to_vec()];
@@ -229,7 +306,8 @@ mod tests {
             Target::resolve(None, None, 7000, None),
             Target {
                 address: "127.0.0.1:7000".into(),
-                tls: None
+                tls: None,
+                identity: None
             }
         );
         // Local default with TLS configured: pinned to the hub's own certificate.
@@ -242,7 +320,8 @@ mod tests {
             Target::resolve(Some("hub:7000"), Some(ca), 7000, None),
             Target {
                 address: "hub:7000".into(),
-                tls: Some(Trust::Ca(ca.into()))
+                tls: Some(Trust::Ca(ca.into())),
+                identity: None
             }
         );
         // https:// alone: the system roots.
@@ -250,7 +329,8 @@ mod tests {
             Target::resolve(Some("https://hub.example:7000/"), None, 7000, None),
             Target {
                 address: "hub.example:7000".into(),
-                tls: Some(Trust::System)
+                tls: Some(Trust::System),
+                identity: None
             }
         );
         // http:// and a bare address stay plain, whatever the local environment says.
@@ -266,5 +346,31 @@ mod tests {
             Target::resolve(Some("[::1]:7000"), None, 7000, None).host(),
             "::1"
         );
+    }
+
+    #[test]
+    fn the_probe_presents_a_client_certificate_only_when_it_has_one_to_present() {
+        let pair =
+            || ClientIdentity::new(Path::new("/hub.pem").into(), Path::new("/hub.key").into());
+        let own = pair();
+        let flags = ClientIdentity::new("/c.pem".into(), "/k.pem".into());
+        let given = Some(("/c.pem".as_ref(), "/k.pem".as_ref()));
+        let hub = Some((Path::new("/hub.pem"), Path::new("/hub.key")));
+        // Flags always win.
+        assert_eq!(
+            ClientIdentity::resolve(given, true, hub, true),
+            Some(flags.clone())
+        );
+        assert_eq!(
+            ClientIdentity::resolve(given, false, None, false),
+            Some(flags)
+        );
+        // The local hub that requires certificates: the probe presents the hub's own pair.
+        assert_eq!(ClientIdentity::resolve(None, true, hub, true), Some(own));
+        // Not required (optional presents nothing, a certificate that is not from the client CA
+        // would fail the handshake), not the local hub, or no pair: nothing.
+        assert_eq!(ClientIdentity::resolve(None, true, hub, false), None);
+        assert_eq!(ClientIdentity::resolve(None, false, hub, true), None);
+        assert_eq!(ClientIdentity::resolve(None, true, None, true), None);
     }
 }

@@ -126,6 +126,30 @@ pub async fn serve_with_shutdown(
         (Some((cert, key)), ..) => Some(tls::CertStore::load(cert, key, "http")?),
         (None, ..) => None,
     };
+    // Client certificates (ADR 0020, gRPC listener only): the client CAs are loaded now (a bad
+    // bundle is fatal) and reloaded with the certificates.
+    let client_auth = match (
+        &grpc_tls,
+        config.tls_client_ca.as_deref(),
+        config.client_auth(),
+    ) {
+        (Some(_), Some(ca), Some(mode)) => {
+            let cas = tls::ClientCaStore::load(ca, mode, Arc::clone(&metrics))?;
+            tokio::spawn(reload::watch(
+                cas.paths(),
+                config.reload_interval,
+                stopping.clone(),
+                {
+                    let cas = Arc::clone(&cas);
+                    move || {
+                        cas.reload();
+                    }
+                },
+            ));
+            tls::ClientAuth::from_store(cas)
+        }
+        _ => tls::ClientAuth::None,
+    };
     // One watcher per distinct store (the HTTP port shares the gRPC store by default).
     let mut stores: Vec<Arc<tls::CertStore>> = Vec::new();
     for store in [&grpc_tls, &http_tls].into_iter().flatten() {
@@ -296,7 +320,7 @@ pub async fn serve_with_shutdown(
         std::pin::Pin<Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>>;
     let server: Served = match &grpc_tls {
         Some(store) => {
-            let config = tls::server_config(Arc::clone(store), &[b"h2"], tls::ClientAuth::None);
+            let config = tls::server_config(Arc::clone(store), &[b"h2"], client_auth);
             let accepted = ReceiverStream::new(tls::accept(
                 incoming,
                 config,

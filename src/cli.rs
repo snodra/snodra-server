@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::topology::{InstanceTopology, Topology};
 
-pub const USAGE: &str = "usage:\n  kraken-hub                     run the hub\n  kraken-hub --health-check [REMOTE]      probe the hub's gRPC health service\n  kraken-hub --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  kraken-hub acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n\nA hub with KRAKEN_HUB_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
+pub const USAGE: &str = "usage:\n  kraken-hub                     run the hub\n  kraken-hub --health-check [REMOTE]      probe the hub's gRPC health service\n  kraken-hub --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  kraken-hub acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n  --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate (a hub with KRAKEN_HUB_TLS_CLIENT_AUTH=required)\n\nA hub with KRAKEN_HUB_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
 
 /// Which hub a probe talks to; see [`crate::client::Target::resolve`].
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -14,6 +14,10 @@ pub struct Remote {
     pub address: Option<String>,
     /// `--tls-ca`: PEM file with the CA(s) to trust; turns TLS on.
     pub tls_ca: Option<PathBuf>,
+    /// `--tls-client-cert` and `--tls-client-key`: the client certificate and key (PEM) to
+    /// present, for a hub that asks for one (ADR 0020). Both or neither.
+    pub tls_client_cert: Option<PathBuf>,
+    pub tls_client_key: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -66,8 +70,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
             "--json" => json = true,
             "--address" => remote.address = Some(value("--address", &mut it)?),
             "--tls-ca" => remote.tls_ca = Some(value("--tls-ca", &mut it)?.into()),
+            "--tls-client-cert" => {
+                remote.tls_client_cert = Some(value("--tls-client-cert", &mut it)?.into())
+            }
+            "--tls-client-key" => {
+                remote.tls_client_key = Some(value("--tls-client-key", &mut it)?.into())
+            }
             _ => return Err(UsageError(format!("unknown argument: {arg}"))),
         }
+    }
+    if remote.tls_client_cert.is_some() != remote.tls_client_key.is_some() {
+        return Err(UsageError(
+            "--tls-client-cert and --tls-client-key must be given together".into(),
+        ));
     }
     if topology && health {
         return Err(UsageError(
@@ -79,7 +94,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
     }
     if remote != Remote::default() && !topology && !health {
         return Err(UsageError(
-            "--address and --tls-ca need --topology or --health-check".into(),
+            "--address, --tls-ca and --tls-client-cert/--tls-client-key need --topology or --health-check"
+                .into(),
         ));
     }
     Ok(if topology {
@@ -257,6 +273,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_the_client_certificate_options_in_pairs() {
+        assert_eq!(
+            args(&[
+                "--health-check",
+                "--tls-client-cert",
+                "/c.pem",
+                "--tls-client-key",
+                "/k.pem"
+            ]),
+            Ok(Mode::HealthCheck(Remote {
+                tls_client_cert: Some("/c.pem".into()),
+                tls_client_key: Some("/k.pem".into()),
+                ..Remote::default()
+            }))
+        );
+        for one in [
+            ["--tls-client-cert", "/c.pem"],
+            ["--tls-client-key", "/k.pem"],
+        ] {
+            let mut a = vec!["--topology"];
+            a.extend(one);
+            assert_eq!(
+                err(&a),
+                "--tls-client-cert and --tls-client-key must be given together"
+            );
+        }
+        assert_eq!(
+            err(&["--topology", "--tls-client-cert"]),
+            "--tls-client-cert needs a value"
+        );
+        assert!(USAGE.contains("--tls-client-cert") && USAGE.contains("--tls-client-key"));
+    }
+
+    #[test]
     fn parse_remote_options_and_acl_hash() {
         assert_eq!(
             args(&[
@@ -271,20 +321,25 @@ mod tests {
                 remote: Remote {
                     address: Some("https://hub:7000".into()),
                     tls_ca: Some("/ca.pem".into()),
+                    ..Remote::default()
                 },
             })
         );
         assert_eq!(
             args(&["--health-check", "--tls-ca", "/ca.pem"]),
             Ok(Mode::HealthCheck(Remote {
-                address: None,
                 tls_ca: Some("/ca.pem".into()),
+                ..Remote::default()
             }))
         );
         assert_eq!(err(&["--topology", "--address"]), "--address needs a value");
         assert_eq!(
             err(&["--address", "hub:7000"]),
-            "--address and --tls-ca need --topology or --health-check"
+            "--address, --tls-ca and --tls-client-cert/--tls-client-key need --topology or --health-check"
+        );
+        assert_eq!(
+            err(&["--tls-client-cert", "/c.pem", "--tls-client-key", "/k.pem"]),
+            "--address, --tls-ca and --tls-client-cert/--tls-client-key need --topology or --health-check"
         );
         assert_eq!(
             args(&["acl", "hash", "abc"]),

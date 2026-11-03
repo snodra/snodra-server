@@ -596,6 +596,7 @@ impl FakeClient {
         let target = kraken_hub::client::Target {
             address: addr.to_string(),
             tls: Some(kraken_hub::client::Trust::Ca(ca_pem.to_path_buf())),
+            identity: None,
         };
         let channel = target.connect().await.unwrap();
         let mut client = HubClient::new(channel);
@@ -610,6 +611,36 @@ impl FakeClient {
             rx,
             instance_id: uuid::Uuid::now_v7().to_string(),
         }
+    }
+
+    /// Like [`FakeClient::connect_tls`], presenting the client certificate and key (PEM files)
+    /// in `identity`. `Err` when the hub refuses the handshake (a TLS 1.3 client learns it when
+    /// the stream opens).
+    pub async fn connect_mtls(
+        addr: SocketAddr,
+        ca_pem: &std::path::Path,
+        identity: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Result<Self, String> {
+        let target = kraken_hub::client::Target {
+            address: addr.to_string(),
+            tls: Some(kraken_hub::client::Trust::Ca(ca_pem.to_path_buf())),
+            identity: identity.map(|(cert, key)| {
+                kraken_hub::client::ClientIdentity::new(cert.to_path_buf(), key.to_path_buf())
+            }),
+        };
+        let channel = target.connect().await.map_err(|e| format!("{e:#}"))?;
+        let mut client = HubClient::new(channel);
+        let (tx, rx) = mpsc::channel(64);
+        let rx = client
+            .connect(ReceiverStream::new(rx))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        Ok(Self {
+            tx,
+            rx,
+            instance_id: uuid::Uuid::now_v7().to_string(),
+        })
     }
 
     /// The next message, which must be a `RegisterAck` (the session was accepted).
