@@ -11,6 +11,7 @@ pub mod context;
 pub mod edges;
 pub mod http;
 pub mod jwt;
+pub mod mtls;
 pub mod protocol;
 pub mod queue;
 pub mod registry;
@@ -21,6 +22,10 @@ pub mod session;
 pub mod telemetry;
 pub mod tls;
 pub mod topology;
+
+#[cfg(test)]
+#[path = "pki_test_support.rs"]
+mod pki_test_support;
 
 pub mod proto {
     tonic::include_proto!("kraken.hub.v1");

@@ -665,41 +665,12 @@ impl FakeClient {
     }
 }
 
-/// A throwaway CA that signs server certificates, generated at test time (nothing is checked in).
-pub struct Pki {
-    ca_params: rcgen::CertificateParams,
-    ca_key: rcgen::KeyPair,
-    pub ca_pem: String,
-}
+#[path = "../../src/pki_test_support.rs"]
+mod pki_support;
+#[allow(unused_imports)]
+pub use pki_support::{ClientSpec, Pki};
 
 impl Pki {
-    pub fn new(name: &str) -> Self {
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, name);
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        Self {
-            ca_pem: ca.pem(),
-            ca_params,
-            ca_key,
-        }
-    }
-
-    /// `(certificate PEM, private key PEM)` for a server reachable as `localhost` and `127.0.0.1`.
-    pub fn server(&self) -> (String, String) {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.subject_alt_names.push(rcgen::SanType::IpAddress(
-            std::net::Ipv4Addr::LOCALHOST.into(),
-        ));
-        let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key);
-        let cert = params.signed_by(&key, &issuer).unwrap();
-        (cert.pem(), key.serialize_pem())
-    }
-
     /// Writes `ca.pem`, `cert.pem` and `key.pem` named with `prefix` into `dir`; returns the
     /// paths `(ca, cert, key)`.
     pub fn write(&self, dir: &TempDir, prefix: &str) -> (PathBuf, PathBuf, PathBuf) {

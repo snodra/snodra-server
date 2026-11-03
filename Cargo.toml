@@ -50,6 +50,7 @@ jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
+x509-parser = { version = "0.18", default-features = false }
 
 [build-dependencies]
 tonic-prost-build = "0.14.8"
@@ -63,3 +64,4 @@ rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pe
 # Signing keys for the JWT tests are generated at test time; nothing is checked in.
 rsa = "0.9"
 rand = "0.8"
+time = { version = "0.3", default-features = false, features = ["std"] }
