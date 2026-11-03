@@ -889,6 +889,15 @@ impl Authorizer {
         }
     }
 
+    /// [`Authorizer::prepare`], waiting at most `bound` for it. True when it finished, false
+    /// when the bound passed first; the fetch of a rotated key goes on in the background either
+    /// way, so a later call finds the key.
+    pub async fn prepare_within(&self, credentials: Option<&Credentials>, bound: Duration) -> bool {
+        tokio::time::timeout(bound, self.prepare(credentials))
+            .await
+            .is_ok()
+    }
+
     /// A refresh was ignored because it came less than a second after the last one looked at.
     pub fn refresh_throttled(&self) {
         self.metrics.credentials_refresh("throttled");
@@ -1161,6 +1170,21 @@ impl Authorizer {
         };
         let (principal, rights) = match self.resolve_credential(&acl, credentials, true, service) {
             Ok(found) => found,
+            Err(denials) if denials[0].code == DeniedCode::Unavailable => {
+                // The credential is not bad: the hub cannot judge it yet (the key set is not
+                // loaded, or a rotated key is still being fetched). The session keeps what it
+                // has until the client's next refresh or the expiry decides (ADR 0019,
+                // amendment 2); closing it would punish a client for the identity provider.
+                self.metrics.credentials_refresh("unavailable");
+                if self.may_log(denials[0].reason) {
+                    warn!(
+                        service = %clip(service),
+                        "credentials refresh not judged: {}; the session keeps its credentials",
+                        denials[0].message
+                    );
+                }
+                return Refresh::Kept;
+            }
             Err(denials) => {
                 // A credential that does not resolve is never adopted.
                 self.refresh_refused(&denials, service, None, disposition);
@@ -2757,6 +2781,45 @@ handle = ["*"]
             }
         );
         assert_eq!(refreshes(&fx, "ok"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_whose_key_is_not_known_yet_keeps_the_old_credentials_even_in_enforce() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let rotated = Signer::es256("k2");
+        // Not prepared: the key set does not have k2 and nothing has looked for it.
+        let creds = jwt_creds(rotated.sign(&claims(ISS, "billing", 300)));
+        assert_eq!(fx.auth.refresh(Some(&creds), "billing", &[]), Refresh::Kept);
+        assert_eq!(refreshes(&fx, "unavailable"), Some(1));
+        assert_eq!(refreshes(&fx, "refused"), None);
+        // Not a violation: the credential is not bad, the hub just cannot judge it yet.
+        assert_eq!(fx.m.counter_total("kraken_hub_auth_violations_total"), None);
+    }
+
+    #[tokio::test]
+    async fn preparing_a_rotated_key_can_be_bounded_and_the_fetch_goes_on() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let rotated = Signer::es256("k2");
+        fx.server.serve(&[&rotated]);
+        fx.server.set_delay(Duration::from_millis(600));
+        let creds = jwt_creds(rotated.sign(&claims(ISS, "billing", 300)));
+        let t0 = tokio::time::Instant::now();
+        let finished = fx
+            .auth
+            .prepare_within(Some(&creds), Duration::from_millis(100))
+            .await;
+        assert!(!finished, "the fetch is slower than the bound");
+        assert!(
+            t0.elapsed() < Duration::from_millis(450),
+            "{:?}",
+            t0.elapsed()
+        );
+        // The fetch was not cancelled with the wait: the key shows up and the refresh passes.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(matches!(
+            fx.auth.refresh(Some(&creds), "billing", &[]),
+            Refresh::Accepted { .. }
+        ));
     }
 
     #[tokio::test]

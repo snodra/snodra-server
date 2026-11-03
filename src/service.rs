@@ -39,6 +39,10 @@ use crate::router::{OpenRefused, Router};
 use crate::session::{SessionMeta, Sessions, Superseded};
 use crate::topology::{ClockAnchor, snapshot};
 
+/// How long a credentials refresh may wait for a rotated signing key to be fetched. The stream
+/// loop also answers heartbeats (timeout 10 s by default) and the fetch itself may take 10 s.
+const REFRESH_KEY_WAIT: Duration = Duration::from_millis(1500);
+
 pub struct HubService {
     pub registry: Arc<Registry>,
     pub sessions: Arc<Sessions>,
@@ -750,7 +754,10 @@ async fn run_stream(
                     debug!(instance = %instance_id, "credentials refresh throttled");
                     continue;
                 }
-                ctx.auth.prepare(Some(&new)).await;
+                // The loop answers heartbeats too: waiting here for a slow key route would get
+                // the session evicted. A key not known after the bound is judged as not known
+                // yet (the session keeps its credentials); the fetch goes on without us.
+                ctx.auth.prepare_within(Some(&new), REFRESH_KEY_WAIT).await;
                 match ctx.auth.refresh(Some(&new), &service, &handled) {
                     Refresh::Accepted {
                         principal: fresh,

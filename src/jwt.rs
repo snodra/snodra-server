@@ -572,13 +572,28 @@ impl Jwt {
     /// once per refetch interval; concurrent callers share the fetch. Does nothing otherwise
     /// (nothing is loaded yet, no `kid`, a known `kid`, a token that is not a JWT). Call before
     /// [`Jwt::verify`].
-    pub async fn ensure_key(&self, token: &str) {
+    pub async fn ensure_key(self: &Arc<Self>, token: &str) {
         let Ok(TokenHeader { kid: Some(kid), .. }) = read_header(token) else {
             return;
         };
-        if !self.is_loaded() || self.has_kid(&kid) {
+        if !self.is_loaded() || self.has_kid(&kid) || self.throttled() {
             return;
         }
+        // The fetch runs as a task of its own, so a caller that stops waiting (a bounded wait,
+        // a client that went away) does not cancel it: its result and its place in the throttle
+        // stay honest, and the next caller finds the key.
+        let jwt = Arc::clone(self);
+        let _ = tokio::spawn(async move { jwt.refetch_for(kid).await }).await;
+    }
+
+    /// True while an unknown-`kid` refetch is not allowed yet.
+    fn throttled(&self) -> bool {
+        self.state.read().unwrap().last_forced.is_some_and(|at| {
+            Instant::now().saturating_duration_since(at) < self.settings.refetch_interval
+        })
+    }
+
+    async fn refetch_for(&self, kid: String) {
         let _one_at_a_time = self.fetching.lock().await;
         if self.has_kid(&kid) {
             return;

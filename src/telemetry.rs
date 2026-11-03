@@ -313,7 +313,7 @@ impl Metrics {
                 .build(),
             credentials_refreshes: meter
                 .u64_counter("kraken_hub_credentials_refreshes_total")
-                .with_description("ClientMessage.credentials refreshes, per result: ok, refused, wrong_service, throttled")
+                .with_description("ClientMessage.credentials refreshes, per result: ok, refused, wrong_service, throttled, unavailable")
                 .build(),
             seen: Mutex::new(Seen::default()),
         })

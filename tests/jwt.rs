@@ -64,6 +64,8 @@ struct Opts {
     mode: AuthMode,
     grace: Duration,
     audience: Option<&'static str>,
+    /// `(interval, timeout)` of the heartbeat; the hub's defaults when unset.
+    heartbeat: Option<(Duration, Duration)>,
 }
 
 impl Default for Opts {
@@ -72,6 +74,7 @@ impl Default for Opts {
             mode: AuthMode::Enforce,
             grace: Duration::from_secs(30),
             audience: None,
+            heartbeat: None,
         }
     }
 }
@@ -103,6 +106,14 @@ impl Hub {
             jwks_refresh: Duration::from_secs(3600),
             jwks_refetch_interval: Duration::from_millis(100),
             ..auth_config(opts.mode, &file)
+        };
+        let config = match opts.heartbeat {
+            Some((interval, timeout)) => Config {
+                heartbeat_interval: interval,
+                heartbeat_timeout: timeout,
+                ..config
+            },
+            None => config,
         };
         let (addr, http) = common::start_hub_with_http(config).await;
         let hub = Self {
@@ -556,6 +567,47 @@ async fn a_refresh_moves_the_expiry() {
     // Well past the first token's deadline (3 to 4 s).
     tokio::time::sleep(Duration::from_millis(4200)).await;
     assert!(works(&mut c).await, "the refresh moved the deadline");
+}
+
+#[tokio::test]
+async fn a_refresh_naming_a_new_kid_never_stalls_the_stream_while_the_jwks_is_slow() {
+    // The realm rotates its key and the JWKS route is slow (8 s; the hub's own fetch timeout is
+    // 10 s). Verifying the refresh must not hold the stream's loop: heartbeats keep being
+    // answered past the 4 s heartbeat timeout, and the session stays.
+    let hub = Hub::start(Opts {
+        heartbeat: Some((Duration::from_secs(1), Duration::from_secs(4))),
+        ..Opts::default()
+    })
+    .await;
+    let mut c = registered(&hub, &orders_spec(&hub.jwt("orders", 300))).await;
+    let rotated = Signer::es256("k2");
+    hub.jwks.serve(&[&rotated]);
+    hub.jwks.set_delay(Duration::from_secs(8));
+    let t = rotated.sign(&claims(ISS, "orders", 300));
+    c.tx.send(refresh_jwt(&t)).await.unwrap();
+    let until = Instant::now() + Duration::from_millis(6500);
+    let mut sent = 0i64;
+    while Instant::now() < until {
+        sent += 1;
+        c.heartbeat(sent).await;
+        loop {
+            // The refresh may hold the loop for the hub's bound (1.5 s), not more.
+            match c.next_within(Duration::from_secs(3)).await {
+                Some(Ok(m)) => {
+                    if let Some(kraken_hub::proto::server_message::Message::Heartbeat(h)) =
+                        m.message
+                        && h.sent_at_ms == sent
+                    {
+                        break;
+                    }
+                }
+                other => panic!("heartbeat {sent} was not echoed: {other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    // A key that is merely not known yet does not end the session: the old credentials stay.
+    assert!(works(&mut c).await);
 }
 
 #[tokio::test]
