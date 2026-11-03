@@ -103,6 +103,8 @@ cargo run
 | `KRAKEN_HUB_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots; an unreadable file is a startup error whatever the URI scheme (unused, with a warning, over `http://`) |
 | `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
 | `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
+| `KRAKEN_HUB_TLS_CLIENT_CA` | none | PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS); needs the gRPC pair; an unreadable or empty bundle is a startup error; reloaded with the certificates (a bad file keeps the previous CAs, counted); the HTTP port never asks for a certificate; with `AUTH_MODE=off` it authenticates nothing beyond the handshake (startup warning). See [Security](#security) |
+| `KRAKEN_HUB_TLS_CLIENT_AUTH` | `optional` (when the CA is set) | `optional`: no certificate is fine (token or JWT), one that is presented must verify; `required`: a client without a valid certificate fails the handshake. Without `KRAKEN_HUB_TLS_CLIENT_CA` it is a startup error |
 | `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
 | `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` | `5s` | a TLS handshake that takes longer is dropped; positive |
 | `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
@@ -386,8 +388,8 @@ picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Security
 
-Roadmap P5a and P5b, decision records: umbrella `docs/adr/0018-hub-access-control.md` and
-`docs/adr/0019-hub-jwt-authentication.md`; operator how-to:
+Roadmap P5a, P5b and P5c, decision records: umbrella `docs/adr/0018-hub-access-control.md`,
+`docs/adr/0019-hub-jwt-authentication.md` and `docs/adr/0020-hub-mutual-tls.md`; operator how-to:
 umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) behaves as before.
 
 **Service tokens and the ACL.** With `KRAKEN_HUB_AUTH_MODE=enforce` a service must send a static
@@ -461,11 +463,39 @@ rest are counted as `throttled` and dropped silently, so send at most one per re
 `unavailable` and dropped while the session keeps its old credentials; no reply on success; `off`
 ignores it). A reload that removes the
 service's table closes its session in `enforce`. The topology and the dashboard show each
-instance's `authKind` (`token`, `jwt`, `none`) and a JWT's `expiresAt`. In Keycloak, give each
+instance's `authKind` (`token`, `jwt`, `certificate`, `none`), a JWT's or certificate's `expiresAt` and a
+certificate's `certFingerprint`. In Keycloak, give each
 service a confidential client with service accounts only and client id = service name, add an
 audience mapper and set `KRAKEN_HUB_JWT_AUDIENCE`; a user's access token (`azp` = the gateway
 client) must never get a `[[service]]` table. A token is never logged. The gRPC `Topology` call
-in `enforce` also accepts a valid JWT of a service that has a table.
+in `enforce` also accepts a valid JWT, or a client certificate, of a service that has a table.
+
+**Client certificates (P5c).** Decision record: umbrella `docs/adr/0020-hub-mutual-tls.md`. Set
+`KRAKEN_HUB_TLS_CLIENT_CA` (with the gRPC pair) and the gRPC listener asks for client certificates
+(`KRAKEN_HUB_TLS_CLIENT_AUTH`: `optional` by default, `required` to refuse a client without one; a
+certificate that is presented must always verify against the bundle, or the handshake fails). A
+service authenticates with a certificate that carries **exactly one URI SAN
+`kraken://service/<name>`** (`<name>`: 1 to 128 characters of `[A-Za-z0-9._-]`; DNS and other SANs
+are ignored); none, or several, is `PERMISSION_DENIED` "certificate names no service" / "certificate
+names more than one service" at `Register`. The certificate is the session's principal: its rights are
+the `[[service]]` table of that name (the same tables JWTs use), `Register.service_name` must equal the
+name, and `Register.credentials`, when also sent, must resolve to the same service
+(`PERMISSION_DENIED` "credentials and certificate name different services"; `permissive` counts it and
+the certificate wins; nothing is merged). The session is closed at the certificate's `notAfter` with
+`UNAUTHENTICATED` "certificate expired", with no grace (a TLS session cannot be refreshed; a
+`ClientMessage.credentials` on it is ignored and counted as `ignored_certificate_session`), so a client
+reloads its certificate and reconnects before `notAfter`; `permissive` counts the expiry once, `off`
+never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
+handshakes only. Logs and the topology show a certificate only by the first 8 hex characters of its
+SHA-256 fingerprint. Metrics: `kraken_hub_client_certificates_total{result}` (`ok`, `no_service`,
+`multiple_services`, `mismatch`, `expired`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
+(`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
+`kraken_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
+certificates and remove the service's table to cut it off. `--health-check` and `--topology` take
+`--tls-client-cert <pem>` and `--tls-client-key <pem>`; the local `--health-check` of a `required` hub
+presents the hub's own certificate and key when no flags are given (works when the hub's certificate
+is issued by the client CA with the client usage; otherwise add the flags to the healthcheck). With
+`AUTH_MODE=off` the certificate is only a handshake gate and the hub warns.
 
 **TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
 TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
@@ -482,7 +512,7 @@ certificate file's content **at the moment of each probe**, not at hub start: wh
 in flight the file on disk is new before the hub has reloaded it (up to one
 `KRAKEN_HUB_RELOAD_INTERVAL`, 5 s by default, or `kill -HUP` for an immediate reload), so the
 local healthcheck can be red for up to one poll. Let the healthcheck's `retries` cover that, and
-rotate the pair by replacing the key and the certificate together. Client certificates (mTLS) are P5c.
+rotate the pair by replacing the key and the certificate together. Client certificates: see above.
 
 **Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/topology`, `/api/v1/*`, the event stream
 and the gRPC `Topology` call; the page and its assets stay public. In `enforce` mode the gRPC
@@ -829,7 +859,8 @@ without any client change; v1 clients always send a timeout, so for them an over
 - Metrics (OTLP): `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
   `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
   `kraken_hub_jwks_fetches_total{result}` (`ok`, `network`, `tls`, `timeout`, `status`, `too_large`, `invalid`), `kraken_hub_jwks_keys`,
-  `kraken_hub_credentials_refreshes_total{result}`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
+  `kraken_hub_credentials_refreshes_total{result}`, `kraken_hub_client_certificates_total{result}`,
+  `kraken_hub_tls_handshake_failures_total{listener,reason}`, `kraken_hub_tls_client_ca_reload_errors_total`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
@@ -900,7 +931,8 @@ src/cli.rs        --health-check, --topology and `acl hash` modes
 src/auth.rs       auth modes, ACL parsing and lookup, Principal, Register, refresh, expiry and request checks, constant-time compare
 src/jwt.rs        JWT validation and the JWKS cache and fetch (the tests' key and server helpers are src/jwt_test_support.rs)
 src/reload.rs     mtime polling and SIGHUP for the ACL and the TLS pairs
-src/tls.rs        rustls listeners, reloadable certificate, the mTLS hook (P5c)
+src/tls.rs        rustls listeners, reloadable certificate, the client CA store (mTLS, P5c)
+src/mtls.rs       the service a client certificate names (kraken://service/<name>), notAfter, fingerprint
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
 src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream), security headers
