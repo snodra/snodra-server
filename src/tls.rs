@@ -20,11 +20,15 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use rustls::DigitallySignedStruct;
 use rustls::ServerConfig;
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::ring::default_provider;
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -240,18 +244,186 @@ impl std::str::FromStr for ClientAuthMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "optional" => Ok(Self::Optional),
             "required" => Ok(Self::Required),
-            other => anyhow::bail!("unknown client auth mode {other:?} (expected optional or required)"),
+            other => {
+                anyhow::bail!("unknown client auth mode {other:?} (expected optional or required)")
+            }
         }
     }
 }
 
-/// Whether and how clients must present certificates. Roadmap P5c adds a variant that holds the
-/// client CA and maps a certificate's SAN `kraken://service/<name>` to a service; until then
-/// the listeners authenticate the server only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The client CAs a listener trusts, replaced by [`ClientCaStore::reload`]. The verifier is built
+/// from the PEM bundle; a bundle that does not load keeps the previous verifier.
+pub struct ClientCaStore {
+    current: RwLock<Arc<dyn ClientCertVerifier>>,
+    path: PathBuf,
+    mode: ClientAuthMode,
+    metrics: Arc<Metrics>,
+}
+
+impl fmt::Debug for ClientCaStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientCaStore")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A verifier for the client CAs in the PEM bundle `path`.
+fn load_client_verifier(
+    path: &Path,
+    mode: ClientAuthMode,
+) -> anyhow::Result<Arc<dyn ClientCertVerifier>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("read client CA {}", path.display()))?
+    {
+        roots
+            .add(cert.with_context(|| format!("parse client CA {}", path.display()))?)
+            .with_context(|| format!("client CA {}", path.display()))?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!("no certificate in client CA {}", path.display());
+    }
+    let builder =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::new(default_provider()));
+    let builder = match mode {
+        ClientAuthMode::Required => builder,
+        ClientAuthMode::Optional => builder.allow_unauthenticated(),
+    };
+    builder.build().context("client CA verifier")
+}
+
+impl ClientCaStore {
+    /// Loads the bundle; a bad bundle is fatal at startup.
+    pub fn load(
+        path: &Path,
+        mode: ClientAuthMode,
+        metrics: Arc<Metrics>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let verifier = load_client_verifier(path, mode)?;
+        info!(client_ca = %path.display(), mode = mode.as_str(), "tls client CA loaded");
+        Ok(Arc::new(Self {
+            current: RwLock::new(verifier),
+            path: path.to_path_buf(),
+            mode,
+            metrics,
+        }))
+    }
+
+    /// The file to watch for changes.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        vec![self.path.clone()]
+    }
+
+    pub fn mode(&self) -> ClientAuthMode {
+        self.mode
+    }
+
+    /// Re-reads the bundle. One that cannot be loaded keeps the previous CAs, logs an error and is
+    /// counted (`kraken_hub_tls_client_ca_reload_errors_total`). New handshakes use the new CAs;
+    /// sessions that are live are not judged again.
+    pub fn reload(&self) -> bool {
+        match load_client_verifier(&self.path, self.mode) {
+            Ok(verifier) => {
+                *self.current.write().unwrap() = verifier;
+                info!(client_ca = %self.path.display(), "tls client CA reloaded");
+                true
+            }
+            Err(e) => {
+                self.metrics.client_ca_reload_failed();
+                error!(client_ca = %self.path.display(), error = %format!("{e:#}"), "tls client CA reload failed; keeping the previous one");
+                false
+            }
+        }
+    }
+
+    fn verifier(&self) -> Arc<dyn ClientCertVerifier> {
+        Arc::clone(&self.current.read().unwrap())
+    }
+}
+
+/// What rustls asks at every handshake: it forwards to the store's current verifier, so a
+/// reloaded CA bundle applies to the next handshake without rebuilding the server configuration.
+struct CurrentVerifier(Arc<ClientCaStore>);
+
+impl fmt::Debug for CurrentVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentVerifier").finish_non_exhaustive()
+    }
+}
+
+impl ClientCertVerifier for CurrentVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.0.verifier().offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.verifier().client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // Hints are advisory, and the trait lends a slice of the verifier current at the call, which
+        // a reload may replace. No hints tell a client to present the certificate it holds; the
+        // verifier decides.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.0
+            .verifier()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verifier().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verifier().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.verifier().supported_verify_schemes()
+    }
+}
+
+/// Whether and how clients must present certificates (ADR 0020): `None` authenticates the server
+/// only (the HTTP listener always, and a gRPC listener without a client CA); otherwise the client
+/// CA store the listener verifies against, in the mode it was loaded with.
+#[derive(Debug, Clone, Default)]
 pub enum ClientAuth {
     #[default]
     None,
+    /// A client may present a certificate (it must then verify) or none.
+    Optional(Arc<ClientCaStore>),
+    /// A client without a valid certificate fails the handshake.
+    Required(Arc<ClientCaStore>),
+}
+
+impl ClientAuth {
+    /// The variant for a loaded store: its mode decides.
+    pub fn from_store(store: Arc<ClientCaStore>) -> Self {
+        match store.mode() {
+            ClientAuthMode::Optional => Self::Optional(store),
+            ClientAuthMode::Required => Self::Required(store),
+        }
+    }
 }
 
 /// The server configuration for a listener. `alpn` lists the protocols to offer in order
@@ -264,9 +436,11 @@ pub fn server_config(
     let builder = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_safe_default_protocol_versions()
         .expect("ring supports the default protocol versions");
-    // P5c: `ClientAuth::Required(ca)` becomes `with_client_cert_verifier(..)` here.
     let builder = match client_auth {
         ClientAuth::None => builder.with_no_client_auth(),
+        ClientAuth::Optional(cas) | ClientAuth::Required(cas) => {
+            builder.with_client_cert_verifier(Arc::new(CurrentVerifier(cas)))
+        }
     };
     let mut config = builder.with_cert_resolver(store);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
@@ -343,6 +517,7 @@ where
                 None => None,
             };
             let (acceptor, tx, stopping) = (acceptor.clone(), tx.clone(), stopping.clone());
+            let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
                 let handshake = tokio::time::timeout(limits.timeout, acceptor.accept(tcp));
                 let result = tokio::select! {
@@ -359,13 +534,32 @@ where
                             _ = tx.send(stream) => {}
                         }
                     }
-                    Ok(Err(e)) => debug!(?peer, error = %e, "tls handshake failed"),
-                    Err(_) => debug!(?peer, "tls handshake timed out"),
+                    Ok(Err(e)) => {
+                        metrics.tls_handshake_failure(listener, failure_reason(&e));
+                        debug!(?peer, error = %e, "tls handshake failed");
+                    }
+                    Err(_) => {
+                        metrics.tls_handshake_failure(listener, "timeout");
+                        debug!(?peer, "tls handshake timed out");
+                    }
                 }
             });
         }
     });
     rx
+}
+
+/// Why a handshake failed, as a fixed label: a client certificate that was required and missing,
+/// one that did not verify, or anything else (plain text, scans, protocol errors).
+fn failure_reason(e: &io::Error) -> &'static str {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::NoCertificatesPresented) => "client_cert_missing",
+        Some(rustls::Error::InvalidCertificate(_)) => "client_cert_invalid",
+        _ => "other",
+    }
 }
 
 /// At most one "shedding" line per this long.
@@ -688,5 +882,278 @@ mod tests {
         let mut silent = TcpStream::connect(f.addr).await.unwrap();
         assert!(closed_by_server(&mut silent, Duration::from_secs(2)).await);
         let _ = &mut f;
+    }
+
+    // ---- client certificates (ADR 0020) ----
+
+    use crate::pki_test_support::{ClientSpec, Pki};
+
+    /// An `accept` loop that verifies client certificates against a client CA file.
+    struct Mx {
+        addr: SocketAddr,
+        rx: mpsc::Receiver<TlsStream<TcpStream>>,
+        m: TestMetrics,
+        dir: PathBuf,
+        server_pki: Pki,
+        /// Signs the clients' certificates; its certificate is the client CA file.
+        clients: Pki,
+        store: Arc<ClientCaStore>,
+    }
+
+    impl Drop for Mx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Mx {
+        fn ca_file(&self) -> PathBuf {
+            self.dir.join("client-ca.pem")
+        }
+
+        /// A TLS client trusting the server's CA, presenting `identity` (certificate and key PEM).
+        fn connector(&self, identity: Option<(String, String)>) -> tokio_rustls::TlsConnector {
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from_pem_slice(self.server_pki.ca_pem.as_bytes()).unwrap())
+                .unwrap();
+            let builder = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots);
+            let config = match identity {
+                None => builder.with_no_client_auth(),
+                Some((cert, key)) => builder
+                    .with_client_auth_cert(
+                        CertificateDer::pem_slice_iter(cert.as_bytes())
+                            .collect::<Result<_, _>>()
+                            .unwrap(),
+                        PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap(),
+                    )
+                    .unwrap(),
+            };
+            tokio_rustls::TlsConnector::from(Arc::new(config))
+        }
+
+        /// Connects and reads once: with TLS 1.3 a client learns that the server refused its
+        /// certificate only when it reads. `Ok` when the connection is usable.
+        async fn try_connect(&self, identity: Option<(String, String)>) -> Result<(), String> {
+            let tcp = TcpStream::connect(self.addr).await.unwrap();
+            let mut tls = self
+                .connector(identity)
+                .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::io::AsyncWriteExt::write_all(&mut tls, b"x")
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(500), tls.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => Err("closed by the server".to_string()),
+                Ok(Ok(_)) | Err(_) => Ok(()),
+            }
+        }
+
+        /// The next connection the server completed, with the certificate it presented.
+        async fn accepted(&mut self) -> Option<Option<Vec<u8>>> {
+            let stream = tokio::time::timeout(Duration::from_millis(700), self.rx.recv())
+                .await
+                .ok()??;
+            Some(
+                stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|c| c.as_ref().to_vec()),
+            )
+        }
+
+        /// `(certificate PEM, key PEM)` of a client of the client CA.
+        fn identity(&self, spec: &ClientSpec) -> (String, String) {
+            self.clients.client(spec)
+        }
+
+        fn failures(&self, reason: &str) -> Option<u64> {
+            self.m
+                .counter("kraken_hub_tls_handshake_failures_total", "reason", reason)
+        }
+    }
+
+    async fn mx(mode: ClientAuthMode) -> Mx {
+        let server_pki = Pki::new("server CA");
+        let (cert, key) = server_pki.server();
+        let dir = std::env::temp_dir().join(format!("kraken-hub-mtls-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert_path, cert).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+        let clients = Pki::new("client CA");
+        let ca_path = dir.join("client-ca.pem");
+        std::fs::write(&ca_path, &clients.ca_pem).unwrap();
+        let m = test_metrics();
+        let store = CertStore::load(&cert_path, &key_path, "test").unwrap();
+        let cas = ClientCaStore::load(&ca_path, mode, Arc::clone(&m.metrics)).unwrap();
+        let config = server_config(store, &[b"h2"], ClientAuth::from_store(Arc::clone(&cas)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp_tx, tcp_rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                if tcp_tx.send(Ok(tcp)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let rx = accept(
+            ReceiverStream::new(tcp_rx),
+            config,
+            CancellationToken::new(),
+            HandshakeLimits::default(),
+            "test",
+            Arc::clone(&m.metrics),
+        );
+        Mx {
+            addr,
+            rx,
+            m,
+            dir,
+            server_pki,
+            clients,
+            store: cas,
+        }
+    }
+
+    #[tokio::test]
+    async fn required_refuses_a_client_without_a_certificate_at_the_handshake() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        assert!(mx.try_connect(None).await.is_err());
+        assert!(mx.accepted().await.is_none(), "no connection is handed on");
+        assert_eq!(mx.failures("client_cert_missing"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn required_accepts_a_certificate_from_the_client_ca_and_hands_it_on() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let (cert, key) = mx.identity(&ClientSpec::service("orders"));
+        mx.try_connect(Some((cert.clone(), key))).await.unwrap();
+        let presented = mx
+            .accepted()
+            .await
+            .expect("accepted")
+            .expect("a certificate");
+        let sent = CertificateDer::from_pem_slice(cert.as_bytes()).unwrap();
+        assert_eq!(presented, sent.as_ref());
+    }
+
+    #[tokio::test]
+    async fn optional_accepts_a_client_without_a_certificate() {
+        let mut mx = mx(ClientAuthMode::Optional).await;
+        mx.try_connect(None).await.unwrap();
+        assert_eq!(mx.accepted().await, Some(None));
+        assert_eq!(mx.failures("client_cert_missing"), None);
+    }
+
+    #[tokio::test]
+    async fn optional_accepts_a_valid_certificate() {
+        let mut mx = mx(ClientAuthMode::Optional).await;
+        mx.try_connect(Some(mx.identity(&ClientSpec::service("orders"))))
+            .await
+            .unwrap();
+        assert!(mx.accepted().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_certificate_from_another_ca_is_refused_in_both_modes() {
+        for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+            let mut mx = mx(mode).await;
+            let other = Pki::new("some other CA");
+            let identity = other.client(&ClientSpec::service("orders"));
+            assert!(mx.try_connect(Some(identity)).await.is_err(), "{mode:?}");
+            assert!(mx.accepted().await.is_none());
+            assert_eq!(mx.failures("client_cert_invalid"), Some(1), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_certificate_is_refused_at_the_handshake() {
+        let mx = mx(ClientAuthMode::Optional).await;
+        let (cert, key) =
+            mx.identity(&ClientSpec::service("orders").valid_for(Duration::from_secs(1)));
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        // It ended one second after its creation, a second ago.
+        assert!(mx.try_connect(Some((cert, key))).await.is_err());
+        assert_eq!(mx.failures("client_cert_invalid"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_client_ca_reloads_for_new_handshakes() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let old = mx.identity(&ClientSpec::service("orders"));
+        mx.try_connect(Some(old.clone())).await.unwrap();
+        mx.accepted().await.expect("accepted");
+
+        // The bundle is replaced by another CA: its certificates work, the old CA's do not.
+        let next = Pki::new("next client CA");
+        std::fs::write(mx.ca_file(), &next.ca_pem).unwrap();
+        assert!(mx.store.reload());
+        mx.try_connect(Some(next.client(&ClientSpec::service("orders"))))
+            .await
+            .unwrap();
+        mx.accepted().await.expect("accepted");
+        assert!(mx.try_connect(Some(old)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bad_client_ca_file_keeps_the_previous_verifier_and_is_counted() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let identity = mx.identity(&ClientSpec::service("orders"));
+        for junk in [
+            "",
+            "not pem at all",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        ] {
+            std::fs::write(mx.ca_file(), junk).unwrap();
+            assert!(!mx.store.reload(), "{junk:?}");
+        }
+        std::fs::remove_file(mx.ca_file()).unwrap();
+        assert!(!mx.store.reload());
+        assert_eq!(
+            mx.m.counter_total("kraken_hub_tls_client_ca_reload_errors_total"),
+            Some(4)
+        );
+        mx.try_connect(Some(identity)).await.unwrap();
+        mx.accepted().await.expect("accepted");
+    }
+
+    #[test]
+    fn a_client_ca_that_does_not_load_is_a_startup_error() {
+        let m = test_metrics();
+        let dir = std::env::temp_dir().join(format!("kraken-hub-ca-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.pem");
+        assert!(
+            ClientCaStore::load(&missing, ClientAuthMode::Optional, Arc::clone(&m.metrics))
+                .is_err()
+        );
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let e = ClientCaStore::load(&empty, ClientAuthMode::Optional, Arc::clone(&m.metrics))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("no certificate"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_auth_modes_parse() {
+        assert_eq!(
+            "required".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+        assert_eq!(
+            " Optional ".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Optional
+        );
+        assert!("none".parse::<ClientAuthMode>().is_err());
     }
 }

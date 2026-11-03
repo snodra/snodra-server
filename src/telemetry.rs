@@ -193,6 +193,9 @@ pub struct Metrics {
     acl_generation: Gauge<u64>,
     acl_reload_errors: Counter<u64>,
     tls_handshakes_shed: Counter<u64>,
+    tls_handshake_failures: Counter<u64>,
+    tls_client_ca_reload_errors: Counter<u64>,
+    client_certificates: Counter<u64>,
     jwt_validations: Counter<u64>,
     jwks_fetches: Counter<u64>,
     jwks_keys: Gauge<u64>,
@@ -299,6 +302,18 @@ impl Metrics {
                 .u64_counter("kraken_hub_tls_handshakes_shed_total")
                 .with_description("TCP connections dropped before their TLS handshake because every handshake slot was busy (reason `slots`) or the peer IP already held its share (reason `per_ip`), per listener")
                 .build(),
+            tls_handshake_failures: meter
+                .u64_counter("kraken_hub_tls_handshake_failures_total")
+                .with_description("TLS handshakes that failed, per listener and reason: client_cert_missing (a required client certificate was not presented), client_cert_invalid (it did not verify against the client CA or was expired), timeout, other (plain text, scans, protocol errors)")
+                .build(),
+            tls_client_ca_reload_errors: meter
+                .u64_counter("kraken_hub_tls_client_ca_reload_errors_total")
+                .with_description("Client CA bundle reloads that failed to read or parse; the previous CAs stay in force")
+                .build(),
+            client_certificates: meter
+                .u64_counter("kraken_hub_client_certificates_total")
+                .with_description("Client certificates judged at Register (ADR 0020), per result: ok, no_service, multiple_services, mismatch (credentials name another service), expired (the session was closed or, in permissive, counted at notAfter)")
+                .build(),
             jwt_validations: meter
                 .u64_counter("kraken_hub_jwt_validations_total")
                 .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, key_pending, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
@@ -343,6 +358,28 @@ impl Metrics {
                 KeyValue::new("reason", reason),
             ],
         );
+    }
+
+    /// A TLS handshake that failed; `reason` is one of a fixed set, never text a peer chose.
+    pub fn tls_handshake_failure(&self, listener: &'static str, reason: &'static str) {
+        self.tls_handshake_failures.add(
+            1,
+            &[
+                KeyValue::new("listener", listener),
+                KeyValue::new("reason", reason),
+            ],
+        );
+    }
+
+    /// A client CA bundle reload that failed.
+    pub fn client_ca_reload_failed(&self) {
+        self.tls_client_ca_reload_errors.add(1, &[]);
+    }
+
+    /// A client certificate judged (ADR 0020); `result` is one of a fixed set.
+    pub fn client_certificate(&self, result: &'static str) {
+        self.client_certificates
+            .add(1, &[KeyValue::new("result", result)]);
     }
 
     /// One JWT validated (or refused): `result` is one of a fixed set of labels, never text a

@@ -1962,10 +1962,16 @@ mod tests {
             ("KRAKEN_HUB_TLS_CLIENT_AUTH", "sometimes"),
         ])
         .unwrap_err();
-        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_AUTH"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_AUTH"),
+            "{e:#}"
+        );
         // The mode without the CA, and the CA without the server pair, are startup errors.
         let e = with(&[("KRAKEN_HUB_TLS_CLIENT_AUTH", "required")]).unwrap_err();
-        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"),
+            "{e:#}"
+        );
         let e = with_env(&[("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem")]).unwrap_err();
         assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CERT"), "{e:#}");
         // An empty value is unset, like every path variable.
@@ -1996,7 +2002,10 @@ mod tests {
             ..base
         };
         let w = enforced.security_warnings();
-        assert!(!w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")), "{w:?}");
+        assert!(
+            !w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")),
+            "{w:?}"
+        );
     }
 
     #[test]
