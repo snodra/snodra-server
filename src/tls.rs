@@ -3,8 +3,9 @@
 //! * [`CertStore`] holds the current certificate and key and hands them to every handshake
 //!   (`ResolvesServerCert`), so a reloaded certificate applies to new connections while the
 //!   existing ones keep running on the one they started with.
-//! * [`server_config`] builds the rustls server configuration. Client certificates are P5c:
-//!   [`ClientAuth`] is the hook, with a single variant until then.
+//! * [`server_config`] builds the rustls server configuration. With a client CA (P5c, ADR 0020)
+//!   it verifies client certificates through [`ClientCaStore`] ([`ClientAuth`]: none, optional or
+//!   required) and turns session resumption off, so every handshake meets the current CA bundle.
 //! * [`accept`] turns a stream of accepted TCP connections into completed TLS handshakes, one
 //!   task per connection (a slow or plain-text client never holds up the accept loop), for the
 //!   gRPC server ([`TlsConn`]) and for axum ([`TlsListener`]).
@@ -436,14 +437,26 @@ pub fn server_config(
     let builder = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_safe_default_protocol_versions()
         .expect("ring supports the default protocol versions");
-    let builder = match client_auth {
-        ClientAuth::None => builder.with_no_client_auth(),
-        ClientAuth::Optional(cas) | ClientAuth::Required(cas) => {
-            builder.with_client_cert_verifier(Arc::new(CurrentVerifier(cas)))
-        }
+    let (builder, verifies_clients) = match client_auth {
+        ClientAuth::None => (builder.with_no_client_auth(), false),
+        ClientAuth::Optional(cas) | ClientAuth::Required(cas) => (
+            builder.with_client_cert_verifier(Arc::new(CurrentVerifier(cas))),
+            true,
+        ),
     };
     let mut config = builder.with_cert_resolver(store);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    if verifies_clients {
+        // No session resumption (ADR 0020 review ruling 17). On resumption rustls copies the
+        // cached client certificate chain into `peer_certificates` without calling the verifier,
+        // so a client whose CA a reload dropped would keep authenticating with the old
+        // certificate. Without a session cache and without tickets every handshake is a full one
+        // and goes through the current verifier. Without a client CA there is nothing to bypass,
+        // and the defaults stay.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+        // `ticketer` stays at its default, which produces no stateless tickets.
+    }
     Arc::new(config)
 }
 
@@ -948,9 +961,17 @@ mod tests {
         /// Connects and reads once: with TLS 1.3 a client learns that the server refused its
         /// certificate only when it reads. `Ok` when the connection is usable.
         async fn try_connect(&self, identity: Option<(String, String)>) -> Result<(), String> {
+            self.try_connect_with(&self.connector(identity)).await
+        }
+
+        /// [`Self::try_connect`] with a connector the caller keeps, so that its session cache is
+        /// reused and a second connect offers to resume the first one's session.
+        async fn try_connect_with(
+            &self,
+            connector: &tokio_rustls::TlsConnector,
+        ) -> Result<(), String> {
             let tcp = TcpStream::connect(self.addr).await.unwrap();
-            let mut tls = self
-                .connector(identity)
+            let mut tls = connector
                 .connect(ServerName::try_from("localhost").unwrap(), tcp)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1112,6 +1133,30 @@ mod tests {
             .unwrap();
         mx.accepted().await.expect("accepted");
         assert!(mx.try_connect(Some(old)).await.is_err());
+    }
+
+    /// Review fix I1: rustls copies a resumed session's client certificate chain into
+    /// `peer_certificates` without calling the verifier, so a client that resumes would keep
+    /// authenticating with a certificate of a CA that a reload has dropped.
+    #[tokio::test]
+    async fn a_client_cannot_resume_a_session_after_its_ca_was_dropped() {
+        for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+            let mut mx = mx(mode).await;
+            let connector = mx.connector(Some(mx.identity(&ClientSpec::service("orders"))));
+            mx.try_connect_with(&connector).await.unwrap();
+            mx.accepted().await.expect("accepted");
+
+            let next = Pki::new("next client CA");
+            std::fs::write(mx.ca_file(), &next.ca_pem).unwrap();
+            assert!(mx.store.reload());
+
+            // The same client configuration, with the session cache of the first connect.
+            assert!(
+                mx.try_connect_with(&connector).await.is_err(),
+                "{mode:?}: the dropped CA's certificate must not resume"
+            );
+            assert!(mx.accepted().await.is_none(), "{mode:?}");
+        }
     }
 
     #[tokio::test]
