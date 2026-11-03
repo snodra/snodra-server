@@ -31,6 +31,10 @@ pub struct ClientSpec {
     pub valid_for: Option<Duration>,
     /// `serverAuth` only: a certificate that may not be used by a client.
     pub server_auth_only: bool,
+    /// No extended key usage at all (webpki accepts that: any purpose).
+    pub no_eku: bool,
+    /// `CA:TRUE` on the leaf: a CA certificate used as an end entity.
+    pub ca: bool,
 }
 
 impl ClientSpec {
@@ -46,6 +50,21 @@ impl ClientSpec {
         self.valid_for = Some(d);
         self
     }
+
+    pub fn server_auth_only(mut self) -> Self {
+        self.server_auth_only = true;
+        self
+    }
+
+    pub fn no_eku(mut self) -> Self {
+        self.no_eku = true;
+        self
+    }
+
+    pub fn ca(mut self) -> Self {
+        self.ca = true;
+        self
+    }
 }
 
 impl Pki {
@@ -59,6 +78,27 @@ impl Pki {
             ca_pem: ca.pem(),
             ca_params,
             ca_key,
+        }
+    }
+
+    /// An intermediate CA signed by this one, naming `uris` as URI SANs (a test of which
+    /// certificate of a chain names a service). Its `ca_pem` is its own certificate, so a client
+    /// of this intermediate sends `leaf PEM + ca_pem` as its chain.
+    pub fn intermediate(&self, name: &str, uris: &[&str]) -> Pki {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, name);
+        for uri in uris {
+            params
+                .subject_alt_names
+                .push(SanType::URI((*uri).try_into().unwrap()));
+        }
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        Pki {
+            ca_pem: cert.pem(),
+            ca_params: params,
+            ca_key: key,
         }
     }
 
@@ -94,11 +134,16 @@ impl Pki {
                 .subject_alt_names
                 .push(SanType::DnsName(name.as_str().try_into().unwrap()));
         }
-        params.extended_key_usages = vec![if spec.server_auth_only {
-            ExtendedKeyUsagePurpose::ServerAuth
-        } else {
-            ExtendedKeyUsagePurpose::ClientAuth
-        }];
+        if !spec.no_eku {
+            params.extended_key_usages = vec![if spec.server_auth_only {
+                ExtendedKeyUsagePurpose::ServerAuth
+            } else {
+                ExtendedKeyUsagePurpose::ClientAuth
+            }];
+        }
+        if spec.ca {
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        }
         if let Some(valid_for) = spec.valid_for {
             let now = time::OffsetDateTime::now_utc();
             params.not_before = now - time::Duration::seconds(60);

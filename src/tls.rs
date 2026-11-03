@@ -1117,6 +1117,57 @@ mod tests {
         assert_eq!(mx.failures("client_cert_invalid"), Some(1));
     }
 
+    // What the client verifier makes of the certificate itself (extended key usage, basic
+    // constraints, chains).
+
+    #[tokio::test]
+    async fn a_certificate_that_may_only_authenticate_servers_is_refused() {
+        for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+            let mut mx = mx(mode).await;
+            let id = mx.identity(&ClientSpec::service("orders").server_auth_only());
+            assert!(mx.try_connect(Some(id)).await.is_err(), "{mode:?}");
+            assert!(mx.accepted().await.is_none(), "{mode:?}");
+            assert_eq!(mx.failures("client_cert_invalid"), Some(1), "{mode:?}");
+        }
+    }
+
+    /// webpki treats a leaf without an extended key usage as valid for any purpose (RFC 5280:
+    /// the extension restricts only when present). Pinned here so a rustls change is noticed.
+    #[tokio::test]
+    async fn a_certificate_without_an_extended_key_usage_is_accepted() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let id = mx.identity(&ClientSpec::service("orders").no_eku());
+        mx.try_connect(Some(id)).await.unwrap();
+        assert!(mx.accepted().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_leaf_that_is_itself_a_ca_is_refused() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let id = mx.identity(&ClientSpec::service("orders").ca());
+        assert!(mx.try_connect(Some(id)).await.is_err());
+        assert!(mx.accepted().await.is_none());
+        assert_eq!(mx.failures("client_cert_invalid"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_chain_through_an_intermediate_is_accepted_and_the_leaf_is_what_is_handed_on() {
+        let mut mx = mx(ClientAuthMode::Required).await;
+        let sub = mx.clients.intermediate("sub CA", &[]);
+        let (leaf, key) = sub.client(&ClientSpec::service("orders"));
+        // The client sends the leaf and its intermediate; the client CA file holds the root only.
+        mx.try_connect(Some((format!("{leaf}{}", sub.ca_pem), key.clone())))
+            .await
+            .unwrap();
+        let presented = mx.accepted().await.unwrap().expect("a certificate");
+        let leaf_der = CertificateDer::from_pem_slice(leaf.as_bytes()).unwrap();
+        assert_eq!(presented, leaf_der.as_ref(), "the first one is the leaf");
+
+        // Without the intermediate the server cannot build the chain.
+        assert!(mx.try_connect(Some((leaf, key))).await.is_err());
+        assert_eq!(mx.failures("client_cert_invalid"), Some(1));
+    }
+
     #[tokio::test]
     async fn the_client_ca_reloads_for_new_handshakes() {
         let mut mx = mx(ClientAuthMode::Required).await;

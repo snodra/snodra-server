@@ -408,6 +408,63 @@ async fn a_certificate_that_names_no_service_or_several_is_permission_denied_at_
     }
 }
 
+/// A chain `leaf, intermediate` written as one certificate file, as a client sends it.
+fn chain_identity(hub: &Hub, name: &str, sub: &Pki, spec: &ClientSpec) -> (PathBuf, PathBuf) {
+    let (leaf, key) = sub.client(spec);
+    (
+        hub.dir.write(
+            &format!("{name}-cert.pem"),
+            &format!("{leaf}{}", sub.ca_pem),
+        ),
+        hub.dir.write(&format!("{name}-key.pem"), &key),
+    )
+}
+
+#[tokio::test]
+async fn the_service_is_read_from_the_leaf_of_a_chain_and_never_from_an_intermediate() {
+    let hub = Hub::start(enforce()).await;
+
+    // The leaf names orders, the intermediate names billing: the session is orders.
+    let sub = hub
+        .clients
+        .intermediate("sub CA", &["kraken://service/billing"]);
+    let id = chain_identity(&hub, "orders", &sub, &ClientSpec::service("orders"));
+    let mut c = hub.register(&id, &orders()).await;
+    c.expect_ack().await;
+    assert_eq!(hub.instance("orders").await["authKind"], "certificate");
+    // ... and it cannot register as billing, the name its intermediate carries.
+    let mut as_billing = hub
+        .register(
+            &id,
+            &Spec {
+                service: "billing",
+                commands: vec!["billing.Charge"],
+                ..Spec::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        as_billing.expect_closed().await.code(),
+        tonic::Code::PermissionDenied
+    );
+
+    // A URI SAN on the intermediate alone does not name a service: the leaf names none.
+    let id = chain_identity(&hub, "bare", &sub, &ClientSpec::default());
+    let mut bare = hub
+        .register(
+            &id,
+            &Spec {
+                service: "billing",
+                commands: vec!["billing.Charge"],
+                ..Spec::default()
+            },
+        )
+        .await;
+    let status = bare.expect_closed().await;
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(status.message(), "certificate names no service");
+}
+
 #[tokio::test]
 async fn a_certificate_cannot_register_as_another_service() {
     let hub = Hub::start(enforce()).await;
