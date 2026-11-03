@@ -36,7 +36,10 @@ function instanceRows(service, data) {
       { class: 'mono nowrap', content: [
         i.instanceId,
         i.auth ? [' ', i.authenticatedService
-          ? badge('good', 'authenticated', `The token is granted service ${i.authenticatedService}`)
+          ? badge('good', i.authKind === 'jwt' ? 'authenticated (jwt)' : 'authenticated',
+            i.authKind === 'jwt'
+              ? `The JWT is for service ${i.authenticatedService}; it expires ${new Date(i.expiresAt).toISOString()} unless the client refreshes it`
+              : `The token is granted service ${i.authenticatedService}`)
           : badge('warn', i.auth, 'No valid token at registration: enforce mode would refuse this instance')] : null,
         i.stale ? [' ', badge('warn', 'stale', 'Heartbeat older than a third of the eviction timeout; still routed')] : null,
         merged ? (i.flags || []).map((f) => [' ', badge('crit', f.text, 'The reachable hubs disagree about this instance')]) : null,

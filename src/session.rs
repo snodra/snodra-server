@@ -199,6 +199,8 @@ pub struct SessionDetail {
     pub status: Option<StatusDetail>,
     /// How the session authenticated (ADR 0018).
     pub auth: AuthStatus,
+    /// Who its credentials speak for: the kind and, for a JWT, the expiry the topology shows.
+    pub principal: Option<Arc<Principal>>,
 }
 
 /// What the ACL check of a reload needs to know about a session.
@@ -507,6 +509,7 @@ impl Sessions {
                 last_heartbeat: s.last_heartbeat,
                 status: s.status.clone(),
                 auth: s.meta.auth.clone(),
+                principal: s.meta.principal.clone(),
             })
             .collect()
     }
@@ -530,6 +533,28 @@ impl Sessions {
             return false;
         };
         session.status = Some(StatusDetail::from_report(report, now));
+        true
+    }
+
+    /// Replaces the credentials of the session `token` after a refresh: who it speaks for and
+    /// how it authenticated. Ignored (`false`) unless that session is still the current one.
+    pub fn set_credentials(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        token: u64,
+        principal: Option<Arc<Principal>>,
+        auth: AuthStatus,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(session) = inner
+            .get_mut(instance_id)
+            .filter(|s| s.context == *ctx && s.token == token)
+        else {
+            return false;
+        };
+        session.meta.principal = principal;
+        session.meta.auth = auth;
         true
     }
 
@@ -656,6 +681,49 @@ mod tests {
         assert_eq!(sessions.token_of(&D, "a"), Some(newer));
         let newest = sessions.allocate_token();
         assert_eq!(insert(newest), Ok(Some(newer)), "a newer one replaces");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_replaces_the_principal_and_the_auth_status_of_the_current_session() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut meta = v1();
+        meta.principal = Some(Arc::new(Principal::token([1; 32], "svc")));
+        meta.auth = AuthStatus::Authenticated {
+            service: "svc".into(),
+        };
+        let token = sessions.insert(&D, "a", "svc", meta, tx, CancellationToken::new());
+        let jwt = Arc::new(Principal {
+            service: "svc".into(),
+            key: crate::auth::AclKey::Service("svc".into()),
+            expires_at: Some(std::time::SystemTime::UNIX_EPOCH),
+        });
+        let status = AuthStatus::Authenticated {
+            service: "svc".into(),
+        };
+        // A stale token (an older stream of the instance) changes nothing.
+        assert!(!sessions.set_credentials(&D, "a", token + 1, Some(jwt.clone()), status.clone()));
+        assert_eq!(
+            sessions.auth_views()[0]
+                .principal
+                .as_deref()
+                .map(Principal::label),
+            Some(Principal::token([1; 32], "svc").label())
+        );
+        assert!(sessions.set_credentials(&D, "a", token, Some(jwt.clone()), status.clone()));
+        let view = &sessions.auth_views()[0];
+        assert_eq!(view.principal.as_deref(), Some(&*jwt));
+        let detail = &sessions.details()[0];
+        assert_eq!(
+            detail.principal.as_deref(),
+            Some(&*jwt),
+            "the topology reads it too"
+        );
+        assert_eq!(
+            sessions.sender_info(&D, "a").unwrap().principal.as_deref(),
+            Some(&*jwt)
+        );
+        assert!(!sessions.set_credentials(&D, "gone", token, None, status));
     }
 
     #[tokio::test]

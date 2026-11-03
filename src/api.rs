@@ -959,6 +959,8 @@ mod tests {
             shared_query_types: vec![],
             auth: None,
             authenticated_service: None,
+            auth_kind: None,
+            expires_at: None,
         }
     }
 

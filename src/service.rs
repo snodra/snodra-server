@@ -23,7 +23,9 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthMode, Authorizer, Denied, Disposition, Principal};
+use crate::auth::{
+    AuthMode, Authorizer, Denied, Disposition, Expiry, Principal, Refresh, RefreshGate,
+};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::proto::hub_server::Hub;
@@ -206,6 +208,8 @@ impl Hub for HubService {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(crate::auth::bearer);
+        // A service's JWT reads it like an ACL token; its rotated key is fetched first.
+        self.auth.prepare_bearer(presented).await;
         self.auth
             .check_topology(presented, self.config.dashboard_token.as_ref())?;
         debug!("topology requested");
@@ -329,6 +333,22 @@ impl StreamCtx {
     }
 }
 
+/// Points `timer` at the expiry of `principal` (`exp` plus the grace); false, and nothing to
+/// wait for, when it never expires.
+fn arm_expiry(
+    auth: &Authorizer,
+    principal: Option<&Principal>,
+    timer: Pin<&mut tokio::time::Sleep>,
+) -> bool {
+    match auth.expiry_deadline(principal) {
+        Some(deadline) => {
+            timer.reset(deadline);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Closes a handshake that failed access control: the status goes to the client and the stream
 /// ends. No session exists yet. The authorizer has already logged and counted the refusal (once
 /// per `Register`, rate-limited), so nothing is logged here.
@@ -394,7 +414,9 @@ async fn run_stream(
     // Access control (ADR 0018): the credentials and the claimed service and types are judged
     // before any session state exists. Like the version, the credentials are read from the
     // first Register only; a later one cannot change who the session is.
-    let handled = handled_types(&first);
+    let mut handled = handled_types(&first);
+    // A rotated signing key is fetched before the credentials are judged (ADR 0019).
+    ctx.auth.prepare(first.credentials.as_ref()).await;
     let admission = ctx
         .auth
         .admit(first.credentials.as_ref(), v2, &service, &handled);
@@ -402,7 +424,7 @@ async fn run_stream(
         refuse(&tx, denied).await;
         return;
     }
-    let principal = admission.principal;
+    let mut principal = admission.principal;
     let ack = v2.then(|| {
         protocol::register_ack(
             &ctx.config,
@@ -534,10 +556,31 @@ async fn run_stream(
     let out = tx.downgrade();
     drop(tx);
 
+    // A JWT session is judged expired at `exp` plus the grace unless a refresh moved it (ADR
+    // 0019). One timer per stream, re-armed by a refresh: no sweeper, and a token session or a
+    // hub in `off` never arms it.
+    let expiry = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(expiry);
+    let mut expiry_armed = arm_expiry(&ctx.auth, principal.as_deref(), expiry.as_mut());
+    let mut refresh_gate = RefreshGate::default();
+
     loop {
         let msg = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut expiry, if expiry_armed => {
+                // Asked once: permissive counts and keeps the session, enforce closes it.
+                expiry_armed = false;
+                if let Some(p) = principal.as_deref()
+                    && let Expiry::Close(denied) = ctx.auth.expired(p, &service)
+                {
+                    if let Some(tx) = out.upgrade() {
+                        let _ = tx.try_send(Err(denied.to_status()));
+                    }
+                    break;
+                }
+                continue;
+            }
             msg = inbound.next() => msg,
         };
         let msg = match msg {
@@ -592,6 +635,7 @@ async fn run_stream(
                             }
                             break;
                         }
+                        handled = handled_types(&reg);
                         // No types left: a graceful stop. Its queue goes to other instances.
                         if reg.command_types.is_empty()
                             && reg.query_types.is_empty()
@@ -693,7 +737,53 @@ async fn run_stream(
                     _ => unreachable!("matched above"),
                 }
             }
-            Some(client_message::Message::Credentials(_)) => {}
+            Some(client_message::Message::Credentials(new)) => {
+                // `off` checks nothing, so there is nothing to refresh.
+                if ctx.auth.mode() == AuthMode::Off {
+                    debug!(instance = %instance_id, "credentials refresh ignored: access control is off");
+                    continue;
+                }
+                // One refresh per second is looked at: verifying a signature is work a client
+                // must not be able to ask for in a loop.
+                if !refresh_gate.allow(Instant::now()) {
+                    ctx.auth.refresh_throttled();
+                    debug!(instance = %instance_id, "credentials refresh throttled");
+                    continue;
+                }
+                ctx.auth.prepare(Some(&new)).await;
+                match ctx.auth.refresh(Some(&new), &service, &handled) {
+                    Refresh::Accepted {
+                        principal: fresh,
+                        status,
+                    } => {
+                        principal = Some(fresh);
+                        ctx.sessions.set_credentials(
+                            &ctx.context,
+                            &instance_id,
+                            token,
+                            principal.clone(),
+                            status,
+                        );
+                        expiry_armed = arm_expiry(&ctx.auth, principal.as_deref(), expiry.as_mut());
+                        // A reload that ran while the refresh was judged saw the old principal.
+                        if let Some(status) =
+                            ctx.judge_again(principal.as_deref(), &service, &handled)
+                        {
+                            if let Some(tx) = out.upgrade() {
+                                let _ = tx.try_send(Err(status));
+                            }
+                            break;
+                        }
+                    }
+                    Refresh::Kept => {}
+                    Refresh::Close(denied) => {
+                        if let Some(tx) = out.upgrade() {
+                            let _ = tx.try_send(Err(denied.to_status()));
+                        }
+                        break;
+                    }
+                }
+            }
             None => {}
         }
     }

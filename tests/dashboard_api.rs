@@ -293,7 +293,8 @@ async fn types_topology_settings_and_version_have_their_shape() {
             "instance-status",
             "scatter-gather",
             "streaming",
-            "subscription"
+            "subscription",
+            "credentials-refresh"
         ])
     );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));

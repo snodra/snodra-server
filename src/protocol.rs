@@ -57,6 +57,10 @@ pub const STREAMING: &str = "streaming";
 /// updates as parts, ends them with `ReplyEnd`, and honours `Cancel`.
 pub const SUBSCRIPTION: &str = "subscription";
 
+/// Capability of credential refresh (ADR 0019): the client may send `ClientMessage.credentials`
+/// to replace its session's credential before it expires.
+pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
+
 /// Optional protocol features this hub supports. A later phase adds `processors`.
 pub const HUB_CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
@@ -64,6 +68,7 @@ pub const HUB_CAPABILITIES: &[&str] = &[
     SCATTER_GATHER,
     STREAMING,
     SUBSCRIPTION,
+    CREDENTIALS_REFRESH,
 ];
 
 /// True when the client declared `capability` and this hub supports it.
@@ -206,6 +211,32 @@ mod tests {
     }
 
     #[test]
+    fn credentials_refresh_is_offered_to_a_client_that_declares_it() {
+        assert!(HUB_CAPABILITIES.contains(&CREDENTIALS_REFRESH));
+        assert_eq!(CREDENTIALS_REFRESH, "credentials-refresh");
+        let declares = [
+            "credentials-refresh".to_string(),
+            "flow-control".to_string(),
+        ];
+        assert_eq!(
+            shared_capabilities(&declares),
+            ["flow-control", "credentials-refresh"]
+        );
+        assert!(shares(&declares, CREDENTIALS_REFRESH));
+        assert!(
+            shared_capabilities(&["flow-control".to_string()])
+                .iter()
+                .all(|c| c != CREDENTIALS_REFRESH)
+        );
+        // It reaches the ack of a Register that declared it.
+        let ack = register_ack(&Config::default(), &ContextId::default(), 2, &declares);
+        let Some(server_message::Message::RegisterAck(ack)) = ack.message else {
+            panic!("an ack")
+        };
+        assert!(ack.capabilities.iter().any(|c| c == "credentials-refresh"));
+    }
+
+    #[test]
     fn only_declared_capabilities_the_hub_knows_are_shared() {
         let client = ["made-up".to_string(), "flow-control".to_string()];
         assert_eq!(shared_capabilities(&client), ["flow-control"]);
@@ -237,11 +268,17 @@ mod tests {
             let message = ClientMessage {
                 message: Some(client_message::Message::Register(register.clone())),
             };
+            // A refresh carries the credential too (ADR 0019).
+            let refresh = ClientMessage {
+                message: Some(client_message::Message::Credentials(credentials.clone())),
+            };
             for text in [
                 format!("{credentials:?}"),
                 format!("{register:?}"),
                 format!("{message:?}"),
                 format!("{register:#?}"),
+                format!("{refresh:?}"),
+                format!("{refresh:#?}"),
             ] {
                 assert!(!text.contains(secret), "{text}");
                 assert!(text.contains("***"), "{text}");

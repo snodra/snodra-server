@@ -113,6 +113,14 @@ pub struct InstanceTopology {
     /// The service the instance's token is granted in the ACL, when it authenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated_service: Option<String>,
+    /// How the credentials were presented (ADR 0019): `token`, `jwt` or `none`. Absent when
+    /// access control is off; JSON only, like `auth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<String>,
+    /// When a JWT session's token expires (`exp`), milliseconds since the epoch; absent for a
+    /// token or no credentials. Never any token material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 fn never_reported() -> i64 {
@@ -232,6 +240,18 @@ pub fn snapshot(
                 shared_query_types: shared_queries,
                 auth: d.auth.label().map(str::to_string),
                 authenticated_service: d.auth.service().map(str::to_string),
+                auth_kind: d.auth.label().map(|_| {
+                    d.principal
+                        .as_deref()
+                        .map_or("none", |p| p.kind().as_str())
+                        .to_string()
+                }),
+                expires_at: d
+                    .principal
+                    .as_deref()
+                    .and_then(|p| p.expires_at)
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                 instance_id: d.instance_id,
             });
     }
@@ -396,6 +416,8 @@ impl Topology {
                             shared_query_types: i.shared_query_types.clone(),
                             auth: None,
                             authenticated_service: None,
+                            auth_kind: None,
+                            expires_at: None,
                         })
                         .collect(),
                 })

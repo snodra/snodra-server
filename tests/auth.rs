@@ -137,7 +137,7 @@ async fn enforce_refuses_missing_credentials_with_unauthenticated() {
 }
 
 #[tokio::test]
-async fn enforce_says_jwt_credentials_are_not_supported_yet() {
+async fn enforce_says_jwt_credentials_are_not_configured_without_an_issuer() {
     let h = hub(AuthMode::Enforce).await;
     let s = Spec {
         jwt: Some("a.b.c"),
@@ -148,7 +148,7 @@ async fn enforce_says_jwt_credentials_are_not_supported_yet() {
     assert_eq!(status.code(), Code::Unauthenticated);
     assert_eq!(
         status.message(),
-        "jwt credentials are not supported by this hub yet"
+        "jwt credentials are not configured on this hub"
     );
 }
 

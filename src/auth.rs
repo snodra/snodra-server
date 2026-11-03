@@ -710,6 +710,16 @@ pub enum Disposition {
     Kept,
 }
 
+/// Three non-empty dot-separated segments: worth verifying as a JWT. Anything else is a static
+/// token, which is not counted as a malformed JWT.
+fn looks_like_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None) if !a.is_empty() && !b.is_empty() && !c.is_empty()
+    )
+}
+
 /// The token of an `Authorization: Bearer <token>` value (the scheme is case-insensitive).
 pub fn bearer(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
@@ -842,6 +852,16 @@ impl Authorizer {
         self.mode
     }
 
+    /// [`Authorizer::prepare`] for a bearer token that may be a JWT (the gRPC `Topology` call).
+    pub async fn prepare_bearer(&self, presented: Option<&str>) {
+        if let (Some(jwt), Some(token)) = (&self.jwt, presented)
+            && self.mode != AuthMode::Off
+            && looks_like_jwt(token)
+        {
+            jwt.ensure_key(token).await;
+        }
+    }
+
     /// Makes the key cache ready for the JWT in `credentials` (a rotated key is fetched), so the
     /// synchronous [`Authorizer::admit`] and [`Authorizer::check_topology`] can judge it. Call it
     /// first for credentials that came from a client; it does nothing for a token.
@@ -852,6 +872,11 @@ impl Authorizer {
         {
             jwt.ensure_key(token).await;
         }
+    }
+
+    /// A refresh was ignored because it came less than a second after the last one looked at.
+    pub fn refresh_throttled(&self) {
+        self.metrics.credentials_refresh("throttled");
     }
 
     /// Starts the background fetch of the JWKS, when JWT credentials are configured.
@@ -1222,6 +1247,17 @@ impl Authorizer {
         (remaining <= MAX_EXPIRY_WAIT).then(|| tokio::time::Instant::now() + remaining)
     }
 
+    /// True when `token` is a valid JWT of a service that has a `[[service]]` table: a service
+    /// may read the topology, like any ACL token (ADR 0019). A user's access token (`azp` is a
+    /// frontend client) has no table, so it never does.
+    fn jwt_has_entry(&self, token: &str) -> bool {
+        let Some(jwt) = &self.jwt else { return false };
+        looks_like_jwt(token)
+            && jwt
+                .verify(token)
+                .is_ok_and(|v| self.acl().rights(&AclKey::Service(v.azp)).is_some())
+    }
+
     /// Judges a gRPC `Topology` call carrying `presented` (the bearer token, if any) against the
     /// dashboard token `dashboard` (if one is set) and the ACL. The topology lists every service,
     /// type and instance id, so:
@@ -1249,7 +1285,7 @@ impl Authorizer {
         // Looked up even when the dashboard token matched, so the time does not tell which
         // of the two the caller presented.
         let acl_ok = presented.is_some_and(|t| self.acl().lookup(&digest_of(t)).is_some());
-        if dashboard_ok || acl_ok {
+        if dashboard_ok || acl_ok || presented.is_some_and(|t| self.jwt_has_entry(t)) {
             return Ok(());
         }
         if self.mode == AuthMode::Enforce || dashboard.is_some() {
