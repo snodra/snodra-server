@@ -713,3 +713,49 @@ async fn the_topology_rpc_without_a_certificate_still_needs_a_token_on_an_option
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn a_client_ca_without_the_server_pair_stops_the_hub_instead_of_serving_plain_text() {
+    // `Config::from_env` refuses this; a Config built in code must not slip through.
+    let dir = TempDir::new();
+    let ca = dir.write("client-ca.pem", &Pki::new("client CA").ca_pem);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = kraken_hub::serve_with_shutdown(
+        Config {
+            otlp_endpoint: None,
+            tls_client_ca: Some(ca),
+            ..Config::default()
+        },
+        listener,
+        None,
+        std::future::pending(),
+    )
+    .await;
+    let e = result.expect_err("the hub must not start");
+    assert!(
+        format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"),
+        "{e:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_ca_that_does_not_load_stops_the_hub_at_startup() {
+    let dir = TempDir::new();
+    let (_, cert, key) = Pki::new("hub CA").write(&dir, "hub");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = kraken_hub::serve_with_shutdown(
+        Config {
+            otlp_endpoint: None,
+            tls_cert: Some(cert),
+            tls_key: Some(key),
+            tls_client_ca: Some(dir.path("missing.pem")),
+            ..Config::default()
+        },
+        listener,
+        None,
+        std::future::pending(),
+    )
+    .await;
+    let e = result.expect_err("the hub must not start");
+    assert!(format!("{e:#}").contains("missing.pem"), "{e:#}");
+}

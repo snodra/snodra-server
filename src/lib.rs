@@ -148,6 +148,9 @@ pub async fn serve_with_shutdown(
             ));
             tls::ClientAuth::from_store(cas)
         }
+        (None, Some(_), _) => anyhow::bail!(
+            "KRAKEN_HUB_TLS_CLIENT_CA needs KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY"
+        ),
         _ => tls::ClientAuth::None,
     };
     // One watcher per distinct store (the HTTP port shares the gRPC store by default).
