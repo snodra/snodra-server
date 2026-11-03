@@ -17,8 +17,9 @@
 //! produces a [`Principal`]: who the credential speaks for and the ACL entry it resolves through
 //! (a token's digest, or a service name for a JWT, ADR 0019). A session keeps its principal
 //! ([`crate::session::SessionMeta::principal`]) and every later check looks the entry up again,
-//! so a reload takes effect on live sessions. P5c adds a client certificate; it plugs into
-//! [`Authorizer::admit`] in the place of the token lookup.
+//! so a reload takes effect on live sessions. A client certificate (P5c, ADR 0020) is the third
+//! kind: the handshake proves it, [`crate::mtls::identify`] reads the service from it, and
+//! [`Authorizer::admit`] resolves that service through its `[[service]]` table.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
