@@ -126,3 +126,40 @@ async fn the_topology_mode_sends_the_dashboard_token_from_its_environment() {
     let out = run(Some("wrong-wrong-wrong-wrong")).await;
     assert!(!out.status.success());
 }
+
+/// Review fix: a client certificate given for a plain-text target used to be dropped without a
+/// word, so a probe the operator believed authenticated ran unauthenticated.
+#[tokio::test]
+async fn a_client_certificate_for_a_plain_text_target_is_refused() {
+    use kraken_hub::client::{ClientIdentity, Target};
+
+    let addr = start_hub(Config {
+        otlp_endpoint: None,
+        ..Config::default()
+    })
+    .await;
+    let identity = ClientIdentity::new("/nowhere/c.pem".into(), "/nowhere/k.pem".into());
+    let target = Target::plain(addr).with_identity(Some(identity));
+    let e = kraken_hub::health_probe_target(&target).await.unwrap_err();
+    assert!(format!("{e:#}").contains("needs TLS"), "{e:#}");
+
+    // The same through the binary: a failed probe that says why, not a SERVING.
+    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    for mode in ["--health-check", "--topology"] {
+        let out = tokio::process::Command::new(bin)
+            .args([mode, "--address", &format!("http://{addr}")])
+            .args(["--tls-client-cert", "/nowhere/c.pem"])
+            .args(["--tls-client-key", "/nowhere/k.pem"])
+            .env_clear()
+            .output()
+            .await
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{mode}: {text}");
+        assert!(text.contains("needs TLS"), "{mode}: {text}");
+    }
+}

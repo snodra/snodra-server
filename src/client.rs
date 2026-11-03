@@ -90,7 +90,8 @@ pub struct Target {
     pub address: String,
     /// `None`: plain text.
     pub tls: Option<Trust>,
-    /// The client certificate to present; `None`: none (needs `tls`).
+    /// The client certificate to present; `None`: none. Needs `tls`: connecting to a plain-text
+    /// target with one is an error, not a silently dropped credential.
     pub identity: Option<ClientIdentity>,
 }
 
@@ -155,6 +156,16 @@ impl Target {
     /// Connects (the caller bounds the time).
     pub async fn connect(&self) -> anyhow::Result<Channel> {
         let Some(trust) = &self.tls else {
+            // A client certificate for a plain-text target is a mistake the operator must hear
+            // about: the probe would otherwise run unauthenticated and look as if it did not.
+            if self.identity.is_some() {
+                anyhow::bail!(
+                    "a client certificate needs TLS, but {} is plain text \
+                     (use an https:// address or --tls-ca, or drop --tls-client-cert and \
+                     --tls-client-key)",
+                    self.address
+                );
+            }
             return Ok(Endpoint::from_shared(format!("http://{}", self.address))?
                 .connect()
                 .await?);
