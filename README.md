@@ -94,6 +94,13 @@ cargo run
 
 | `KRAKEN_HUB_AUTH_MODE` | `off` | `off`, `permissive` (evaluate every rule, log and count violations, allow everything) or `enforce` (refuse them); anything but `off` needs `KRAKEN_HUB_ACL_FILE`. See [Security](#security) |
 | `KRAKEN_HUB_ACL_FILE` | none | TOML ACL: SHA-256 of each static token to its service, `handle` and `send` patterns; reloaded when it changes |
+| `KRAKEN_HUB_JWT_ISSUER` | none | the `iss` a JWT credential must carry, exact match; unset: JWT credentials are off and refused as "not configured". Needs an auth mode other than `off`. See [Security](#security) |
+| `KRAKEN_HUB_JWT_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | where the signing keys are fetched from (Keycloak's path, no OIDC discovery); separate from the issuer so a hub can fetch internally and validate the public issuer. `http://` warns once unless loopback or a single-label name. Without an issuer it is a startup error |
+| `KRAKEN_HUB_JWT_AUDIENCE` | none | when set, a JWT's `aud` (string or array) must contain it |
+| `KRAKEN_HUB_JWT_LEEWAY` | `30s` | clock skew tolerated on `exp`, `nbf` and `iat` |
+| `KRAKEN_HUB_JWT_EXPIRY_GRACE` | `30s` | how long after `exp` a JWT session stays open without a refresh |
+| `KRAKEN_HUB_JWKS_REFRESH` | `5m` | how often the signing keys are fetched again (an unknown `kid` fetches at most once per 30 s on top); positive |
+| `KRAKEN_HUB_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots |
 | `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
 | `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
 | `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
@@ -379,7 +386,8 @@ picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Security
 
-Roadmap P5a, decision record: umbrella `docs/adr/0018-hub-access-control.md`; operator how-to:
+Roadmap P5a and P5b, decision records: umbrella `docs/adr/0018-hub-access-control.md` and
+`docs/adr/0019-hub-jwt-authentication.md`; operator how-to:
 umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) behaves as before.
 
 **Service tokens and the ACL.** With `KRAKEN_HUB_AUTH_MODE=enforce` a service must send a static
@@ -401,7 +409,11 @@ accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it 
 | Violation | `enforce` | `permissive` |
 |---|---|---|
 | no credentials (a v1 client sends none), unknown token | stream closed with `UNAUTHENTICATED` | logged, counted, allowed |
-| `jwt` credentials | `UNAUTHENTICATED` "jwt credentials are not supported by this hub yet" (P5b) | same |
+| `jwt` credentials with no `KRAKEN_HUB_JWT_ISSUER` | `UNAUTHENTICATED` "jwt credentials are not configured on this hub" | same |
+| an invalid JWT (expired, wrong issuer or audience, bad signature, `none`/`HS*`, an ID or refresh token) | `UNAUTHENTICATED` with a short reason, never the token | logged, counted (`jwt_invalid`), allowed as unauthenticated |
+| a JWT for another service (`azp` differs), or for a service with no `[[service]]` table | `PERMISSION_DENIED` "token azp `<a>` is not service `<b>`" / "no ACL entry for service `<a>`" | logged, counted, allowed |
+| a JWT before the first fetch of the signing keys | `UNAVAILABLE` "jwks not loaded yet" (clients retry) | the same, counted (`jwks_unavailable`) |
+| a JWT session past `exp` + `KRAKEN_HUB_JWT_EXPIRY_GRACE` without a refresh | stream closed with `UNAUTHENTICATED` "credentials expired" | counted once (`expired`), logged once, session kept |
 | a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription) | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
@@ -420,6 +432,36 @@ Refusals are logged once per refused `Register` (the status sent back lists up t
 then "and N more"), a client-chosen service name or type is cut to 128 characters in logs and
 messages, and each reason logs at most 10 lines per 10 s, then one notice and, when the next window
 opens, how many lines were dropped. The metric counts every refusal regardless.
+
+**JWT credentials (P5b).** Decision record: umbrella `docs/adr/0019-hub-jwt-authentication.md`. A
+service may register with a Keycloak client-credentials access token in
+`Register.credentials.jwt` instead of a static token. Set `KRAKEN_HUB_JWT_ISSUER` (and an auth
+mode other than `off`); the keys are fetched from `KRAKEN_HUB_JWT_JWKS_URI` in the background, at
+startup, every `KRAKEN_HUB_JWKS_REFRESH` and, throttled to once per 30 s, when a token names an
+unknown `kid` (a rotation needs no restart; a failed fetch keeps the last good keys; startup never
+waits for Keycloak). Algorithms `RS256/384/512`, `PS256/384/512`, `ES256/384`; `none` and `HS*` are
+refused. Checked: signature, `iss` (exact), `exp`, `nbf`, `iat` (with `KRAKEN_HUB_JWT_LEEWAY`), `aud`
+when `KRAKEN_HUB_JWT_AUDIENCE` is set, `typ` when present (must be `Bearer`), and `azp` (required;
+it must equal `Register.service_name`). The rights come from a **`[[service]]` table** named after
+the service, never from a `[[token]]` entry (and `[[service]]` tables never apply to static tokens):
+
+```toml
+[[service]]
+name   = "billing-service"   # the token's azp, unique among [[service]]
+handle = ["billing.*"]       # the same patterns, `control` and `contexts` as [[token]]
+send   = ["orders.*"]
+```
+
+A JWT session expires at `exp` plus the grace unless the client sends `ClientMessage.credentials`
+with a fresh credential for the same service (a token session may move to a JWT and back; handled
+types are judged again against the new entry; one refresh per second per session is looked at, the
+rest are counted as `throttled`; no reply on success; `off` ignores it). A reload that removes the
+service's table closes its session in `enforce`. The topology and the dashboard show each
+instance's `authKind` (`token`, `jwt`, `none`) and a JWT's `expiresAt`. In Keycloak, give each
+service a confidential client with service accounts only and client id = service name, add an
+audience mapper and set `KRAKEN_HUB_JWT_AUDIENCE`; a user's access token (`azp` = the gateway
+client) must never get a `[[service]]` table. A token is never logged. The gRPC `Topology` call
+in `enforce` also accepts a valid JWT of a service that has a table.
 
 **TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
 TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
@@ -507,11 +549,13 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
 - The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`, `scatter-gather`, `streaming`, `subscription`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
-- `credentials` (static token or JWT) is accepted and ignored until hub access control ships; it
-  is never logged.
+- `credentials` (static token or JWT) is checked in `permissive` and `enforce` and ignored in
+  `off`; it is never logged. A client that declared `credentials-refresh` may send
+  `ClientMessage.credentials` to replace its session's credential before a JWT expires
+  ([Security](#security)).
 - `ErrorCode.UNSUPPORTED` (10) answers a request mode the session did not declare or the hub
   does not implement yet (v2 sessions only; a v1 session gets `INVALID_REQUEST`). `CANCELLED` (9)
   ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION` (or a subscription that outlived
@@ -776,7 +820,9 @@ without any client change; v1 clients always send a timeout, so for them an over
 - Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
   [Dashboard](#dashboard)); Grafana for history.
 - Metrics (OTLP): `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
-  `kraken_hub_acl_reload_errors_total`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
+  `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
+  `kraken_hub_jwks_fetches_total{result}`, `kraken_hub_jwks_keys`,
+  `kraken_hub_credentials_refreshes_total{result}`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
   `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
   `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
   `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
@@ -844,7 +890,8 @@ src/service.rs    Hub.Connect stream handling
 src/telemetry.rs  tracing subscriber, OTLP export, metrics
 src/topology.rs   topology snapshot (gRPC, HTTP and CLI share it)
 src/cli.rs        --health-check, --topology and `acl hash` modes
-src/auth.rs       auth modes, ACL parsing and lookup, Register and request checks, constant-time compare
+src/auth.rs       auth modes, ACL parsing and lookup, Principal, Register, refresh, expiry and request checks, constant-time compare
+src/jwt.rs        JWT validation and the JWKS cache and fetch (the tests' key and server helpers are src/jwt_test_support.rs)
 src/reload.rs     mtime polling and SIGHUP for the ACL and the TLS pairs
 src/tls.rs        rustls listeners, reloadable certificate, the mTLS hook (P5c)
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
@@ -853,7 +900,7 @@ src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, tls.rs, dashboard_auth.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
