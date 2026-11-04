@@ -8464,7 +8464,7 @@ mod auth_tests {
                 "{mode:?}"
             );
         }
-        // Off judges nothing, as before.
+        // Off judges nothing: the request is routed.
         let mut f = fixture(AuthMode::Off);
         f.router.route(
             &D,

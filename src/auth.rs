@@ -2060,7 +2060,7 @@ contexts = ["default"]
         );
         assert!(!message.contains("x.T10"), "{message}");
         assert!(message.ends_with("and 15 more"), "{message}");
-        // One forbidden type reads as before.
+        // One forbidden type is named alone, without a count of more.
         let one = a.recheck(
             Some(&tok("tok-billing", "billing")),
             "billing",
