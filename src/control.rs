@@ -366,8 +366,15 @@ impl Answer {
             (Self::Letters(_), A::DeadLetterList(_)) => true,
             (Self::Retry(_), A::DeadLetterRetry(_)) => true,
             (Self::RetryAll(_), A::DeadLetterRetryAll(_)) => true,
-            (Self::Ok(_) | Self::Reset(_) | Self::Letters(_) | Self::Retry(_), _) => false,
-            (Self::RetryAll(_), _) => false,
+            (
+                Self::Ok(_)
+                | Self::Reset(_)
+                | Self::Letters(_)
+                | Self::Retry(_)
+                | Self::RetryAll(_),
+                _,
+            ) => false,
+            // A refusal, and what the hub concluded itself, answer any request.
             _ => true,
         };
         if fits { self } else { Self::Unexpected }
