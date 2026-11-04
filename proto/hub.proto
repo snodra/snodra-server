@@ -299,7 +299,9 @@ message ProcessorResume {}
 
 // Stop consuming (leave the consumer group) and hold the operation lock until lease_ms from now.
 // Re-sent with the same operation_id to renew the lease. Answered with ok once the instance has
-// left the group; LOCKED when another operation holds the lock.
+// left the group; LOCKED when another operation holds the lock; NOT_PREPARED for an operation
+// that already ended on the instance, or a renewal whose lock is gone (a late renewal never takes
+// the lock again).
 message ResetPrepare {
   string operation_id = 1;
   int64 lease_ms = 2;
@@ -368,7 +370,9 @@ message ControlReply {
   oneof result {
     // pause, resume, reset_prepare, reset_finish, dead_letter_discard (the letter existed).
     ControlOk ok = 10;
-    // The instance would not or could not act; nothing changed.
+    // The instance would not or could not act. Nothing changed unless the message says what did:
+    // a reset_execute refused after its reset handlers ran ends with "reset handlers ran (n), m
+    // markers deleted, offsets not moved: retry the reset".
     ControlRefused refused = 11;
     // reset_execute succeeded.
     ResetOutcome reset = 12;
@@ -399,16 +403,19 @@ enum ControlRefusal {
   CONTROL_REFUSAL_UNKNOWN_PROCESSOR = 1;
   // Another operation holds the processor's lock (the message names it).
   CONTROL_REFUSAL_LOCKED = 2;
-  // reset_execute or reset_finish for an operation this instance does not hold.
+  // reset_execute or reset_finish for an operation this instance does not hold; reset_prepare
+  // for an operation that ended on it, or a renewal whose lock is gone.
   CONTROL_REFUSAL_NOT_PREPARED = 3;
   // Kafka refused: the consumer group still has members (the message lists their client ids).
   CONTROL_REFUSAL_GROUP_NOT_EMPTY = 4;
-  // A @ResetHandler threw; nothing changed.
+  // A reset handler threw (or panicked); the message says how many ran (their effects stay) and
+  // that no marker or offset changed.
   CONTROL_REFUSAL_RESET_HANDLER_FAILED = 5;
   // A bad target, a bad letter id, a dead-letter mode other than "collection", a limit out of
   // range.
   CONTROL_REFUSAL_INVALID = 6;
-  // Anything else (a MongoDB or Kafka error); the message says what.
+  // Anything else (a MongoDB or Kafka error, or "lease lost: ..." when the executor's lease was
+  // lost mid-execute); the message says what.
   CONTROL_REFUSAL_FAILED = 7;
   // A retry or discard of a letter that does not exist.
   CONTROL_REFUSAL_NOT_FOUND = 8;
