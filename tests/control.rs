@@ -559,6 +559,42 @@ async fn the_lease_is_renewed_while_the_reset_runs_and_never_after_the_finish() 
     }
 }
 
+/// An execute that times out may still run on the executor, or may already have run reset
+/// handlers and deleted markers: the 504 says so rather than "nothing changed".
+#[tokio::test]
+async fn an_execute_timeout_says_the_executor_may_still_finish_or_have_changed_things() {
+    let (grpc, http) = hub(Config {
+        reset_timeout: Duration::from_millis(400),
+        ..config()
+    })
+    .await;
+    let b1 = ControlClient::p6b(
+        grpc,
+        "svc",
+        "b-1",
+        &["audit"],
+        answering(|req| is(req, "execute").then_some(Reaction::Silent)),
+    )
+    .await;
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 504, "{}", r.body);
+    let body = json_of(&r);
+    assert_eq!(body["outcome"], "failed");
+    assert_eq!(body["error"]["stage"], "execute");
+    assert_eq!(body["error"]["result"], "timeout");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("may still finish")
+            && message.contains("reset handlers")
+            && message.contains("markers"),
+        "{message}"
+    );
+    assert_eq!(
+        actions(&b1.seen()),
+        ["prepare", "execute", "finish-aborted"]
+    );
+}
+
 /// A renewal sent just before the execute's reply is answered before any finish is sent: a
 /// renewal that reached an instance after its finish would find the lock free.
 #[tokio::test]

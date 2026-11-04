@@ -1161,10 +1161,18 @@ impl Control {
             failed => {
                 report.outcome = "failed";
                 report.verdict = failed.verdict();
+                let mut answer = failed.view();
+                if matches!(failed, Answer::Timeout | Answer::Left) {
+                    // Unlike a refusal, no answer does not mean nothing changed.
+                    answer.message = format!(
+                        "{}: the executor may still finish the reset, or may already have run reset handlers or deleted markers; check the processor before resetting again",
+                        answer.message
+                    );
+                }
                 report.error = Some(StageError {
                     stage: "execute",
                     instance_id: Some(executor.instance_id.clone()),
-                    answer: failed.view(),
+                    answer,
                 });
                 warn!(service = %clip(service), processor = %clip(processor), operation_id = %operation_id, "reset failed: the execute did not succeed");
             }
