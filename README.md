@@ -466,7 +466,10 @@ waits for. The state lives in each service's MongoDB (`processor_control`), not 
   `controls are disabled`. The dashboard token never writes; the write token also reads.
 - **Status codes:** 400 bad body, 401 no or an unknown credential, 403 no right or disabled, 404 unknown service or
   processor, 409 locked, refused or an instance without the capability, 502 an instance failed, 503 no capable
-  instance, 504 timeout.
+  instance, 504 timeout. A refused execute is not always "nothing changed": after the reset handlers ran the
+  instance's message says what changed, and an execute that timed out (504) or whose instance left (502) may still
+  finish or may already have run reset handlers or deleted markers (its `error.message` says so). The finish goes out
+  once the lease renewals in flight are answered, so a late renewal never re-takes the lock.
 - **Audit:** one `info` line `control` per call past the credential check (caller, service, processor, action,
   outcome, duration, the reset's operation id) and `kraken_hub_control_total{action,outcome}`.
 - **Dashboard:** a second password field, "Write token" (`sessionStorage`, never a URL), shows the controls on the
