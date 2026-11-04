@@ -45,7 +45,7 @@ async fn plain_http(addr: SocketAddr) -> String {
     let fut = async {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _ = s
-            .write_all(b"GET /topology HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /api/v1/topology HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await;
         let mut raw = Vec::new();
         let _ = s.read_to_end(&mut raw).await;

@@ -40,7 +40,7 @@ async fn json(http: SocketAddr, path: &str) -> Value {
     serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{path}: {e}: {}", r.body))
 }
 
-/// Polls `GET /topology` until `done` holds (bounded).
+/// Polls `GET /api/v1/topology` until `done` holds (bounded).
 async fn topology_until(http: SocketAddr, done: impl Fn(&Topology) -> bool) -> Topology {
     let deadline = tokio::time::Instant::now() + BOUND;
     loop {

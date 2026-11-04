@@ -1,4 +1,4 @@
-//! Integration tests for the HTTP JSON mirror (`GET /topology`).
+//! Integration tests for the HTTP topology (`GET /api/v1/topology`) against the gRPC one.
 
 mod common;
 

@@ -1,4 +1,4 @@
-//! The dashboard token (roadmap P5a, ADR 0018): `/topology`, `/api/v1/*` and the event stream
+//! The dashboard token (roadmap P5a, ADR 0018): `/api/v1/*` and the event stream
 //! need `Authorization: Bearer <token>` when `KRAKEN_HUB_DASHBOARD_TOKEN` is set; the page and its
 //! assets stay public.
 

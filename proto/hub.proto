@@ -186,8 +186,7 @@ message ProcessorStatus {
   // The processor's name: "default" for the handlers without a processing group, else the
   // group name ([a-z0-9][a-z0-9-]{0,47}).
   string name = 1;
-  // The Kafka consumer group: the service's group for "default", "<that group>.<name>" for a
-  // named processor.
+  // The Kafka consumer group: "<the service's group>.<name>", "default" included.
   string group_id = 2;
   // The Kafka topic the processor consumes.
   string topic = 3;
