@@ -33,6 +33,7 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 - [Topology view](#topology-view)
 - [Dashboard](#dashboard)
 - [Event processors](#event-processors)
+- [Processor control](#processor-control)
 - [Security](#security)
 - [Protocol summary](#protocol-summary)
 - [Routing and limitations](#routing-and-limitations)
@@ -87,7 +88,7 @@ cargo run
 | `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` | `0` | a subscription open for longer ends with `ReplyEnd{error = CANCELLED}` and its targets are cancelled; `0` is unlimited, otherwise at least `1s` |
 | `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
 | `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
-| `KRAKEN_HUB_DASHBOARD_ENABLED` | `true` | serve the read-only dashboard (`/ui/`) and its API (`/api/v1/`) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `KRAKEN_HUB_DASHBOARD_ENABLED` | `true` | serve the dashboard (`/ui/`) and its API (`/api/v1/`, the processor controls included) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `KRAKEN_HUB_GRAFANA_URL` | none | Grafana base URL the dashboard links to; must be `http://` or `https://` without user info (`user:password@` is rejected at startup, as the link is served unauthenticated) |
 | `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` | `10000` | cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least recently used go first |
 | `KRAKEN_HUB_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
@@ -111,7 +112,9 @@ cargo run
 | `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
 | `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/topology`, `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
 | `KRAKEN_HUB_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `KRAKEN_HUB_DASHBOARD_TOKEN` when both are set (as `KRAKEN_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
-| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | reserved for the processor controls of roadmap P6b; parsed (the file variant like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`), unused |
+| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | at least 16 characters; the [processor controls](#processor-control)' token (`Authorization: Bearer <token>` on the mutating calls), which also reads what the dashboard token reads; the file variant is read and reloaded like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`. Unset and no ACL entry with `control = true`: the controls answer 403 `controls are disabled` |
+| `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters) |
+| `KRAKEN_HUB_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -261,14 +264,17 @@ sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
 
 ## Dashboard
 
-A read-only web dashboard is compiled into the binary and served on the HTTP port: open
+A web dashboard is compiled into the binary and served on the HTTP port: open
 `http://localhost:7001/` (it redirects to `/ui/`). It shows what the topology view shows, plus who
-calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
+calls whom and how that goes, and controls the services' event processors. Decision record:
+umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 
-> **Authentication is opt-in.** The dashboard and `/api/v1/` are read-only. Without
-> `KRAKEN_HUB_DASHBOARD_TOKEN` they are open to anyone who reaches port 7001, like `GET /topology`:
-> keep the port on the private network (the page footer says the same). With the token set the
-> page asks for it and every data endpoint needs it; see [Security](#security).
+> **Authentication is opt-in for reads.** Without `KRAKEN_HUB_DASHBOARD_TOKEN` the dashboard and
+> the reads of `/api/v1/` are open to anyone who reaches port 7001, like `GET /topology`: keep the
+> port on the private network (the page footer says the same). With the token set the page asks
+> for it and every data endpoint needs it; see [Security](#security). The only writes, the
+> [processor controls](#processor-control), always need the write token or an ACL credential with
+> `control = true`, and are off when neither is configured.
 
 | Page | Shows |
 |---|---|
@@ -277,7 +283,8 @@ calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-
 | Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
 | Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
 | Processors | every (service, processor): group, topic, worst state over its instances, instances, partitions, lag (sum of the known lags), dead letters (or the mode `topic` / `log`), the latest error with its age; a row opens to every instance's report and partitions (position, committed, high watermark, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
-| Dead letters, Events | placeholders: available from phase 6b (dead letters with retry and discard) and phase 7 (events) |
+| Dead letters | the processors that keep letters, and per processor (`#/dead-letters?service=…&processor=…`) its letters as one instance lists them through the hub (no payloads); with a write credential Retry, Retry all and Discard (confirmed). Read on demand, not live |
+| Events | placeholder: available from phase 7 |
 
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
 `KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana. With `KRAKEN_HUB_PEERS` set the header
@@ -305,6 +312,7 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
 | `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
 | `processors` | the event processors per service, aggregated over the instances (see [Event processors](#event-processors)) |
+| `services/{service}/processors/{processor}/dead-letters?limit=` | a processor's dead letters, listed by one instance; the mutating routes under `services/` are in [Processor control](#processor-control) |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
 
 - **Builder call:** at most 64 streams are open at once; the 65th gets `503` and its page polls.
@@ -432,7 +440,43 @@ and shows it.
 - **Dashboard.** The Processors page re-aggregates `instances[]` in the browser with the same rules
   (`ui/processors.js`), over every reachable peer under "All hubs": an instance two hubs hold counts once, with its
   freshest report (lowest `statusAgeMs`); a peer that answers 404 (it predates P6a) is named as older, not
-  unreachable. Read-only: pause, resume, replay and dead-letter retry from the dashboard are roadmap P6b.
+  unreachable. Since P6b a report also carries `replaying`, `operationId` and per partition `replayUntil`; the page
+  shows PAUSED and STOPPED (with the reset's operation id) and a replaying badge, and with a write credential Pause,
+  Resume and Reset (see [Processor control](#processor-control)).
+
+## Processor control
+
+Decision record: umbrella `docs/adr/0023-hub-control-plane-for-event-processors.md` (roadmap P6b; the operator guide
+with every JSON body is the umbrella's `docs/05-services/hub.md`, "Processor control"). The hub is a stateless control
+plane: `src/control.rs` sends `ServerMessage.control` to every live session of the service that declared the
+capability `processor-control` and whose latest status lists the processor, matches each `ClientMessage.control_reply`
+to its request by `control_id` and session, times requests out (`KRAKEN_HUB_CONTROL_TIMEOUT`, 10 s; a reset's execute
+`KRAKEN_HUB_RESET_TIMEOUT`, 120 s), fails them at once when the session leaves, and drops (and counts) replies nobody
+waits for. The state lives in each service's MongoDB (`processor_control`), not in the hub.
+
+| Route under `/api/v1/services/{service}/processors/{processor}/` | Credential | Does |
+|---|---|---|
+| `POST pause`, `POST resume` | write | on every capable instance; 200 with the counts when at least one persisted it |
+| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"offsets":[{"partition":0,"offset":12}]}}` (at most 4 KiB, 1024 offsets) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while an instance reports the processor without the capability |
+| `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the freshest capable instance |
+| `POST dead-letters/{id}/retry`, `POST dead-letters/retry-all`, `DELETE dead-letters/{id}` | write | the library's retry, retry all and discard |
+
+- **Write credential:** `Authorization: Bearer` with `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` (constant-time against its
+  digest) or a static ACL token or JWT whose ACL entry has `control = true`. Neither configured: every write is 403
+  `controls are disabled`. The dashboard token never writes; the write token also reads.
+- **Status codes:** 400 bad body, 401 no or an unknown credential, 403 no right or disabled, 404 unknown service or
+  processor, 409 locked, refused or an instance without the capability, 502 an instance failed, 503 no capable
+  instance, 504 timeout.
+- **Audit:** one `info` line `control` per call past the credential check (caller, service, processor, action,
+  outcome, duration, the reset's operation id) and `kraken_hub_control_total{action,outcome}`.
+- **Dashboard:** a second password field, "Write token" (`sessionStorage`, never a URL), shows the controls on the
+  Processors and Dead letters pages; with peers a control goes to the hub that served the page, which reaches every
+  instance.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $KRAKEN_HUB_DASHBOARD_WRITE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"to":"earliest"}' http://localhost:7001/api/v1/services/service-b/processors/audit/reset
+```
 
 ## Security
 
@@ -575,6 +619,9 @@ with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`
 rewriting the file behind `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`: the new token applies within one reload
 poll and the old one stops working at once. Peers
 (`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
+**Write token.** `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` authorizes the [processor controls](#processor-control) and
+reads what the dashboard token reads; an ACL entry with `control = true` authorizes them too. Serve the HTTP port over
+TLS when it is set (the hub warns otherwise).
 
 Both libraries send the token (P5a), with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
 `KRAKEN_HUB_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT (P5b), or present a
@@ -639,7 +686,7 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
 - The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`, `processors`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`, `processors`, `processor-control`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
 - `credentials` (static token or JWT) is checked in `permissive` and `enforce` and ignored in
@@ -923,7 +970,8 @@ without any client change; v1 clients always send a timeout, so for them an over
   `kraken_hub_stream_parts_total{service,type}` (parts relayed),
   `kraken_hub_subscriptions_open{service,instance}` (subscription targets open per handler
   instance; with `streams_open` the only metrics with an instance label) and
-  `kraken_hub_subscription_updates_total{service,type}` (updates relayed). Queue depth and
+  `kraken_hub_subscription_updates_total{service,type}` (updates relayed), `kraken_hub_control_total{action,outcome}`
+  (processor control calls) and `kraken_hub_control_unknown_replies_total` (control replies nobody waited for). Queue depth and
   permits are refreshed by the watchdog every tick (at most a second), not per request.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
@@ -988,12 +1036,13 @@ src/tls.rs        rustls listeners, reloadable certificate, the client CA store 
 src/mtls.rs       the service a client certificate names (kraken://service/<name>), notAfter, fingerprint
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
-src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream), security headers
+src/http.rs       the HTTP port: /topology, /api/v1 (JSON, the summary stream, the processor controls and their write credential), security headers
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
 src/processors.rs event processor reports (bounds) and the per-service view of /api/v1/processors (P6a)
+src/control.rs    processor control (P6b): request/reply correlation, pause and resume, the leased reset, dead letters, audit
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake P6b instance of tests/common/control.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
