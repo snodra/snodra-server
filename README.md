@@ -32,6 +32,7 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 - [Running locally](#running-locally)
 - [Topology view](#topology-view)
 - [Dashboard](#dashboard)
+- [Event processors](#event-processors)
 - [Security](#security)
 - [Protocol summary](#protocol-summary)
 - [Routing and limitations](#routing-and-limitations)
@@ -110,7 +111,7 @@ cargo run
 | `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
 | `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/topology`, `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
 | `KRAKEN_HUB_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `KRAKEN_HUB_DASHBOARD_TOKEN` when both are set (as `KRAKEN_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
-| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | reserved for the processor controls of roadmap P6; parsed (the file variant like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`), unused |
+| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | reserved for the processor controls of roadmap P6b; parsed (the file variant like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`), unused |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -204,6 +205,7 @@ Top level:
 | `tags` | map | `Register.tags` |
 | `connectedHubIds` | list of string | `InstanceStatus.connected_hub_ids` as last reported: the hubs the instance holds a stream to; empty when never reported |
 | `statusAgeMs` | int64 | time since that report, ms; `-1` when never reported (also when a JSON snapshot from an older hub lacks the field) |
+| `processors` | list | `InstanceStatus.processors` of that report, as kept (see [Event processors](#event-processors)): `name`, `groupId`, `topic`, `state`, `partitions[]` (`partition`, `position`, `committed`, `highWatermark`, `lag`), `processedTotal`, `failedTotal`, `deadLetters`, `lastError`, `lastErrorAtMs`, `eventTypes`, `deadLetterMode`; `[]` when never reported, from a session without the `processors` capability, or from an older hub's JSON |
 
 `types[]`:
 
@@ -271,10 +273,11 @@ calls whom and how that goes. Decision record: umbrella `docs/adr/0015-embedded-
 | Page | Shows |
 |---|---|
 | Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
-| Services | every service with its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
+| Services | every service with its event processors (a count linking to the Processors page and a dead-letter badge) and its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
 | Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
 | Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
-| Processors, Dead letters, Events | placeholders: available from phase 6 (processors, dead letters) and phase 7 (events) |
+| Processors | every (service, processor): group, topic, worst state over its instances, instances, partitions, lag (sum of the known lags), dead letters (or the mode `topic` / `log`), the latest error with its age; a row opens to every instance's report and partitions (position, committed, high watermark, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
+| Dead letters, Events | placeholders: available from phase 6b (dead letters with retry and discard) and phase 7 (events) |
 
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
 `KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana. With `KRAKEN_HUB_PEERS` set the header
@@ -301,6 +304,7 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
 | `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
+| `processors` | the event processors per service, aggregated over the instances (see [Event processors](#event-processors)) |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
 
 - **Builder call:** at most 64 streams are open at once; the 65th gets `503` and its page polls.
@@ -386,6 +390,50 @@ reload. `tests/dashboard_ui.rs` checks that every referenced asset and every imp
 and loads each page in headless Chrome when one is installed (`KRAKEN_HUB_TEST_BROWSER=<path>`
 picks a binary, `none` skips; CI without a browser runs the static checks only).
 
+## Event processors
+
+Decision record: umbrella `docs/adr/0022-named-event-processors-status-and-dead-letters.md` (roadmap P6a). Each
+service instance runs its Kafka event handlers in event processors (`default`, plus one per named processing group,
+each its own consumer group) and, with the client libraries' P6a slice, reports them every 5 s in
+`InstanceStatus.processors`. The hub reads no Kafka and stores nothing else: it keeps the latest report per session
+and shows it.
+
+- **`processors` capability.** A v2 client that declares it (next to `instance-status`) gets it back in the ack and
+  fills `InstanceStatus.processors` (`ProcessorStatus{name, group_id, topic, state, partitions[], processed_total,
+  failed_total, dead_letters, last_error, last_error_at_ms, event_types, dead_letter_mode}`, `PartitionStatus{partition,
+  position, committed, high_watermark, lag}`, `-1` for unknown offsets). The processors are kept only for a session that
+  shares both capabilities; each report replaces the list; it is dropped with the session.
+- **Builder call: bounds.** At most 32 processors per report, 1024 partitions and 256 event types each; names are cut
+  at 64 bytes, group id and topic at 256, the last error at 512, an event type at 256, the mode at 32, always at a
+  UTF-8 boundary; an empty or repeated name, a negative or repeated partition and empty event types are dropped;
+  offsets below -1 read as -1; an unknown state number reads as `UNSPECIFIED`. Never an error to the client.
+- **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /topology` and
+  `/api/v1/topology`, and under each service in `kraken-hub --topology` a table with one row per (processor,
+  instance): state, group, topic, partitions as ranges (`0-2,5`), the known lag, processed, failed, dead letters (or
+  `(topic)` / `(log)`), the last error (60 characters) with its age.
+- **`GET /api/v1/processors`** (dashboard token, CORS for the peers, off with the dashboard):
+
+  ```json
+  { "hubId": "hub-a", "nowMs": 1762250000000,
+    "services": [ { "serviceName": "service-b", "deadLetters": 2,
+      "processors": [ { "name": "orders", "groupId": "service-b.orders", "topic": "kraken.events",
+        "deadLetterMode": "collection", "state": "FAILING", "instancesReporting": 2,
+        "assignedPartitions": 2, "lag": 13, "deadLetters": 2, "processedTotal": 6, "failedTotal": 1,
+        "eventTypes": ["examples.OrderPlaced"],
+        "lastError": { "message": "handler failed: boom", "atMs": 1762249990000, "instanceId": "b-1" },
+        "instances": [ { "instanceId": "b-1", "statusAgeMs": 1200, "state": "FAILING", "partitions": [ … ], … } ] } ] } ] }
+  ```
+
+  Per processor: the worst state of its instances (`FAILING`, `UNSPECIFIED`, `STARTING`, `PAUSED`, `STOPPED`,
+  `RUNNING`); `assignedPartitions` counts distinct partitions (one two instances report during a rebalance counts once,
+  as the freshest report has it); `lag` sums their known lags (`null` when none is known); `deadLetters` is the
+  highest count an instance reported (they all sample the same collection); totals are sums; `lastError` is the most
+  recent; group, topic and mode come from the freshest report. Services without a processor are not listed.
+- **Dashboard.** The Processors page re-aggregates `instances[]` in the browser with the same rules
+  (`ui/processors.js`), over every reachable peer under "All hubs": an instance two hubs hold counts once, with its
+  freshest report (lowest `statusAgeMs`); a peer that answers 404 (it predates P6a) is named as older, not
+  unreachable. Read-only: pause, resume, replay and dead-letter retry from the dashboard are roadmap P6b.
+
 ## Security
 
 Roadmap P5a, P5b and P5c, decision records: umbrella `docs/adr/0018-hub-access-control.md`,
@@ -404,7 +452,7 @@ handle  = ["billing.*"]              # types it may handle: commands, queries, s
 send    = ["orders.*"]               # types it may send, in every request mode
 ```
 
-Patterns are an exact type, `prefix.*` or `*`. `control` is reserved for P6 and `contexts` only
+Patterns are an exact type, `prefix.*` or `*`. `control` is reserved for P6b and `contexts` only
 accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
 `printf %s "$TOKEN" | kraken-hub acl hash -` (or `kraken-hub acl hash <token>`).
 
@@ -591,7 +639,7 @@ Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
   later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
   anything above 2 is answered as 2.
 - The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
+  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`, `processors`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
   `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
   before any ack knows it talks to an older hub and runs in legacy mode.
 - `credentials` (static token or JWT) is checked in `permissive` and `enforce` and ignored in
@@ -926,7 +974,7 @@ src/config.rs     KRAKEN_HUB_* parsing, effective request timeout, per-version h
 src/context.rs    ContextId (always "default")
 src/protocol.rs   version negotiation, RegisterAck
 src/registry.rs   service/type ownership and instance selection
-src/session.rs    per-connection outbound buffers
+src/session.rs    per-connection outbound buffers and the latest InstanceStatus (hub ids, processors)
 src/router.rs     request forwarding, flow control, candidate choice, timeouts, reply relay, one terminal message per id
 src/queue.rs      per-instance queue (priority, then age; count and byte caps)
 src/service.rs    Hub.Connect stream handling
@@ -942,9 +990,10 @@ src/client.rs     TLS client side of the probes (--tls-ca, pinned local certific
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
 src/http.rs       the HTTP port: /topology, /api/v1 (JSON and the summary stream), security headers
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
+src/processors.rs event processor reports (bounds) and the per-service view of /api/v1/processors (P6a)
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
