@@ -6,9 +6,7 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{
-    ALL_CAPS, FakeClient, Spec, TempDir, acl_entry, auth_config, start_hub, start_hub_with_http,
-};
+use common::{FakeClient, Spec, TempDir, acl_entry, auth_config, start_hub, start_hub_with_http};
 use kraken_hub::auth::AuthMode;
 use kraken_hub::config::Config;
 use kraken_hub::proto::{
@@ -49,7 +47,6 @@ fn spec<'a>(service: &'a str, token: Option<&'a str>) -> Spec<'a> {
     Spec {
         service,
         token,
-        caps: ALL_CAPS.to_vec(),
         ..Spec::default()
     }
 }
@@ -201,39 +198,30 @@ async fn a_refused_registration_leaves_nothing_behind() {
     };
     let mut c = FakeClient::register_spec(grpc, &s).await;
     assert_eq!(c.expect_closed().await.code(), Code::Unauthenticated);
-    let (_, body) = common::http_get(http, "/topology").await;
+    let (_, body) = common::http_get(http, "/api/v1/topology").await;
     let t: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(t["totals"]["instances"], 0);
     assert_eq!(t["types"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
-async fn a_v1_client_is_refused_in_enforce_and_allowed_in_permissive() {
+async fn a_client_without_credentials_is_refused_in_enforce_and_allowed_in_permissive() {
     let h = hub(AuthMode::Enforce).await;
-    let v1 = Spec {
-        v1: true,
-        ..spec("orders", None)
-    };
-    let mut c = FakeClient::register_spec(h.addr, &v1).await;
+    let mut c = FakeClient::register_spec(h.addr, &spec("orders", None)).await;
     let status = c.expect_closed().await;
     assert_eq!(status.code(), Code::Unauthenticated);
-    assert!(status.message().contains("v1"), "{}", status.message());
+    assert_eq!(
+        status.message(),
+        "credentials required: Register.credentials.token is missing"
+    );
 
     let h = hub(AuthMode::Permissive).await;
-    let v1 = Spec {
-        v1: true,
+    let s = Spec {
         commands: vec!["orders.Place"],
         ..spec("orders", None)
     };
-    let mut c = FakeClient::register_spec(h.addr, &v1).await;
-    c.heartbeat(1).await;
-    // A v1 session gets no ack, only the heartbeat echo: it is registered and open.
-    match c.next().await {
-        Some(Ok(ServerMessage {
-            message: Some(server_message::Message::Heartbeat(_)),
-        })) => {}
-        other => panic!("expected a heartbeat echo, got {other:?}"),
-    }
+    let mut c = FakeClient::register_spec(h.addr, &s).await;
+    c.expect_ack().await;
 }
 
 // ---- modes -------------------------------------------------------------------------------
@@ -320,11 +308,11 @@ async fn permissive_marks_unauthenticated_sessions_in_the_topology() {
     let mut bad = FakeClient::register_spec(grpc, &spec("stranger", None)).await;
     bad.expect_ack().await;
     eventually("both sessions in the topology", || async {
-        let (_, body) = common::http_get(http, "/topology").await;
+        let (_, body) = common::http_get(http, "/api/v1/topology").await;
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["totals"]["instances"] == 2
     })
     .await;
-    let (_, body) = common::http_get(http, "/topology").await;
+    let (_, body) = common::http_get(http, "/api/v1/topology").await;
     let t: serde_json::Value = serde_json::from_str(&body).unwrap();
     let instance = |service: &str| {
         t["services"]
@@ -347,7 +335,7 @@ async fn permissive_marks_unauthenticated_sessions_in_the_topology() {
     .await;
     let mut c = FakeClient::register_spec(grpc, &spec("web", None)).await;
     c.expect_ack().await;
-    let (_, body) = common::http_get(http.unwrap(), "/topology").await;
+    let (_, body) = common::http_get(http.unwrap(), "/api/v1/topology").await;
     assert!(
         !body.contains("authenticatedService") && !body.contains("\"auth\""),
         "{body}"
@@ -722,7 +710,6 @@ async fn the_topology_rpc_needs_the_dashboard_token_when_one_is_set() {
 fn flow_orders<'a>(token: &'a str) -> Spec<'a> {
     Spec {
         commands: vec!["orders.Place"],
-        caps: vec!["flow-control"],
         initial_permits: 1,
         ..spec("orders", Some(token))
     }

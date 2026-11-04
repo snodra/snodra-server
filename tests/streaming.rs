@@ -1,13 +1,12 @@
-//! Streaming queries end to end (ADR 0017, P4b), over real gRPC with raw clients: a v2 sender
-//! that declared "streaming", v2 handlers with and without it, flow-controlled handlers, and the
-//! codes a session without the capability may see.
+//! Streaming queries end to end (ADR 0017), over real gRPC with raw clients: credits, endings,
+//! cancels, a handler's permit, shared types and the refusals.
 
 mod common;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{FakeClient, start_hub};
+use common::{FakeClient, PERMITS, start_hub};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{
     ClientMessage, ErrorCode, Register, ReplyEnd, ReplyPart, Request, RequestKind, RequestMode,
@@ -15,8 +14,6 @@ use kraken_hub::proto::{
 };
 
 const SHORT: Duration = Duration::from_millis(1500);
-const STREAMING: &str = "streaming";
-const SCATTER: &str = "scatter-gather";
 
 fn config() -> Config {
     Config {
@@ -52,46 +49,32 @@ async fn nothing_within(c: &mut FakeClient, d: Duration) {
     }
 }
 
-/// A v2 client declaring `capabilities`, handling `queries` (exclusive) and `shared` queries,
-/// with `initial_permits` (0 = unlimited; needs "flow-control" among the capabilities).
+/// A client handling `queries` (exclusive) and `shared` queries, with `initial_permits`; does
+/// not wait for the ack.
 async fn register(
     addr: SocketAddr,
     service: &str,
     queries: &[&str],
     shared: &[&str],
-    capabilities: &[&str],
     initial_permits: u32,
 ) -> FakeClient {
     let client = FakeClient::connect(addr).await;
-    let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     client
         .send_raw_register(Register {
-            service_name: service.to_string(),
-            instance_id: client.instance_id.clone(),
-            query_types: strings(queries),
-            shared_query_types: strings(shared),
-            protocol_version: 2,
-            capabilities: strings(capabilities),
-            client_version: "fake-client/1.0".to_string(),
+            shared_query_types: shared.iter().map(|s| s.to_string()).collect(),
             initial_permits,
-            ..Register::default()
+            ..client.register_message(service, &[], queries)
         })
         .await;
     client
 }
 
-/// A streaming handler of the exclusive query `exp.Stream` and a streaming sender, both
-/// handshaken.
+/// A handler of the exclusive query `exp.Stream` and a sender, both handshaken.
 async fn pair(addr: SocketAddr) -> (FakeClient, FakeClient) {
-    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], &[STREAMING], 0).await;
+    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], PERMITS).await;
     handshake(&mut handler, 1).await;
-    let mut sender = register(addr, "svc-web", &[], &[], &[STREAMING, SCATTER], 0).await;
-    match &handshake(&mut sender, 1).await[..] {
-        [server_message::Message::RegisterAck(ack)] => {
-            assert_eq!(ack.capabilities, [SCATTER, STREAMING]);
-        }
-        other => panic!("expected the ack, got {other:?}"),
-    }
+    let mut sender = register(addr, "svc-web", &[], &[], PERMITS).await;
+    handshake(&mut sender, 1).await;
     (handler, sender)
 }
 
@@ -440,7 +423,7 @@ async fn a_cancel_from_the_sender_and_the_disconnects() {
     assert_eq!((end_code(&e), e.parts), (ErrorCode::HandlerDisconnected, 1));
 
     // The sender leaves: the handler is cancelled.
-    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], &[STREAMING], 0).await;
+    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], PERMITS).await;
     handshake(&mut handler, 1).await;
     sender
         .tx
@@ -457,17 +440,9 @@ async fn a_cancel_from_the_sender_and_the_disconnects() {
 #[tokio::test]
 async fn a_stream_holds_its_handlers_permit_until_it_ends() {
     let addr = start_hub(config()).await;
-    let mut handler = register(
-        addr,
-        "svc-h",
-        &["exp.Stream"],
-        &[],
-        &[STREAMING, "flow-control"],
-        1,
-    )
-    .await;
+    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], 1).await;
     handshake(&mut handler, 1).await;
-    let mut sender = register(addr, "svc-web", &[], &[], &[STREAMING], 0).await;
+    let mut sender = register(addr, "svc-web", &[], &[], PERMITS).await;
     handshake(&mut sender, 1).await;
     sender
         .tx
@@ -499,90 +474,39 @@ async fn a_stream_holds_its_handlers_permit_until_it_ends() {
 }
 
 #[tokio::test]
-async fn streaming_is_refused_with_codes_the_session_knows() {
+async fn an_unknown_mode_is_invalid_request_and_a_type_without_owner_no_handler() {
     let addr = start_hub(config()).await;
-    let mut legacy = register(addr, "svc-old", &["old.Stream"], &[], &[SCATTER], 0).await;
-    handshake(&mut legacy, 1).await;
     let (mut handler, mut sender) = pair(addr).await;
-
-    // A v2 sender without the capability: UNSUPPORTED.
-    let mut plain = register(addr, "svc-plain", &[], &[], &[SCATTER], 0).await;
-    handshake(&mut plain, 1).await;
-    plain
-        .tx
-        .send(stream("p1", "exp.Stream", 1_000, 0, 0))
-        .await
-        .unwrap();
-    let (id, code, _) = expect_error(&mut plain).await;
-    assert_eq!((id.as_str(), code), ("p1", ErrorCode::Unsupported));
-    // Its client-sent multi-part messages are ignored.
-    plain.tx.send(FakeClient::flow("p1", 5)).await.unwrap();
-    plain.tx.send(FakeClient::cancel("p1", "x")).await.unwrap();
-    plain
-        .tx
-        .send(FakeClient::part_ok("p1#1", 0, b"x"))
-        .await
-        .unwrap();
-    plain.tx.send(FakeClient::end("p1#1", None)).await.unwrap();
-    assert!(handshake(&mut plain, 2).await.is_empty());
-
-    // A raw v1 client: INVALID_REQUEST, never a multi-part message.
-    let mut v1 = FakeClient::register(addr, "svc-v1", &[], &[]).await;
-    v1.heartbeat(1).await;
-    v1.tx
-        .send(stream("v1", "exp.Stream", 1_000, 0, 0))
-        .await
-        .unwrap();
-    loop {
-        match message(&mut v1).await {
-            server_message::Message::Heartbeat(_) => {}
-            server_message::Message::Error(e) => {
-                assert_eq!(e.code(), ErrorCode::InvalidRequest);
-                break;
-            }
-            other => panic!("a v1 session got {other:?}"),
-        }
+    let mut weird = stream("w1", "exp.Stream", 1_000, 0, 0);
+    if let Some(client_message::Message::Request(r)) = weird.message.as_mut() {
+        r.mode = 42;
     }
-
-    // No capable instance of the owner: UNSUPPORTED naming it; no owner: NO_HANDLER.
-    sender
-        .tx
-        .send(stream("old", "old.Stream", 1_000, 0, 0))
-        .await
-        .unwrap();
-    let (id, code, message) = expect_error(&mut sender).await;
-    assert_eq!((id.as_str(), code), ("old", ErrorCode::Unsupported));
-    assert!(
-        message.contains("svc-old") && message.contains("streaming"),
-        "{message}"
-    );
+    sender.tx.send(weird).await.unwrap();
+    let (id, code, _) = expect_error(&mut sender).await;
+    assert_eq!((id.as_str(), code), ("w1", ErrorCode::InvalidRequest));
     sender
         .tx
         .send(stream("none", "nobody.Stream", 1_000, 0, 0))
         .await
         .unwrap();
     assert_eq!(expect_error(&mut sender).await.1, ErrorCode::NoHandler);
-    assert!(
-        handshake(&mut legacy, 2).await.is_empty(),
-        "nothing reached the old handler"
-    );
     assert!(handshake(&mut handler, 2).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_shared_type_streams_from_one_capable_owner_instance_and_a_gather_cancels_the_rest() {
+async fn a_shared_type_streams_from_one_owner_instance_and_a_gather_cancels_the_rest() {
     let addr = start_hub(config()).await;
-    let mut a1 = register(addr, "svc-a", &[], &["search.Stream"], &[STREAMING], 0).await;
-    let mut b1 = register(addr, "svc-b", &[], &["search.Stream"], &[STREAMING], 0).await;
-    let mut b2 = register(addr, "svc-b", &[], &["search.Stream"], &[], 0).await;
+    let mut a1 = register(addr, "svc-a", &[], &["search.Stream"], PERMITS).await;
+    let mut b1 = register(addr, "svc-b", &[], &["search.Stream"], PERMITS).await;
+    let mut b2 = register(addr, "svc-b", &[], &["search.Stream"], PERMITS).await;
     for h in [&mut a1, &mut b1, &mut b2] {
         handshake(h, 1).await;
     }
-    let mut sender = register(addr, "svc-web", &[], &[], &[STREAMING, SCATTER], 0).await;
+    let mut sender = register(addr, "svc-web", &[], &[], PERMITS).await;
     handshake(&mut sender, 1).await;
-    // Two streams: one capable instance each, never b2.
+    // Three streams: one instance each.
     let mut targets = Vec::new();
-    for id in ["st1", "st2"] {
+    for id in ["st1", "st2", "st3"] {
         sender
             .tx
             .send(stream(id, "search.Stream", 5_000, 0, 0))
@@ -591,31 +515,28 @@ async fn a_shared_type_streams_from_one_capable_owner_instance_and_a_gather_canc
         let got = tokio::select! {
             r = expect_request(&mut a1) => ("a1", r),
             r = expect_request(&mut b1) => ("b1", r),
+            r = expect_request(&mut b2) => ("b2", r),
         };
         assert_eq!(got.1.id, format!("{id}#1"));
         targets.push(got.0);
     }
     targets.sort();
-    assert_eq!(
-        targets,
-        ["a1", "b1"],
-        "round-robin over the capable instances"
-    );
+    assert_eq!(targets, ["a1", "b1", "b2"], "spread over the instances");
     // Whichever got which: each ends the stream it serves.
-    for h in [&mut a1, &mut b1] {
-        for id in ["st1#1", "st2#1"] {
+    for h in [&mut a1, &mut b1, &mut b2] {
+        for id in ["st1#1", "st2#1", "st3#1"] {
             h.tx.send(FakeClient::end(id, None)).await.unwrap();
         }
     }
     let mut ends = vec![
         expect_end(&mut sender).await.request_id,
         expect_end(&mut sender).await.request_id,
+        expect_end(&mut sender).await.request_id,
     ];
     ends.sort();
-    assert_eq!(ends, ["st1", "st2"]);
-    assert!(handshake(&mut b2, 2).await.is_empty(), "b2 got nothing");
+    assert_eq!(ends, ["st1", "st2", "st3"]);
 
-    // A gather with max_results 1: b2 answers first; a1 and b1 (capable) are cancelled.
+    // A gather with max_results 1: b2 answers first; a1 and b1 are cancelled.
     let mut g = FakeClient::request("g1", RequestKind::Query, "search.Stream", "", 5_000);
     if let Some(client_message::Message::Request(r)) = g.message.as_mut() {
         r.mode = RequestMode::ScatterGather as i32;
@@ -641,7 +562,7 @@ async fn a_shared_type_streams_from_one_capable_owner_instance_and_a_gather_canc
     );
     assert!(
         handshake(&mut b2, 3).await.is_empty(),
-        "b2 cannot be cancelled"
+        "b2 answered: nothing to cancel"
     );
 }
 
@@ -654,8 +575,8 @@ async fn parts_and_the_end_reach_a_slow_sender_in_order() {
     .await;
     // With a one-slot buffer a heartbeat echo (best effort) may be dropped behind the ack, so
     // the handshake reads the ack itself.
-    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], &[STREAMING], 0).await;
-    let mut sender = register(addr, "svc-web", &[], &[], &[STREAMING], 0).await;
+    let mut handler = register(addr, "svc-h", &["exp.Stream"], &[], PERMITS).await;
+    let mut sender = register(addr, "svc-web", &[], &[], PERMITS).await;
     for c in [&mut handler, &mut sender] {
         assert!(matches!(
             message(c).await,

@@ -1,6 +1,5 @@
 //! Scatter-gather queries and shared query types end to end (ADR 0017), over real gRPC with raw
-//! clients: a v2 sender that declared "scatter-gather", v2 and v1 handler instances, and a raw v1
-//! client that must never see a multi-part message or a code it does not know.
+//! clients.
 
 mod common;
 
@@ -17,7 +16,6 @@ use kraken_hub::proto::{
 use tonic::transport::Endpoint;
 
 const SHORT: Duration = Duration::from_millis(1500);
-const SCATTER: &str = "scatter-gather";
 
 fn config() -> Config {
     Config {
@@ -47,26 +45,18 @@ async fn handshake(c: &mut FakeClient, n: i64) -> Vec<server_message::Message> {
     }
 }
 
-/// A v2 client declaring `capabilities`, handling `queries` (exclusive) and `shared` queries.
-async fn register_v2(
+/// A client handling `queries` (exclusive) and `shared` queries; does not wait for the ack.
+async fn register(
     addr: SocketAddr,
     service: &str,
     queries: &[&str],
     shared: &[&str],
-    capabilities: &[&str],
 ) -> FakeClient {
     let client = FakeClient::connect(addr).await;
-    let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     client
         .send_raw_register(Register {
-            service_name: service.to_string(),
-            instance_id: client.instance_id.clone(),
-            query_types: strings(queries),
-            shared_query_types: strings(shared),
-            protocol_version: 2,
-            capabilities: strings(capabilities),
-            client_version: "fake-client/1.0".to_string(),
-            ..Register::default()
+            shared_query_types: shared.iter().map(|s| s.to_string()).collect(),
+            ..client.register_message(service, &[], queries)
         })
         .await;
     client
@@ -101,27 +91,13 @@ async fn gather(c: &mut FakeClient) -> (Vec<ReplyPart>, ReplyEnd) {
     }
 }
 
-/// Drains whatever arrives within `quiet` and fails on any message a v1 client cannot know.
-async fn assert_only_v1_messages(c: &mut FakeClient, quiet: Duration) -> Vec<ServerMessage> {
+/// Whatever arrives within `quiet`.
+async fn drain(c: &mut FakeClient, quiet: Duration) -> Vec<ServerMessage> {
     let mut seen = Vec::new();
     while let Ok(Some(Ok(m))) = tokio::time::timeout(quiet, c.rx.message())
         .await
         .map(|r| r.transpose())
     {
-        match &m.message {
-            Some(server_message::Message::Request(r)) => {
-                assert_eq!(r.mode, 0, "a v1 handler got a request mode");
-                assert_eq!(r.max_results, 0);
-            }
-            Some(server_message::Message::Reply(_))
-            | Some(server_message::Message::Heartbeat(_)) => {}
-            Some(server_message::Message::Error(e)) => assert!(
-                e.code <= ErrorCode::PermissionDenied as i32,
-                "v1 session got error code {}",
-                e.code
-            ),
-            other => panic!("v1 session got a v2 message: {other:?}"),
-        }
         seen.push(m);
     }
     seen
@@ -130,19 +106,14 @@ async fn assert_only_v1_messages(c: &mut FakeClient, quiet: Duration) -> Vec<Ser
 #[tokio::test]
 async fn a_scatter_gather_over_three_instances_of_two_owners_gets_three_parts_and_an_end() {
     let addr = start_hub(config()).await;
-    let mut a1 = register_v2(addr, "svc-a", &[], &["search.Find"], &[]).await;
-    let mut b1 = register_v2(addr, "svc-b", &[], &["search.Find"], &[]).await;
-    let mut b2 = register_v2(addr, "svc-b", &[], &["search.Find"], &[]).await;
+    let mut a1 = register(addr, "svc-a", &[], &["search.Find"]).await;
+    let mut b1 = register(addr, "svc-b", &[], &["search.Find"]).await;
+    let mut b2 = register(addr, "svc-b", &[], &["search.Find"]).await;
     for h in [&mut a1, &mut b1, &mut b2] {
         handshake(h, 1).await;
     }
-    let mut sender = register_v2(addr, "svc-web", &[], &[], &[SCATTER]).await;
-    match &handshake(&mut sender, 1).await[..] {
-        [server_message::Message::RegisterAck(ack)] => {
-            assert_eq!(ack.capabilities, [SCATTER]);
-        }
-        other => panic!("expected the ack, got {other:?}"),
-    }
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
+    handshake(&mut sender, 1).await;
 
     sender
         .tx
@@ -219,6 +190,12 @@ async fn a_scatter_gather_over_three_instances_of_two_owners_gets_three_parts_an
         handshake(&mut sender, 2).await.is_empty(),
         "nothing after the end"
     );
+    // A target whose answer came after the end may have been sent a cancel for it.
+    for h in [&mut a1, &mut b1, &mut b2] {
+        for m in handshake(h, 2).await {
+            assert!(matches!(m, server_message::Message::Cancel(_)), "{m:?}");
+        }
+    }
 
     // A point query on the shared type goes to one owner instance.
     sender
@@ -247,15 +224,11 @@ async fn a_scatter_gather_over_three_instances_of_two_owners_gets_three_parts_an
 }
 
 #[tokio::test]
-async fn v1_handlers_serve_scatter_targets_unchanged_and_the_deadline_ends_the_gather() {
+async fn targets_get_plain_unary_requests_and_the_deadline_ends_the_gather() {
     let addr = start_hub(config()).await;
     let mut h1 = FakeClient::register(addr, "svc-old", &[], &["old.Get"]).await;
     let mut h2 = FakeClient::register(addr, "svc-old", &[], &["old.Get"]).await;
-    h1.heartbeat(1).await;
-    h2.heartbeat(1).await;
-    assert_only_v1_messages(&mut h1, Duration::from_millis(200)).await;
-    assert_only_v1_messages(&mut h2, Duration::from_millis(200)).await;
-    let mut sender = register_v2(addr, "svc-web", &[], &[], &[SCATTER]).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
     handshake(&mut sender, 1).await;
 
     sender
@@ -264,7 +237,7 @@ async fn v1_handlers_serve_scatter_targets_unchanged_and_the_deadline_ends_the_g
         .await
         .unwrap();
     let r = expect_request(&mut h1).await;
-    assert_eq!(r.mode, 0);
+    assert_eq!((r.mode, r.max_results), (0, 0));
     h1.tx
         .send(FakeClient::reply_ok(&r.id, b"h1"))
         .await
@@ -274,29 +247,36 @@ async fn v1_handlers_serve_scatter_targets_unchanged_and_the_deadline_ends_the_g
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].responder_instance, h1.instance_id);
     assert_eq!((end.parts, end.failed, end.timed_out), (1, 0, 1));
-    let h2_saw = assert_only_v1_messages(&mut h2, Duration::from_millis(200)).await;
-    assert_eq!(h2_saw.len(), 1, "the target request only: {h2_saw:?}");
-    // h2's late answer goes nowhere.
-    let late = match &h2_saw[0].message {
-        Some(server_message::Message::Request(r)) => r.id.clone(),
-        other => panic!("expected the request, got {other:?}"),
+    // h2 got its target request, then a cancel for it at the deadline.
+    let h2_saw = drain(&mut h2, Duration::from_millis(200)).await;
+    let late = match &h2_saw[..] {
+        [
+            ServerMessage {
+                message: Some(server_message::Message::Request(r)),
+            },
+            ServerMessage {
+                message: Some(server_message::Message::Cancel(c)),
+            },
+        ] if c.request_id == r.id && c.reason == "deadline" => r.id.clone(),
+        other => panic!("expected the request and its cancel, got {other:?}"),
     };
+    // h2's late answer goes nowhere.
     h2.tx
         .send(FakeClient::reply_ok(&late, b"late"))
         .await
         .unwrap();
     assert!(handshake(&mut sender, 2).await.is_empty());
-    assert_only_v1_messages(&mut h1, Duration::from_millis(200)).await;
+    assert!(drain(&mut h1, Duration::from_millis(200)).await.is_empty());
 }
 
 #[tokio::test]
 async fn a_target_that_disconnects_is_a_failed_part() {
     let addr = start_hub(config()).await;
-    let mut a1 = register_v2(addr, "svc-a", &[], &["search.Find"], &[]).await;
-    let mut b1 = register_v2(addr, "svc-b", &[], &["search.Find"], &[]).await;
+    let mut a1 = register(addr, "svc-a", &[], &["search.Find"]).await;
+    let mut b1 = register(addr, "svc-b", &[], &["search.Find"]).await;
     handshake(&mut a1, 1).await;
     handshake(&mut b1, 1).await;
-    let mut sender = register_v2(addr, "svc-web", &[], &[], &[SCATTER]).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
     handshake(&mut sender, 1).await;
     sender
         .tx
@@ -322,56 +302,10 @@ async fn a_target_that_disconnects_is_a_failed_part() {
 }
 
 #[tokio::test]
-async fn senders_without_the_capability_and_raw_v1_clients_are_refused_with_codes_they_know() {
+async fn a_scatter_gather_of_a_command_or_an_unknown_type_is_refused() {
     let addr = start_hub(config()).await;
-    let mut a1 = register_v2(addr, "svc-a", &[], &["search.Find"], &[]).await;
-    handshake(&mut a1, 1).await;
-
-    // A v2 sender that did not declare scatter-gather: UNSUPPORTED, no ack capability.
-    let mut plain = register_v2(addr, "svc-plain", &[], &[], &["flow-control"]).await;
-    match &handshake(&mut plain, 1).await[..] {
-        [server_message::Message::RegisterAck(ack)] => {
-            assert!(!ack.capabilities.iter().any(|c| c == SCATTER));
-        }
-        other => panic!("expected the ack, got {other:?}"),
-    }
-    plain
-        .tx
-        .send(scatter("p1", "search.Find", 1_000, 0))
-        .await
-        .unwrap();
-    match message(&mut plain).await {
-        server_message::Message::Error(e) => {
-            assert_eq!(
-                (e.request_id.as_str(), e.code()),
-                ("p1", ErrorCode::Unsupported)
-            );
-        }
-        other => panic!("expected UNSUPPORTED, got {other:?}"),
-    }
-
-    // A raw v1 client that sets the mode field anyway: INVALID_REQUEST, never a part or an end.
-    let mut v1 = FakeClient::register(addr, "svc-v1", &[], &[]).await;
-    v1.heartbeat(1).await;
-    v1.tx
-        .send(scatter("v1", "search.Find", 1_000, 0))
-        .await
-        .unwrap();
-    let mut saw = assert_only_v1_messages(&mut v1, Duration::from_millis(300)).await;
-    saw.retain(|m| matches!(m.message, Some(server_message::Message::Error(_))));
-    match &saw[..] {
-        [
-            ServerMessage {
-                message: Some(server_message::Message::Error(e)),
-            },
-        ] => assert_eq!(e.code(), ErrorCode::InvalidRequest),
-        other => panic!("expected one INVALID_REQUEST, got {other:?}"),
-    }
-    // Nothing reached the handler.
-    assert!(handshake(&mut a1, 2).await.is_empty());
-
     // A scatter-gather of a command: INVALID_REQUEST; of an unknown type: NO_HANDLER.
-    let mut sender = register_v2(addr, "svc-web", &[], &[], &[SCATTER]).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
     handshake(&mut sender, 1).await;
     let mut cmd = scatter("c1", "svc.Do", 1_000, 0);
     if let Some(client_message::Message::Request(r)) = cmd.message.as_mut() {
@@ -399,13 +333,13 @@ async fn senders_without_the_capability_and_raw_v1_clients_are_refused_with_code
 #[tokio::test]
 async fn exclusive_and_shared_registrants_conflict_and_the_topology_lists_every_owner() {
     let addr = start_hub(config()).await;
-    let mut a1 = register_v2(addr, "svc-a", &[], &["search.Find"], &[]).await;
-    let mut b1 = register_v2(addr, "svc-b", &["own.Get"], &["search.Find"], &[]).await;
+    let mut a1 = register(addr, "svc-a", &[], &["search.Find"]).await;
+    let mut b1 = register(addr, "svc-b", &["own.Get"], &["search.Find"]).await;
     handshake(&mut a1, 1).await;
     handshake(&mut b1, 1).await;
 
     // An exclusive registrant of the shared type fails with ALREADY_EXISTS.
-    let mut c1 = register_v2(addr, "svc-c", &["search.Find"], &[], &[]).await;
+    let mut c1 = register(addr, "svc-c", &["search.Find"], &[]).await;
     match c1.next().await {
         Some(Err(status)) => {
             assert_eq!(status.code(), tonic::Code::AlreadyExists);
@@ -431,7 +365,6 @@ async fn exclusive_and_shared_registrants_conflict_and_the_topology_lists_every_
         .unwrap();
     assert!(find.shared);
     assert_eq!(find.owner_services, ["svc-a", "svc-b"]);
-    assert_eq!(find.owner_service, "svc-a");
     assert_eq!(find.live_instances, 2);
     let own = topo.types.iter().find(|t| t.r#type == "own.Get").unwrap();
     assert!(!own.shared);

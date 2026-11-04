@@ -159,6 +159,9 @@ fn dechunk(mut rest: &str) -> String {
     out
 }
 
+/// `Register.initial_permits` of a test client that should never run out.
+pub const PERMITS: u32 = 1024;
+
 pub struct FakeClient {
     pub tx: mpsc::Sender<ClientMessage>,
     pub rx: Streaming<ServerMessage>,
@@ -187,7 +190,21 @@ impl FakeClient {
         }
     }
 
+    /// Connects, sends a `Register` ([`FakeClient::send_register`]) and consumes its
+    /// `RegisterAck`, so the next message is whatever the hub sends after it.
     pub async fn register(
+        addr: SocketAddr,
+        service: &str,
+        commands: &[&str],
+        queries: &[&str],
+    ) -> Self {
+        let mut client = Self::register_no_wait(addr, service, commands, queries).await;
+        client.expect_ack().await;
+        client
+    }
+
+    /// Connects and sends a `Register` without waiting for its `RegisterAck`.
+    pub async fn register_no_wait(
         addr: SocketAddr,
         service: &str,
         commands: &[&str],
@@ -198,52 +215,28 @@ impl FakeClient {
         client
     }
 
-    /// Like [`FakeClient::register`] for a protocol v2 client: `protocol_version` 2, a client
-    /// version and (ignored) credentials.
-    pub async fn register_v2(
-        addr: SocketAddr,
-        service: &str,
-        commands: &[&str],
-        queries: &[&str],
-    ) -> Self {
-        let client = Self::connect(addr).await;
-        client.send_register_v2(service, commands, queries).await;
-        client
-    }
-
-    fn register_message(&self, service: &str, commands: &[&str], queries: &[&str]) -> Register {
+    /// The `Register` this client sends: a client version and [`PERMITS`] permits.
+    pub fn register_message(&self, service: &str, commands: &[&str], queries: &[&str]) -> Register {
         Register {
             service_name: service.to_string(),
             instance_id: self.instance_id.clone(),
             command_types: commands.iter().map(|s| s.to_string()).collect(),
             query_types: queries.iter().map(|s| s.to_string()).collect(),
+            client_version: "fake-client/1.0".to_string(),
+            initial_permits: PERMITS,
             ..Register::default()
         }
     }
 
-    /// Sends a v1 `Register` (no version fields) for this client's instance id (first or
-    /// re-register).
+    /// Sends a `Register` for this client's instance id (first or re-register); the hub answers
+    /// each accepted one with a `RegisterAck`.
     pub async fn send_register(&self, service: &str, commands: &[&str], queries: &[&str]) {
         let reg = self.register_message(service, commands, queries);
         self.send_raw_register(reg).await;
     }
 
-    /// Sends a v2 `Register` for this client's instance id.
-    pub async fn send_register_v2(&self, service: &str, commands: &[&str], queries: &[&str]) {
-        let reg = Register {
-            protocol_version: 2,
-            capabilities: vec!["not-a-real-capability".to_string()],
-            client_version: "fake-client/1.0".to_string(),
-            credentials: Some(Credentials {
-                kind: Some(credentials::Kind::Token("s3cret".to_string())),
-            }),
-            ..self.register_message(service, commands, queries)
-        };
-        self.send_raw_register(reg).await;
-    }
-
-    /// A v2 client that shares flow-control and starts with `initial_permits` (0 = unlimited),
-    /// with the given load factor and tags.
+    /// A client that starts with `initial_permits`, with the given tags; does not wait for the
+    /// ack.
     pub async fn register_flow(
         addr: SocketAddr,
         service: &str,
@@ -253,9 +246,6 @@ impl FakeClient {
     ) -> Self {
         let client = Self::connect(addr).await;
         let reg = Register {
-            protocol_version: 2,
-            capabilities: vec!["flow-control".to_string()],
-            client_version: "fake-client/1.0".to_string(),
             initial_permits,
             tags: tags
                 .iter()
@@ -283,35 +273,14 @@ impl FakeClient {
         client
     }
 
-    /// A v2 `Register` sharing flow-control (first or re-register; an empty `commands` list is
+    /// A `Register` with `initial_permits` (first or re-register; an empty `commands` list is
     /// what a client sends when it stops gracefully).
     pub async fn send_register_flow(&self, service: &str, commands: &[&str], initial_permits: u32) {
         let reg = Register {
-            protocol_version: 2,
-            capabilities: vec!["flow-control".to_string()],
-            client_version: "fake-client/1.0".to_string(),
             initial_permits,
             ..self.register_message(service, commands, &[])
         };
         self.send_raw_register(reg).await;
-    }
-
-    /// A v2 client declaring exactly `capabilities`.
-    pub async fn register_v2_with(
-        addr: SocketAddr,
-        service: &str,
-        commands: &[&str],
-        capabilities: &[&str],
-    ) -> Self {
-        let client = Self::connect(addr).await;
-        let reg = Register {
-            protocol_version: 2,
-            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
-            client_version: "fake-client/1.0".to_string(),
-            ..client.register_message(service, commands, &[])
-        };
-        client.send_raw_register(reg).await;
-        client
     }
 
     /// Sends an `InstanceStatus` (multi-hub HA, ADR 0016).
@@ -560,9 +529,6 @@ pub fn auth_config(mode: kraken_hub::auth::AuthMode, acl: &std::path::Path) -> C
     }
 }
 
-/// Every capability a test sender may need.
-pub const ALL_CAPS: &[&str] = &["scatter-gather", "streaming", "subscription"];
-
 /// What a test `Register` carries.
 #[derive(Default, Clone)]
 pub struct Spec<'a> {
@@ -572,10 +538,7 @@ pub struct Spec<'a> {
     pub shared: Vec<&'a str>,
     pub token: Option<&'a str>,
     pub jwt: Option<&'a str>,
-    /// A protocol v1 client: no version, capabilities or credentials field.
-    pub v1: bool,
-    pub caps: Vec<&'a str>,
-    /// `Register.initial_permits` (needs the "flow-control" capability to take effect).
+    /// `Register.initial_permits`; 0 reads as [`PERMITS`].
     pub initial_permits: u32,
 }
 
@@ -593,15 +556,13 @@ impl Spec<'_> {
             command_types: self.commands.iter().map(|s| s.to_string()).collect(),
             query_types: self.queries.iter().map(|s| s.to_string()).collect(),
             shared_query_types: self.shared.iter().map(|s| s.to_string()).collect(),
-            protocol_version: if self.v1 { 0 } else { 2 },
-            capabilities: self.caps.iter().map(|c| c.to_string()).collect(),
-            client_version: if self.v1 {
-                String::new()
+            client_version: "fake-client/1.0".into(),
+            credentials,
+            initial_permits: if self.initial_permits == 0 {
+                PERMITS
             } else {
-                "fake-client/1.0".into()
+                self.initial_permits
             },
-            credentials: if self.v1 { None } else { credentials },
-            initial_permits: self.initial_permits,
             ..Register::default()
         }
     }

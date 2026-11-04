@@ -1,7 +1,6 @@
-//! Processor control, hub side (ADR 0023, P6b): the HTTP API asks instances that declared
-//! "processor-control" to pause, resume, reset (prepare all, execute on one, finish all) and to
-//! work on their dead letters, over real gRPC to fake instances; the write credential guards every
-//! mutation.
+//! Processor control, hub side (ADR 0023): the HTTP API asks the instances that report a processor
+//! to pause, resume, reset (prepare all, execute on one, finish all) and to work on their dead
+//! letters, over real gRPC to fake instances; the write credential guards every mutation.
 
 mod common;
 
@@ -10,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::control::{
-    ControlClient, P6A, Reaction, action_of, actions, default_result, ok, ok_to_everything, refused,
+    ControlClient, Reaction, action_of, actions, default_result, ok, ok_to_everything, refused,
 };
-use common::{FakeClient, HttpResponse, TempDir, http_send, start_hub_with_http};
+use common::{HttpResponse, TempDir, http_send, start_hub_with_http};
 use kraken_hub::auth::{AuthMode, Secret, hash_token};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{ControlRefusal, ControlRequest, control_reply, control_request};
@@ -92,19 +91,9 @@ fn operation_of(req: &ControlRequest) -> String {
 }
 
 #[tokio::test]
-async fn the_ack_lists_processor_control_to_a_client_that_declares_it() {
-    let (grpc, _http) = hub(config()).await;
-    // `ControlClient::start` asserts every declared capability is acknowledged.
-    let _b = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let mut p6a = FakeClient::register_v2_with(grpc, "svc", &[], P6A).await;
-    let ack = p6a.expect_ack().await;
-    assert!(ack.capabilities.iter().all(|c| c != "processor-control"));
-}
-
-#[tokio::test]
-async fn a_pause_reaches_only_capable_sessions_that_report_the_processor() {
+async fn a_pause_reaches_the_sessions_that_report_the_processor() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "svc",
         "b-1",
@@ -112,18 +101,8 @@ async fn a_pause_reaches_only_capable_sessions_that_report_the_processor() {
         ok_to_everything(),
     )
     .await;
-    let b2 = ControlClient::p6b(grpc, "svc", "b-2", &["default"], ok_to_everything()).await;
-    let b3 = ControlClient::start(
-        grpc,
-        "svc",
-        "b-3",
-        P6A,
-        &["audit"],
-        None,
-        ok_to_everything(),
-    )
-    .await;
-    let c1 = ControlClient::p6b(grpc, "other", "c-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["default"], ok_to_everything()).await;
+    let c1 = ControlClient::new(grpc, "other", "c-1", &["audit"], ok_to_everything()).await;
 
     let r = post(http, PAUSE, "").await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -133,14 +112,13 @@ async fn a_pause_reaches_only_capable_sessions_that_report_the_processor() {
             "service": "svc", "processor": "audit", "action": "pause",
             "acknowledged": 1, "failed": 0,
             "instances": [{ "instanceId": "b-1", "result": "ok", "code": null, "message": "" }],
-            "notCapable": ["b-3"],
         })
     );
     let seen = b1.seen();
     assert_eq!(actions(&seen), ["pause"]);
     assert_eq!(seen[0].processor, "audit");
     assert!(!seen[0].control_id.is_empty());
-    for other in [&b2, &b3, &c1] {
+    for other in [&b2, &c1] {
         assert!(other.seen().is_empty(), "{} was asked", other.instance_id);
     }
 
@@ -161,8 +139,8 @@ async fn a_pause_is_200_when_one_instance_persisted_it_and_502_or_504_when_none_
         ..config()
     })
     .await;
-    let _b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let _b2 = ControlClient::p6b(
+    let _b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let _b2 = ControlClient::new(
         grpc,
         "svc",
         "b-2",
@@ -191,7 +169,7 @@ async fn a_pause_is_200_when_one_instance_persisted_it_and_502_or_504_when_none_
         ..config()
     })
     .await;
-    let _f = ControlClient::p6b(
+    let _f = ControlClient::new(
         grpc,
         "svc",
         "f-1",
@@ -199,7 +177,7 @@ async fn a_pause_is_200_when_one_instance_persisted_it_and_502_or_504_when_none_
         answering(|_| Some(Reaction::Reply(refused(ControlRefusal::Failed, "no")))),
     )
     .await;
-    let _s = ControlClient::p6b(
+    let _s = ControlClient::new(
         grpc,
         "svc",
         "s-1",
@@ -222,19 +200,9 @@ async fn a_pause_is_200_when_one_instance_persisted_it_and_502_or_504_when_none_
 }
 
 #[tokio::test]
-async fn unknown_services_and_processors_are_404_and_no_capable_instance_is_503() {
+async fn unknown_services_and_processors_are_404() {
     let (grpc, http) = hub(config()).await;
-    let _b = ControlClient::p6b(grpc, "svc", "b-1", &["default"], ok_to_everything()).await;
-    let _old = ControlClient::start(
-        grpc,
-        "old",
-        "o-1",
-        P6A,
-        &["audit"],
-        None,
-        ok_to_everything(),
-    )
-    .await;
+    let _b = ControlClient::new(grpc, "svc", "b-1", &["default"], ok_to_everything()).await;
     for path in [
         "/api/v1/services/ghost/processors/audit/pause",
         "/api/v1/services/svc/processors/audit/pause",
@@ -260,33 +228,15 @@ async fn unknown_services_and_processors_are_404_and_no_capable_instance_is_503(
     )
     .await;
     assert_eq!(r.status, 404);
-    // Instances report it, none accepts control.
-    let r = post(http, "/api/v1/services/old/processors/audit/pause", "").await;
-    assert_eq!(r.status, 503, "{}", r.body);
-    assert!(
-        json_of(&r)["error"]
-            .as_str()
-            .unwrap()
-            .contains("processor-control")
-    );
-    let r = call(
-        http,
-        "GET",
-        "/api/v1/services/old/processors/audit/dead-letters",
-        Some(WRITE),
-        "",
-    )
-    .await;
-    assert_eq!(r.status, 503);
 }
 
 #[tokio::test]
 async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_all() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let b2 = ControlClient::p6b(grpc, "svc", "b-2", &["audit"], ok_to_everything()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["audit"], ok_to_everything()).await;
     // Reports it, but does not run it (any more) when asked: not involved.
-    let b3 = ControlClient::p6b(
+    let b3 = ControlClient::new(
         grpc,
         "svc",
         "b-3",
@@ -403,8 +353,8 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
 #[tokio::test]
 async fn a_locked_prepare_aborts_the_reset_on_every_instance() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let b2 = ControlClient::p6b(
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(
         grpc,
         "svc",
         "b-2",
@@ -439,8 +389,8 @@ async fn a_prepare_that_times_out_aborts_the_reset() {
         ..config()
     })
     .await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let b2 = ControlClient::p6b(
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(
         grpc,
         "svc",
         "b-2",
@@ -472,8 +422,8 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
             })
         })
     };
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], refusing()).await;
-    let b2 = ControlClient::p6b(grpc, "svc", "b-2", &["audit"], refusing()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], refusing()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["audit"], refusing()).await;
     let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
     assert_eq!(r.status, 409, "{}", r.body);
     let body = json_of(&r);
@@ -498,7 +448,7 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
         (ControlRefusal::Failed, 502),
     ] {
         let (grpc, http) = hub(config()).await;
-        let _b = ControlClient::p6b(
+        let _b = ControlClient::new(
             grpc,
             "svc",
             "b-1",
@@ -525,8 +475,8 @@ async fn the_lease_is_renewed_while_the_reset_runs_and_never_after_the_finish() 
                 .then(|| Reaction::After(Duration::from_millis(1100), default_result(req)))
         })
     };
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], slow()).await;
-    let b2 = ControlClient::p6b(grpc, "svc", "b-2", &["audit"], slow()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], slow()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["audit"], slow()).await;
     let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
     assert_eq!(r.status, 200, "{}", r.body);
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -568,7 +518,7 @@ async fn an_execute_timeout_says_the_executor_may_still_finish_or_have_changed_t
         ..config()
     })
     .await;
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "svc",
         "b-1",
@@ -623,7 +573,7 @@ async fn the_finish_waits_for_the_renewals_in_flight() {
                 .then(|| Reaction::After(Duration::from_millis(300), default_result(req)))
         })
     };
-    let _b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], behaviour).await;
+    let _b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], behaviour).await;
     let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
     assert_eq!(r.status, 200, "{}", r.body);
     let log = log.lock().unwrap().clone();
@@ -637,33 +587,9 @@ async fn the_finish_waits_for_the_renewals_in_flight() {
 }
 
 #[tokio::test]
-async fn a_reset_is_refused_up_front_while_an_instance_lacks_the_capability() {
-    let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
-    let _old = ControlClient::start(
-        grpc,
-        "svc",
-        "b-old",
-        P6A,
-        &["audit"],
-        None,
-        ok_to_everything(),
-    )
-    .await;
-    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
-    assert_eq!(r.status, 409, "{}", r.body);
-    let error = json_of(&r)["error"].as_str().unwrap().to_string();
-    assert!(
-        error.contains("b-old") && error.contains("keep consuming"),
-        "{error}"
-    );
-    assert!(b1.seen().is_empty(), "nobody was prepared");
-}
-
-#[tokio::test]
 async fn a_second_reset_of_a_processor_is_refused_while_one_runs() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "svc",
         "b-1",
@@ -701,7 +627,7 @@ async fn a_second_reset_of_a_processor_is_refused_while_one_runs() {
 #[tokio::test]
 async fn an_instance_that_leaves_mid_call_fails_it_at_once() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "svc",
         "b-1",
@@ -758,7 +684,7 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
         ..config()
     })
     .await;
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "svc",
         "b-1",
@@ -905,7 +831,7 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
 #[tokio::test]
 async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
     let (grpc, http) = hub(config()).await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
     let many: Vec<String> = (0..1025)
         .map(|p| format!("{{\"partition\":{p},\"offset\":0}}"))
         .collect();
@@ -955,7 +881,7 @@ async fn without_a_write_token_or_an_acl_control_entry_controls_are_disabled() {
         ..config()
     })
     .await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
     for (method, path, body) in [
         ("POST", PAUSE, ""),
         ("POST", RESUME, ""),
@@ -995,7 +921,7 @@ async fn the_write_token_writes_the_read_token_never_does() {
         ..config()
     })
     .await;
-    let b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
     assert_eq!(status(http, "POST", PAUSE, None, "").await.0, 401);
     assert_eq!(
         status(http, "POST", PAUSE, Some("not-the-token-0123456789"), "")
@@ -1016,12 +942,7 @@ async fn the_write_token_writes_the_read_token_never_does() {
         (Some("Bearer"), "")
     );
     // The write token reads what the dashboard token reads; no token reads nothing.
-    for path in [
-        "/api/v1/processors",
-        "/api/v1/topology",
-        "/topology",
-        LETTERS,
-    ] {
+    for path in ["/api/v1/processors", "/api/v1/topology", LETTERS] {
         assert_eq!(
             status(http, "GET", path, Some(WRITE), "").await.0,
             200,
@@ -1060,7 +981,6 @@ async fn an_acl_credential_controls_only_with_control_set() {
         grpc,
         "svc",
         "b-1",
-        common::control::P6B,
         &["audit"],
         Some("tok-svc-0123456789"),
         ok_to_everything(),

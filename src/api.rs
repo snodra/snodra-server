@@ -11,7 +11,6 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::config::Config;
 use crate::edges::{EdgeSnapshot, Latency, WindowTotals};
-use crate::protocol;
 use crate::registry::Kind;
 use crate::topology::{KindName, Topology, Totals};
 
@@ -85,9 +84,6 @@ pub struct Version {
     pub hub_id: String,
     /// The hub crate version.
     pub version: String,
-    /// The highest protocol version the hub speaks.
-    pub protocol_version: u32,
-    pub capabilities: Vec<String>,
     pub started_at_ms: i64,
     pub now_ms: i64,
     /// Content hash of the embedded dashboard assets; a page whose own build differs is stale.
@@ -105,11 +101,6 @@ pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
     Version {
         hub_id: t.hub_id.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_version: protocol::HUB_PROTOCOL_VERSION,
-        capabilities: protocol::HUB_CAPABILITIES
-            .iter()
-            .map(|c| c.to_string())
-            .collect(),
         started_at_ms: t.hub_started_at_ms,
         now_ms: t.now_ms,
         build_id: build_id.to_string(),
@@ -174,7 +165,7 @@ pub fn types(t: &Topology, edges: &EdgeSnapshot) -> TypesView {
             TypeView {
                 type_name: o.type_name.clone(),
                 kind: o.kind,
-                owners: o.owners(),
+                owners: o.owner_services.clone(),
                 shared: o.shared,
                 registered: true,
                 instances: instances.remove(o.type_name.as_str()).unwrap_or_default(),
@@ -307,8 +298,8 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
         })
         .collect();
     for o in &t.types {
-        for owner in o.owners() {
-            services.entry(owner).or_default();
+        for owner in &o.owner_services {
+            services.entry(owner.clone()).or_default();
         }
     }
     for e in &edges.edges {
@@ -334,7 +325,7 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
                     id: type_id(&o.type_name),
                     name: o.type_name.clone(),
                     type_kind: o.kind,
-                    owners: o.owners(),
+                    owners: o.owner_services.clone(),
                     shared: o.shared,
                     registered: true,
                     orphaned: o.orphaned,
@@ -370,9 +361,9 @@ pub fn graph(t: &Topology, edges: &EdgeSnapshot) -> Graph {
         let traffic = tt.map_or_else(Traffic::default, |tt| {
             Traffic::of(tt.count, tt.errors, &tt.latency)
         });
-        o.owners().into_iter().map(move |owner| GraphEdge {
+        o.owner_services.iter().map(move |owner| GraphEdge {
             from: type_id(&o.type_name),
-            to: service_id(&owner),
+            to: service_id(owner),
             role: EdgeRole::Handle,
             traffic: traffic.clone(),
         })
@@ -598,35 +589,28 @@ pub fn settings(c: &Config) -> SettingsView {
             fmt_duration(c.heartbeat_interval),
             Some(fmt_duration(d.heartbeat_interval)),
             Plain,
-            "heartbeat period announced to v2 clients",
+            "heartbeat period announced to clients",
         ),
         setting(
             "KRAKEN_HUB_HEARTBEAT_TIMEOUT",
             fmt_duration(c.heartbeat_timeout),
             Some(fmt_duration(d.heartbeat_timeout)),
             Plain,
-            "dead-instance threshold, v2 sessions",
-        ),
-        setting(
-            "KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT",
-            fmt_duration(c.legacy_heartbeat_timeout),
-            Some(fmt_duration(d.legacy_heartbeat_timeout)),
-            Plain,
-            "dead-instance threshold, v1 sessions",
+            "dead-instance threshold",
         ),
         setting(
             "KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE",
             c.queue_capacity_per_instance.to_string(),
             Some(d.queue_capacity_per_instance.to_string()),
             Plain,
-            "requests queued per flow-controlled instance",
+            "requests queued per instance",
         ),
         setting(
             "KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE",
             fmt_size(c.queue_bytes_per_instance),
             Some(fmt_size(d.queue_bytes_per_instance)),
             Plain,
-            "encoded bytes queued per flow-controlled instance",
+            "encoded bytes queued per instance",
         ),
         setting(
             "KRAKEN_HUB_QUEUE_BYTES_TOTAL",
@@ -836,7 +820,7 @@ pub fn settings(c: &Config) -> SettingsView {
             String::new(),
             None,
             Sensitivity::Secret,
-            "bearer token the dashboard, its API and /topology require; unset: open",
+            "bearer token the dashboard's API requires; unset: open",
         ),
         setting(
             "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
@@ -905,10 +889,8 @@ pub fn revision(t: &Topology, edges: &WindowTotals) -> String {
         s.push('\u{1}');
         for i in &svc.instances {
             s.push_str(&format!(
-                "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}\u{2}",
+                "{}|{}|{:?}|{:?}|{:?}|{:?}\u{2}",
                 i.instance_id,
-                i.protocol_version,
-                i.flow_controlled,
                 i.stale,
                 i.command_types,
                 i.query_types,
@@ -920,12 +902,7 @@ pub fn revision(t: &Topology, edges: &WindowTotals) -> String {
     for o in &t.types {
         s.push_str(&format!(
             "{}|{:?}|{:?}|{}|{}|{}\u{3}",
-            o.type_name,
-            o.kind,
-            o.owners(),
-            o.shared,
-            o.orphaned,
-            o.live_instances
+            o.type_name, o.kind, o.owner_services, o.shared, o.orphaned, o.live_instances
         ));
     }
     format!("{:016x}", xxh64(s.as_bytes(), edges.keys_hash))
@@ -961,9 +938,7 @@ mod tests {
             in_flight_as_sender: 0,
             command_types: commands.iter().map(|s| s.to_string()).collect(),
             query_types: queries.iter().map(|s| s.to_string()).collect(),
-            protocol_version: 2,
             client_version: "lib/1".into(),
-            flow_controlled: false,
             permits_available: 0,
             queued: 0,
             load_factor: 100,
@@ -984,12 +959,11 @@ mod tests {
         TypeOwnership {
             type_name: name.into(),
             kind,
-            owner_service: owner.into(),
             live_instances: live,
             orphaned: live == 0,
             orphaned_for_ms: if live == 0 { 1500 } else { 0 },
             shared: false,
-            owner_services: vec![],
+            owner_services: vec![owner.into()],
         }
     }
 
@@ -1252,7 +1226,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 48);
+        assert_eq!(v.settings.len(), 47);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         let control = get("KRAKEN_HUB_CONTROL_TIMEOUT");
         assert_eq!(

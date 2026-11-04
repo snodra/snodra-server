@@ -6,7 +6,7 @@
 //!
 //! How the window is driven: A registers, then B floods A with 300 large requests that A never
 //! reads, filling A's HTTP/2 flow-control window and outbound buffer so the response body cannot
-//! drain. A stops heartbeating, so the watchdog evicts it (300 ms legacy timeout). A then sends a late
+//! drain. A stops heartbeating, so the watchdog evicts it (300 ms timeout). A then sends a late
 //! `Register` on the same stream and goes away; after the owner grace (100 ms) and a sweep, the
 //! type must have no owner: a request gets NO_HANDLER, not HANDLER_DISCONNECTED.
 
@@ -31,7 +31,7 @@ fn heartbeat() -> ClientMessage {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_register_after_eviction_leaves_no_ghost() {
     let config = Config {
-        legacy_heartbeat_timeout: Duration::from_millis(300), // the fake client speaks v1
+        heartbeat_timeout: Duration::from_millis(300),
         owner_grace: Duration::from_millis(100),
         otlp_endpoint: None,
         ..Config::default()

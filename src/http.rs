@@ -1,11 +1,10 @@
-//! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): `GET /topology` for the CLI and the
-//! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see
-//! [`crate::assets`]) and its API under `/api/v1/` (roadmap P2; `processors` since P6a, ADR 0022;
-//! the processor controls under `/api/v1/services/` since P6b, ADR 0023). With
-//! `KRAKEN_HUB_DASHBOARD_TOKEN` set (ADR 0018), `/topology` and every read under `/api/v1/` (the
-//! event stream included) need `Authorization: Bearer <token>` (the dashboard token, or the write
-//! token, which reads too); the page and its assets stay public, because the page is what asks
-//! for the token. The mutating control calls need the write token or an ACL credential whose
+//! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): unless
+//! `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see [`crate::assets`]) and its API
+//! under `/api/v1/` (`processors`, ADR 0022; the processor controls under `/api/v1/services/`,
+//! ADR 0023); with the dashboard disabled every path is 404. With `KRAKEN_HUB_DASHBOARD_TOKEN`
+//! set (ADR 0018), every read under `/api/v1/` (the event stream included) needs
+//! `Authorization: Bearer <token>` (the dashboard token, or the write token, which reads too);
+//! the page and its assets stay public, because the page is what asks for the token. The mutating control calls need the write token or an ACL credential whose
 //! entry has `control = true`, whatever the dashboard token; with neither configured they answer
 //! 403 `controls are disabled`.
 
@@ -123,8 +122,8 @@ impl HttpState {
     }
 }
 
-/// The HTTP routes: `/topology` always; the dashboard (`/`, `/ui` redirect to `/ui/`) and its
-/// API when enabled. Unknown paths are 404. The API answers CORS for the peer origins only.
+/// The HTTP routes: the dashboard (`/`, `/ui` redirect to `/ui/`) and its API when enabled.
+/// Unknown paths are 404. The API answers CORS for the peer origins only.
 pub fn app(state: HttpState) -> axum::Router {
     let guard: Option<Arc<ReadGuard>> = state.config.dashboard_token.clone().map(|read| {
         Arc::new(ReadGuard {
@@ -132,13 +131,7 @@ pub fn app(state: HttpState) -> axum::Router {
             write: state.config.dashboard_write_token.clone(),
         })
     });
-    let mut app = axum::Router::new().route("/topology", get(get_topology));
-    if let Some(guard) = &guard {
-        app = app.route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(guard),
-            require_token,
-        ));
-    }
+    let mut app = axum::Router::new();
     if state.config.dashboard_enabled {
         // Peer origins are validated at startup (no control characters), so the header is valid.
         let csp = HeaderValue::from_str(&csp(&state.config.peers))
@@ -336,10 +329,6 @@ fn fresh_json<T: Serialize>(value: T) -> Response {
         .into_response()
 }
 
-async fn get_topology(State(s): State<HttpState>) -> Json<Topology> {
-    Json(s.topology())
-}
-
 async fn api_topology(State(s): State<HttpState>) -> Response {
     fresh_json(s.topology())
 }
@@ -383,7 +372,6 @@ fn status_of(verdict: Verdict) -> StatusCode {
         Verdict::NotFound => StatusCode::NOT_FOUND,
         Verdict::Conflict => StatusCode::CONFLICT,
         Verdict::Failed => StatusCode::BAD_GATEWAY,
-        Verdict::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         Verdict::Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }
@@ -509,7 +497,7 @@ async fn api_resume(
     fan_out(s, Action::Resume, service, processor, headers, body).await
 }
 
-/// Pause or resume on every capable instance that runs the processor: 200 with the counts when
+/// Pause or resume on every instance that runs the processor: 200 with the counts when
 /// at least one persisted it.
 async fn fan_out(
     s: HttpState,
@@ -658,7 +646,7 @@ fn describe(answer: &Answer) -> String {
     }
 }
 
-/// A dead-letter call on the capable instance with the freshest status.
+/// A dead-letter call on the instance with the freshest status.
 async fn letters(
     s: HttpState,
     caller: String,
@@ -1082,7 +1070,7 @@ mod tests {
         });
         let app = app(s);
         let get = |auth: Option<&str>| {
-            let mut r = axum::http::Request::builder().uri("/topology");
+            let mut r = axum::http::Request::builder().uri("/api/v1/topology");
             if let Some(a) = auth {
                 r = r.header(header::AUTHORIZATION, a);
             }
@@ -1133,13 +1121,7 @@ mod tests {
         });
         let ctx = ContextId::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let meta = SessionMeta {
-            protocol_version: 2,
-            instance_status: true,
-            processors: true,
-            processor_control: true,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
+        let meta = SessionMeta::default();
         let token = s
             .sessions
             .insert(&ctx, "b-1", "svc", meta, tx, CancellationToken::new());

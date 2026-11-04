@@ -31,7 +31,6 @@ fn bearer(token: &str) -> String {
 }
 
 const JSON_PATHS: &[&str] = &[
-    "/topology",
     "/api/v1/topology",
     "/api/v1/types",
     "/api/v1/graph",
@@ -57,7 +56,7 @@ async fn every_data_endpoint_is_401_without_the_token_and_200_with_it() {
     let r = http_request(
         http,
         "GET",
-        "/topology",
+        "/api/v1/topology",
         &[("authorization", &format!("bearer {TOKEN}"))],
     )
     .await;
@@ -96,7 +95,7 @@ async fn a_wrong_token_is_the_same_bare_401() {
     // A token in the URL is never honoured.
     for path in [
         format!("/api/v1/topology?token={TOKEN}"),
-        format!("/topology?access_token={TOKEN}"),
+        format!("/api/v1/topology?access_token={TOKEN}"),
     ] {
         assert_eq!(http_get_full(http, &path).await.status, 401, "{path}");
     }
@@ -243,35 +242,6 @@ async fn a_peer_page_may_forward_the_token_cross_origin() {
     )
     .await;
     assert!(r.header("access-control-allow-origin").is_none());
-}
-
-#[tokio::test]
-async fn topology_stays_protected_when_the_dashboard_is_off() {
-    let http = start(Config {
-        dashboard_enabled: false,
-        ..config()
-    })
-    .await;
-    assert_eq!(http_get_full(http, "/topology").await.status, 401);
-    let r = http_request(
-        http,
-        "GET",
-        "/topology",
-        &[("Authorization", &bearer(TOKEN))],
-    )
-    .await;
-    assert_eq!(r.status, 200);
-    assert_eq!(
-        http_request(
-            http,
-            "GET",
-            "/api/v1/topology",
-            &[("Authorization", &bearer(TOKEN))]
-        )
-        .await
-        .status,
-        404
-    );
 }
 
 #[tokio::test]

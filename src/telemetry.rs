@@ -131,12 +131,9 @@ pub enum Outcome {
     Timeout,
     HandlerDisconnected,
     HandlerError,
-    /// The hub rejected the request for capacity (full queue or session buffer), whatever code
-    /// the sender was sent (RESOURCE_EXHAUSTED, or HANDLER_ERROR "handler busy").
+    /// The hub rejected the request for capacity (full queue or session buffer):
+    /// RESOURCE_EXHAUSTED.
     ResourceExhausted,
-    /// The hub rejected a request mode the sender did not declare or the hub does not implement
-    /// (UNSUPPORTED).
-    Unsupported,
     /// A streaming query ended before its handler did: the sender cancelled it, or it outlived
     /// `KRAKEN_HUB_MAX_STREAM_DURATION` (CANCELLED).
     Cancelled,
@@ -156,7 +153,6 @@ impl Outcome {
             Outcome::HandlerError => "handler_error",
             Outcome::InvalidRequest => "invalid_request",
             Outcome::ResourceExhausted => "resource_exhausted",
-            Outcome::Unsupported => "unsupported",
             Outcome::Cancelled => "cancelled",
             Outcome::Denied => "denied",
         }
@@ -246,11 +242,11 @@ impl Metrics {
                 .build(),
             queue_depth: meter
                 .u64_gauge("kraken_hub_queue_depth")
-                .with_description("Requests queued for flow-controlled instances, per service")
+                .with_description("Requests queued for instances, per service")
                 .build(),
             permits_available: meter
                 .u64_gauge("kraken_hub_permits_available")
-                .with_description("Permits flow-controlled instances have left, per service")
+                .with_description("Permits instances have left, per service")
                 .build(),
             queue_wait: meter
                 .f64_histogram("kraken_hub_queue_wait_seconds")
@@ -434,7 +430,7 @@ impl Metrics {
         self.acl_reload_errors.add(1, &[]);
     }
 
-    /// Queue depth and permits left per service (flow-controlled instances summed); services
+    /// Queue depth and permits left per service (its instances summed); services
     /// that had flows before and have none now are written back as 0.
     pub fn flows_set(&self, by_service: HashMap<String, (u64, u64)>) {
         let mut seen = self.seen.lock().unwrap();

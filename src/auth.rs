@@ -182,7 +182,7 @@ fn from_hex(s: &str) -> Option<Digest> {
 /// `KRAKEN_HUB_AUTH_MODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
-    /// No checks (the behaviour before P5a).
+    /// No checks.
     Off,
     /// Every rule is evaluated; violations are logged and counted, everything is allowed.
     Permissive,
@@ -1060,18 +1060,16 @@ impl Authorizer {
     }
 
     /// Judges a `Register`: the credentials (`None`: the client sent none), the service name it
-    /// claims and every type it handles. `v2` says whether the client speaks protocol v2 (a v1
-    /// client cannot send credentials; the refusal says so). Every violation is logged and
-    /// counted; in `enforce` the first is returned in [`Admission::refused`], in `permissive`
-    /// the registration goes ahead and `status` says it is unauthenticated.
+    /// claims and every type it handles. Every violation is logged and counted; in `enforce` the
+    /// first is returned in [`Admission::refused`], in `permissive` the registration goes ahead
+    /// and `status` says it is unauthenticated.
     pub fn admit(
         &self,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
         handled: &[String],
     ) -> Admission {
-        self.admit_with(None, credentials, v2, service, handled)
+        self.admit_with(None, credentials, service, handled)
     }
 
     /// [`Authorizer::admit`] for a stream whose TLS peer presented a client certificate (`peer`:
@@ -1081,7 +1079,6 @@ impl Authorizer {
         &self,
         peer: Option<&[u8]>,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
         handled: &[String],
     ) -> Admission {
@@ -1089,7 +1086,7 @@ impl Authorizer {
             AuthMode::Off => None,
             _ => peer.map(crate::mtls::identify),
         };
-        self.admit_with(identified, credentials, v2, service, handled)
+        self.admit_with(identified, credentials, service, handled)
     }
 
     /// [`Authorizer::admit`] for a certificate already read. A certificate that names exactly one
@@ -1102,18 +1099,16 @@ impl Authorizer {
         &self,
         cert: Result<ClientCert, CertError>,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
         handled: &[String],
     ) -> Admission {
-        self.admit_with(Some(cert), credentials, v2, service, handled)
+        self.admit_with(Some(cert), credentials, service, handled)
     }
 
     fn admit_with(
         &self,
         cert: Option<Result<ClientCert, CertError>>,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
         handled: &[String],
     ) -> Admission {
@@ -1125,7 +1120,7 @@ impl Authorizer {
             };
         }
         let acl = self.acl();
-        let (matched, mut denials) = self.resolve_principal(&acl, cert, credentials, v2, service);
+        let (matched, mut denials) = self.resolve_principal(&acl, cert, credentials, service);
         if let Some((principal, rights)) = &matched {
             denials.extend(judge(*rights, principal, service, handled));
         }
@@ -1183,11 +1178,10 @@ impl Authorizer {
         acl: &'a Acl,
         cert: Option<Result<ClientCert, CertError>>,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
     ) -> (Option<(Principal, Rights<'a>)>, Vec<Denied>) {
         let from_credentials =
-            |side: Vec<Denied>| match self.resolve_credential(acl, credentials, v2, service) {
+            |side: Vec<Denied>| match self.resolve_credential(acl, credentials, service) {
                 Ok(found) => (Some(found), side),
                 Err(denials) => (None, [side, denials].concat()),
             };
@@ -1217,7 +1211,7 @@ impl Authorizer {
         let mut side = Vec::new();
         let mut result = "ok";
         if credentials_present(credentials) {
-            match self.resolve_credential(acl, credentials, v2, service) {
+            match self.resolve_credential(acl, credentials, service) {
                 Ok((other, _)) if other.service != cert.service => {
                     result = "mismatch";
                     side.push(Denied::new(
@@ -1259,7 +1253,6 @@ impl Authorizer {
         &self,
         acl: &'a Acl,
         credentials: Option<&Credentials>,
-        v2: bool,
         service: &str,
     ) -> Result<(Principal, Rights<'a>), Vec<Denied>> {
         match credentials.and_then(|c| c.kind.as_ref()) {
@@ -1278,11 +1271,7 @@ impl Authorizer {
             Some(credentials::Kind::Token(_)) | None => Err(vec![Denied::new(
                 "no_credentials",
                 DeniedCode::Unauthenticated,
-                if v2 {
-                    "credentials required: Register.credentials.token is missing"
-                } else {
-                    "credentials required: this client speaks protocol v1 and sends none"
-                },
+                "credentials required: Register.credentials.token is missing",
             )]),
         }
     }
@@ -1349,7 +1338,7 @@ impl Authorizer {
         } else {
             Disposition::Allowed
         };
-        let (principal, rights) = match self.resolve_credential(&acl, credentials, true, service) {
+        let (principal, rights) = match self.resolve_credential(&acl, credentials, service) {
             Ok(found) => found,
             Err(denials) if denials[0].code == DeniedCode::Unavailable => {
                 // The credential is not bad: the hub cannot judge it yet (the key set is not
@@ -1508,7 +1497,7 @@ impl Authorizer {
     ///   presented, the call is `UNAUTHENTICATED`.
     /// * `permissive`: the same, except that an unauthenticated call is allowed when no dashboard
     ///   token is set (it is logged and counted as `topology_unauthenticated`). A dashboard token
-    ///   that is set stays required, as before access control existed.
+    ///   that is set stays required.
     /// * `off`: only the dashboard token, when set.
     pub fn check_topology(
         &self,
@@ -1952,7 +1941,7 @@ contexts = ["default"]
             ),
             Some(2)
         );
-        // A dashboard token that is set keeps being required, as before the ACL existed.
+        // A dashboard token that is set stays required.
         let dash = Secret::new("dash-token-0123456789");
         assert_eq!(
             a.check_topology(None, Some(&dash)).unwrap_err().code(),
@@ -2000,7 +1989,7 @@ contexts = ["default"]
         capture_logs();
         let (a, m) = authorizer(AuthMode::Enforce);
         let name = "s".repeat(5000);
-        let admission = a.admit(Some(&token("nope")), true, &name, &[]);
+        let admission = a.admit(Some(&token("nope")), &name, &[]);
         let denied = admission.refused.unwrap();
         assert!(denied.message.len() < 200, "{}", denied.message.len());
         let lines = refusals();
@@ -2012,7 +2001,7 @@ contexts = ["default"]
             Some(1)
         );
         // A wrong-service denial quotes the name too, cut.
-        let admission = a.admit(Some(&token("tok-orders")), true, &name, &[]);
+        let admission = a.admit(Some(&token("tok-orders")), &name, &[]);
         let message = admission.refused.unwrap().message;
         assert!(message.len() < 200, "{}", message.len());
     }
@@ -2024,7 +2013,6 @@ contexts = ["default"]
         // The wrong service and three types outside `handle`: two denials, one line.
         let admission = a.admit(
             Some(&token("tok-billing")),
-            true,
             "orders",
             &types(&["x.A", "x.B", "x.C"]),
         );
@@ -2118,7 +2106,7 @@ contexts = ["default"]
         capture_logs();
         let (a, m) = authorizer(AuthMode::Enforce);
         for _ in 0..200 {
-            let admission = a.admit(Some(&token("nope")), true, "orders", &[]);
+            let admission = a.admit(Some(&token("nope")), "orders", &[]);
             assert!(admission.refused.is_some());
         }
         let lines = refusals();
@@ -2250,7 +2238,7 @@ contexts = ["default"]
     #[test]
     fn off_allows_everything_and_counts_nothing() {
         let (a, m) = authorizer(AuthMode::Off);
-        let adm = a.admit(None, false, "whatever", &types(&["x.Y"]));
+        let adm = a.admit(None, "whatever", &types(&["x.Y"]));
         assert_eq!(adm.refused, None);
         assert_eq!(adm.status, AuthStatus::Off);
         assert!(a.check_send(None, "whatever", "x.Y").is_ok());
@@ -2269,7 +2257,6 @@ contexts = ["default"]
         let (a, _m) = authorizer(AuthMode::Enforce);
         let adm = a.admit(
             Some(&token("tok-billing")),
-            true,
             "billing",
             &types(&["billing.Pay", "shared.Ping"]),
         );
@@ -2289,21 +2276,19 @@ contexts = ["default"]
     #[test]
     fn enforce_refuses_each_kind_of_violation_with_its_status() {
         let (a, _m) = authorizer(AuthMode::Enforce);
-        let refused = |creds: Option<Credentials>, v2: bool, service: &str, handled: &[&str]| {
-            a.admit(creds.as_ref(), v2, service, &types(handled))
+        let refused = |creds: Option<Credentials>, service: &str, handled: &[&str]| {
+            a.admit(creds.as_ref(), service, &types(handled))
                 .refused
                 .expect("refused")
         };
-        let d = refused(None, true, "billing", &[]);
+        let d = refused(None, "billing", &[]);
         assert_eq!(
             (d.reason, d.code),
             ("no_credentials", DeniedCode::Unauthenticated)
         );
-        let d = refused(None, false, "billing", &[]);
-        assert!(d.message.contains("protocol v1"), "{}", d.message);
-        let d = refused(Some(token("")), true, "billing", &[]);
+        let d = refused(Some(token("")), "billing", &[]);
         assert_eq!(d.reason, "no_credentials");
-        let d = refused(Some(token("who?")), true, "billing", &[]);
+        let d = refused(Some(token("who?")), "billing", &[]);
         assert_eq!(
             (d.reason, d.code),
             ("unknown_token", DeniedCode::Unauthenticated)
@@ -2312,20 +2297,19 @@ contexts = ["default"]
         let jwt = Credentials {
             kind: Some(credentials::Kind::Jwt("a.b.c".into())),
         };
-        let d = refused(Some(jwt), true, "billing", &[]);
+        let d = refused(Some(jwt), "billing", &[]);
         assert_eq!(
             (d.reason, d.code),
             ("jwt_not_configured", DeniedCode::Unauthenticated)
         );
         assert_eq!(d.message, "jwt credentials are not configured on this hub");
-        let d = refused(Some(token("tok-billing")), true, "orders", &[]);
+        let d = refused(Some(token("tok-billing")), "orders", &[]);
         assert_eq!(
             (d.reason, d.code),
             ("wrong_service", DeniedCode::PermissionDenied)
         );
         let d = refused(
             Some(token("tok-billing")),
-            true,
             "billing",
             &["billing.Pay", "orders.Place", "x.Y"],
         );
@@ -2340,7 +2324,7 @@ contexts = ["default"]
         );
         assert_eq!(d.to_status().code(), tonic::Code::PermissionDenied);
         assert_eq!(
-            refused(None, true, "billing", &[]).to_status().code(),
+            refused(None, "billing", &[]).to_status().code(),
             tonic::Code::Unauthenticated
         );
     }
@@ -2348,14 +2332,13 @@ contexts = ["default"]
     #[test]
     fn permissive_allows_every_violation_but_counts_it() {
         let (a, m) = authorizer(AuthMode::Permissive);
-        let adm = a.admit(None, false, "billing", &types(&["billing.Pay"]));
+        let adm = a.admit(None, "billing", &types(&["billing.Pay"]));
         assert_eq!(adm.refused, None);
         assert_eq!(adm.principal, None);
         assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
         assert_eq!(adm.status.label(), Some("unauthenticated (permissive)"));
         let adm = a.admit(
             Some(&token("tok-billing")),
-            true,
             "billing",
             &types(&["orders.Place"]),
         );
@@ -2394,7 +2377,7 @@ contexts = ["default"]
     fn unauthenticated_clients_cannot_mint_service_labels() {
         let (a, m) = authorizer(AuthMode::Enforce);
         for n in 0..5 {
-            let _ = a.admit(None, true, &format!("random-{n}"), &[]);
+            let _ = a.admit(None, &format!("random-{n}"), &[]);
         }
         assert_eq!(
             m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
@@ -2507,7 +2490,7 @@ contexts = ["default"]
     fn admit_and_the_dashboard_secret_use_the_constant_time_compare() {
         let (a, _m) = authorizer(AuthMode::Enforce);
         let before = ct::COMPARISONS.with(|c| c.get());
-        let _ = a.admit(Some(&token("tok-orders")), true, "orders", &[]);
+        let _ = a.admit(Some(&token("tok-orders")), "orders", &[]);
         assert_eq!(ct::COMPARISONS.with(|c| c.get()) - before, 2);
 
         let secret = Secret::new("s3cret-dashboard-token");
@@ -2814,7 +2797,6 @@ handle = ["*"]
         let creds = fx.token("billing", 300);
         let adm = fx.auth.admit(
             Some(&creds),
-            true,
             "billing",
             &types(&["billing.Pay", "shared.Ping"]),
         );
@@ -2832,9 +2814,7 @@ handle = ["*"]
         );
         // The rights are the [[service]] table's, not the [[token]] table's: the token entry
         // for `billing` has `billing.*` too, so tell them apart by a type only one grants.
-        let adm = fx
-            .auth
-            .admit(Some(&creds), true, "billing", &types(&["x.Only"]));
+        let adm = fx.auth.admit(Some(&creds), "billing", &types(&["x.Only"]));
         assert_eq!(adm.refused.expect("refused").reason, "handle_denied");
     }
 
@@ -2863,7 +2843,7 @@ handle = ["*"]
         let fx = jwt_fx(AuthMode::Enforce).await;
         let adm = fx
             .auth
-            .admit(Some(&fx.token("orders", 300)), true, "billing", &[]);
+            .admit(Some(&fx.token("orders", 300)), "billing", &[]);
         let d = adm.refused.expect("refused");
         assert_eq!(
             (d.reason, d.code),
@@ -2871,9 +2851,7 @@ handle = ["*"]
         );
         assert_eq!(d.message, "token azp orders is not service billing");
         // An azp the ACL does not know says so, after the mismatch.
-        let adm = fx
-            .auth
-            .admit(Some(&fx.token("ghost", 300)), true, "billing", &[]);
+        let adm = fx.auth.admit(Some(&fx.token("ghost", 300)), "billing", &[]);
         assert_eq!(adm.refused.unwrap().reason, "wrong_service");
     }
 
@@ -2883,9 +2861,7 @@ handle = ["*"]
         // `web` has a token elsewhere in the file but no [[service]] table; the user-token case
         // (azp = the frontend client) is the same refusal.
         for service in ["ghost", "kraken-frontend"] {
-            let adm = fx
-                .auth
-                .admit(Some(&fx.token(service, 300)), true, service, &[]);
+            let adm = fx.auth.admit(Some(&fx.token(service, 300)), service, &[]);
             let d = adm.refused.expect("refused");
             assert_eq!(
                 (d.reason, d.code),
@@ -2902,7 +2878,7 @@ handle = ["*"]
         let expired = fx.token("billing", -120);
         let d = fx
             .auth
-            .admit(Some(&expired), true, "billing", &[])
+            .admit(Some(&expired), "billing", &[])
             .refused
             .unwrap();
         assert_eq!(
@@ -2913,16 +2889,12 @@ handle = ["*"]
         let wrong_key = jwt_creds(Signer::es256("k1").sign(&claims(ISS, "billing", 300)));
         let d = fx
             .auth
-            .admit(Some(&wrong_key), true, "billing", &[])
+            .admit(Some(&wrong_key), "billing", &[])
             .refused
             .unwrap();
         assert_eq!(d.message, "invalid token signature");
         let junk = jwt_creds("a.b.c".into());
-        let d = fx
-            .auth
-            .admit(Some(&junk), true, "billing", &[])
-            .refused
-            .unwrap();
+        let d = fx.auth.admit(Some(&junk), "billing", &[]).refused.unwrap();
         assert_eq!(d.message, "malformed token");
         assert_eq!(d.to_status().code(), tonic::Code::Unauthenticated);
         assert_eq!(
@@ -2955,7 +2927,7 @@ handle = ["*"]
         let key = Signer::es256("k1");
         let creds = jwt_creds(key.sign(&claims(ISS, "billing", 300)));
         a.prepare(Some(&creds)).await;
-        let d = a.admit(Some(&creds), true, "billing", &[]).refused.unwrap();
+        let d = a.admit(Some(&creds), "billing", &[]).refused.unwrap();
         assert_eq!(
             (d.reason, d.code),
             ("jwks_unavailable", DeniedCode::Unavailable)
@@ -2972,19 +2944,12 @@ handle = ["*"]
         let creds = jwt_creds(rotated.sign(&claims(ISS, "billing", 300)));
         // Without the async step the sync check cannot know the key: the client is told to
         // retry (UNAVAILABLE), not that its registration is rejected.
-        let d = fx
-            .auth
-            .admit(Some(&creds), true, "billing", &[])
-            .refused
-            .unwrap();
+        let d = fx.auth.admit(Some(&creds), "billing", &[]).refused.unwrap();
         assert_eq!(d.message, "signing key not known yet");
         assert_eq!(d.code, DeniedCode::Unavailable);
         tokio::time::sleep(Duration::from_millis(150)).await;
         fx.auth.prepare(Some(&creds)).await;
-        assert_eq!(
-            fx.auth.admit(Some(&creds), true, "billing", &[]).refused,
-            None
-        );
+        assert_eq!(fx.auth.admit(Some(&creds), "billing", &[]).refused, None);
     }
 
     #[tokio::test]
@@ -2992,7 +2957,7 @@ handle = ["*"]
         let fx = jwt_fx(AuthMode::Permissive).await;
         let adm = fx
             .auth
-            .admit(Some(&fx.token("billing", -120)), true, "billing", &[]);
+            .admit(Some(&fx.token("billing", -120)), "billing", &[]);
         assert_eq!(adm.refused, None);
         assert_eq!(adm.principal, None);
         assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
@@ -3003,7 +2968,7 @@ handle = ["*"]
         // A valid one for the right service is authenticated.
         let adm = fx
             .auth
-            .admit(Some(&fx.token("billing", 300)), true, "billing", &[]);
+            .admit(Some(&fx.token("billing", 300)), "billing", &[]);
         assert!(adm.principal.is_some());
     }
 
@@ -3012,7 +2977,7 @@ handle = ["*"]
         let fx = jwt_fx(AuthMode::Enforce).await;
         let adm = fx
             .auth
-            .admit(Some(&fx.token("billing", 300)), true, "billing", &[]);
+            .admit(Some(&fx.token("billing", 300)), "billing", &[]);
         let p = adm.principal.unwrap();
         assert!(
             fx.auth
@@ -3057,19 +3022,14 @@ handle = ["*"]
     #[tokio::test]
     async fn the_service_label_knows_the_names_of_service_tables() {
         let fx = jwt_fx(AuthMode::Enforce).await;
-        let _ = fx.auth.admit(
-            Some(&fx.token("billing", 300)),
-            true,
-            "billing",
-            &types(&["x.Y"]),
-        );
+        let _ = fx
+            .auth
+            .admit(Some(&fx.token("billing", 300)), "billing", &types(&["x.Y"]));
         assert_eq!(
             fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
             Some(1)
         );
-        let _ = fx
-            .auth
-            .admit(Some(&fx.token("ghost", 300)), true, "ghost", &[]);
+        let _ = fx.auth.admit(Some(&fx.token("ghost", 300)), "ghost", &[]);
         assert_eq!(
             fx.m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
             Some(1)
@@ -3297,7 +3257,7 @@ handle = ["*"]
         let fx = jwt_fx(AuthMode::Enforce).await;
         let p = fx
             .auth
-            .admit(Some(&fx.token("billing", 60)), true, "billing", &[])
+            .admit(Some(&fx.token("billing", 60)), "billing", &[])
             .principal
             .unwrap();
         let Expiry::Close(d) = fx.auth.expired(&p, "billing") else {
@@ -3318,7 +3278,7 @@ handle = ["*"]
         let fx = jwt_fx(AuthMode::Permissive).await;
         let p = fx
             .auth
-            .admit(Some(&fx.token("billing", 60)), true, "billing", &[])
+            .admit(Some(&fx.token("billing", 60)), "billing", &[])
             .principal
             .unwrap();
         assert_eq!(fx.auth.expired(&p, "billing"), Expiry::Keep);
@@ -3454,13 +3414,7 @@ handle = ["billing.*"]
     fn enforce_admits_a_certificate_whose_service_has_a_table() {
         let (a, m) = authorizer(AuthMode::Enforce);
         let bytes = svc("orders");
-        let adm = a.admit_peer(
-            Some(&bytes),
-            None,
-            true,
-            "orders",
-            &types(&["orders.Place"]),
-        );
+        let adm = a.admit_peer(Some(&bytes), None, "orders", &types(&["orders.Place"]));
         assert_eq!(adm.refused, None);
         let p = adm.principal.expect("a principal");
         assert_eq!(p.kind(), CredentialKind::Certificate);
@@ -3498,7 +3452,7 @@ handle = ["billing.*"]
                 "certificate names more than one service",
             ),
         ] {
-            let adm = a.admit_peer(Some(&der(&spec)), None, true, "orders", &[]);
+            let adm = a.admit_peer(Some(&der(&spec)), None, "orders", &[]);
             let denied = adm.refused.expect("refused");
             assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
             assert_eq!(denied.message, text);
@@ -3514,18 +3468,12 @@ handle = ["billing.*"]
     fn permissive_counts_a_certificate_that_names_no_service_and_falls_back_to_the_credentials() {
         let (a, m) = authorizer(AuthMode::Permissive);
         let bytes = der(&ClientSpec::default());
-        let adm = a.admit_peer(Some(&bytes), None, true, "orders", &[]);
+        let adm = a.admit_peer(Some(&bytes), None, "orders", &[]);
         assert_eq!(adm.refused, None);
         assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
         assert_eq!(results(&m, "no_service"), Some(1));
         // With a valid token next to it, the token is the principal.
-        let adm = a.admit_peer(
-            Some(&bytes),
-            Some(&token("tok-orders")),
-            true,
-            "orders",
-            &[],
-        );
+        let adm = a.admit_peer(Some(&bytes), Some(&token("tok-orders")), "orders", &[]);
         assert_eq!(adm.principal.unwrap().kind(), CredentialKind::Token);
         assert_eq!(results(&m, "no_service"), Some(2));
     }
@@ -3534,7 +3482,7 @@ handle = ["billing.*"]
     fn a_certificate_for_another_service_than_the_one_registered_is_refused() {
         let (a, _m) = authorizer(AuthMode::Enforce);
         let denied = a
-            .admit_peer(Some(&svc("billing")), None, true, "orders", &[])
+            .admit_peer(Some(&svc("billing")), None, "orders", &[])
             .refused
             .unwrap();
         assert_eq!(denied.reason, "wrong_service");
@@ -3557,7 +3505,7 @@ handle = ["billing.*"]
             m.metrics.clone(),
         );
         let denied = a
-            .admit_peer(Some(&svc("orders")), None, true, "orders", &[])
+            .admit_peer(Some(&svc("orders")), None, "orders", &[])
             .refused
             .unwrap();
         assert_eq!(denied.reason, "no_acl_entry");
@@ -3573,24 +3521,12 @@ handle = ["billing.*"]
         // The service table allows orders.*; the token entry of the same service allows * but
         // is not consulted.
         assert_eq!(
-            a.admit_peer(
-                Some(&bytes),
-                None,
-                true,
-                "orders",
-                &types(&["orders.Place"])
-            )
-            .refused,
+            a.admit_peer(Some(&bytes), None, "orders", &types(&["orders.Place"]))
+                .refused,
             None
         );
         let denied = a
-            .admit_peer(
-                Some(&bytes),
-                None,
-                true,
-                "orders",
-                &types(&["billing.Charge"]),
-            )
+            .admit_peer(Some(&bytes), None, "orders", &types(&["billing.Charge"]))
             .refused
             .unwrap();
         assert_eq!(denied.reason, "handle_denied");
@@ -3609,24 +3545,12 @@ handle = ["billing.*"]
         let (a, m) = authorizer(AuthMode::Enforce);
         let bytes = svc("orders");
         // The same service: the certificate is the principal, and the token adds nothing.
-        let adm = a.admit_peer(
-            Some(&bytes),
-            Some(&token("tok-orders")),
-            true,
-            "orders",
-            &[],
-        );
+        let adm = a.admit_peer(Some(&bytes), Some(&token("tok-orders")), "orders", &[]);
         assert_eq!(adm.refused, None);
         assert_eq!(adm.principal.unwrap().kind(), CredentialKind::Certificate);
         assert_eq!(results(&m, "ok"), Some(1));
         // Another service: PERMISSION_DENIED.
-        let adm = a.admit_peer(
-            Some(&bytes),
-            Some(&token("tok-billing")),
-            true,
-            "orders",
-            &[],
-        );
+        let adm = a.admit_peer(Some(&bytes), Some(&token("tok-billing")), "orders", &[]);
         let denied = adm.refused.unwrap();
         assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
         assert_eq!(
@@ -3638,7 +3562,7 @@ handle = ["billing.*"]
         assert_eq!(violations(&m, "cert_mismatch"), Some(1));
         // A credential that does not resolve at all is refused as it always is.
         let denied = a
-            .admit_peer(Some(&bytes), Some(&token("nope")), true, "orders", &[])
+            .admit_peer(Some(&bytes), Some(&token("nope")), "orders", &[])
             .refused
             .unwrap();
         assert_eq!(denied.reason, "unknown_token");
@@ -3651,7 +3575,6 @@ handle = ["billing.*"]
         let adm = a.admit_peer(
             Some(&svc("orders")),
             Some(&token("tok-billing")),
-            true,
             "orders",
             &[],
         );
@@ -3668,7 +3591,7 @@ handle = ["billing.*"]
     #[test]
     fn off_ignores_a_certificate() {
         let (a, m) = authorizer(AuthMode::Off);
-        let adm = a.admit_peer(Some(&svc("billing")), None, true, "orders", &[]);
+        let adm = a.admit_peer(Some(&svc("billing")), None, "orders", &[]);
         assert_eq!(adm.principal, None);
         assert_eq!(adm.status, AuthStatus::Off);
         assert_eq!(adm.refused, None);
@@ -3701,7 +3624,7 @@ handle = ["billing.*"]
         let (a, m) = authorizer(AuthMode::Enforce);
         let mut p = crate::mtls::identify(&svc("orders")).unwrap();
         p.not_after = SystemTime::now() - Duration::from_secs(1);
-        let adm = a.admit_identified(Ok(p), None, true, "orders", &[]);
+        let adm = a.admit_identified(Ok(p), None, "orders", &[]);
         let denied = adm.refused.unwrap();
         assert_eq!(denied.reason, "expired");
         assert_eq!(denied.to_status().code(), tonic::Code::Unauthenticated);
@@ -3792,13 +3715,7 @@ handle = ["billing.*"]
         capture_logs();
         let (a, _m) = authorizer(AuthMode::Enforce);
         let bytes = svc("orders");
-        let adm = a.admit_peer(
-            Some(&bytes),
-            None,
-            true,
-            "orders",
-            &types(&["billing.Charge"]),
-        );
+        let adm = a.admit_peer(Some(&bytes), None, "orders", &types(&["billing.Charge"]));
         assert!(adm.refused.is_some());
         let cert = crate::mtls::identify(&bytes).unwrap();
         let full: String = cert

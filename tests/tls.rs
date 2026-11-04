@@ -81,7 +81,7 @@ async fn grpc_serves_tls_only_and_verifies_against_the_ca() {
 
     // A client that trusts the CA registers and gets its ack over TLS.
     let mut client = FakeClient::connect_tls(grpc, &ca).await;
-    client.send_register_v2("svc", &["svc.Do"], &[]).await;
+    client.send_register("svc", &["svc.Do"], &[]).await;
     client.expect_ack().await;
     assert!(probe(grpc, &ca).await.unwrap());
 
@@ -105,7 +105,7 @@ async fn http_serves_tls_only() {
     let (ca, cert, key) = pki.write(&dir, "hub");
     let (_grpc, http) = start_hub_with_http(config(&cert, &key)).await;
     let http = http.unwrap();
-    let r = https_request(http, &pki.ca_pem, "GET", "/topology", &[])
+    let r = https_request(http, &pki.ca_pem, "GET", "/api/v1/topology", &[])
         .await
         .unwrap();
     assert_eq!(r.status, 200);
@@ -122,7 +122,7 @@ async fn http_serves_tls_only() {
     );
     let other = Pki::new("other CA");
     assert!(
-        https_request(http, &other.ca_pem, "GET", "/topology", &[])
+        https_request(http, &other.ca_pem, "GET", "/api/v1/topology", &[])
             .await
             .is_err()
     );
@@ -145,14 +145,14 @@ async fn the_http_listener_can_use_its_own_pair() {
     let http = http.unwrap();
     assert!(probe(grpc, &grpc_ca).await.unwrap());
     assert_eq!(
-        https_request(http, &http_pki.ca_pem, "GET", "/topology", &[])
+        https_request(http, &http_pki.ca_pem, "GET", "/api/v1/topology", &[])
             .await
             .unwrap()
             .status,
         200
     );
     assert!(
-        https_request(http, &grpc_pki.ca_pem, "GET", "/topology", &[])
+        https_request(http, &grpc_pki.ca_pem, "GET", "/api/v1/topology", &[])
             .await
             .is_err()
     );
@@ -168,10 +168,10 @@ async fn a_replaced_certificate_applies_to_new_connections_and_not_to_open_ones(
 
     // An open stream and an open-and-served HTTP exchange on the first certificate.
     let mut open = FakeClient::connect_tls(grpc, &first_ca).await;
-    open.send_register_v2("svc", &["svc.Do"], &[]).await;
+    open.send_register("svc", &["svc.Do"], &[]).await;
     open.expect_ack().await;
     assert_eq!(
-        https_request(http, &first.ca_pem, "GET", "/topology", &[])
+        https_request(http, &first.ca_pem, "GET", "/api/v1/topology", &[])
             .await
             .unwrap()
             .status,
@@ -191,7 +191,7 @@ async fn a_replaced_certificate_applies_to_new_connections_and_not_to_open_ones(
     })
     .await;
     eventually("HTTP presents the new certificate", || async {
-        https_request(http, &second.ca_pem, "GET", "/topology", &[])
+        https_request(http, &second.ca_pem, "GET", "/api/v1/topology", &[])
             .await
             .is_ok()
     })
@@ -262,9 +262,7 @@ async fn the_probes_of_the_hubs_own_container_work_with_tls() {
     })
     .await;
     let mut client = FakeClient::connect_tls(grpc, &ca).await;
-    client
-        .send_register_v2("billing", &["billing.Pay"], &[])
-        .await;
+    client.send_register("billing", &["billing.Pay"], &[]).await;
     client.expect_ack().await;
 
     // No --address, no --tls-ca, the environment configures TLS: the hub's own certificate is
@@ -316,9 +314,7 @@ async fn the_binary_speaks_tls_with_tls_ca_and_in_its_own_container() {
     })
     .await;
     let mut client = FakeClient::connect_tls(grpc, &ca).await;
-    client
-        .send_register_v2("billing", &["billing.Pay"], &[])
-        .await;
+    client.send_register("billing", &["billing.Pay"], &[]).await;
     client.expect_ack().await;
     let bin = env!("CARGO_BIN_EXE_kraken-hub");
     let address = format!("https://localhost:{}", grpc.port());

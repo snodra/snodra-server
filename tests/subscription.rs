@@ -1,6 +1,5 @@
-//! Subscription queries end to end (ADR 0017, P4c), over real gRPC with raw clients: a v2
-//! sender that declared "subscription", v2 handlers with and without it, and the codes a
-//! session without the capability may see.
+//! Subscription queries end to end (ADR 0017), over real gRPC with raw clients: the initial
+//! result and the updates, credits, endings, cancels and the refusals.
 
 mod common;
 
@@ -15,8 +14,6 @@ use kraken_hub::proto::{
 };
 
 const SHORT: Duration = Duration::from_millis(1500);
-const SUBSCRIPTION: &str = "subscription";
-const STREAMING: &str = "streaming";
 
 fn config() -> Config {
     Config {
@@ -46,45 +43,32 @@ async fn handshake(c: &mut FakeClient, n: i64) -> Vec<server_message::Message> {
     }
 }
 
-/// A v2 client declaring `capabilities`, handling `queries` (exclusive) and `shared` queries.
+/// A client handling `queries` (exclusive) and `shared` queries; does not wait for the ack.
 async fn register(
     addr: SocketAddr,
     service: &str,
     queries: &[&str],
     shared: &[&str],
-    capabilities: &[&str],
 ) -> FakeClient {
     let client = FakeClient::connect(addr).await;
-    let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     client
         .send_raw_register(Register {
-            service_name: service.to_string(),
-            instance_id: client.instance_id.clone(),
-            query_types: strings(queries),
-            shared_query_types: strings(shared),
-            protocol_version: 2,
-            capabilities: strings(capabilities),
-            client_version: "fake-client/1.0".to_string(),
-            ..Register::default()
+            shared_query_types: shared.iter().map(|s| s.to_string()).collect(),
+            ..client.register_message(service, &[], queries)
         })
         .await;
     client
 }
 
-/// Two handlers of the shared query `acct.Watch` (services svc-a and svc-b, both with
-/// "subscription") and a sender, all handshaken.
+/// Two handlers of the shared query `acct.Watch` (services svc-a and svc-b) and a sender, all
+/// handshaken.
 async fn trio(addr: SocketAddr) -> (FakeClient, FakeClient, FakeClient) {
-    let mut a = register(addr, "svc-a", &[], &["acct.Watch"], &[SUBSCRIPTION]).await;
-    let mut b = register(addr, "svc-b", &[], &["acct.Watch"], &[SUBSCRIPTION]).await;
+    let mut a = register(addr, "svc-a", &[], &["acct.Watch"]).await;
+    let mut b = register(addr, "svc-b", &[], &["acct.Watch"]).await;
     handshake(&mut a, 1).await;
     handshake(&mut b, 1).await;
-    let mut sender = register(addr, "svc-web", &[], &[], &[SUBSCRIPTION, STREAMING]).await;
-    match &handshake(&mut sender, 1).await[..] {
-        [server_message::Message::RegisterAck(ack)] => {
-            assert_eq!(ack.capabilities, [STREAMING, SUBSCRIPTION]);
-        }
-        other => panic!("expected the ack, got {other:?}"),
-    }
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
+    handshake(&mut sender, 1).await;
     (a, b, sender)
 }
 
@@ -349,8 +333,8 @@ async fn the_disconnects_cancel_the_targets_or_end_the_subscription() {
     assert_eq!((end_code(&e), e.parts), (ErrorCode::HandlerDisconnected, 2));
 
     // The sender leaves: every target is cancelled.
-    let mut a = register(addr, "svc-a", &[], &["acct.Watch"], &[SUBSCRIPTION]).await;
-    let mut b = register(addr, "svc-b", &[], &["acct.Watch"], &[SUBSCRIPTION]).await;
+    let mut a = register(addr, "svc-a", &[], &["acct.Watch"]).await;
+    let mut b = register(addr, "svc-b", &[], &["acct.Watch"]).await;
     handshake(&mut a, 1).await;
     handshake(&mut b, 1).await;
     let (initial_on_a, ta, tb) = open(&mut sender, &mut a, &mut b, "sub2", 0, 0).await;
@@ -369,65 +353,17 @@ async fn the_disconnects_cancel_the_targets_or_end_the_subscription() {
 }
 
 #[tokio::test]
-async fn subscriptions_are_refused_with_codes_the_session_knows() {
+async fn a_subscription_without_owner_is_no_handler_and_unknown_parts_are_ignored() {
     let addr = start_hub(config()).await;
-    let mut legacy = register(addr, "svc-old", &["old.Watch"], &[], &[STREAMING]).await;
-    handshake(&mut legacy, 1).await;
     let (mut a, mut b, mut sender) = trio(addr).await;
 
-    // A v2 sender without the capability: UNSUPPORTED.
-    let mut plain = register(addr, "svc-plain", &[], &[], &[STREAMING]).await;
-    handshake(&mut plain, 1).await;
-    plain
-        .tx
-        .send(subscribe("p1", "acct.Watch", 1_000, 0, 0))
-        .await
-        .unwrap();
-    let (id, code, why) = expect_error(&mut plain).await;
-    assert_eq!((id.as_str(), code), ("p1", ErrorCode::Unsupported));
-    assert!(why.contains("\"subscription\""), "{why}");
-
-    // A raw v1 client: INVALID_REQUEST, never a multi-part message.
-    let mut v1 = FakeClient::register(addr, "svc-v1", &[], &[]).await;
-    v1.heartbeat(1).await;
-    v1.tx
-        .send(subscribe("v1", "acct.Watch", 1_000, 0, 0))
-        .await
-        .unwrap();
-    loop {
-        match message(&mut v1).await {
-            server_message::Message::Heartbeat(_) => {}
-            server_message::Message::Error(e) => {
-                assert_eq!(e.code(), ErrorCode::InvalidRequest);
-                break;
-            }
-            other => panic!("a v1 session got {other:?}"),
-        }
-    }
-
-    // No capable instance of the owner: UNSUPPORTED naming it; no owner: NO_HANDLER.
-    sender
-        .tx
-        .send(subscribe("old", "old.Watch", 1_000, 0, 0))
-        .await
-        .unwrap();
-    let (id, code, why) = expect_error(&mut sender).await;
-    assert_eq!((id.as_str(), code), ("old", ErrorCode::Unsupported));
-    assert!(
-        why.contains("svc-old") && why.contains("subscription"),
-        "{why}"
-    );
     sender
         .tx
         .send(subscribe("none", "nobody.Watch", 1_000, 0, 0))
         .await
         .unwrap();
     assert_eq!(expect_error(&mut sender).await.1, ErrorCode::NoHandler);
-    assert!(
-        handshake(&mut legacy, 2).await.is_empty(),
-        "nothing reached the old handler"
-    );
-    // A subscription-only session's multi-part messages are read (and ignored when unknown).
+    // Multi-part messages for an unknown id are ignored.
     a.tx.send(FakeClient::part_ok("ghost#1", 1, b"x"))
         .await
         .unwrap();

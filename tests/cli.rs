@@ -50,14 +50,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
         ..Config::default()
     })
     .await;
-    let mut c = FakeClient::register_v2_with(
-        addr,
-        "billing",
-        &["Pay"],
-        &["instance-status", "processors"],
-    )
-    .await;
-    let _ack = c.next().await;
+    let c = FakeClient::register(addr, "billing", &["Pay"], &[]).await;
     c.status_with_processors(
         &["hub"],
         vec![ProcessorStatus {

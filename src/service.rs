@@ -212,8 +212,8 @@ impl Hub for HubService {
         &self,
         request: Request<TopologyRequest>,
     ) -> Result<Response<TopologyResponse>, Status> {
-        // The same data as `GET /topology`, so the same dashboard token (the CLI sends it as
-        // metadata); in permissive and enforce mode an ACL token reads it too (ADR 0018).
+        // The same data as `GET /api/v1/topology`, so the same dashboard token (the CLI sends it
+        // as metadata); in permissive and enforce mode an ACL token reads it too (ADR 0018).
         let presented = request
             .metadata()
             .get("authorization")
@@ -293,7 +293,6 @@ impl StreamCtx {
                     commands = reg.command_types.len(),
                     queries = reg.query_types.len(),
                     shared_queries = reg.shared_query_types.len(),
-                    protocol_version = reg.protocol_version,
                     client_version = %reg.client_version,
                     "register"
                 );
@@ -424,20 +423,27 @@ async fn run_stream(
             .await;
         return;
     }
+    if first.initial_permits == 0 {
+        warn!(service = %crate::auth::clip(&first.service_name), instance = %crate::auth::clip(&first.instance_id), "register without permits");
+        let _ = tx
+            .send(Err(Status::invalid_argument(
+                "Register.initial_permits must be at least 1",
+            )))
+            .await;
+        return;
+    }
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
-    // Version, capabilities and client version are fixed by the first Register (ADR 0013).
-    let v2 = protocol::is_v2(first.protocol_version);
     // Access control (ADR 0018): the credentials and the claimed service and types are judged
-    // before any session state exists. Like the version, the credentials are read from the
-    // first Register only; a later one cannot change who the session is.
+    // before any session state exists. Like the client version, the permits and the placement,
+    // the credentials are read from the first Register only; a later one cannot change who the
+    // session is.
     let mut handled = handled_types(&first);
     // A rotated signing key is fetched before the credentials are judged (ADR 0019).
     ctx.auth.prepare(first.credentials.as_ref()).await;
     let admission = ctx.auth.admit_peer(
         peer.as_deref(),
         first.credentials.as_ref(),
-        v2,
         &service,
         &handled,
     );
@@ -446,29 +452,8 @@ async fn run_stream(
         return;
     }
     let mut principal = admission.principal;
-    let ack = v2.then(|| {
-        protocol::register_ack(
-            &ctx.config,
-            &ctx.context,
-            first.protocol_version,
-            &first.capabilities,
-        )
-    });
-    // So are the flow-control settings and the placement (ADR 0014).
-    let flow_control = v2 && protocol::shares(&first.capabilities, protocol::FLOW_CONTROL);
-    // And whether its InstanceStatus reports are kept (ADR 0016).
-    let instance_status = v2 && protocol::shares(&first.capabilities, protocol::INSTANCE_STATUS);
-    // And whether it may send scatter-gather queries (ADR 0017).
-    let scatter_gather = v2 && protocol::shares(&first.capabilities, protocol::SCATTER_GATHER);
-    // And whether it sends or serves streaming queries (ADR 0017, P4b).
-    let streaming = v2 && protocol::shares(&first.capabilities, protocol::STREAMING);
-    // And subscription queries (ADR 0017, P4c).
-    let subscription = v2 && protocol::shares(&first.capabilities, protocol::SUBSCRIPTION);
-    // And whether its InstanceStatus carries event processors (ADR 0022).
-    let processors = v2 && protocol::shares(&first.capabilities, protocol::PROCESSORS);
-    // And whether it answers processor control (ADR 0023).
-    let processor_control =
-        v2 && protocol::shares(&first.capabilities, protocol::PROCESSOR_CONTROL);
+    let ack = protocol::register_ack(&ctx.config, &ctx.context);
+    // So is the placement (ADR 0014).
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -478,32 +463,23 @@ async fn run_stream(
             .collect(),
     };
     let meta = SessionMeta {
-        protocol_version: first.protocol_version,
-        capabilities: first.capabilities.clone(),
         client_version: first.client_version.clone(),
-        heartbeat_timeout: ctx.config.heartbeat_timeout_for(first.protocol_version),
-        flow_control,
-        initial_permits: first.initial_permits,
         placement: placement.clone(),
-        instance_status,
-        scatter_gather,
-        streaming,
-        subscription,
-        processors,
-        processor_control,
         principal: principal.clone(),
         auth: admission.status.clone(),
     };
-    let permits = meta.permits();
     // Flow state, then the session, then the registration under it (ADR 0014): a request routed
     // to the session always finds its flow, and a late disconnect of an older stream with the
     // same instance id can never unregister this stream's registration. Tokens grow per stream,
     // so of two concurrent handshakes of one instance id the newer wins in both maps.
     let token = ctx.sessions.allocate_token();
-    match ctx
-        .router
-        .open_session(&ctx.context, &instance_id, token, &service, permits)
-    {
+    match ctx.router.open_session(
+        &ctx.context,
+        &instance_id,
+        token,
+        &service,
+        first.initial_permits,
+    ) {
         Ok(()) => {}
         Err(OpenRefused::Superseded) => {
             debug!(instance = %instance_id, "superseded by a newer stream during handshake");
@@ -563,18 +539,17 @@ async fn run_stream(
         return;
     }
     // The ack is queued before this task reads the next inbound message, so it precedes the echo
-    // of the heartbeat that follows the Register (the stream's messages are handled in order).
-    // Requests routed to this instance meanwhile may come first; clients handle them anyway.
-    if let Some(ack) = &ack {
-        let sent = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => false,
-            sent = tx.send(Ok(ack.clone())) => sent.is_ok(),
-        };
-        if !sent {
-            ctx.disconnect(&instance_id, token);
-            return;
-        }
+    // of the heartbeat that follows the Register (the stream's messages are handled in order):
+    // the client waits for it. Requests routed to this instance meanwhile may come first;
+    // clients handle them anyway.
+    let sent = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        sent = tx.send(Ok(ack.clone())) => sent.is_ok(),
+    };
+    if !sent {
+        ctx.disconnect(&instance_id, token);
+        return;
     }
     ctx.router.refresh_gauges();
     // Requests taken over from a replaced session go out now that the ack is queued.
@@ -673,7 +648,7 @@ async fn run_stream(
                         }
                         ctx.router.refresh_gauges();
                         // Best effort like the heartbeat echo: a full buffer drops this ack.
-                        if let (Some(ack), Some(tx)) = (&ack, out.upgrade())
+                        if let Some(tx) = out.upgrade()
                             && let Err(mpsc::error::TrySendError::Full(_)) =
                                 tx.try_send(Ok(ack.clone()))
                         {
@@ -719,58 +694,28 @@ async fn run_stream(
                     .on_permits(&ctx.context, &instance_id, token, p.count, p.grant)
             }
             Some(client_message::Message::Status(status)) => {
-                // Kept only for sessions that negotiated "instance-status"; ignored otherwise.
-                let kept = ctx.sessions.set_status(
-                    &ctx.context,
-                    &instance_id,
-                    token,
-                    &status,
-                    Instant::now(),
-                );
-                if !kept {
-                    debug!(instance = %instance_id, "InstanceStatus without the capability ignored");
-                }
+                ctx.sessions
+                    .set_status(&ctx.context, &instance_id, token, &status, Instant::now());
             }
-            // Multi-part messages from a client (ADR 0017, P4b and P4c): a handler's streamed
-            // parts and end (or pushed updates), a sender's credits and cancellation. Only a
-            // session that negotiated "streaming" or "subscription" sends them meaningfully;
-            // from any other they are ignored.
-            Some(
-                m @ (client_message::Message::Part(_)
-                | client_message::Message::End(_)
-                | client_message::Message::Flow(_)
-                | client_message::Message::Cancel(_)),
-            ) => {
-                if !streaming && !subscription {
-                    debug!(instance = %instance_id, "multi-part client message without the streaming or subscription capability ignored");
-                    continue;
-                }
-                match m {
-                    client_message::Message::Part(part) => {
-                        ctx.router
-                            .on_stream_part_from(&ctx.context, &instance_id, token, part)
-                    }
-                    client_message::Message::End(end) => {
-                        ctx.router
-                            .on_stream_end_from(&ctx.context, &instance_id, token, end)
-                    }
-                    client_message::Message::Flow(flow) => {
-                        ctx.router
-                            .on_flow_from(&ctx.context, &instance_id, token, flow)
-                    }
-                    client_message::Message::Cancel(cancel) => {
-                        ctx.router
-                            .on_cancel_from(&ctx.context, &instance_id, token, cancel)
-                    }
-                    _ => unreachable!("matched above"),
-                }
+            // Multi-part messages from a client (ADR 0017): a handler's streamed parts and end (or
+            // pushed updates), a sender's credits and cancellation.
+            Some(client_message::Message::Part(part)) => {
+                ctx.router
+                    .on_stream_part_from(&ctx.context, &instance_id, token, part)
+            }
+            Some(client_message::Message::End(end)) => {
+                ctx.router
+                    .on_stream_end_from(&ctx.context, &instance_id, token, end)
+            }
+            Some(client_message::Message::Flow(flow)) => {
+                ctx.router
+                    .on_flow_from(&ctx.context, &instance_id, token, flow)
+            }
+            Some(client_message::Message::Cancel(cancel)) => {
+                ctx.router
+                    .on_cancel_from(&ctx.context, &instance_id, token, cancel)
             }
             Some(client_message::Message::ControlReply(reply)) => {
-                // Only a session that negotiated "processor-control" was ever asked (ADR 0023).
-                if !processor_control {
-                    debug!(instance = %instance_id, "ControlReply without the processor-control capability ignored");
-                    continue;
-                }
                 ctx.router
                     .control()
                     .on_reply(&ctx.context, &instance_id, token, reply)
@@ -861,10 +806,12 @@ mod tests {
     fn session(sessions: &Sessions) -> mpsc::Receiver<Result<ServerMessage, Status>> {
         let ctx = ContextId::default();
         let (tx, rx) = mpsc::channel(4);
-        let mut meta = SessionMeta::v1(Duration::from_secs(30));
-        meta.principal = Some(Arc::new(Principal::token(digest_of("tok"), "orders")));
-        meta.auth = AuthStatus::Authenticated {
-            service: "orders".into(),
+        let meta = SessionMeta {
+            principal: Some(Arc::new(Principal::token(digest_of("tok"), "orders"))),
+            auth: AuthStatus::Authenticated {
+                service: "orders".into(),
+            },
+            ..SessionMeta::default()
         };
         let token = sessions.insert(&ctx, "i1", "orders", meta, tx, CancellationToken::new());
         sessions.set_handled(&ctx, "i1", token, vec!["orders.Place".into()]);
@@ -1002,8 +949,10 @@ mod tests {
 
         // The session registered with orders.Place.
         let (tx, mut rx) = mpsc::channel(4);
-        let mut meta = SessionMeta::v1(Duration::from_secs(30));
-        meta.principal = Some(Arc::new(principal.clone()));
+        let meta = SessionMeta {
+            principal: Some(Arc::new(principal.clone())),
+            ..SessionMeta::default()
+        };
         let token = sessions.insert(
             &ctx.context,
             "i1",
@@ -1077,10 +1026,7 @@ mod tests {
         crate::telemetry::test_support::capture_logs();
         let m = test_metrics();
         let auth = Authorizer::with_acl(AuthMode::Enforce, Acl::default(), m.metrics.clone());
-        let denied = auth
-            .admit(None, true, "orders", &[])
-            .refused
-            .expect("refused");
+        let denied = auth.admit(None, "orders", &[]).refused.expect("refused");
         let logged_by_admit = crate::telemetry::test_support::logged()
             .iter()
             .filter(|l| l.field("reason").is_some())

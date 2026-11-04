@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::{ALL_CAPS, FakeClient, Spec, TempDir, acl_entry, auth_config};
+use common::{FakeClient, Spec, TempDir, acl_entry, auth_config};
 use keys::{JwksServer, Signer, claims, forge_hs256, forge_none, now};
 use kraken_hub::auth::AuthMode;
 use kraken_hub::config::Config;
@@ -23,8 +23,6 @@ use tonic::{Code, Status};
 
 const ISS: &str = "https://sso.example/realms/kraken";
 const AUD: &str = "kraken-hub";
-/// The capabilities of a client that refreshes its credentials.
-const CAPS: &[&str] = &["credentials-refresh"];
 
 fn service_entry(name: &str, handle: &[&str], send: &[&str]) -> String {
     let list = |items: &[&str]| {
@@ -160,12 +158,9 @@ impl Hub {
 }
 
 fn spec<'a>(service: &'a str, jwt: &'a str) -> Spec<'a> {
-    let mut caps = ALL_CAPS.to_vec();
-    caps.extend(CAPS);
     Spec {
         service,
         jwt: Some(jwt),
-        caps,
         ..Spec::default()
     }
 }
@@ -235,7 +230,7 @@ async fn auth_kind(hub: &Hub, service: &str) -> String {
     let http = hub.http.expect("an HTTP listener");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let (_, body) = common::http_get(http, "/topology").await;
+        let (_, body) = common::http_get(http, "/api/v1/topology").await;
         let t: serde_json::Value = serde_json::from_str(&body).unwrap();
         let found = t["services"]
             .as_array()
@@ -278,9 +273,7 @@ async fn a_valid_jwt_registers_and_its_rights_come_from_the_service_table() {
     let hub = Hub::start(Opts::default()).await;
     let t = hub.jwt("orders", 300);
     let mut c = FakeClient::register_spec(hub.addr, &orders_spec(&t)).await;
-    let ack = c.expect_ack().await;
-    // The hub offers credentials-refresh and the client declared it.
-    assert!(ack.capabilities.iter().any(|c| c == "credentials-refresh"));
+    c.expect_ack().await;
     // `send` is the service table's: billing.Charge passes (nobody handles it), admin.Wipe does not.
     assert!(works(&mut c).await);
     c.tx.send(request("r2", "admin.Wipe")).await.unwrap();
@@ -554,8 +547,7 @@ async fn off_ignores_the_credentials_and_their_expiry() {
     let mut c = FakeClient::register_spec(hub.addr, &orders_spec(&t)).await;
     c.expect_ack().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // Off sends no credentials-refresh capability back as a promise it checks anything, but the
-    // session lives on.
+    // Off checks nothing: the refresh is ignored and the session lives on.
     c.tx.send(refresh_jwt("garbage")).await.unwrap();
     assert!(c.silent_for(Duration::from_millis(400)).await);
     c.tx.send(request("r1", "billing.Charge")).await.unwrap();
@@ -697,7 +689,6 @@ async fn a_token_session_may_move_to_a_jwt_and_back() {
         service: "orders",
         commands: vec!["orders.Place"],
         token: Some("tok-orders"),
-        caps: [ALL_CAPS, CAPS].concat(),
         ..Spec::default()
     };
     // token -> jwt: from then on the JWT's expiry applies.
@@ -728,19 +719,6 @@ async fn a_refresh_judges_the_handled_types_against_the_new_entry() {
         "{}",
         status.message()
     );
-}
-
-#[tokio::test]
-async fn a_hub_offers_credentials_refresh_only_to_a_client_that_declares_it() {
-    let hub = Hub::start(Opts::default()).await;
-    let t = hub.jwt("orders", 300);
-    let plain = Spec {
-        caps: ALL_CAPS.to_vec(),
-        ..orders_spec(&t)
-    };
-    let mut c = FakeClient::register_spec(hub.addr, &plain).await;
-    let ack = c.expect_ack().await;
-    assert!(!ack.capabilities.iter().any(|c| c == "credentials-refresh"));
 }
 
 // ---- reloads ------------------------------------------------------------------------------
@@ -800,7 +778,7 @@ async fn the_topology_shows_how_each_instance_authenticated() {
     let _token = registered(&hub, &web).await;
     let _none = registered(&hub, &spec("stranger", "")).await;
     let body = loop {
-        let (_, body) = common::http_get(http, "/topology").await;
+        let (_, body) = common::http_get(http, "/api/v1/topology").await;
         let t: serde_json::Value = serde_json::from_str(&body).unwrap();
         // Three sessions and the probe that registered first may still be going away.
         let n = t["services"]
@@ -850,7 +828,7 @@ async fn the_topology_shows_nothing_about_authentication_when_it_is_off() {
     .await;
     let _c = FakeClient::register_spec(hub.addr, &spec("orders", "x")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let (_, body) = common::http_get(hub.http.unwrap(), "/topology").await;
+    let (_, body) = common::http_get(hub.http.unwrap(), "/api/v1/topology").await;
     assert!(
         !body.contains("authKind") && !body.contains("expiresAt"),
         "{body}"

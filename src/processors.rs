@@ -1,7 +1,7 @@
-//! Event processors (ADR 0022, roadmap P6a): what each instance reports about its Kafka event
-//! processors in `InstanceStatus.processors` (capability "processors"), bounded as the hub keeps
-//! it, and the per-service view the dashboard and `GET /api/v1/processors` show. Since P6b (ADR
-//! 0023) a report also says whether the processor replays and which reset holds its lock.
+//! Event processors (ADR 0022): what each instance reports about its Kafka event processors in
+//! `InstanceStatus.processors`, bounded as the hub keeps it, and the per-service view the
+//! dashboard and `GET /api/v1/processors` show. A report also says whether the processor replays
+//! and which reset holds its lock (ADR 0023).
 //!
 //! The hub only relays and aggregates what the libraries report: it reads no Kafka, keeps no
 //! history and stores nothing beyond the latest report of each live session (in the session's
@@ -816,9 +816,7 @@ mod tests {
             in_flight_as_sender: 0,
             command_types: vec![],
             query_types: vec![],
-            protocol_version: 2,
             client_version: String::new(),
-            flow_controlled: false,
             permits_available: 0,
             queued: 0,
             load_factor: 100,

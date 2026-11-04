@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, bail};
 
 use crate::auth::{AuthMode, Secret};
-use crate::protocol;
 use crate::tls::ClientAuthMode;
 
 #[derive(Debug, Clone)]
@@ -19,7 +18,7 @@ pub struct Config {
     pub hub_id: String,
     /// Address the gRPC server binds to. `KRAKEN_HUB_LISTEN`, default `0.0.0.0:7000`.
     pub listen: SocketAddr,
-    /// Address of the HTTP JSON mirror (`GET /topology`). `KRAKEN_HUB_HTTP_LISTEN`, default
+    /// Address of the dashboard and its API (`/ui/`, `/api/v1/`). `KRAKEN_HUB_HTTP_LISTEN`, default
     /// `0.0.0.0:7001`; an explicitly empty value disables the HTTP listener.
     pub http_listen: Option<SocketAddr>,
     /// OTLP gRPC endpoint for traces and metrics. `KRAKEN_HUB_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
@@ -31,26 +30,22 @@ pub struct Config {
     /// Upper bound for `Request.timeout_ms`; larger hints are clamped.
     /// `KRAKEN_HUB_MAX_TIMEOUT_MS`, default 60000.
     pub max_timeout: Duration,
-    /// Heartbeat period announced to v2 sessions in `RegisterAck`.
+    /// Heartbeat period announced to every session in `RegisterAck`.
     /// `KRAKEN_HUB_HEARTBEAT_INTERVAL`, default 3 s. `heartbeat_timeout` must be at least twice it.
     pub heartbeat_interval: Duration,
-    /// A v2 session (`Register.protocol_version >= 2`) is dropped after this long without a
-    /// heartbeat. `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, default 10 s.
+    /// A session is dropped after this long without a heartbeat.
+    /// `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, default 10 s.
     pub heartbeat_timeout: Duration,
-    /// A v1 session (`protocol_version` 0, clients that heartbeat every 10 s) is dropped after this
-    /// long without a heartbeat. `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT`, default 30 s.
-    pub legacy_heartbeat_timeout: Duration,
     /// Per-type request timeouts. For a listed type the override replaces the default (requests
     /// with `timeout_ms == 0`) and the clamp (`max_timeout`). `KRAKEN_HUB_TIMEOUT_OVERRIDES`,
     /// `type=ms,type=ms`, default none.
     pub timeout_overrides: BTreeMap<String, Duration>,
-    /// Requests the hub queues for one flow-controlled instance before rejecting new ones.
+    /// Requests the hub queues for one instance before rejecting new ones.
     /// `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE`, default 10 000.
     pub queue_capacity_per_instance: usize,
-    /// Encoded bytes the hub queues for one flow-controlled instance before rejecting new
-    /// requests. `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
+    /// Encoded bytes the hub queues for one instance before rejecting new requests. `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
     pub queue_bytes_per_instance: usize,
-    /// Encoded bytes the hub queues over all flow-controlled instances together before
+    /// Encoded bytes the hub queues over all instances together before
     /// rejecting new requests (reason `queue_bytes_total`). `KRAKEN_HUB_QUEUE_BYTES_TOTAL`,
     /// default 512 MiB.
     pub queue_bytes_total: usize,
@@ -79,8 +74,8 @@ pub struct Config {
     /// `DEADLINE_EXCEEDED`. `KRAKEN_HUB_HANDSHAKE_TIMEOUT`, default 10 s.
     pub handshake_timeout: Duration,
     /// Serve the read-only dashboard (`/ui/`) and its JSON API (`/api/v1/`) on the HTTP port and
-    /// keep the edge statistics they show. `KRAKEN_HUB_DASHBOARD_ENABLED`, default true.
-    /// `GET /topology` is served either way.
+    /// keep the edge statistics they show. `KRAKEN_HUB_DASHBOARD_ENABLED`, default true. When
+    /// false the HTTP port serves nothing (every path is 404); the gRPC `Topology` stays.
     pub dashboard_enabled: bool,
     /// Grafana base URL the dashboard links to (`http://` or `https://`).
     /// `KRAKEN_HUB_GRAFANA_URL`, default none (no link).
@@ -120,7 +115,7 @@ pub struct Config {
     /// `required`. `None` when `KRAKEN_HUB_TLS_CLIENT_AUTH` is unset; setting it without the CA is
     /// an error. Read it through [`Config::client_auth`].
     pub tls_client_auth: Option<ClientAuthMode>,
-    /// When set, `/api/*`, `/topology`, the event stream and the gRPC `Topology` call need
+    /// When set, `/api/*`, the event stream and the gRPC `Topology` call need
     /// `Authorization: Bearer <token>`. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_TOKEN`,
     /// at least 16 characters. Unrelated to the ACL tokens.
     pub dashboard_token: Option<Secret>,
@@ -198,7 +193,6 @@ impl Default for Config {
             max_timeout: Duration::from_millis(60_000),
             heartbeat_interval: Duration::from_secs(3),
             heartbeat_timeout: Duration::from_secs(10),
-            legacy_heartbeat_timeout: Duration::from_secs(30),
             timeout_overrides: BTreeMap::new(),
             queue_capacity_per_instance: 10_000,
             queue_bytes_per_instance: 64 * 1024 * 1024,
@@ -289,10 +283,6 @@ impl Config {
         }
         if let Some(v) = var("KRAKEN_HUB_HEARTBEAT_TIMEOUT") {
             c.heartbeat_timeout = parse_duration(&v).context("KRAKEN_HUB_HEARTBEAT_TIMEOUT")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT") {
-            c.legacy_heartbeat_timeout =
-                parse_duration(&v).context("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT")?;
         }
         if let Some(v) = var("KRAKEN_HUB_TIMEOUT_OVERRIDES") {
             c.timeout_overrides = parse_overrides(&v).context("KRAKEN_HUB_TIMEOUT_OVERRIDES")?;
@@ -710,19 +700,21 @@ impl Config {
         // dashboard token: without it, enforce leaves the same data open on the HTTP port.
         let enforce_open_http = self.auth_mode == AuthMode::Enforce
             && self.dashboard_token.is_none()
+            && self.dashboard_enabled
             && self.http_listen.is_some();
         if let (true, Some(http)) = (enforce_open_http, self.http_listen) {
             out.push(format!(
-                "access control is enforced but KRAKEN_HUB_DASHBOARD_TOKEN is not set: GET /topology and the dashboard API on {http} are open to any peer that can reach it (only the gRPC Topology needs a token); set KRAKEN_HUB_DASHBOARD_TOKEN or KRAKEN_HUB_DASHBOARD_TOKEN_FILE"
+                "access control is enforced but KRAKEN_HUB_DASHBOARD_TOKEN is not set: the dashboard API on {http} is open to any peer that can reach it (only the gRPC Topology needs a token); set KRAKEN_HUB_DASHBOARD_TOKEN or KRAKEN_HUB_DASHBOARD_TOKEN_FILE"
             ));
         }
         if let Some(http) = self.http_listen
             && open(http)
+            && self.dashboard_enabled
         {
             if self.dashboard_token.is_none() {
                 if !enforce_open_http {
                     out.push(format!(
-                        "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: /topology and the dashboard API are open to any peer"
+                        "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: the dashboard API is open to any peer"
                     ));
                 }
             } else if self.http_tls().is_none() {
@@ -767,18 +759,6 @@ impl Config {
         out
     }
 
-    /// Settings that are valid but probably wrong; `main` logs them once telemetry is up.
-    pub fn warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.legacy_heartbeat_timeout < LEGACY_TIMEOUT_WARN_BELOW {
-            out.push(format!(
-                "KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT is {:?}: v1 clients heartbeat every 10 s, so below {:?} one late heartbeat evicts them",
-                self.legacy_heartbeat_timeout, LEGACY_TIMEOUT_WARN_BELOW
-            ));
-        }
-        out
-    }
-
     /// The deadline the hub applies to a request of `type_name` that asked for `requested_ms`
     /// (`Request.timeout_ms`): `> 0` gives `min(requested, override or max)`, `0` gives
     /// `override or default`. An override therefore also moves the clamp for its type, up or down.
@@ -790,21 +770,7 @@ impl Config {
             Duration::from_millis(requested_ms.into()).min(over.unwrap_or(self.max_timeout))
         }
     }
-
-    /// The eviction threshold of a session that declared `protocol_version` in its first
-    /// `Register`: v2 sessions are told the interval and get the short timeout, v1 sessions keep
-    /// the timeout their 10 s heartbeats were designed for.
-    pub fn heartbeat_timeout_for(&self, protocol_version: u32) -> Duration {
-        if protocol::is_v2(protocol_version) {
-            self.heartbeat_timeout
-        } else {
-            self.legacy_heartbeat_timeout
-        }
-    }
 }
-
-/// v1 clients heartbeat every 10 s; a legacy timeout below two of their intervals is suspicious.
-const LEGACY_TIMEOUT_WARN_BELOW: Duration = Duration::from_secs(20);
 
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
@@ -1108,7 +1074,6 @@ mod tests {
         assert_eq!(c.max_timeout, Duration::from_millis(60_000));
         assert_eq!(c.heartbeat_interval, Duration::from_secs(3));
         assert_eq!(c.heartbeat_timeout, Duration::from_secs(10));
-        assert_eq!(c.legacy_heartbeat_timeout, Duration::from_secs(30));
         assert!(c.timeout_overrides.is_empty());
         assert_eq!(c.owner_grace, Duration::from_secs(60));
         assert_eq!(c.session_buffer, 1024);
@@ -1134,13 +1099,11 @@ mod tests {
             ("KRAKEN_HUB_ID", "hub-1"),
             ("KRAKEN_HUB_HEARTBEAT_INTERVAL", "500ms"),
             ("KRAKEN_HUB_HEARTBEAT_TIMEOUT", "2s"),
-            ("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT", "45"),
         ])
         .unwrap();
         assert_eq!(c.hub_id, "hub-1");
         assert_eq!(c.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(c.heartbeat_timeout, Duration::from_secs(2));
-        assert_eq!(c.legacy_heartbeat_timeout, Duration::from_secs(45));
     }
 
     #[test]
@@ -1151,24 +1114,6 @@ mod tests {
         let err = with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "6s")]).unwrap_err();
         assert!(err.to_string().contains("at least twice"), "{err:#}");
         assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "5s")]).is_ok());
-    }
-
-    #[test]
-    fn short_legacy_timeout_is_a_warning_not_an_error() {
-        assert!(Config::default().warnings().is_empty());
-        let c = with_env(&[("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT", "15s")]).unwrap();
-        let warnings = c.warnings();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT"),
-            "{warnings:?}"
-        );
-        assert!(
-            with_env(&[("KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT", "20s")])
-                .unwrap()
-                .warnings()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -1270,17 +1215,6 @@ mod tests {
                 "{type_name} timeout_ms={requested}"
             );
         }
-    }
-
-    /// Per-session heartbeat timeout: v2 sessions get the short timeout, v1 (version 0) and the
-    /// never-defined version 1 keep the legacy one.
-    #[test]
-    fn heartbeat_timeout_is_chosen_per_protocol_version() {
-        let c = Config::default();
-        assert_eq!(c.heartbeat_timeout_for(0), Duration::from_secs(30));
-        assert_eq!(c.heartbeat_timeout_for(1), Duration::from_secs(30));
-        assert_eq!(c.heartbeat_timeout_for(2), Duration::from_secs(10));
-        assert_eq!(c.heartbeat_timeout_for(7), Duration::from_secs(10));
     }
 
     #[test]
@@ -2105,6 +2039,16 @@ mod tests {
             w.iter()
                 .any(|m| m.contains("127.0.0.1:7001") && m.contains("enforce")),
             "{w:?}"
+        );
+        // Without the dashboard the HTTP port serves nothing: nothing is open.
+        let off = Config {
+            dashboard_enabled: false,
+            ..enforced.clone()
+        };
+        assert!(
+            !off.security_warnings()
+                .iter()
+                .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
         );
         let with_token = Config {
             dashboard_token: Some(crate::auth::Secret::new("0123456789abcdef0123")),

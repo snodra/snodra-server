@@ -1,6 +1,5 @@
-//! Multi-hub HA, hub side (ADR 0016): the latest `InstanceStatus` of a session that negotiated
-//! "instance-status" shows in the topology (gRPC and `GET /topology`); without the capability, and
-//! from a raw v1 client, the report is ignored and nothing else changes.
+//! Multi-hub HA, hub side (ADR 0016): the latest `InstanceStatus` of a session shows in the
+//! topology (gRPC and `GET /api/v1/topology`).
 
 mod common;
 
@@ -10,7 +9,7 @@ use std::time::Duration;
 use common::{FakeClient, http_get, start_hub_with_http};
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{ErrorCode, RegisterAck, TopologyRequest, server_message};
+use kraken_hub::proto::{RegisterAck, TopologyRequest, server_message};
 use kraken_hub::topology::{InstanceTopology, Topology};
 use tonic::transport::Endpoint;
 
@@ -92,12 +91,11 @@ fn json_instance<'a>(t: &'a serde_json::Value, service: &str) -> &'a serde_json:
 }
 
 #[tokio::test]
-async fn a_client_with_the_capability_reports_status_and_topology_shows_it() {
+async fn a_client_reports_status_and_topology_shows_it() {
     let (grpc, http) = start_hub_with_http(config()).await;
     let http = http.unwrap();
-    let mut c = FakeClient::register_v2_with(grpc, "svc", &["a.Do"], &["instance-status"]).await;
+    let mut c = FakeClient::register_no_wait(grpc, "svc", &["a.Do"], &[]).await;
     let ack = expect_ack(&mut c).await;
-    assert_eq!(ack.capabilities, ["instance-status"]);
     assert_eq!(ack.hub_id, "hub-a");
 
     // Registered, nothing reported yet.
@@ -116,16 +114,10 @@ async fn a_client_with_the_capability_reports_status_and_topology_shows_it() {
         after.status_age_ms
     );
 
-    for path in ["/topology", "/api/v1/topology"] {
-        let t = http_json(http, path).await;
-        let i = json_instance(&t, "svc");
-        assert_eq!(
-            i["connectedHubIds"],
-            serde_json::json!(["hub-a", "hub-b"]),
-            "{path}"
-        );
-        assert!(i["statusAgeMs"].as_i64().unwrap() >= 0, "{path}: {i}");
-    }
+    let t = http_json(http, "/api/v1/topology").await;
+    let i = json_instance(&t, "svc");
+    assert_eq!(i["connectedHubIds"], serde_json::json!(["hub-a", "hub-b"]));
+    assert!(i["statusAgeMs"].as_i64().unwrap() >= 0, "{i}");
 
     // The next report replaces the previous one.
     c.status(&["hub-a"], 0).await;
@@ -135,89 +127,10 @@ async fn a_client_with_the_capability_reports_status_and_topology_shows_it() {
     // A new stream of the same instance starts without a status.
     let mut again = FakeClient::connect(grpc).await;
     again.instance_id = c.instance_id.clone();
-    again
-        .send_raw_register(kraken_hub::proto::Register {
-            service_name: "svc".into(),
-            instance_id: c.instance_id.clone(),
-            protocol_version: 2,
-            capabilities: vec!["instance-status".into()],
-            ..Default::default()
-        })
-        .await;
+    again.send_register("svc", &["a.Do"], &[]).await;
     expect_ack(&mut again).await;
     sync(&mut again, 4).await;
     let fresh = rpc_instance(grpc, "svc").await;
     assert!(fresh.connected_hub_ids.is_empty());
     assert_eq!(fresh.status_age_ms, -1);
-}
-
-#[tokio::test]
-async fn a_v2_client_without_the_capability_is_not_offered_it_and_its_status_is_ignored() {
-    let (grpc, http) = start_hub_with_http(config()).await;
-    let http = http.unwrap();
-    let mut c = FakeClient::register_v2_with(grpc, "svc", &[], &["flow-control"]).await;
-    let ack = expect_ack(&mut c).await;
-    assert_eq!(
-        ack.capabilities,
-        ["flow-control"],
-        "never offered undeclared"
-    );
-    c.status(&["hub-a"], 1).await;
-    sync(&mut c, 1).await;
-    let i = rpc_instance(grpc, "svc").await;
-    assert!(i.connected_hub_ids.is_empty());
-    assert_eq!(i.status_age_ms, -1);
-    let t = http_json(http, "/topology").await;
-    let i = json_instance(&t, "svc");
-    assert_eq!(i["connectedHubIds"], serde_json::json!([]));
-    assert_eq!(i["statusAgeMs"], -1);
-}
-
-/// A raw v1 client never sees the capability; if it sent an InstanceStatus anyway (it cannot know
-/// the message, but a buggy client might), the hub ignores it and the session carries on as v1.
-#[tokio::test]
-async fn a_raw_v1_client_is_unaffected() {
-    let (grpc, _http) = start_hub_with_http(config()).await;
-    let mut handler = FakeClient::register(grpc, "svc-h", &["h.Do"], &[]).await;
-    let mut sender = FakeClient::register(grpc, "svc-s", &[], &[]).await;
-    // No ack: the first message of a v1 session is the echo.
-    handler.heartbeat(1).await;
-    match next_message(&mut handler).await {
-        server_message::Message::Heartbeat(h) => assert_eq!(h.sent_at_ms, 1),
-        other => panic!("v1 got {other:?} before the echo"),
-    }
-    handler.status(&["hub-a"], 1).await;
-    sync(&mut handler, 2).await;
-    let i = rpc_instance(grpc, "svc-h").await;
-    assert_eq!((i.protocol_version, i.status_age_ms), (0, -1));
-    assert!(i.connected_hub_ids.is_empty());
-
-    // Requests still flow both ways, with v1 messages only.
-    sender
-        .tx
-        .send(FakeClient::request(
-            "r1",
-            kraken_hub::proto::RequestKind::Command,
-            "h.Do",
-            "",
-            0,
-        ))
-        .await
-        .unwrap();
-    match next_message(&mut handler).await {
-        server_message::Message::Request(r) => assert_eq!(r.id, "r1"),
-        other => panic!("expected the request, got {other:?}"),
-    }
-    handler
-        .tx
-        .send(FakeClient::reply_ok("r1", b"{}"))
-        .await
-        .unwrap();
-    match next_message(&mut sender).await {
-        server_message::Message::Reply(r) => assert_eq!(r.request_id, "r1"),
-        server_message::Message::Error(e) => {
-            panic!("got error {:?}", ErrorCode::try_from(e.code))
-        }
-        other => panic!("expected the reply, got {other:?}"),
-    }
 }

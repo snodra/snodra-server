@@ -222,7 +222,7 @@ impl ResolvesServerCert for CertStore {
 /// `KRAKEN_HUB_TLS_CLIENT_AUTH`: whether a client must present a certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClientAuthMode {
-    /// A client may present one (it must then verify) or none (token or JWT, as before).
+    /// A client may present one (it must then verify) or none (token or JWT).
     #[default]
     Optional,
     /// A client without a valid certificate fails the handshake.

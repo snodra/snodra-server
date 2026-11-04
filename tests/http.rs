@@ -63,7 +63,7 @@ async fn get_topology_returns_json_equal_to_rpc() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let (status, body) = http_get(http, "/topology").await;
+    let (status, body) = http_get(http, "/api/v1/topology").await;
     assert_eq!(status, 200);
     let mut from_http: Topology = serde_json::from_str(&body).expect("valid topology JSON");
     let mut from_rpc = rpc_topology(grpc).await;

@@ -80,7 +80,7 @@ impl Hub {
     /// The hub's topology JSON, over its TLS HTTP port.
     async fn topology(&self) -> serde_json::Value {
         let ca = std::fs::read_to_string(&self.server_ca).unwrap();
-        let r = common::https_request(self.http, &ca, "GET", "/topology", &[])
+        let r = common::https_request(self.http, &ca, "GET", "/api/v1/topology", &[])
             .await
             .unwrap();
         serde_json::from_str(&r.body).unwrap()
@@ -159,7 +159,7 @@ async fn a_required_hub_refuses_a_client_without_a_certificate_and_serves_one_wi
     assert!(hub.connect(None).await.is_err());
     let id = hub.identity("orders", &ClientSpec::service("orders"));
     let mut client = hub.connect(Some(&id)).await.unwrap();
-    client.send_register_v2("orders", &[], &[]).await;
+    client.send_register("orders", &[], &[]).await;
     client.expect_ack().await;
 }
 
@@ -171,7 +171,7 @@ async fn an_optional_hub_accepts_a_client_without_a_certificate() {
     })
     .await;
     let mut client = hub.connect(None).await.unwrap();
-    client.send_register_v2("orders", &[], &[]).await;
+    client.send_register("orders", &[], &[]).await;
     client.expect_ack().await;
 }
 

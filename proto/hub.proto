@@ -35,26 +35,22 @@ message ClientMessage {
     Request request = 2;
     Reply reply = 3;
     Heartbeat heartbeat = 4;
-    // Flow control (capability "flow-control"): more requests this instance can take now.
+    // Flow control (ADR 0014): more requests this instance can take now.
     Permits permits = 5;
-    // Multi-part messages (ADR 0017). Allocated now so no later phase renumbers; the hub ignores
-    // them until the phase that defines them ships: a handler's streamed parts and end (P4b,
-    // capability "streaming"), credits and cancellation (P4b/P4c).
+    // Multi-part messages (ADR 0017): a handler's streamed parts and end (a streaming query, or
+    // the pushed updates of a subscription), a sender's credits and its cancellation.
     ReplyPart part = 6;
     ReplyEnd end = 7;
     Flow flow = 8;
     Cancel cancel = 9;
-    // Multi-hub HA (capability "instance-status"): what this instance sees, every 5 s. Sent only
-    // to a hub whose RegisterAck lists "instance-status"; the hub keeps the latest per session.
+    // Multi-hub HA (ADR 0016): what this instance sees, every 5 s; the hub keeps the latest per
+    // session.
     InstanceStatus status = 10;
-    // Credential refresh (capability "credentials-refresh", P5b, ADR 0019): a new credential for
-    // this session, for the same service as its Register. The hub validates it as it validates the
-    // Register's and, for a JWT, moves the session's expiry; a refused refresh closes the stream in
-    // enforce. Sent only to a hub whose RegisterAck lists "credentials-refresh".
+    // Credential refresh (ADR 0019): a new credential for this session, for the same service as
+    // its Register. The hub validates it as it validates the Register's and, for a JWT, moves the
+    // session's expiry; a refused refresh closes the stream in enforce.
     Credentials credentials = 11;
-    // Processor control (capability "processor-control", P6b, ADR 0023): the answer to a
-    // ServerMessage.control, matched by control_id. Sent only to a hub whose RegisterAck lists
-    // "processor-control".
+    // Processor control (ADR 0023): the answer to a ServerMessage.control, matched by control_id.
     ControlReply control_reply = 12;
   }
 }
@@ -71,20 +67,16 @@ message ServerMessage {
     Error error = 3;
     // Echo of a client Heartbeat, or an unsolicited keep-alive.
     Heartbeat heartbeat = 4;
-    // Protocol v2 only: answers every accepted Register of a session that declared
-    // Register.protocol_version >= 2. Never sent to a v1 session (protocol_version 0).
+    // Answers every accepted Register (see RegisterAck).
     RegisterAck register_ack = 5;
-    // Multi-part messages (ADR 0017), sent only to a session that declared the capability of the
-    // request mode. Scatter-gather (capability "scatter-gather", P4a): one ReplyPart per target
-    // that answered, then one ReplyEnd, for a Request with mode SCATTER_GATHER this instance
-    // sent. Streaming (P4b) and subscriptions (P4c) reuse them; Flow and Cancel arrive with P4b.
+    // Multi-part messages (ADR 0017): the answers of a Request with a mode other than UNARY this
+    // instance sent (see RequestMode), and, to a handler, a sender's credits and cancellation.
     ReplyPart part = 6;
     ReplyEnd end = 7;
     Flow flow = 8;
     Cancel cancel = 9;
-    // Processor control (capability "processor-control", P6b, ADR 0023): the hub asks this
-    // instance to act on one of its event processors. Sent only to a session whose first Register
-    // declared "processor-control"; exactly one ClientMessage.control_reply answers it.
+    // Processor control (ADR 0023): the hub asks this instance to act on one of its event
+    // processors; exactly one ClientMessage.control_reply answers it.
     ControlRequest control = 10;
   }
 }
@@ -101,12 +93,10 @@ message ServerMessage {
 // (the later Register fails). A type listed in shared_query_types and in command_types or
 // query_types of the same Register is rejected with INVALID_ARGUMENT. Commands are never shared.
 //
-// Version negotiation (ADR 0013): protocol_version, capabilities and client_version are read from
-// the first Register of a stream only; later Registers cannot change them. A v2 session
-// (protocol_version >= 2) gets a RegisterAck for every accepted Register, written before the echo
-// of any Heartbeat that follows it, so a new client tells a new hub (ack first) from an old one
-// (echo first, no ack). Fields initial_permits, load_factor and tags (8-10) are read from the
-// first Register of a stream too. Field 11 is allocated to a later roadmap phase (contexts).
+// Every accepted Register is answered with a RegisterAck, written before the echo of any
+// Heartbeat that follows it. credentials, initial_permits, load_factor, tags and client_version
+// are read from the first Register of a stream only; later Registers cannot change them. Field 11
+// is allocated to a later roadmap phase (contexts).
 message Register {
   // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
   string service_name = 1;
@@ -116,22 +106,12 @@ message Register {
   repeated string command_types = 3;
   // Fully qualified query type names this instance handles, for example "files.GetFileMetadata".
   repeated string query_types = 4;
-  // 0 (unset) is protocol v1: no RegisterAck, legacy heartbeat timeout. 2 is the version this
-  // file defines; 1 is never sent and reads as v1; anything above 2 is answered as 2.
-  uint32 protocol_version = 5;
-  // Optional protocol features this client supports; unknown names are ignored by the hub.
-  // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED),
-  // "instance-status" (ClientMessage.status), "scatter-gather" (Request.mode SCATTER_GATHER,
-  // ReplyPart, ReplyEnd), "credentials-refresh" (ClientMessage.credentials), "processors"
-  // (InstanceStatus.processors, ADR 0022) and "processor-control" (ServerMessage.control,
-  // ClientMessage.control_reply, ADR 0023).
-  repeated string capabilities = 6;
   // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
-  // Flow control: requests the hub may forward before the next Permits message. Honoured only
-  // when the session shares the "flow-control" capability; 0 (or no flow-control) means
-  // unlimited, the v1 behaviour. With permits the hub queues further requests per instance
-  // (ordered by Request.priority, then age) until Permits arrive.
+  // Flow control (ADR 0014): requests the hub may forward before the next Permits message, and
+  // the session's permit cap. At least 1; a Register with 0 is rejected with INVALID_ARGUMENT.
+  // The hub queues further requests per instance (ordered by Request.priority, then age) until
+  // Permits arrive.
   uint32 initial_permits = 8;
   // Relative capacity of this instance; 0 reads as 100. Weights its share of the
   // consistent-hash ring (128 * load_factor / 100 virtual nodes, 8..1024) and its load score.
@@ -144,24 +124,19 @@ message Register {
   string client_version = 12;
   // Fully qualified query type names this instance handles that many services may own (ADR
   // 0017), for example a "search.FindAnything" every service answers. A point query to such a
-  // type goes to one live instance of any owner; a scatter-gather query to all of them. Plain
-  // (no capability needed): a hub that predates the field ignores it, so a client relying on it
-  // should check the hub's RegisterAck lists "scatter-gather".
+  // type goes to one live instance of any owner; a scatter-gather query to all of them.
   repeated string shared_query_types = 13;
 }
 
 // Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
 // per handled request, batched (16, or 50 ms after the first unsent one), and at once when the
 // permits still held by the hub are down to min(16, initial_permits / 2). The hub never lets a
-// session hold more than its cap, which starts at initial_permits. Ignored for sessions without
-// flow control.
+// session hold more than its cap, which starts at initial_permits.
 message Permits {
   uint32 count = 1;
   // Multi-hub HA (ADR 0016): when > 0, the hub first raises this session's cap to
-  // max(cap, grant), then adds `count` (still clamped at the cap). A grant never lowers the cap
-  // and is ignored for unlimited sessions (initial_permits 0 or no flow control). Clients send it
-  // with the top-up that moves a departed hub's share to the surviving ones; a hub that predates
-  // the field ignores it and keeps clamping at initial_permits.
+  // max(cap, grant), then adds `count` (still clamped at the cap). A grant never lowers the cap.
+  // Clients send it with the top-up that moves a departed hub's share to the surviving ones.
   uint32 grant = 2;
 }
 
@@ -176,12 +151,11 @@ message InstanceStatus {
   repeated string connected_hub_ids = 1;
   // Handlers of this instance running now, over all its hubs.
   uint32 handlers_in_flight = 2;
-  // Event processors (capability "processors", ADR 0022): one entry per Kafka event processor
-  // this instance started, as of this report. Sent only to a hub whose RegisterAck lists
-  // "processors" (an older hub never gets the field). The hub keeps the latest list per session,
-  // bounded: at most 32 processors, 1024 partitions and 256 event types each; longer strings are
-  // cut at a UTF-8 boundary (name 64 bytes, group_id and topic 256, last_error 512, an event type
-  // 256, operation_id 64); the excess is dropped, never an error to the client.
+  // Event processors (ADR 0022): one entry per Kafka event processor this instance started, as
+  // of this report. The hub keeps the latest list per session, bounded: at most 32 processors,
+  // 1024 partitions and 256 event types each; longer strings are cut at a UTF-8 boundary (name 64
+  // bytes, group_id and topic 256, last_error 512, an event type 256, operation_id 64); the excess
+  // is dropped, never an error to the client.
   repeated ProcessorStatus processors = 3;
 }
 
@@ -197,11 +171,11 @@ enum ProcessorState {
   PROCESSOR_RUNNING = 2;
   // A record exhausted its attempts in the last 60 s, or the consumer reports an error.
   PROCESSOR_FAILING = 3;
-  // Stopping or stopped (shutdown), or stopped for a reset (P6b, ADR 0023): out of the consumer
+  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of the consumer
   // group while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
   PROCESSOR_STOPPED = 4;
-  // Paused from the hub's control plane (P6b, ADR 0023): still in the consumer group, consuming
-  // nothing. Allocated in P6a, which never sent it.
+  // Paused from the hub's control plane (ADR 0023): still in the consumer group, consuming
+  // nothing.
   PROCESSOR_PAUSED = 5;
 }
 
@@ -241,10 +215,10 @@ message ProcessorStatus {
   // Where a record goes once its attempts are exhausted: "collection" (the dead_letters
   // collection, the default), "topic" (<topic>.dlt) or "log" (logged and skipped).
   string dead_letter_mode = 12;
-  // A replay range is open on this instance's partitions (P6b, ADR 0023): records below a
+  // A replay range is open on this instance's partitions (ADR 0023): records below a
   // partition's replay_until are handled again.
   bool replaying = 13;
-  // The reset operation holding the processor's lock (P6b, ADR 0023); empty when none.
+  // The reset operation holding the processor's lock (ADR 0023); empty when none.
   string operation_id = 14;
 }
 
@@ -262,16 +236,15 @@ message PartitionStatus {
   // high_watermark - committed (high_watermark - position when committed is -1); -1 when
   // unknown; never negative otherwise.
   int64 lag = 5;
-  // The end (exclusive) of the partition's open replay range (P6b, ADR 0023): its records below
+  // The end (exclusive) of the partition's open replay range (ADR 0023): its records below
   // this offset are a replay; 0 when the partition is not replaying.
   int64 replay_until = 6;
 }
 
-// The hub asks this instance to act on one of its event processors (capability
-// "processor-control", ADR 0023). Exactly one ControlReply with the same control_id answers it;
-// the hub gives up after its control timeout (10 s, reset_execute 120 s) and drops a late reply.
-// An instance handles control requests off its stream's read loop, one at a time per processor,
-// and logs each at INFO.
+// The hub asks this instance to act on one of its event processors (ADR 0023). Exactly one
+// ControlReply with the same control_id answers it; the hub gives up after its control timeout
+// (10 s, reset_execute 120 s) and drops a late reply. An instance handles control requests off its
+// stream's read loop, one at a time per processor, and logs each at INFO.
 message ControlRequest {
   // Unique per request, chosen by the hub (UUID).
   string control_id = 1;
@@ -480,8 +453,8 @@ message DeadLetterRetryAllOutcome {
 }
 
 // How a client authenticates itself to the hub. Carried on Register (ADR 0018) and on
-// ClientMessage.credentials: token since P5a; jwt since P5b (ADR 0019), refused with
-// UNAUTHENTICATED by a hub that has no JWT issuer configured.
+// ClientMessage.credentials (ADR 0019). A jwt is refused with UNAUTHENTICATED by a hub that has no
+// JWT issuer configured.
 message Credentials {
   oneof kind {
     // Static pre-shared token.
@@ -491,16 +464,14 @@ message Credentials {
   }
 }
 
-// The hub's answer to an accepted Register of a v2 session. Carries the values the client needs
-// to align with this hub: heartbeat cadence, the eviction threshold applied to this session and
-// the request timeout rules.
+// The hub's answer to every accepted Register, written before the echo of any Heartbeat that
+// follows it: the client's confirmation that the Register was processed (the ack of a later
+// Register is dropped, like a Heartbeat echo, when the session's outbound buffer is full). Carries
+// the values the client needs to align with this hub: heartbeat cadence, the eviction threshold
+// applied to this session and the request timeout rules.
 message RegisterAck {
   // Identifies this hub process (KRAKEN_HUB_ID, default hostname plus a random suffix).
   string hub_id = 1;
-  // The negotiated protocol version: min(Register.protocol_version, hub's version), currently 2.
-  uint32 protocol_version = 2;
-  // Capabilities both sides support (the intersection), for example "flow-control".
-  repeated string capabilities = 3;
   // How often the client should send a Heartbeat.
   uint32 heartbeat_interval_ms = 4;
   // The hub evicts this session after this long without a Heartbeat.
@@ -516,20 +487,23 @@ message RegisterAck {
   map<string, uint32> type_timeouts_ms = 9;
 }
 
-// How the hub delivers a Request and its answers (ADR 0017). A sender may use a mode other than
-// UNARY only if its session declared the mode's capability and the hub's RegisterAck lists it;
-// otherwise the request fails with UNSUPPORTED (INVALID_REQUEST for a v1 session). Handlers
-// always receive mode UNARY.
+// How the hub delivers a Request and its answers (ADR 0017). The modes other than UNARY are for
+// queries only: a command fails with INVALID_REQUEST, and so does a mode value this file does not
+// define. No live instance fails with an Error NO_HANDLER.
 enum RequestMode {
-  // One handler, one Reply or Error. The v1 behaviour.
+  // One handler, one Reply or Error.
   UNARY = 0;
-  // Queries only (capability "scatter-gather", P4a): every live instance of every owner gets an
-  // ordinary unary Request; the sender gets one ReplyPart per answer, in arrival order, then a
-  // ReplyEnd. A command fails with INVALID_REQUEST; no live instance, with an Error NO_HANDLER.
+  // Every live instance of every owner gets an ordinary unary Request; the sender gets one
+  // ReplyPart per answer, in arrival order, then a ReplyEnd.
   SCATTER_GATHER = 1;
-  // Allocated to P4b (streaming queries with credits). Rejected with UNSUPPORTED until then.
+  // One live instance gets the Request (mode STREAMING, id "<id>#1", the sender's
+  // initial_credit) and answers with ReplyParts and a ReplyEnd, relayed to the sender under the
+  // sender's credits (initial_credit, then Flow).
   STREAMING = 2;
-  // Allocated to P4c (subscription queries). Rejected with UNSUPPORTED until then.
+  // The initial result comes from one live instance (an ordinary unary Request "<id>#0"); every
+  // live instance of every owner gets the Request with mode SUBSCRIPTION ("<id>#n", n >= 1) and
+  // pushes its updates as ReplyParts. The sender gets the initial result, then the updates, as
+  // ReplyParts under its credits, until a ReplyEnd or its Cancel.
   SUBSCRIPTION = 3;
 }
 
@@ -560,7 +534,7 @@ message Request {
   // `type` (RegisterAck.type_timeouts_ms):
   //   timeout_ms > 0:  min(timeout_ms, override or max_timeout_ms)
   //   timeout_ms == 0: override or default_timeout_ms (5000 ms unless configured)
-  // v2 clients send 0 unless their caller chose a timeout, so per-type overrides apply.
+  // Clients send 0 unless their caller chose a timeout, so per-type overrides apply.
   uint32 timeout_ms = 7;
   // UNARY (the default) or a multi-part mode; see RequestMode. For SCATTER_GATHER, timeout_ms is
   // the deadline of the whole gather: the ReplyEnd comes when every target answered or the
@@ -590,11 +564,10 @@ message Reply {
   }
 }
 
-// Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, and INVALID_REQUEST
-// (malformed request or duplicate in-flight id); handlers produce HANDLER_ERROR, UNAUTHENTICATED,
-// PERMISSION_DENIED and INVALID_REQUEST inside a Reply. The hub never sends a code above 7 to a
-// v1 session, and RESOURCE_EXHAUSTED only to a session that shares the "flow-control"
-// capability.
+// Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, INVALID_REQUEST
+// (malformed request or duplicate in-flight id), RESOURCE_EXHAUSTED and CANCELLED, and
+// UNAUTHENTICATED or PERMISSION_DENIED for a request its access control refuses; handlers produce
+// HANDLER_ERROR, UNAUTHENTICATED, PERMISSION_DENIED and INVALID_REQUEST inside a Reply.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   // No connected instance has registered Request.type.
@@ -615,15 +588,10 @@ enum ErrorCode {
   PERMISSION_DENIED = 7;
   // The target instance cannot take the request now: its queue at the hub is full (entries, its
   // bytes, or the bytes queued over the whole hub) or its session buffer is full. The handler
-  // never saw the request. Sent only to senders that share the "flow-control" capability; other
-  // senders get HANDLER_ERROR "handler busy" instead.
+  // never saw the request.
   RESOURCE_EXHAUSTED = 8;
-  // The request or the stream was cancelled (Cancel, P4b). Allocated; not produced yet.
+  // The stream or subscription was ended by the hub (it outlived the hub's maximum duration).
   CANCELLED = 9;
-  // The request needs a feature the sender, the hub or the target did not declare: a mode other
-  // than UNARY from a v2 session that did not declare its capability, or a mode this hub does
-  // not implement yet (STREAMING, SUBSCRIPTION). Never sent to a v1 session.
-  UNSUPPORTED = 10;
 }
 
 message Error {
@@ -639,8 +607,8 @@ message Error {
 
 // One answer of a multi-part request (ADR 0017). For scatter-gather, one per target that answered,
 // in arrival order, with the sender's Request.id. A target's Reply{error}, a hub-side failure of
-// one target (HANDLER_DISCONNECTED, RESOURCE_EXHAUSTED or HANDLER_ERROR "handler busy") is a part
-// with `error` set and no payload.
+// one target (HANDLER_DISCONNECTED or RESOURCE_EXHAUSTED) is a part with `error` set and no
+// payload.
 message ReplyPart {
   // The sender's Request.id.
   string request_id = 1;
@@ -661,7 +629,7 @@ message ReplyPart {
 message ReplyEnd {
   // The sender's Request.id.
   string request_id = 1;
-  // Set when the request failed as a whole. Unset for scatter-gather in P4a: partial answers are
+  // Set when the request failed as a whole. Never set for scatter-gather: partial answers are
   // answers, and the counts below tell what was missing.
   Error error = 2;
   // ReplyParts sent, failed ones included.
@@ -672,24 +640,24 @@ message ReplyEnd {
   uint32 timed_out = 5;
 }
 
-// Streaming credits (P4b): the receiver of a stream may get `credits` more parts. Allocated; the
-// hub ignores it until P4b.
+// Credits (ADR 0017): the receiver of a stream or a subscription may get `credits` more parts.
+// From the sender with its Request.id; the hub passes it on to a streaming handler ("<id>#1").
 message Flow {
   string request_id = 1;
   uint32 credits = 2;
 }
 
-// Cancels a multi-part request (P4b, both ways). Allocated; the hub ignores it until P4b.
+// Cancels a stream or a subscription (ADR 0017): from the sender with its Request.id, no
+// ReplyEnd follows; from the hub to a handler with the target's id ("<id>#n") when the request
+// ended, the reason saying why.
 message Cancel {
   string request_id = 1;
   string reason = 2;
 }
 
-// Keep-alive. A v2 client sends one every RegisterAck.heartbeat_interval_ms (3 s by default) and
-// is evicted after RegisterAck.heartbeat_timeout_ms (10 s by default) without one. A v1 client
-// sends one every 10 seconds and is evicted after the legacy timeout (30 s by default). The stream
-// closing evicts at once. The hub echoes a client Heartbeat with `sent_at_ms` unchanged; clients
-// use the echo to confirm a Register was processed.
+// Keep-alive. A client sends one every RegisterAck.heartbeat_interval_ms (3 s by default) and is
+// evicted after RegisterAck.heartbeat_timeout_ms (10 s by default) without one. The stream closing
+// evicts at once. The hub echoes a client Heartbeat with `sent_at_ms` unchanged.
 message Heartbeat {
   // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
   int64 sent_at_ms = 1;
@@ -705,8 +673,7 @@ message TopologyResponse {
   int64 hub_started_at_ms = 1;
   // Wall clock (epoch milliseconds) at snapshot time.
   int64 now_ms = 2;
-  // The hub's heartbeat eviction threshold for v2 sessions in milliseconds (v1 sessions use the
-  // legacy threshold).
+  // The hub's heartbeat eviction threshold in milliseconds (RegisterAck.heartbeat_timeout_ms).
   int64 heartbeat_timeout_ms = 3;
   repeated ServiceTopology services = 4;
   // Sorted by type name.
@@ -728,7 +695,7 @@ message InstanceTopology {
   int64 connected_since_ms = 2;
   // now_ms minus the last heartbeat (or the registration time if none yet).
   int64 last_heartbeat_age_ms = 3;
-  // True when the last heartbeat is older than a third of this session's eviction threshold.
+  // True when the last heartbeat is older than a third of the eviction threshold.
   bool stale = 4;
   // Pending requests forwarded to this instance (each scatter-gather target included).
   uint32 in_flight_as_handler = 5;
@@ -738,11 +705,9 @@ message InstanceTopology {
   repeated string command_types = 7;
   // Sorted.
   repeated string query_types = 8;
-  // Register.protocol_version of the session's first Register (0 = v1).
-  uint32 protocol_version = 9;
   // Register.client_version, empty when the client did not send one.
   string client_version = 10;
-  // Requests the hub may still forward before the next Permits (0 when not flow-controlled).
+  // Requests the hub may still forward before the next Permits.
   uint32 permits_available = 11;
   // Requests waiting in the hub's queue for this instance.
   uint32 queued = 12;
@@ -750,8 +715,6 @@ message InstanceTopology {
   uint32 load_factor = 13;
   // Register.tags.
   map<string, string> tags = 14;
-  // True when the hub forwards to this instance only with permits.
-  bool flow_controlled = 15;
   // InstanceStatus.connected_hub_ids as last reported; empty when never reported.
   repeated string connected_hub_ids = 16;
   // now_ms minus the time of the last InstanceStatus; -1 when never reported.
@@ -759,7 +722,7 @@ message InstanceTopology {
   // Sorted; the query types of query_types this instance registered as shared (ADR 0017).
   repeated string shared_query_types = 18;
   // InstanceStatus.processors of the latest report, as the hub keeps them (bounded, ADR 0022);
-  // empty when never reported or the session did not negotiate "processors".
+  // empty when never reported.
   repeated ProcessorStatus processors = 19;
 }
 
@@ -767,8 +730,6 @@ message TypeOwnership {
   string type = 1;
   // Reuses RequestKind (COMMAND or QUERY).
   RequestKind kind = 2;
-  // The owner; for a shared query type, the first of owner_services.
-  string owner_service = 3;
   // Instances currently listing the type (over all owners of a shared type).
   uint32 live_instances = 4;
   // No live instance; stays until the owner grace sweep removes the type.

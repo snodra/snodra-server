@@ -84,13 +84,9 @@ pub struct InstanceTopology {
     pub in_flight_as_sender: u32,
     pub command_types: Vec<String>,
     pub query_types: Vec<String>,
-    /// `Register.protocol_version` of the session (0 = v1).
-    pub protocol_version: u32,
-    /// `Register.client_version`, empty for v1 clients.
+    /// `Register.client_version`, empty when the client sent none.
     pub client_version: String,
-    /// The hub forwards to this instance only with permits.
-    pub flow_controlled: bool,
-    /// Permits left (0 when not flow-controlled).
+    /// Permits left.
     pub permits_available: u32,
     /// Requests waiting in the hub's queue for this instance.
     pub queued: u32,
@@ -98,13 +94,10 @@ pub struct InstanceTopology {
     pub load_factor: u32,
     pub tags: BTreeMap<String, String>,
     /// `InstanceStatus.connected_hub_ids` as last reported (ADR 0016); empty when never reported.
-    #[serde(default)]
     pub connected_hub_ids: Vec<String>,
     /// Milliseconds since the last `InstanceStatus`; -1 when never reported.
-    #[serde(default = "never_reported")]
     pub status_age_ms: i64,
     /// The query types (of `query_types`) registered as shared (ADR 0017).
-    #[serde(default)]
     pub shared_query_types: Vec<String>,
     /// How the session authenticated (ADR 0018): `authenticated` or `unauthenticated
     /// (permissive)`. Absent when access control is off. JSON only: the gRPC response has no
@@ -127,13 +120,8 @@ pub struct InstanceTopology {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_fingerprint: Option<String>,
     /// `InstanceStatus.processors` of the latest report, bounded (ADR 0022); empty when never
-    /// reported or the session did not negotiate "processors".
-    #[serde(default)]
+    /// reported.
     pub processors: Vec<ProcessorReport>,
-}
-
-fn never_reported() -> i64 {
-    -1
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -142,28 +130,13 @@ pub struct TypeOwnership {
     #[serde(rename = "type")]
     pub type_name: String,
     pub kind: KindName,
-    /// The first of `owner_services`.
-    pub owner_service: String,
     pub live_instances: u32,
     pub orphaned: bool,
     pub orphaned_for_ms: i64,
     /// A shared query type: many services may own it (ADR 0017).
-    #[serde(default)]
     pub shared: bool,
-    /// Every owning service, sorted. Empty only when read from a hub that predates the field.
-    #[serde(default)]
+    /// Every owning service, sorted (one for an exclusive type).
     pub owner_services: Vec<String>,
-}
-
-impl TypeOwnership {
-    /// Every owner: `owner_services`, or `owner_service` from a hub that predates the list.
-    pub fn owners(&self) -> Vec<String> {
-        if self.owner_services.is_empty() {
-            vec![self.owner_service.clone()]
-        } else {
-            self.owner_services.clone()
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -223,7 +196,7 @@ pub fn snapshot(
                 ms(now.saturating_duration_since(st.at)),
                 st.processors,
             ),
-            None => (vec![], never_reported(), vec![]),
+            None => (vec![], -1, vec![]),
         };
         let flight = in_flight.get(&d.instance_id).copied().unwrap_or_default();
         by_service
@@ -232,15 +205,12 @@ pub fn snapshot(
             .push(InstanceTopology {
                 connected_since_ms: anchor.to_epoch_ms(d.connected_since),
                 last_heartbeat_age_ms: ms(age),
-                // Each session against its own threshold (v2 and v1 sessions differ).
-                stale: age > d.heartbeat_timeout / 3,
+                stale: age > heartbeat_timeout / 3,
                 in_flight_as_handler: flight.as_handler,
                 in_flight_as_sender: flight.as_sender,
                 command_types: commands,
                 query_types: queries,
-                protocol_version: d.protocol_version,
                 client_version: d.client_version,
-                flow_controlled: flow.flow_controlled,
                 permits_available: flow.permits_available,
                 queued: flow.queued,
                 load_factor,
@@ -287,7 +257,6 @@ pub fn snapshot(
                 Kind::Command => KindName::Command,
                 Kind::Query => KindName::Query,
             },
-            owner_service: t.owner_service.clone(),
             live_instances: t.live_instances,
             orphaned: t.orphaned_for.is_some(),
             orphaned_for_ms: t.orphaned_for.map_or(0, ms),
@@ -347,13 +316,11 @@ impl Topology {
                             in_flight_as_sender: i.in_flight_as_sender,
                             command_types: i.command_types.clone(),
                             query_types: i.query_types.clone(),
-                            protocol_version: i.protocol_version,
                             client_version: i.client_version.clone(),
                             permits_available: i.permits_available,
                             queued: i.queued,
                             load_factor: i.load_factor,
                             tags: i.tags.clone().into_iter().collect(),
-                            flow_controlled: i.flow_controlled,
                             connected_hub_ids: i.connected_hub_ids.clone(),
                             status_age_ms: i.status_age_ms,
                             shared_query_types: i.shared_query_types.clone(),
@@ -371,7 +338,6 @@ impl Topology {
                         KindName::Command => proto::RequestKind::Command,
                         KindName::Query => proto::RequestKind::Query,
                     } as i32,
-                    owner_service: t.owner_service.clone(),
                     live_instances: t.live_instances,
                     orphaned: t.orphaned,
                     orphaned_for_ms: t.orphaned_for_ms,
@@ -417,9 +383,7 @@ impl Topology {
                             in_flight_as_sender: i.in_flight_as_sender,
                             command_types: i.command_types.clone(),
                             query_types: i.query_types.clone(),
-                            protocol_version: i.protocol_version,
                             client_version: i.client_version.clone(),
-                            flow_controlled: i.flow_controlled,
                             permits_available: i.permits_available,
                             queued: i.queued,
                             load_factor: i.load_factor,
@@ -451,7 +415,6 @@ impl Topology {
                             KindName::Command
                         }
                     },
-                    owner_service: t.owner_service.clone(),
                     live_instances: t.live_instances,
                     orphaned: t.orphaned,
                     orphaned_for_ms: t.orphaned_for_ms,
@@ -510,7 +473,7 @@ mod tests {
     }
 
     fn connect(f: &Fx, id: &str, service: &str) {
-        connect_with(f, id, service, SessionMeta::v1(Duration::from_secs(30)));
+        connect_with(f, id, service, SessionMeta::default());
     }
 
     fn connect_with(f: &Fx, id: &str, service: &str, meta: SessionMeta) {
@@ -583,28 +546,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_uses_each_session_own_timeout() {
+    async fn snapshot_reports_the_client_version() {
         let f = fx();
-        connect(&f, "v1", "svc");
+        connect(&f, "none", "svc");
         connect_with(
             &f,
-            "v2",
+            "lib",
             "svc",
             SessionMeta {
-                protocol_version: 2,
                 client_version: "lib/1".into(),
-                ..SessionMeta::v1(Duration::from_secs(10))
+                ..SessionMeta::default()
             },
         );
-        let base = Instant::now();
-        f.sessions.touch(&D, "v1", base);
-        f.sessions.touch(&D, "v2", base);
-        // 5 s of silence: more than 10 s / 3, less than 30 s / 3.
         let t = snap(
             &f,
             f.anchor.instant,
             Duration::from_secs(10),
-            base + Duration::from_secs(5),
+            Instant::now(),
         );
         let by_id = |id: &str| {
             t.services[0]
@@ -613,22 +571,8 @@ mod tests {
                 .find(|i| i.instance_id == id)
                 .unwrap()
         };
-        assert!(by_id("v2").stale);
-        assert!(!by_id("v1").stale);
-        assert_eq!(
-            (
-                by_id("v2").protocol_version,
-                by_id("v2").client_version.as_str()
-            ),
-            (2, "lib/1")
-        );
-        assert_eq!(
-            (
-                by_id("v1").protocol_version,
-                by_id("v1").client_version.as_str()
-            ),
-            (0, "")
-        );
+        assert_eq!(by_id("lib").client_version, "lib/1");
+        assert_eq!(by_id("none").client_version, "");
         assert_eq!(t.hub_id, "hub-x");
     }
 
@@ -644,10 +588,10 @@ mod tests {
             .unwrap();
         connect(&f, "i1", "a");
         let token = f.sessions.token_of(&D, "i1").unwrap();
-        let _ = f.router.open_session(&D, "i1", token, "a", Some(4));
+        let _ = f.router.open_session(&D, "i1", token, "a", 4);
         connect(&f, "i2", "b");
         let t2 = f.sessions.token_of(&D, "i2").unwrap();
-        let _ = f.router.open_session(&D, "i2", t2, "b", None);
+        let _ = f.router.open_session(&D, "i2", t2, "b", 1);
         let t = snap(
             &f,
             f.anchor.instant,
@@ -655,20 +599,17 @@ mod tests {
             Instant::now(),
         );
         let i1 = &t.services[0].instances[0];
-        assert!(i1.flow_controlled);
         assert_eq!(
             (i1.permits_available, i1.queued, i1.load_factor),
             (4, 0, 250)
         );
         assert_eq!(i1.tags["zone"], "z1");
         let i2 = &t.services[1].instances[0];
-        assert!(!i2.flow_controlled);
-        assert_eq!((i2.permits_available, i2.load_factor), (0, 100));
+        assert_eq!((i2.permits_available, i2.load_factor), (1, 100));
         assert_eq!(t.totals.queued, 0);
         let json = serde_json::to_string(&t).unwrap();
         for field in [
             "permitsAvailable",
-            "flowControlled",
             "loadFactor",
             "\"tags\":{\"zone\":\"z1\"}",
         ] {
@@ -680,12 +621,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reports_the_latest_instance_status() {
         let f = fx();
-        let meta = SessionMeta {
-            protocol_version: 2,
-            instance_status: true,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
-        connect_with(&f, "reported", "svc", meta);
+        connect(&f, "reported", "svc");
         connect(&f, "silent", "svc");
         let token = f.sessions.token_of(&D, "reported").unwrap();
         let at = Instant::now();
@@ -736,13 +672,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reports_the_latest_processors() {
         let f = fx();
-        let meta = SessionMeta {
-            protocol_version: 2,
-            instance_status: true,
-            processors: true,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
-        connect_with(&f, "p", "svc", meta);
+        connect(&f, "p", "svc");
         connect(&f, "silent", "svc");
         let token = f.sessions.token_of(&D, "p").unwrap();
         let report = proto::InstanceStatus {
@@ -823,23 +753,6 @@ mod tests {
         assert_eq!(serde_json::from_value::<Topology>(json).unwrap(), t);
     }
 
-    #[test]
-    fn json_without_the_status_fields_reads_as_never_reported() {
-        let json = serde_json::json!({
-            "instanceId": "i1", "connectedSinceMs": 1, "lastHeartbeatAgeMs": 0, "stale": false,
-            "inFlightAsHandler": 0, "inFlightAsSender": 0, "commandTypes": [], "queryTypes": [],
-            "protocolVersion": 0, "clientVersion": "", "flowControlled": false,
-            "permitsAvailable": 0, "queued": 0, "loadFactor": 100, "tags": {}
-        });
-        let i: InstanceTopology = serde_json::from_value(json).unwrap();
-        assert!(i.connected_hub_ids.is_empty());
-        assert_eq!(i.status_age_ms, -1);
-        assert!(
-            i.processors.is_empty(),
-            "an older hub's JSON has no processors"
-        );
-    }
-
     fn sample() -> Topology {
         let f = fx();
         f.registry
@@ -851,9 +764,8 @@ mod tests {
             "i2",
             "b",
             SessionMeta {
-                protocol_version: 2,
                 client_version: "lib/1".into(),
-                ..SessionMeta::v1(Duration::from_secs(10))
+                ..SessionMeta::default()
             },
         );
         f.registry.register(&D, "i2", "b", &[], &[]).unwrap();
@@ -882,7 +794,6 @@ mod tests {
         assert!(json.contains("lastHeartbeatAgeMs"), "{json}");
         assert!(json.contains("heartbeatTimeoutMs"), "{json}");
         assert!(json.contains("\"hubId\":\"hub-x\""), "{json}");
-        assert!(json.contains("\"protocolVersion\":2"), "{json}");
         assert!(json.contains("\"clientVersion\":\"lib/1\""), "{json}");
         assert_eq!(serde_json::from_str::<Topology>(&json).unwrap(), t);
     }

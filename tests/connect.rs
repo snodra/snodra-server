@@ -1,12 +1,13 @@
 mod common;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{
-    ClientMessage, ErrorCode, Heartbeat, Request, RequestKind, client_message, reply,
-    server_message,
+    ClientMessage, ErrorCode, Heartbeat, Register, RegisterAck, Request, RequestKind,
+    client_message, reply, server_message,
 };
 use tonic::Code;
 
@@ -68,9 +69,8 @@ async fn duplicate_type_owner_closes_with_already_exists() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "svc-a", &["x.Do"], &[]).await;
     // Heartbeat echo proves A's Register was processed before the competing one is sent.
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
-    let mut probe = FakeClient::register(addr, "svc-b", &["x.Do"], &[]).await;
+    sync(&mut a, 1).await;
+    let mut probe = FakeClient::register_no_wait(addr, "svc-b", &["x.Do"], &[]).await;
     let status = match probe.next_within(SHORT).await.unwrap() {
         Err(s) => s,
         Ok(m) => panic!("expected error status, got {m:?}"),
@@ -84,8 +84,7 @@ async fn command_round_trip_between_two_services() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "a", &["b.Do"], &[]).await;
     // Heartbeat echo proves A's Register was processed.
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     let mut sent = FakeClient::request("r1", RequestKind::Command, "b.Do", "", 0);
@@ -122,8 +121,7 @@ async fn command_round_trip_between_two_services() {
 async fn handler_error_reply_is_forwarded_unchanged() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "a", &["b.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -175,10 +173,6 @@ async fn routing_key_sticks_to_one_instance_of_two() {
     let addr = start_hub(Config::default()).await;
     let mut a1 = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
     let mut a2 = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    for a in [&mut a1, &mut a2] {
-        a.tx.send(heartbeat(1)).await.unwrap();
-        a.next_within(SHORT).await.unwrap().unwrap();
-    }
     let b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -228,8 +222,7 @@ async fn routing_key_sticks_to_one_instance_of_two() {
 async fn handler_stream_close_fails_in_flight_with_handler_disconnected() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -253,8 +246,7 @@ async fn handler_stream_close_fails_in_flight_with_handler_disconnected() {
 async fn short_timeout_yields_timeout_error() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -307,11 +299,116 @@ async fn health_service_reports_serving() {
     assert_eq!(resp.status, ServingStatus::Serving as i32);
 }
 
+/// Sends a heartbeat and skips everything up to its echo (acks included): the hub has handled
+/// what this stream sent before it.
+async fn sync(c: &mut FakeClient, n: i64) {
+    c.tx.send(heartbeat(n)).await.unwrap();
+    loop {
+        if let Some(server_message::Message::Heartbeat(h)) =
+            c.next_within(SHORT).await.unwrap().unwrap().message
+            && h.sent_at_ms == n
+        {
+            return;
+        }
+    }
+}
+
+/// The next message, which must be the echo of the heartbeat `sent_at_ms`.
+async fn expect_echo(c: &mut FakeClient, sent_at_ms: i64) {
+    match c.next_within(SHORT).await.unwrap().unwrap().message {
+        Some(server_message::Message::Heartbeat(h)) => assert_eq!(h.sent_at_ms, sent_at_ms),
+        other => panic!("expected the echo of {sent_at_ms}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_ack_carries_the_configured_values_before_the_echo() {
+    let addr = start_hub(Config {
+        hub_id: "hub-under-test".to_string(),
+        heartbeat_interval: Duration::from_millis(1500),
+        heartbeat_timeout: Duration::from_secs(7),
+        default_timeout: Duration::from_millis(4000),
+        max_timeout: Duration::from_millis(50_000),
+        timeout_overrides: [("t.Long".to_string(), Duration::from_millis(90_000))].into(),
+        ..Config::default()
+    })
+    .await;
+    let mut c = FakeClient::register_no_wait(addr, "svc", &["t.Long"], &[]).await;
+    c.heartbeat(77).await;
+    assert_eq!(
+        c.expect_ack().await,
+        RegisterAck {
+            hub_id: "hub-under-test".to_string(),
+            heartbeat_interval_ms: 1500,
+            heartbeat_timeout_ms: 7000,
+            default_timeout_ms: 4000,
+            max_timeout_ms: 50_000,
+            context: "default".to_string(),
+            type_timeouts_ms: HashMap::from([("t.Long".to_string(), 90_000)]),
+        }
+    );
+    expect_echo(&mut c, 77).await;
+}
+
+#[tokio::test]
+async fn every_accepted_register_is_acked_before_the_echo_and_the_client_version_stays() {
+    let addr = start_hub(Config::default()).await;
+    let mut c = FakeClient::register_no_wait(addr, "svc", &["a.One"], &[]).await;
+    c.heartbeat(1).await;
+    c.expect_ack().await;
+    expect_echo(&mut c, 1).await;
+
+    // A re-register is acked too; it cannot change the client version.
+    c.send_raw_register(Register {
+        client_version: "other/2.0".to_string(),
+        ..c.register_message("svc", &["a.One", "a.Two"], &[])
+    })
+    .await;
+    c.heartbeat(2).await;
+    c.expect_ack().await;
+    expect_echo(&mut c, 2).await;
+
+    let t = kraken_hub::topology_probe(addr).await.unwrap();
+    let instance = &t.services[0].instances[0];
+    assert_eq!(instance.client_version, "fake-client/1.0");
+    assert_eq!(instance.command_types, ["a.One", "a.Two"]);
+}
+
+#[tokio::test]
+async fn zero_timeout_gets_the_per_type_override() {
+    let addr = start_hub(Config {
+        timeout_overrides: [("t.Quick".to_string(), Duration::from_millis(200))].into(),
+        ..Config::default()
+    })
+    .await;
+    let _handler = FakeClient::register(addr, "svc-h", &["t.Quick"], &[]).await;
+    let mut sender = FakeClient::register(addr, "svc-s", &[], &[]).await;
+    let started = tokio::time::Instant::now();
+    sender
+        .tx
+        .send(FakeClient::request(
+            "q1",
+            RequestKind::Command,
+            "t.Quick",
+            "",
+            0,
+        ))
+        .await
+        .unwrap();
+    let e = expect_error(&mut sender).await;
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert_eq!(e.message, "no reply within 200 ms");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn stale_instance_is_evicted_by_watchdog() {
-    // A v1 client (no protocol_version) is held to the legacy timeout.
     let config = Config {
-        legacy_heartbeat_timeout: Duration::from_millis(300),
+        heartbeat_timeout: Duration::from_millis(300),
         ..Config::default()
     };
     let addr = start_hub(config).await;
@@ -339,8 +436,7 @@ async fn reregister_replaces_type_list() {
     let mut a = FakeClient::register(addr, "a", &["a.One"], &[]).await;
     a.send_register("a", &["a.Two"], &[]).await;
     // Heartbeat echo proves the re-Register (sent earlier on the same stream) was processed.
-    a.tx.send(heartbeat(7)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 7).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -373,15 +469,13 @@ async fn late_disconnect_of_old_stream_does_not_evict_reconnected_instance() {
     let mut second = FakeClient::connect(addr).await;
     second.instance_id = first.instance_id.clone();
     second.send_register("a", &["a.Do"], &[]).await;
-    second.tx.send(heartbeat(1)).await.unwrap();
-    second.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut second, 1).await;
 
     // The first stream ends late; the replaced session's task must not touch the new one.
     drop(first);
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
     // Give the hub a round trip on b's stream so the old stream's close is likely processed.
-    b.tx.send(heartbeat(2)).await.unwrap();
-    b.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut b, 2).await;
 
     b.tx.send(FakeClient::request(
         "r1",
@@ -411,12 +505,10 @@ async fn late_disconnect_of_old_stream_does_not_evict_reconnected_instance() {
 async fn rejected_reregister_closes_stream_and_unregisters() {
     let addr = start_hub(Config::default()).await;
     let mut other = FakeClient::register(addr, "other", &["o.Do"], &[]).await;
-    other.tx.send(heartbeat(1)).await.unwrap();
-    other.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut other, 1).await;
 
     let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     a.send_register("a", &["o.Do"], &[]).await;
     let status = a.next_within(SHORT).await.unwrap().unwrap_err();
     assert_eq!(status.code(), Code::AlreadyExists);
@@ -515,10 +607,9 @@ async fn shutdown_returns_promptly(with_http: bool) {
         },
     ));
     let mut a = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut a, 1).await;
     if let Some(http_addr) = http_addr {
-        let (status, _) = common::http_get(http_addr, "/topology").await;
+        let (status, _) = common::http_get(http_addr, "/api/v1/topology").await;
         assert_eq!(status, 200);
     }
 
@@ -553,7 +644,7 @@ async fn shutdown_with_http_returns_promptly_and_closes_http_port() {
 #[tokio::test]
 async fn register_with_type_in_both_lists_is_invalid_argument() {
     let addr = start_hub(Config::default()).await;
-    let mut c = FakeClient::register(addr, "svc", &["x.Do"], &["x.Do"]).await;
+    let mut c = FakeClient::register_no_wait(addr, "svc", &["x.Do"], &["x.Do"]).await;
     let status = c.next_within(SHORT).await.unwrap().unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(
@@ -566,9 +657,8 @@ async fn register_with_type_in_both_lists_is_invalid_argument() {
 async fn register_kind_conflict_is_already_exists() {
     let addr = start_hub(Config::default()).await;
     let mut a = FakeClient::register(addr, "svc-a", &["x.Do"], &[]).await;
-    a.tx.send(heartbeat(1)).await.unwrap();
-    a.next_within(SHORT).await.unwrap().unwrap();
-    let mut b = FakeClient::register(addr, "svc-b", &[], &["x.Do"]).await;
+    sync(&mut a, 1).await;
+    let mut b = FakeClient::register_no_wait(addr, "svc-b", &[], &["x.Do"]).await;
     let status = b.next_within(SHORT).await.unwrap().unwrap_err();
     assert_eq!(status.code(), Code::AlreadyExists);
     assert_eq!(
@@ -585,8 +675,7 @@ async fn register_kind_conflict_is_already_exists() {
 async fn replaced_session_fails_requests_forwarded_to_it() {
     let addr = start_hub(Config::default()).await;
     let mut old = FakeClient::register(addr, "a", &["a.Do"], &[]).await;
-    old.tx.send(heartbeat(1)).await.unwrap();
-    old.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut old, 1).await;
     let mut b = FakeClient::register(addr, "b", &[], &[]).await;
 
     b.tx.send(FakeClient::request(
@@ -604,8 +693,7 @@ async fn replaced_session_fails_requests_forwarded_to_it() {
     let mut new = FakeClient::connect(addr).await;
     new.instance_id = old.instance_id.clone();
     new.send_register("a", &["a.Do"], &[]).await;
-    new.tx.send(heartbeat(2)).await.unwrap();
-    new.next_within(SHORT).await.unwrap().unwrap();
+    sync(&mut new, 2).await;
 
     let e = expect_error(&mut b).await;
     assert_eq!(e.request_id, "r1");

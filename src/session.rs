@@ -52,15 +52,14 @@ pub struct StatusDetail {
     /// [`MAX_STATUS_HUB_IDS`], in the reported order.
     pub connected_hub_ids: Vec<String>,
     pub handlers_in_flight: u32,
-    /// `processors` as reported, bounded ([`crate::processors::bound`], ADR 0022); empty unless
-    /// the session negotiated "processors".
+    /// `processors` as reported, bounded ([`crate::processors::bound`], ADR 0022).
     pub processors: Vec<ProcessorReport>,
     /// When the hub received the report.
     pub at: Instant,
 }
 
 impl StatusDetail {
-    fn from_report(report: &InstanceStatus, at: Instant, keep_processors: bool) -> Self {
+    fn from_report(report: &InstanceStatus, at: Instant) -> Self {
         let mut ids: Vec<String> = Vec::new();
         for id in &report.connected_hub_ids {
             if ids.len() == MAX_STATUS_HUB_IDS {
@@ -74,11 +73,7 @@ impl StatusDetail {
         Self {
             connected_hub_ids: ids,
             handlers_in_flight: report.handlers_in_flight,
-            processors: if keep_processors {
-                processors::bound(&report.processors)
-            } else {
-                Vec::new()
-            },
+            processors: processors::bound(&report.processors),
             at,
         }
     }
@@ -88,78 +83,18 @@ impl StatusDetail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Superseded;
 
-/// What a session negotiated in the first `Register` of its stream; fixed for the stream's life.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the first `Register` of a session's stream fixed for the stream's life.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionMeta {
-    /// `Register.protocol_version` as sent (0 = v1).
-    pub protocol_version: u32,
-    /// `Register.capabilities` as sent.
-    pub capabilities: Vec<String>,
-    /// `Register.client_version` as sent (empty for v1 clients).
+    /// `Register.client_version` as sent.
     pub client_version: String,
-    /// The session is evicted after this long without a heartbeat (v2 or legacy timeout).
-    pub heartbeat_timeout: Duration,
-    /// The session shares the "flow-control" capability: it may get RESOURCE_EXHAUSTED and,
-    /// with `initial_permits > 0`, is forwarded requests only with permits.
-    pub flow_control: bool,
-    /// `Register.initial_permits` as sent.
-    pub initial_permits: u32,
     /// Load factor and tags from the first `Register`, re-applied on every re-register.
     pub placement: Placement,
-    /// The session is v2 and shares the "instance-status" capability: its `InstanceStatus`
-    /// reports are kept (ADR 0016). Reports from any other session are ignored.
-    pub instance_status: bool,
-    /// The session is v2 and shares the "scatter-gather" capability: it may send requests with
-    /// mode SCATTER_GATHER and get ReplyPart / ReplyEnd (ADR 0017).
-    pub scatter_gather: bool,
-    /// The session is v2 and shares the "streaming" capability: it may send requests with mode
-    /// STREAMING, is a target for them, and sends and receives the multi-part messages
-    /// (ADR 0017, P4b).
-    pub streaming: bool,
-    /// The session is v2 and shares the "subscription" capability: it may send requests with
-    /// mode SUBSCRIPTION, is a target for them, and sends and receives the multi-part messages
-    /// (ADR 0017, P4c).
-    pub subscription: bool,
-    /// The session is v2 and shares the "processors" capability: the `processors` of its
-    /// `InstanceStatus` reports are kept (ADR 0022). Needs `instance_status` too.
-    pub processors: bool,
-    /// The session is v2 and shares the "processor-control" capability: the hub may send it
-    /// `ServerMessage.control` and reads its `ControlReply` (ADR 0023).
-    pub processor_control: bool,
     /// Who the session's credentials speak for, when their ACL entry existed (ADR 0018, 0019);
     /// every later request is judged against the current ACL entry this names.
     pub principal: Option<Arc<Principal>>,
     /// How the session authenticated, for the topology and the dashboard.
     pub auth: AuthStatus,
-}
-
-impl SessionMeta {
-    /// A v1 session (protocol_version 0) with the given eviction threshold.
-    pub fn v1(heartbeat_timeout: Duration) -> Self {
-        Self {
-            protocol_version: 0,
-            capabilities: Vec::new(),
-            client_version: String::new(),
-            heartbeat_timeout,
-            flow_control: false,
-            initial_permits: 0,
-            placement: Placement::default(),
-            instance_status: false,
-            scatter_gather: false,
-            streaming: false,
-            subscription: false,
-            processors: false,
-            processor_control: false,
-            principal: None,
-            auth: AuthStatus::Off,
-        }
-    }
-
-    /// The permits the hub starts this session with: `None` (unlimited, the v1 behaviour) unless
-    /// the session shares flow-control and asked for permits.
-    pub fn permits(&self) -> Option<u32> {
-        (self.flow_control && self.initial_permits > 0).then_some(self.initial_permits)
-    }
 }
 
 pub struct Session {
@@ -187,16 +122,7 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderInfo {
     pub token: u64,
-    pub flow_control: bool,
     pub service: String,
-    /// `Register.protocol_version` of the session (0 = v1).
-    pub protocol_version: u32,
-    /// The session shares "scatter-gather".
-    pub scatter_gather: bool,
-    /// The session shares "streaming".
-    pub streaming: bool,
-    /// The session shares "subscription".
-    pub subscription: bool,
     /// See [`SessionMeta::principal`].
     pub principal: Option<Arc<Principal>>,
 }
@@ -207,9 +133,7 @@ pub struct SessionDetail {
     pub context: ContextId,
     pub instance_id: InstanceId,
     pub service: String,
-    pub protocol_version: u32,
     pub client_version: String,
-    pub heartbeat_timeout: Duration,
     pub connected_since: Instant,
     pub last_heartbeat: Instant,
     /// The latest `InstanceStatus`, `None` when never reported.
@@ -227,8 +151,6 @@ pub struct ProcessorHolder {
     pub context: ContextId,
     pub instance_id: InstanceId,
     pub token: u64,
-    /// The session shares "processor-control"; one that does not is never sent a request.
-    pub capable: bool,
     /// When the hub received the status that lists the processor.
     pub reported_at: Instant,
 }
@@ -344,8 +266,7 @@ impl Sessions {
         (token, replaced)
     }
 
-    /// The current session's token, whether it shares the "flow-control" capability, and its
-    /// service.
+    /// The current session's token, its service and who it speaks for.
     pub fn sender_info(&self, ctx: &ContextId, instance_id: &str) -> Option<SenderInfo> {
         self.inner
             .lock()
@@ -354,12 +275,7 @@ impl Sessions {
             .filter(|s| s.context == *ctx)
             .map(|s| SenderInfo {
                 token: s.token,
-                flow_control: s.meta.flow_control,
                 service: s.service.clone(),
-                protocol_version: s.meta.protocol_version,
-                scatter_gather: s.meta.scatter_gather,
-                streaming: s.meta.streaming,
-                subscription: s.meta.subscription,
                 principal: s.meta.principal.clone(),
             })
     }
@@ -399,36 +315,6 @@ impl Sessions {
                 handled: s.handled.clone(),
             })
             .collect()
-    }
-
-    /// True when the current session of `instance_id` negotiated the "streaming" capability
-    /// (so it understands `ReplyPart`, `ReplyEnd`, `Flow` and `Cancel`).
-    pub fn negotiated_streaming(&self, ctx: &ContextId, instance_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(instance_id)
-            .is_some_and(|s| s.context == *ctx && s.meta.streaming)
-    }
-
-    /// True when the current session of `instance_id` negotiated the "subscription" capability
-    /// (ADR 0017, P4c: it serves subscription queries and understands the multi-part messages).
-    pub fn negotiated_subscription(&self, ctx: &ContextId, instance_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(instance_id)
-            .is_some_and(|s| s.context == *ctx && s.meta.subscription)
-    }
-
-    /// True when the current session of `instance_id` understands the multi-part messages
-    /// (`ReplyPart`, `ReplyEnd`, `Flow`, `Cancel`): it negotiated "streaming" or "subscription".
-    pub fn negotiated_multipart(&self, ctx: &ContextId, instance_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(instance_id)
-            .is_some_and(|s| s.context == *ctx && (s.meta.streaming || s.meta.subscription))
     }
 
     /// The token of the current session of `instance_id`, if any.
@@ -532,9 +418,7 @@ impl Sessions {
                 context: s.context.clone(),
                 instance_id: id.clone(),
                 service: s.service.clone(),
-                protocol_version: s.meta.protocol_version,
                 client_version: s.meta.client_version.clone(),
-                heartbeat_timeout: s.meta.heartbeat_timeout,
                 connected_since: s.connected_since,
                 last_heartbeat: s.last_heartbeat,
                 status: s.status.clone(),
@@ -544,10 +428,9 @@ impl Sessions {
             .collect()
     }
 
-    /// Keeps `report` (bounded) as the latest `InstanceStatus` of the session `token`, replacing
-    /// the previous one. Ignored (`false`) unless that session is still the current one for
-    /// `instance_id` and negotiated "instance-status" (so never for a v1 session); its
-    /// `processors` are kept only when the session also negotiated "processors" (ADR 0022).
+    /// Keeps `report` (bounded, ADR 0016 and 0022) as the latest `InstanceStatus` of the session
+    /// `token`, replacing the previous one. Ignored (`false`) unless that session is still the
+    /// current one for `instance_id`.
     pub fn set_status(
         &self,
         ctx: &ContextId,
@@ -559,15 +442,11 @@ impl Sessions {
         let mut inner = self.inner.lock().unwrap();
         let Some(session) = inner
             .get_mut(instance_id)
-            .filter(|s| s.context == *ctx && s.token == token && s.meta.instance_status)
+            .filter(|s| s.context == *ctx && s.token == token)
         else {
             return false;
         };
-        session.status = Some(StatusDetail::from_report(
-            report,
-            now,
-            session.meta.processors,
-        ));
+        session.status = Some(StatusDetail::from_report(report, now));
         true
     }
 
@@ -649,10 +528,10 @@ impl Sessions {
         }
     }
 
-    /// Instances whose last heartbeat is strictly older than their own heartbeat timeout.
-    pub fn stale(&self, now: Instant) -> Vec<InstanceId> {
+    /// Instances whose last heartbeat is strictly older than `timeout`.
+    pub fn stale(&self, now: Instant, timeout: Duration) -> Vec<InstanceId> {
         let mut ids: Vec<InstanceId> = self
-            .stale_with_tokens(now)
+            .stale_with_tokens(now, timeout)
             .into_iter()
             .map(|(_, id, _)| id)
             .collect();
@@ -661,12 +540,16 @@ impl Sessions {
     }
 
     /// Like [`Sessions::stale`], with each session's context and token for [`Sessions::remove_if`].
-    pub fn stale_with_tokens(&self, now: Instant) -> Vec<(ContextId, InstanceId, u64)> {
+    pub fn stale_with_tokens(
+        &self,
+        now: Instant,
+        timeout: Duration,
+    ) -> Vec<(ContextId, InstanceId, u64)> {
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.last_heartbeat + s.meta.heartbeat_timeout < now)
+            .filter(|(_, s)| s.last_heartbeat + timeout < now)
             .map(|(id, s)| (s.context.clone(), id.clone(), s.token))
             .collect()
     }
@@ -693,7 +576,6 @@ impl Sessions {
                     context: s.context.clone(),
                     instance_id: id.clone(),
                     token: s.token,
-                    capable: s.meta.processor_control,
                     reported_at: status.at,
                 });
             }
@@ -714,12 +596,11 @@ impl Sessions {
 mod tests {
     use super::*;
     use crate::proto::InstanceStatus;
-    use crate::protocol;
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
 
-    fn v1() -> SessionMeta {
-        SessionMeta::v1(Duration::from_secs(30))
+    fn meta() -> SessionMeta {
+        SessionMeta::default()
     }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -735,7 +616,7 @@ mod tests {
                 &D,
                 "a",
                 "svc",
-                v1(),
+                meta(),
                 tx.clone(),
                 CancellationToken::new(),
                 token,
@@ -752,7 +633,7 @@ mod tests {
     async fn a_refresh_replaces_the_principal_and_the_auth_status_of_the_current_session() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let mut meta = v1();
+        let mut meta = meta();
         meta.principal = Some(Arc::new(Principal::token([1; 32], "svc")));
         meta.auth = AuthStatus::Authenticated {
             service: "svc".into(),
@@ -800,7 +681,7 @@ mod tests {
     async fn send_with_full_buffer_is_busy() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        sessions.insert(&D, "a", "svc", v1(), tx, CancellationToken::new());
+        sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
         assert_eq!(sessions.send(&D, "a", ServerMessage::default()), Ok(()));
         assert_eq!(
             sessions.send(&D, "a", ServerMessage::default()),
@@ -812,7 +693,7 @@ mod tests {
     async fn send_to_dropped_receiver_is_gone() {
         let sessions = Sessions::new();
         let (tx, rx) = mpsc::channel(1);
-        sessions.insert(&D, "a", "svc", v1(), tx, CancellationToken::new());
+        sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
         drop(rx);
         assert_eq!(
             sessions.send(&D, "a", ServerMessage::default()),
@@ -821,36 +702,19 @@ mod tests {
     }
 
     #[test]
-    fn stale_returns_only_instances_past_their_own_timeout() {
+    fn stale_returns_only_instances_past_the_timeout() {
         let sessions = Sessions::new();
         let now = Instant::now();
         let mut senders = Vec::new();
-        for (id, timeout) in [
-            ("v1-ok", 30),
-            ("v1-late", 30),
-            ("v2-ok", 10),
-            ("v2-late", 10),
-        ] {
+        for id in ["ok", "late"] {
             let (tx, rx) = mpsc::channel(1);
             senders.push(rx);
-            let meta = SessionMeta {
-                protocol_version: if timeout == 10 { 2 } else { 0 },
-                ..SessionMeta::v1(Duration::from_secs(timeout))
-            };
-            sessions.insert(&D, id, "svc", meta, tx, CancellationToken::new());
+            sessions.insert(&D, id, "svc", meta(), tx, CancellationToken::new());
         }
-        // 12 s of silence: past the v2 timeout (10 s), inside the legacy one (30 s).
-        sessions.touch(&D, "v1-ok", now - Duration::from_secs(12));
-        sessions.touch(&D, "v2-late", now - Duration::from_secs(12));
-        sessions.touch(&D, "v2-ok", now - Duration::from_secs(9));
-        sessions.touch(&D, "v1-late", now - Duration::from_secs(31));
-        assert_eq!(sessions.stale(now), ["v1-late", "v2-late"]);
-        let details = sessions.details();
-        let v2 = details.iter().find(|d| d.instance_id == "v2-ok").unwrap();
-        assert_eq!(
-            (v2.protocol_version, v2.heartbeat_timeout),
-            (2, Duration::from_secs(10))
-        );
+        sessions.touch(&D, "ok", now - Duration::from_secs(9));
+        sessions.touch(&D, "late", now - Duration::from_secs(12));
+        assert_eq!(sessions.stale(now, Duration::from_secs(10)), ["late"]);
+        assert_eq!(sessions.stale(now, Duration::from_secs(8)), ["late", "ok"]);
     }
 
     #[test]
@@ -858,8 +722,8 @@ mod tests {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert(&D, "a", "svc", v1(), tx1, CancellationToken::new());
-        let new = sessions.insert(&D, "a", "svc", v1(), tx2, CancellationToken::new());
+        let old = sessions.insert(&D, "a", "svc", meta(), tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", meta(), tx2, CancellationToken::new());
         assert_ne!(old, new);
         assert!(sessions.remove_if(&D, "a", old).is_none());
         assert!(sessions.remove_if(&D, "a", new).is_some());
@@ -873,8 +737,8 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let c1 = CancellationToken::new();
         let c2 = CancellationToken::new();
-        sessions.insert(&D, "a", "svc", v1(), tx1, c1.clone());
-        let new = sessions.insert(&D, "a", "svc", v1(), tx2, c2.clone());
+        sessions.insert(&D, "a", "svc", meta(), tx1, c1.clone());
+        let new = sessions.insert(&D, "a", "svc", meta(), tx2, c2.clone());
         assert!(c1.is_cancelled());
         assert!(!c2.is_cancelled());
         sessions.remove_if(&D, "a", new).unwrap();
@@ -886,15 +750,6 @@ mod tests {
             connected_hub_ids: ids.iter().map(|s| s.to_string()).collect(),
             handlers_in_flight: handlers,
             processors: vec![],
-        }
-    }
-
-    fn with_status_capability() -> SessionMeta {
-        SessionMeta {
-            protocol_version: 2,
-            capabilities: vec![protocol::INSTANCE_STATUS.to_string()],
-            instance_status: true,
-            ..SessionMeta::v1(Duration::from_secs(10))
         }
     }
 
@@ -910,14 +765,7 @@ mod tests {
     fn instance_status_is_stored_replaced_and_dropped_with_the_session() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let token = sessions.insert(
-            &D,
-            "a",
-            "svc",
-            with_status_capability(),
-            tx,
-            CancellationToken::new(),
-        );
+        let token = sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
         assert_eq!(status_of(&sessions, "a"), None, "nothing before a report");
         let t0 = Instant::now();
         assert!(sessions.set_status(&D, "a", token, &status(&["h1", "h2"], 3), t0));
@@ -933,14 +781,7 @@ mod tests {
 
         // A stale token (an older stream) never writes; the new session starts without status.
         let (tx2, _rx2) = mpsc::channel(1);
-        let newer = sessions.insert(
-            &D,
-            "a",
-            "svc",
-            with_status_capability(),
-            tx2,
-            CancellationToken::new(),
-        );
+        let newer = sessions.insert(&D, "a", "svc", meta(), tx2, CancellationToken::new());
         assert_eq!(status_of(&sessions, "a"), None, "dropped with the session");
         assert!(!sessions.set_status(&D, "a", token, &status(&["old"], 0), t1));
         assert_eq!(status_of(&sessions, "a"), None);
@@ -949,35 +790,19 @@ mod tests {
     }
 
     #[test]
-    fn instance_status_is_ignored_without_the_capability_and_for_v1() {
+    fn instance_status_is_kept_for_every_session() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let v1 = sessions.insert(&D, "v1", "svc", v1(), tx, CancellationToken::new());
-        assert!(!sessions.set_status(&D, "v1", v1, &status(&["h1"], 1), Instant::now()));
-        assert_eq!(status_of(&sessions, "v1"), None);
-
-        let (tx, _rx) = mpsc::channel(1);
-        let without = SessionMeta {
-            protocol_version: 2,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
-        let v2 = sessions.insert(&D, "v2", "svc", without, tx, CancellationToken::new());
-        assert!(!sessions.set_status(&D, "v2", v2, &status(&["h1"], 1), Instant::now()));
-        assert_eq!(status_of(&sessions, "v2"), None);
+        let token = sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
+        assert!(sessions.set_status(&D, "a", token, &status(&["h1"], 1), Instant::now()));
+        assert_eq!(status_of(&sessions, "a").unwrap().connected_hub_ids, ["h1"]);
     }
 
     #[test]
     fn instance_status_is_bounded() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let token = sessions.insert(
-            &D,
-            "a",
-            "svc",
-            with_status_capability(),
-            tx,
-            CancellationToken::new(),
-        );
+        let token = sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
         let long = "x".repeat(MAX_STATUS_HUB_ID_BYTES + 1);
         let edge = "y".repeat(MAX_STATUS_HUB_ID_BYTES);
         let mut ids: Vec<String> = vec![long.clone(), String::new(), edge.clone(), "h0".into()];
@@ -1012,14 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn processors_are_kept_bounded_only_for_a_session_that_negotiated_them() {
+    fn processors_are_kept_bounded() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let both = SessionMeta {
-            processors: true,
-            ..with_status_capability()
-        };
-        let token = sessions.insert(&D, "p6a", "svc", both, tx, CancellationToken::new());
+        let token = sessions.insert(&D, "p6a", "svc", meta(), tx, CancellationToken::new());
         let mut report = status(&["h1"], 0);
         report.processors = (0..40).map(|i| processor(&format!("p{i}"))).collect();
         assert!(sessions.set_status(&D, "p6a", token, &report, Instant::now()));
@@ -1031,63 +852,29 @@ mod tests {
         // The next report replaces the list (an empty one clears it).
         assert!(sessions.set_status(&D, "p6a", token, &status(&["h1"], 0), Instant::now()));
         assert!(status_of(&sessions, "p6a").unwrap().processors.is_empty());
-
-        // A P5c session ("instance-status" only): its hub ids are kept, processors never.
-        let (tx, _rx) = mpsc::channel(1);
-        let p5c = sessions.insert(
-            &D,
-            "p5c",
-            "svc",
-            with_status_capability(),
-            tx,
-            CancellationToken::new(),
-        );
-        assert!(sessions.set_status(&D, "p5c", p5c, &report, Instant::now()));
-        let kept = status_of(&sessions, "p5c").unwrap();
-        assert_eq!(kept.connected_hub_ids, ["h1"]);
-        assert!(kept.processors.is_empty());
-
-        // "processors" without "instance-status": the report is not kept at all, as before.
-        let (tx, _rx) = mpsc::channel(1);
-        let only = SessionMeta {
-            protocol_version: 2,
-            processors: true,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
-        let only = sessions.insert(&D, "only", "svc", only, tx, CancellationToken::new());
-        assert!(!sessions.set_status(&D, "only", only, &report, Instant::now()));
-        assert_eq!(status_of(&sessions, "only"), None);
     }
 
     #[test]
     fn the_holders_of_a_processor_are_the_sessions_whose_latest_status_lists_it() {
         let sessions = Sessions::new();
         let mut rxs = Vec::new();
-        let mut insert = |id: &str, service: &str, capable: bool, names: &[&str]| {
+        let mut insert = |id: &str, service: &str, names: &[&str]| {
             let (tx, rx) = mpsc::channel(1);
             rxs.push(rx);
-            let meta = SessionMeta {
-                processors: true,
-                processor_control: capable,
-                ..with_status_capability()
-            };
-            let token = sessions.insert(&D, id, service, meta, tx, CancellationToken::new());
+            let token = sessions.insert(&D, id, service, meta(), tx, CancellationToken::new());
             let mut report = status(&["h1"], 0);
             report.processors = names.iter().map(|n| processor(n)).collect();
             assert!(sessions.set_status(&D, id, token, &report, Instant::now()));
             token
         };
-        let a = insert("a", "svc", true, &["audit", "default"]);
-        insert("b", "svc", false, &["audit"]);
-        insert("c", "svc", true, &["default"]);
-        insert("d", "other", true, &["audit"]);
+        let a = insert("a", "svc", &["audit", "default"]);
+        insert("b", "svc", &["audit"]);
+        insert("c", "svc", &["default"]);
+        insert("d", "other", &["audit"]);
         let mut holders = sessions.processor_holders(&D, "svc", "audit").unwrap();
         holders.sort_by(|x, y| x.instance_id.cmp(&y.instance_id));
-        let seen: Vec<(&str, bool)> = holders
-            .iter()
-            .map(|h| (h.instance_id.as_str(), h.capable))
-            .collect();
-        assert_eq!(seen, [("a", true), ("b", false)]);
+        let seen: Vec<&str> = holders.iter().map(|h| h.instance_id.as_str()).collect();
+        assert_eq!(seen, ["a", "b"]);
         assert_eq!(holders[0].token, a);
         assert_eq!(
             sessions.processor_holders(&D, "svc", "orders"),
@@ -1101,14 +888,7 @@ mod tests {
     fn instance_status_drops_duplicate_ids() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let token = sessions.insert(
-            &D,
-            "a",
-            "svc",
-            with_status_capability(),
-            tx,
-            CancellationToken::new(),
-        );
+        let token = sessions.insert(&D, "a", "svc", meta(), tx, CancellationToken::new());
         let report = status(&["h2", "h1", "h2"], 0);
         assert!(sessions.set_status(&D, "a", token, &report, Instant::now()));
         assert_eq!(
@@ -1118,48 +898,12 @@ mod tests {
     }
 
     #[test]
-    fn the_multipart_capabilities_are_read_per_session() {
-        let sessions = Sessions::new();
-        let mut rxs = Vec::new();
-        for (id, streaming, subscription) in [
-            ("plain", false, false),
-            ("stream", true, false),
-            ("sub", false, true),
-            ("both", true, true),
-        ] {
-            let (tx, rx) = mpsc::channel(1);
-            rxs.push(rx);
-            let meta = SessionMeta {
-                protocol_version: 2,
-                streaming,
-                subscription,
-                ..SessionMeta::v1(Duration::from_secs(10))
-            };
-            sessions.insert(&D, id, "svc", meta, tx, CancellationToken::new());
-        }
-        let negotiated = |id: &str| {
-            (
-                sessions.negotiated_streaming(&D, id),
-                sessions.negotiated_subscription(&D, id),
-                sessions.negotiated_multipart(&D, id),
-            )
-        };
-        assert_eq!(negotiated("plain"), (false, false, false));
-        assert_eq!(negotiated("stream"), (true, false, true));
-        assert_eq!(negotiated("sub"), (false, true, true));
-        assert_eq!(negotiated("both"), (true, true, true));
-        assert_eq!(negotiated("nobody"), (false, false, false));
-        let info = sessions.sender_info(&D, "sub").unwrap();
-        assert!(info.subscription && !info.streaming);
-    }
-
-    #[test]
     fn with_current_runs_only_for_the_current_token() {
         let sessions = Sessions::new();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let old = sessions.insert(&D, "a", "svc", v1(), tx1, CancellationToken::new());
-        let new = sessions.insert(&D, "a", "svc", v1(), tx2, CancellationToken::new());
+        let old = sessions.insert(&D, "a", "svc", meta(), tx1, CancellationToken::new());
+        let new = sessions.insert(&D, "a", "svc", meta(), tx2, CancellationToken::new());
         assert_eq!(sessions.with_current(&D, "a", old, || 1), None);
         assert_eq!(sessions.with_current(&D, "a", new, || 2), Some(2));
         assert_eq!(sessions.with_current(&D, "b", new, || 3), None);

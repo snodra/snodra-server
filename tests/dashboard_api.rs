@@ -44,7 +44,7 @@ async fn json(http: SocketAddr, path: &str) -> Value {
 async fn topology_until(http: SocketAddr, done: impl Fn(&Topology) -> bool) -> Topology {
     let deadline = tokio::time::Instant::now() + BOUND;
     loop {
-        let (status, body) = http_get(http, "/topology").await;
+        let (status, body) = http_get(http, "/api/v1/topology").await;
         assert_eq!(status, 200);
         let t: Topology = serde_json::from_str(&body).unwrap();
         if done(&t) {
@@ -110,7 +110,7 @@ async fn with_traffic(http: SocketAddr, grpc: SocketAddr) -> (FakeClient, FakeCl
         &["examples.CountGreetings"],
     )
     .await;
-    let mut a = FakeClient::register_v2(grpc, "service-a", &[], &[]).await;
+    let mut a = FakeClient::register(grpc, "service-a", &[], &[]).await;
     topology_until(http, |t| t.totals.instances == 2 && t.types.len() == 2).await;
     for i in 0..3 {
         call(
@@ -224,7 +224,7 @@ async fn types_topology_settings_and_version_have_their_shape() {
     let (grpc, http) = start(config()).await;
     let (a, _b) = with_traffic(http, grpc).await;
 
-    // topology: the same snapshot as GET /topology.
+    // topology: the snapshot the gRPC `Topology` returns.
     let t = json(http, "/api/v1/topology").await;
     for field in [
         "hubId",
@@ -236,19 +236,7 @@ async fn types_topology_settings_and_version_have_their_shape() {
     ] {
         assert!(t.get(field).is_some(), "topology.{field} missing");
     }
-    let mut via_api: Topology = serde_json::from_value(t).unwrap();
-    let (_, body) = http_get(http, "/topology").await;
-    let mut plain: Topology = serde_json::from_str(&body).unwrap();
-    for t in [&mut via_api, &mut plain] {
-        t.now_ms = 0;
-        for s in &mut t.services {
-            for i in &mut s.instances {
-                i.last_heartbeat_age_ms = 0;
-                i.stale = false;
-            }
-        }
-    }
-    assert_eq!(via_api, plain);
+    let _: Topology = serde_json::from_value(t).unwrap();
 
     // types: kind, owners, instances, orphaned, senders and traffic per type.
     let v = json(http, "/api/v1/types").await;
@@ -282,23 +270,9 @@ async fn types_topology_settings_and_version_have_their_shape() {
         assert!(entry["description"].as_str().is_some_and(|d| !d.is_empty()));
     }
 
-    // version: hub id, version, protocol version, start time, build, Grafana link.
+    // version: hub id, version, start time, build, Grafana link.
     let v = json(http, "/api/v1/version").await;
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["protocolVersion"], 2);
-    assert_eq!(
-        v["capabilities"],
-        serde_json::json!([
-            "flow-control",
-            "instance-status",
-            "scatter-gather",
-            "streaming",
-            "subscription",
-            "credentials-refresh",
-            "processors",
-            "processor-control"
-        ])
-    );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(v["startedAtMs"].as_i64().unwrap() <= v["nowMs"].as_i64().unwrap());
     assert!(v["buildId"].as_str().is_some_and(|b| !b.is_empty()));
@@ -419,7 +393,7 @@ async fn the_stream_pushes_summaries_and_a_new_revision_on_change() {
 }
 
 #[tokio::test]
-async fn a_disabled_dashboard_is_404_and_topology_stays() {
+async fn a_disabled_dashboard_is_404() {
     let (grpc, http) = start(Config {
         dashboard_enabled: false,
         ..config()
@@ -437,7 +411,6 @@ async fn a_disabled_dashboard_is_404_and_topology_stays() {
     ] {
         assert_eq!(http_get(http, path).await.0, 404, "{path}");
     }
-    topology_until(http, |t| t.totals.instances == 1).await;
 }
 
 // ---- assets ------------------------------------------------------------------------------

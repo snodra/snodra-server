@@ -88,11 +88,6 @@ pub fn processor(name: &str) -> ProcessorStatus {
     }
 }
 
-/// The capabilities of a P6b instance.
-pub const P6B: &[&str] = &["instance-status", "processors", "processor-control"];
-/// The capabilities of a P6a instance: processors, no control.
-pub const P6A: &[&str] = &["instance-status", "processors"];
-
 pub struct ControlClient {
     pub instance_id: String,
     tx: mpsc::Sender<ClientMessage>,
@@ -109,13 +104,12 @@ impl Drop for ControlClient {
 }
 
 impl ControlClient {
-    /// Registers `instance_id` of `service` with `capabilities` (and the ACL `token`, if any),
-    /// reports `processors` (names) and returns once the hub holds the report.
+    /// Registers `instance_id` of `service` (with the ACL `token`, if any), reports `processors`
+    /// (names) and returns once the hub holds the report.
     pub async fn start(
         addr: SocketAddr,
         service: &str,
         instance_id: &str,
-        capabilities: &[&str],
         processors: &[&str],
         token: Option<&str>,
         behaviour: Behaviour,
@@ -124,22 +118,13 @@ impl ControlClient {
         client.instance_id = instance_id.to_string();
         client
             .send_raw_register(Register {
-                service_name: service.to_string(),
-                instance_id: instance_id.to_string(),
-                protocol_version: 2,
-                capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
-                client_version: "fake-p6b/1.0".to_string(),
                 credentials: token.map(|t| Credentials {
                     kind: Some(credentials::Kind::Token(t.to_string())),
                 }),
-                ..Register::default()
+                ..client.register_message(service, &[], &[])
             })
             .await;
         let ack = client.expect_ack().await;
-        let caps: Vec<&str> = ack.capabilities.iter().map(String::as_str).collect();
-        for c in capabilities {
-            assert!(caps.contains(c), "{c} not acknowledged: {caps:?}");
-        }
         client
             .status_with_processors(
                 &[&ack.hub_id],
@@ -210,15 +195,15 @@ impl ControlClient {
         }
     }
 
-    /// A P6b instance of `service` reporting `processors`, answering with `behaviour`.
-    pub async fn p6b(
+    /// An instance of `service` reporting `processors`, answering with `behaviour`.
+    pub async fn new(
         addr: SocketAddr,
         service: &str,
         instance_id: &str,
         processors: &[&str],
         behaviour: Behaviour,
     ) -> Self {
-        Self::start(addr, service, instance_id, P6B, processors, None, behaviour).await
+        Self::start(addr, service, instance_id, processors, None, behaviour).await
     }
 
     /// Every control request this instance was sent, in order.

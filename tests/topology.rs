@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::{FakeClient, start_hub};
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{RequestKind, TopologyRequest, TopologyResponse, server_message};
+use kraken_hub::proto::{Register, RequestKind, TopologyRequest, TopologyResponse, server_message};
 use tonic::transport::Endpoint;
 
 const BOUND: Duration = Duration::from_secs(3);
@@ -79,7 +79,7 @@ async fn topology_lists_two_services_with_instances_and_types() {
 
     assert_eq!(t.types[0].r#type, "a.Do");
     assert_eq!(t.types[0].kind(), RequestKind::Command);
-    assert_eq!(t.types[0].owner_service, "svc-a");
+    assert_eq!(t.types[0].owner_services, ["svc-a"]);
     assert_eq!(t.types[0].live_instances, 2);
     assert!(!t.types[0].orphaned);
     assert_eq!(t.types[1].r#type, "b.Get");
@@ -97,7 +97,7 @@ async fn topology_lists_two_services_with_instances_and_types() {
         (2, 3, 1, 1)
     );
     assert_eq!(totals.in_flight, 0);
-    // The v2 threshold (KRAKEN_HUB_HEARTBEAT_TIMEOUT); v1 sessions are held to the legacy one.
+    // KRAKEN_HUB_HEARTBEAT_TIMEOUT.
     assert_eq!(t.heartbeat_timeout_ms, 10_000);
     assert!(!t.hub_id.is_empty());
     assert!(t.now_ms >= t.hub_started_at_ms && t.hub_started_at_ms > 0);
@@ -109,6 +109,37 @@ async fn topology_lists_two_services_with_instances_and_types() {
             assert!(!i.stale);
         }
     }
+}
+
+#[tokio::test]
+async fn topology_reports_the_hub_id_and_each_session_client_version() {
+    let addr = start_hub(Config {
+        hub_id: "hub-7".to_string(),
+        ..config()
+    })
+    .await;
+    let _lib = FakeClient::register(addr, "svc-lib", &[], &[]).await;
+    let mut bare = FakeClient::connect(addr).await;
+    bare.send_raw_register(Register {
+        client_version: String::new(),
+        ..bare.register_message("svc-bare", &[], &[])
+    })
+    .await;
+    bare.expect_ack().await;
+
+    let t = topology_until(addr, |t| t.services.len() == 2).await;
+    assert_eq!(t.hub_id, "hub-7");
+    let version = |service: &str| {
+        t.services
+            .iter()
+            .find(|s| s.service_name == service)
+            .unwrap()
+            .instances[0]
+            .client_version
+            .clone()
+    };
+    assert_eq!(version("svc-lib"), "fake-client/1.0");
+    assert_eq!(version("svc-bare"), "");
 }
 
 #[tokio::test]
@@ -196,7 +227,6 @@ async fn topology_reflects_eviction() {
     let addr = start_hub(Config {
         heartbeat_interval: Duration::from_millis(300),
         heartbeat_timeout: Duration::from_secs(1),
-        legacy_heartbeat_timeout: Duration::from_secs(1), // the fake client speaks v1
         ..config()
     })
     .await;

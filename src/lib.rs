@@ -87,7 +87,7 @@ pub async fn bind_http(config: &Config) -> anyhow::Result<Option<TcpListener>> {
 }
 
 /// Runs the hub on `listener` until `shutdown` completes. When `http` is given, the HTTP routes
-/// ([`http::app`]: `GET /topology`, and the dashboard unless disabled) are served there and stop
+/// ([`http::app`]: the dashboard and its API, unless disabled) are served there and stop
 /// on the same signal. Shutdown sequence: health goes
 /// `NOT_SERVING`, the watchdog stops, every session is closed with `UNAVAILABLE` (its pending
 /// requests fail as on any disconnect), then the server drains connections for at most
@@ -282,7 +282,7 @@ pub async fn serve_with_shutdown(
         Arc::clone(&registry),
         Arc::clone(&sessions),
         Arc::clone(&router),
-        watchdog_period(&config),
+        config.heartbeat_timeout,
     ));
 
     let signal = {
@@ -468,30 +468,25 @@ pub async fn topology_probe_target(
     Ok(topology::Topology::from_proto(&response))
 }
 
-/// How often the watchdog looks for silent sessions: a tenth of the shorter heartbeat timeout,
-/// between 10 ms and 1 s, so an eviction lands at most about a second after the timeout.
-fn watchdog_period(config: &Config) -> Duration {
-    (config
-        .heartbeat_timeout
-        .min(config.legacy_heartbeat_timeout)
-        / 10)
-        .clamp(Duration::from_millis(10), Duration::from_secs(1))
+/// How often the watchdog looks for silent sessions: a tenth of the heartbeat timeout, between
+/// 10 ms and 1 s, so an eviction lands at most about a second after the timeout.
+fn watchdog_period(heartbeat_timeout: Duration) -> Duration {
+    (heartbeat_timeout / 10).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
-/// Evicts instances silent for longer than their own heartbeat timeout and sweeps expired type
-/// owners.
+/// Evicts instances silent for longer than `heartbeat_timeout` and sweeps expired type owners.
 async fn watchdog(
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     router: Arc<Router>,
-    period: Duration,
+    heartbeat_timeout: Duration,
 ) {
-    let mut ticker = tokio::time::interval(period);
+    let mut ticker = tokio::time::interval(watchdog_period(heartbeat_timeout));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        for (ctx, id, token) in sessions.stale_with_tokens(now) {
+        for (ctx, id, token) in sessions.stale_with_tokens(now, heartbeat_timeout) {
             warn!(instance = %id, "heartbeat timeout, evicting");
             service::disconnect(&registry, &sessions, &router, &ctx, &id, token);
         }

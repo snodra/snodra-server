@@ -237,8 +237,6 @@ pub struct InstanceTypes {
 pub struct TypeInfo {
     pub type_name: String,
     pub kind: Kind,
-    /// The first of `owner_services`.
-    pub owner_service: String,
     /// Every owning service, sorted (one for an exclusive type).
     pub owner_services: Vec<String>,
     /// Registered as a shared query type.
@@ -704,9 +702,8 @@ impl Registry {
     /// The candidates of a streaming query: like the unkeyed pool of [`Registry::pick_target`]
     /// (every live instance of the owner, or of every owner of a shared type, one rotation per
     /// type), but, as for [`Registry::scatter_targets`], only the instances that list the type
-    /// (a target must serve it). The router keeps those that negotiated "streaming" and chooses
-    /// among them as for any unkeyed request. The type's kind is reported for the router to
-    /// reject a command.
+    /// (a target must serve it). The router chooses among them as for any unkeyed request. The
+    /// type's kind is reported for the router to reject a command.
     pub fn stream_candidates(
         &self,
         ctx: &ContextId,
@@ -824,7 +821,6 @@ impl Registry {
             .map(|(name, o)| TypeInfo {
                 type_name: name.clone(),
                 kind: o.kind,
-                owner_service: o.first_service(),
                 owner_services: o.services.keys().cloned().collect(),
                 shared: o.shared,
                 live_instances: o.holders() as u32,
@@ -1229,7 +1225,7 @@ mod tests {
         assert_eq!(info.live_instances, 0);
         assert_eq!(info.orphaned_for, Some(now - t0));
         assert_eq!(info.kind, Kind::Command);
-        assert_eq!(info.owner_service, "svc");
+        assert_eq!(info.owner_services, ["svc"]);
     }
 
     #[test]
@@ -1324,7 +1320,6 @@ mod tests {
         let info = r.topology(Instant::now()).types.remove(0);
         assert!(info.shared);
         assert_eq!(info.owner_services, ["A", "B"]);
-        assert_eq!(info.owner_service, "A", "the first owner, for old readers");
         assert_eq!((info.kind, info.live_instances), (Kind::Query, 3));
         let snap = r.snapshot();
         assert_eq!(
@@ -1478,7 +1473,7 @@ mod tests {
     }
 
     /// A streaming query goes to one instance chosen like a point query, but only among the
-    /// instances that list the type (the router then keeps those that negotiated "streaming").
+    /// instances that list the type.
     #[test]
     fn stream_candidates_are_the_instances_that_list_the_type_with_one_rotation_per_type() {
         let r = reg();

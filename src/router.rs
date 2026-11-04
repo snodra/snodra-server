@@ -27,7 +27,7 @@
 //! Subscription queries (ADR 0017, P4c): a [`Pending::Subscription`] keyed by the sender's
 //! request id holds the subscription. Its initial result is an ordinary [`Pending::Unary`]
 //! target `<id>#0` (forwarded through flow control, holding a permit, with its own timeout)
-//! whose answer becomes the first part; its update targets (`<id>#n`, n >= 1: every capable
+//! whose answer becomes the first part; its update targets (`<id>#n`, n >= 1: every live
 //! instance at open time) live inside the entry, not in the map: they are written
 //! `Request{mode = SUBSCRIPTION}` directly, outside flow control, and count nowhere. Their parts
 //! are relayed to the sender in arrival order under the sender's credit, buffered up to
@@ -36,7 +36,7 @@
 //! target still serving a `Cancel`.
 //!
 //! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
-//! A flow-controlled session (permits `Some`) is forwarded a request only while it has a permit;
+//! A session is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
 //! their own deadline passes. Lock order: the pending lock and the flows lock are never held
 //! together.
@@ -60,7 +60,6 @@ use crate::proto::{
     Cancel, ErrorCode, Flow as FlowMsg, Reply, ReplyEnd, ReplyPart, Request, RequestKind,
     RequestMode, ServerMessage, reply, server_message,
 };
-use crate::protocol;
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, SenderInfo, Sessions};
@@ -111,9 +110,6 @@ struct Unary {
     /// write): only such a target is sent a `Cancel` when its stream or gather ends; one whose
     /// entry ended between the pop and the write is cancelled by [`Router::note_forwarded`].
     forwarded: bool,
-    /// The sender shares "flow-control": capacity rejections are RESOURCE_EXHAUSTED for it,
-    /// HANDLER_ERROR "handler busy" otherwise.
-    sender_flow_control: bool,
     kind: Kind,
     type_name: String,
     started: Instant,
@@ -233,7 +229,7 @@ struct Subscription {
     /// The initial result was relayed (as part 1): the request is answered for the metrics,
     /// the edge and the in-flight counts; updates may flow.
     initial_done: bool,
-    /// The update targets by target id (`<id>#n`, n >= 1): every capable instance at the open.
+    /// The update targets by target id (`<id>#n`, n >= 1): every live instance at the open.
     /// Each is written the subscription request after the entry exists (`SubTarget::written`);
     /// each still here is owed a `Cancel` when the subscription ends before it did.
     targets: BTreeMap<String, SubTarget>,
@@ -463,8 +459,8 @@ pub struct InFlight {
 struct Flow {
     token: u64,
     service: String,
-    /// Permits left; `None` is unlimited (no flow control, the v1 behaviour).
-    permits: Option<u32>,
+    /// Permits left.
+    permits: u32,
     /// Permits never exceed it, whatever a client sends back. Starts at
     /// `Register.initial_permits`; only a `Permits.grant` from the session raises it (multi-hub
     /// top-up, ADR 0016), and nothing lowers it.
@@ -478,7 +474,6 @@ struct Flow {
 /// One session's flow state, for the topology view.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlowView {
-    pub flow_controlled: bool,
     pub permits_available: u32,
     pub queued: u32,
 }
@@ -486,7 +481,7 @@ pub struct FlowView {
 /// How busy a routing candidate is, for [`choose`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Load {
-    /// Unlimited, or has a permit and nothing queued: a request would be forwarded at once.
+    /// Has a permit and nothing queued: a request would be forwarded at once.
     pub can_take: bool,
     /// Queued plus forwarded requests.
     pub assigned: u32,
@@ -596,10 +591,9 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::ResourceExhausted => Outcome::ResourceExhausted,
         // The hub cancels a stream that outlived KRAKEN_HUB_MAX_STREAM_DURATION.
         ErrorCode::Cancelled => Outcome::Cancelled,
-        ErrorCode::HandlerError
-        | ErrorCode::Unauthenticated
-        | ErrorCode::Unsupported
-        | ErrorCode::Unspecified => Outcome::HandlerError,
+        ErrorCode::HandlerError | ErrorCode::Unauthenticated | ErrorCode::Unspecified => {
+            Outcome::HandlerError
+        }
     }
 }
 
@@ -730,8 +724,8 @@ impl Router {
         }
     }
 
-    /// Starts the flow state of a session (replacing an older session's): `permits` `Some` makes
-    /// it flow-controlled, `None` unlimited. Call before the session becomes current
+    /// Starts the flow state of a session (replacing an older session's) with `permits`, which
+    /// are also its cap (`Register.initial_permits`). Call before the session becomes current
     /// ([`Sessions::insert_with_token`]), so a request routed to the session always finds its flow.
     /// Refuses, and changes nothing, when a newer session of the instance already opened its flow
     /// ([`OpenRefused::Superseded`]: a concurrent, older handshake must give up) or, with access
@@ -745,13 +739,13 @@ impl Router {
         instance_id: &str,
         token: u64,
         service: &str,
-        permits: Option<u32>,
+        permits: u32,
     ) -> Result<(), OpenRefused> {
         let flow = Flow {
             token,
             service: service.to_string(),
             permits,
-            cap: permits.unwrap_or(0),
+            cap: permits,
             queue: InstanceQueue::with_total(
                 self.config.queue_capacity_per_instance,
                 self.config.queue_bytes_per_instance,
@@ -816,12 +810,7 @@ impl Router {
             let Some(f) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
                 return;
             };
-            let ready = if f.permits.is_none() {
-                f.queue.drain()
-            } else {
-                drain(f)
-            };
-            (f.service.clone(), ready)
+            (f.service.clone(), drain(f))
         };
         if !ready.is_empty() {
             self.forward_ready(ctx, instance_id, token, &service, ready);
@@ -850,7 +839,7 @@ impl Router {
 
     /// `Permits{count, grant}` from session `token`: raises the session's cap to `grant` when
     /// above it (a grant never lowers the cap), then adds `count` permits, clamped at the cap, and
-    /// forwards queued requests. Ignored for an unlimited or replaced session.
+    /// forwards queued requests. Ignored for a replaced session.
     pub fn on_permits(
         &self,
         ctx: &ContextId,
@@ -864,11 +853,8 @@ impl Router {
             let Some(flow) = flows.get_mut(instance_id).filter(|f| f.token == token) else {
                 return;
             };
-            let Some(permits) = flow.permits.as_mut() else {
-                return;
-            };
             flow.cap = flow.cap.max(grant);
-            *permits = permits.saturating_add(count).min(flow.cap);
+            flow.permits = flow.permits.saturating_add(count).min(flow.cap);
             (flow.service.clone(), drain(flow))
         };
         self.forward_ready(ctx, instance_id, token, &service, ready);
@@ -884,8 +870,7 @@ impl Router {
                 (
                     id.clone(),
                     FlowView {
-                        flow_controlled: f.permits.is_some(),
-                        permits_available: f.permits.unwrap_or(0),
+                        permits_available: f.permits,
                         queued: f.queue.len() as u32,
                     },
                 )
@@ -911,7 +896,7 @@ impl Router {
             .map(|c| {
                 let load = match flows.get(&c.id) {
                     Some(f) => Load {
-                        can_take: f.permits.is_none_or(|p| p > 0) && f.queue.is_empty(),
+                        can_take: f.permits > 0 && f.queue.is_empty(),
                         assigned: f.assigned.len() as u32,
                     },
                     None => Load {
@@ -948,9 +933,8 @@ impl Router {
             .unwrap()
             .get_mut(handler)
             .filter(|f| f.token == token)
-            && let Some(p) = f.permits.as_mut()
         {
-            *p = (*p + 1).min(f.cap);
+            f.permits = (f.permits + 1).min(f.cap);
         }
     }
 
@@ -1016,9 +1000,7 @@ impl Router {
                 for id in &ended {
                     f.assigned.remove(id);
                 }
-                if let Some(p) = f.permits.as_mut() {
-                    *p = p.saturating_add(ended.len() as u32).min(f.cap);
-                }
+                f.permits = f.permits.saturating_add(ended.len() as u32).min(f.cap);
                 drain(f)
             };
         }
@@ -1039,18 +1021,18 @@ impl Router {
         }
     }
 
-    /// Fails a pending request for capacity: RESOURCE_EXHAUSTED to a sender that shares
-    /// flow-control, HANDLER_ERROR "handler busy" (the v1 answer) to any other sender.
+    /// Fails a pending request for capacity: RESOURCE_EXHAUSTED.
     fn reject_busy(&self, id: &str, why: &str) {
         if let Some(entry) = self.take_unary(id) {
             entry.abort_timer();
             self.release(id, &entry);
-            let (code, message) = if entry.sender_flow_control {
-                (ErrorCode::ResourceExhausted, format!("handler busy: {why}"))
-            } else {
-                (ErrorCode::HandlerError, "handler busy".to_string())
-            };
-            self.finish_with_outcome(id, entry, code, message, Outcome::ResourceExhausted);
+            self.finish_with_outcome(
+                id,
+                entry,
+                ErrorCode::ResourceExhausted,
+                format!("handler busy: {why}"),
+                Outcome::ResourceExhausted,
+            );
         }
     }
 
@@ -1177,10 +1159,7 @@ impl Router {
         };
 
         span.record("kraken.handler", handler.as_str());
-        let (sender_token, sender_flow_control) = match &sender_info {
-            Some(info) => (Some(info.token), info.flow_control),
-            None => (None, false),
-        };
+        let sender_token = sender_info.as_ref().map(|info| info.token);
         // `None`: the handler's session vanished since the pick; the send below reports it Gone.
         let handler_token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
         let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
@@ -1229,7 +1208,6 @@ impl Router {
                 handler: handler.clone(),
                 handler_token,
                 forwarded: false,
-                sender_flow_control,
                 kind,
                 type_name,
                 started: Instant::now(),
@@ -1321,8 +1299,8 @@ impl Router {
         self.dispatch(ctx, &id, &handler, token, req);
     }
 
-    /// Forwards a routed request (its pending entry exists) to `handler`'s session `token`: at
-    /// once when the session is unlimited, else through its queue and permits. Only to the
+    /// Forwards a routed request (its pending entry exists) to `handler`'s session `token`,
+    /// through its queue and permits. Only to the
     /// session the entry names: if it was replaced meanwhile the request fails (Gone) instead of
     /// reaching a stream whose requests the replacement already failed.
     fn dispatch(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, req: Request) {
@@ -1336,7 +1314,6 @@ impl Router {
             message: Some(server_message::Message::Request(req)),
         };
         enum Next {
-            Send(ServerMessage, String),
             /// With one of the session's permits.
             Forward(ServerMessage, String),
             Drained(Vec<Queued>, String),
@@ -1352,14 +1329,10 @@ impl Router {
                 Some(flow) => {
                     flow.assigned.insert(id.to_string());
                     let service = flow.service.clone();
-                    if flow.permits.is_none() {
-                        Next::Send(msg, service)
-                    } else if flow.queue.is_empty()
-                        && let Some(p) = flow.permits.as_mut().filter(|p| **p > 0)
-                    {
+                    if flow.queue.is_empty() && flow.permits > 0 {
                         // A permit and nobody waiting: forward at once. The queue caps bound
                         // what waits, so a request that can go now is not measured against them.
-                        *p -= 1;
+                        flow.permits -= 1;
                         Next::Forward(msg, service)
                     } else {
                         let bytes = prost::Message::encoded_len(&msg);
@@ -1380,12 +1353,6 @@ impl Router {
             }
         };
         match next {
-            Next::Send(msg, service) => {
-                match self.sessions.send_if_current(ctx, handler, token, msg) {
-                    Ok(()) => self.note_forwarded(ctx, id, handler, token, &service),
-                    Err(e) => self.forward_failed(id, handler, &service, e),
-                }
-            }
             Next::Forward(msg, service) => {
                 match self.sessions.send_if_current(ctx, handler, token, msg) {
                     Ok(()) => self.note_forwarded(ctx, id, handler, token, &service),
@@ -1583,8 +1550,8 @@ impl Router {
         };
         // The sender is gone: nobody to answer, so no outcome metric, but it is no longer in
         // flight. A gather's, stream's or subscription's targets have the same sender, so they
-        // are dropped with it; a target still streaming (or gathering, with a capable handler)
-        // is cancelled, and so is every update target of a subscription.
+        // are dropped with it; a target still streaming or gathering is cancelled, and so is
+        // every update target of a subscription.
         for (id, entry) in dropped {
             match entry {
                 Pending::Unary(entry) => {
@@ -1654,16 +1621,16 @@ impl Router {
         self.metrics.flows_set(self.flow_gauges());
     }
 
-    /// Requests queued and permits left per service, over flow-controlled instances: one pass
+    /// Requests queued and permits left per service, over every instance: one pass
     /// for the whole hub, run by the watchdog every tick (at most a second) instead of per
     /// request, so the gauges are right after timeouts, departures and returned permits too.
     fn flow_gauges(&self) -> HashMap<String, (u64, u64)> {
         let flows = self.flows.lock().unwrap();
         let mut by_service: HashMap<String, (u64, u64)> = HashMap::new();
-        for f in flows.values().filter(|f| f.permits.is_some()) {
+        for f in flows.values() {
             let entry = by_service.entry(f.service.clone()).or_default();
             entry.0 += f.queue.len() as u64;
-            entry.1 += u64::from(f.permits.unwrap_or(0));
+            entry.1 += u64::from(f.permits);
         }
         by_service
     }
@@ -1803,11 +1770,10 @@ impl Router {
         self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
-    /// A request with a mode other than UNARY (ADR 0017). Gates, in this order: a v1 sender
-    /// cannot know the newer codes (INVALID_REQUEST); a v2 sender gets UNSUPPORTED for a mode
-    /// this hub does not implement or its session did not declare; the modes are for queries
-    /// only (INVALID_REQUEST); no live target is NO_HANDLER (a streaming query or subscription
-    /// whose owners have no capable instance: UNSUPPORTED); a duplicate id is INVALID_REQUEST.
+    /// A request with a mode other than UNARY (ADR 0017). Gates, in this order: a mode this hub
+    /// does not know, or a sender whose session is gone, is INVALID_REQUEST; the modes are for
+    /// queries only (INVALID_REQUEST); no live target is NO_HANDLER; a duplicate id is
+    /// INVALID_REQUEST.
     fn route_mode(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -1830,29 +1796,23 @@ impl Router {
             mode,
             span: &span,
         };
-        let Some(info) = sender_info.filter(|s| protocol::is_v2(s.protocol_version)) else {
-            let message = format!("invalid request: request mode {mode} needs protocol v2");
+        let Ok(request_mode) = RequestMode::try_from(req.mode) else {
+            let message = format!("invalid request: unknown request mode {}", req.mode);
             return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
         };
-        match RequestMode::try_from(req.mode) {
-            Ok(RequestMode::ScatterGather) => {}
-            Ok(RequestMode::Streaming) => {
+        let Some(info) = sender_info else {
+            let message =
+                format!("invalid request: request mode {mode} from a session that is gone");
+            return self.reject_mode(&m, req_kind, ErrorCode::InvalidRequest, message);
+        };
+        match request_mode {
+            RequestMode::Streaming => {
                 return self.route_stream(ctx, sender, req, req_kind, info, span);
             }
-            Ok(RequestMode::Subscription) => {
+            RequestMode::Subscription => {
                 return self.route_subscription(ctx, sender, req, req_kind, info, span);
             }
-            _ => {
-                let message = format!("request mode {mode} is not supported by this hub");
-                return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
-            }
-        }
-        if !info.scatter_gather {
-            let message = format!(
-                "request mode {mode} needs the \"{}\" capability, not declared by this session",
-                protocol::SCATTER_GATHER
-            );
-            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
+            RequestMode::ScatterGather | RequestMode::Unary => {}
         }
         let reject = |kind: Kind, code: ErrorCode, _outcome: Outcome, message: String| {
             self.reject_mode(&m, kind, code, message);
@@ -1937,7 +1897,6 @@ impl Router {
                     handler: target.id.clone(),
                     handler_token: *token,
                     forwarded: false,
-                    sender_flow_control: info.flow_control,
                     kind,
                     type_name: type_name.clone(),
                     started: now,
@@ -1971,8 +1930,8 @@ impl Router {
             pending.insert(id.clone(), Pending::Scatter(gather));
         }
         self.metrics.scatter_targets(&type_name, targets.len());
-        // Each target gets an ordinary unary request with its own id: v1 handlers serve it
-        // unchanged, and its answer is matched to its target.
+        // Each target gets an ordinary unary request with its own id, and its answer is matched
+        // to its target.
         for (target_id, target, token) in targets {
             let forwarded = Request {
                 id: target_id.clone(),
@@ -2128,9 +2087,8 @@ impl Router {
         })
     }
 
-    /// Bookkeeping of a closed gather: flow state of its unanswered targets (a forwarded one
-    /// whose handler negotiated "streaming" is told to cancel), metrics and edge (one request;
-    /// an error when no part succeeded).
+    /// Bookkeeping of a closed gather: flow state of its unanswered targets (a forwarded one is
+    /// told to cancel), metrics and edge (one request; an error when no part succeeded).
     fn finish_scatter(&self, id: &str, closed: Closed) {
         let Closed {
             gather,
@@ -2188,11 +2146,6 @@ impl Router {
     /// Answers a non-unary request before it was routed.
     fn reject_mode(&self, m: &ModeContext<'_>, kind: Kind, code: ErrorCode, message: String) {
         let outcome = outcome_of(code);
-        let outcome = if code == ErrorCode::Unsupported {
-            Outcome::Unsupported
-        } else {
-            outcome
-        };
         self.record_rejected_mode(m.sender_service, kind, m.type_name, outcome, m.mode);
         record_outcome(m.span, outcome);
         log_outcome(
@@ -2210,8 +2163,8 @@ impl Router {
     // ------------------------------------------------------------------------------------
     // Streaming queries (ADR 0017, P4b)
 
-    /// A query with mode STREAMING from a v2 sender: one capable instance gets the request with
-    /// the credit, as the target `<id>#1` of a [`Pending::Stream`].
+    /// A query with mode STREAMING: one live instance gets the request with the credit, as the
+    /// target `<id>#1` of a [`Pending::Stream`].
     fn route_stream(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -2233,13 +2186,6 @@ impl Router {
             mode,
             span: &span,
         };
-        if !info.streaming {
-            let message = format!(
-                "request mode {mode} needs the \"{}\" capability, not declared by this session",
-                protocol::STREAMING
-            );
-            return self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
-        }
         let for_queries = |type_name: &str| {
             format!("invalid request: {type_name} is a command; {mode} is for queries")
         };
@@ -2259,33 +2205,15 @@ impl Router {
             let message = for_queries(&type_name);
             return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
         }
-        // Only an instance that negotiated "streaming" understands the multi-part messages.
-        let (mut capable, incapable): (Vec<Candidate>, Vec<Candidate>) = pool
-            .candidates
-            .into_iter()
-            .partition(|c| self.sessions.negotiated_streaming(ctx, &c.id));
-        if capable.is_empty() {
-            let mut services: Vec<String> = incapable
-                .iter()
-                .filter_map(|c| self.registry.service_of(ctx, &c.id))
-                .collect();
-            services.sort();
-            services.dedup();
-            let message = format!(
-                "no live instance of {} serving {type_name} negotiated the \"{}\" capability",
-                services.join(", "),
-                protocol::STREAMING
-            );
-            return self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
-        }
+        let mut candidates = pool.candidates;
         let sender_tags = self
             .registry
             .placement_of(ctx, sender)
             .map(|p| p.tags)
             .unwrap_or_default();
-        let loads = self.loads(&capable);
-        let i = choose(&capable, &sender_tags, pool.rotation, |id| loads[id]);
-        let handler = capable.swap_remove(i).id;
+        let loads = self.loads(&candidates);
+        let i = choose(&candidates, &sender_tags, pool.rotation, |id| loads[id]);
+        let handler = candidates.swap_remove(i).id;
         let handler_service = self.registry.service_of(ctx, &handler).unwrap_or_default();
         span.record("kraken.handler", handler.as_str());
         // The sender's own stream, weakly: the stream never keeps a closed stream open.
@@ -2332,7 +2260,6 @@ impl Router {
                 handler: handler.clone(),
                 handler_token,
                 forwarded: false,
-                sender_flow_control: info.flow_control,
                 kind,
                 type_name: type_name.clone(),
                 started: now,
@@ -2382,8 +2309,7 @@ impl Router {
     /// idle timeout starts over, so the handler gets the whole timeout for its first part
     /// whatever the queue wait was. An entry that ended between the pre-write check and the
     /// write (a close that found it neither queued nor forwarded, so sent no `Cancel`) gets its
-    /// `Cancel{id, "closed before forward"}` here, if the handler understands one ("streaming"
-    /// or "subscription"): it must not serve a request the hub forgot.
+    /// `Cancel{id, "closed before forward"}` here: it must not serve a request the hub forgot.
     fn note_forwarded(&self, ctx: &ContextId, id: &str, handler: &str, token: u64, service: &str) {
         let mut pending = self.pending.lock().unwrap();
         let parent = match pending.get_mut(id).and_then(Pending::unary_mut) {
@@ -2393,15 +2319,13 @@ impl Router {
             }
             _ => {
                 drop(pending);
-                if self.sessions.negotiated_multipart(ctx, handler) {
-                    let msg = ServerMessage {
-                        message: Some(server_message::Message::Cancel(Cancel {
-                            request_id: id.to_string(),
-                            reason: "closed before forward".to_string(),
-                        })),
-                    };
-                    self.send_to_handler(ctx, handler, token, service, msg);
-                }
+                let msg = ServerMessage {
+                    message: Some(server_message::Message::Cancel(Cancel {
+                        request_id: id.to_string(),
+                        reason: "closed before forward".to_string(),
+                    })),
+                };
+                self.send_to_handler(ctx, handler, token, service, msg);
                 return;
             }
         };
@@ -2870,7 +2794,7 @@ impl Router {
     // ------------------------------------------------------------------------------------
     // Subscription queries (ADR 0017, P4c)
 
-    /// A query with mode SUBSCRIPTION from a v2 sender: every capable instance of every owner
+    /// A query with mode SUBSCRIPTION: every live instance of every owner
     /// gets `Request{<id>#n, mode = SUBSCRIPTION}` written directly (no permit, no queue), one
     /// of them (chosen as for a point query) gets the initial request `<id>#0` as an ordinary
     /// unary request, and a [`Pending::Subscription`] relays the initial result and the
@@ -2928,16 +2852,6 @@ impl Router {
             mode,
             span: &span,
         };
-        if !info.subscription {
-            let message = format!(
-                "request mode {mode} needs the \"{}\" capability, not declared by this session",
-                protocol::SUBSCRIPTION
-            );
-            {
-                self.reject_mode(&m, req_kind, ErrorCode::Unsupported, message);
-                return None;
-            }
-        }
         let for_queries = |type_name: &str| {
             format!("invalid request: {type_name} is a command; {mode} is for queries")
         };
@@ -2966,43 +2880,22 @@ impl Router {
                 return None;
             }
         }
-        // Only an instance that negotiated "subscription" serves one.
-        let (capable, incapable): (Vec<Candidate>, Vec<Candidate>) = pool
-            .candidates
-            .into_iter()
-            .partition(|c| self.sessions.negotiated_subscription(ctx, &c.id));
-        if capable.is_empty() {
-            let mut services: Vec<String> = incapable
-                .iter()
-                .filter_map(|c| self.registry.service_of(ctx, &c.id))
-                .collect();
-            services.sort();
-            services.dedup();
-            let message = format!(
-                "no live instance of {} serving {type_name} negotiated the \"{}\" capability",
-                services.join(", "),
-                protocol::SUBSCRIPTION
-            );
-            {
-                self.reject_mode(&m, kind, ErrorCode::Unsupported, message);
-                return None;
-            }
-        }
+        let candidates = pool.candidates;
         // The initial result comes from one of them, chosen as a point query is.
         let sender_tags = self
             .registry
             .placement_of(ctx, sender)
             .map(|p| p.tags)
             .unwrap_or_default();
-        let loads = self.loads(&capable);
-        let i = choose(&capable, &sender_tags, pool.rotation, |id| loads[id]);
-        let initial_handler = capable[i].id.clone();
+        let loads = self.loads(&candidates);
+        let i = choose(&candidates, &sender_tags, pool.rotation, |id| loads[id]);
+        let initial_handler = candidates[i].id.clone();
         let initial_service = self
             .registry
             .service_of(ctx, &initial_handler)
             .unwrap_or_default();
         // The update targets, numbered from 1 in target order: service, then instance id.
-        let mut targets: Vec<(InstanceId, String, u64)> = capable
+        let mut targets: Vec<(InstanceId, String, u64)> = candidates
             .into_iter()
             .map(|c| {
                 let service = self.registry.service_of(ctx, &c.id).unwrap_or_default();
@@ -3121,7 +3014,6 @@ impl Router {
                 handler: initial_handler.clone(),
                 handler_token: initial_token,
                 forwarded: false,
-                sender_flow_control: info.flow_control,
                 kind,
                 type_name: type_name.clone(),
                 started: now,
@@ -3712,7 +3604,7 @@ impl Router {
     }
 
     /// `Cancel{<id>#n, reason}` to every update target still serving `sub` and already written
-    /// its request, each closing on the gauge. (Every target negotiated "subscription".)
+    /// its request, each closing on the gauge.
     fn cancel_subscription_targets(&self, sub: &Subscription, reason: &str) {
         for (target_id, t) in &sub.targets {
             self.metrics.subscription_closed(&t.service, &t.handler);
@@ -3729,13 +3621,8 @@ impl Router {
         }
     }
 
-    /// Tells the handler of target `target_id` (forwarded, not answered) to stop, if its session
-    /// understands a `Cancel` ("streaming" or "subscription"; a scatter-gather target's handler
-    /// may not, a stream's or subscription's always does).
+    /// Tells the handler of target `target_id` (forwarded, not answered) to stop.
     fn cancel_target(&self, ctx: &ContextId, target_id: &str, target: &Unary, reason: &str) {
-        if !self.sessions.negotiated_multipart(ctx, &target.handler) {
-            return;
-        }
         let service = target
             .part_of
             .as_ref()
@@ -3889,9 +3776,9 @@ async fn idle_watch(router: Arc<Router>, id: String, timeout: Duration) {
 /// Pops queued requests while the session has permits, one permit each.
 fn drain(flow: &mut Flow) -> Vec<Queued> {
     let mut ready = Vec::new();
-    while let Some(permits) = flow.permits.as_mut().filter(|p| **p > 0) {
+    while flow.permits > 0 {
         let Some(item) = flow.queue.pop() else { break };
-        *permits -= 1;
+        flow.permits -= 1;
         ready.push(item);
     }
     ready
@@ -3938,13 +3825,16 @@ mod tests {
 
     type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
 
+    /// `Register.initial_permits` of a test session that should never run out.
+    const PERMITS: u32 = 1024;
+
     fn fake(sessions: &Sessions, id: &str, service: &str, cap: usize) -> Rx {
         let (tx, rx) = mpsc::channel(cap);
         sessions.insert(
             &D,
             id,
             service,
-            crate::session::SessionMeta::v1(Duration::from_secs(30)),
+            crate::session::SessionMeta::default(),
             tx,
             CancellationToken::new(),
         );
@@ -3958,23 +3848,23 @@ mod tests {
         handler_rx: Rx,
     }
 
-    /// Like [`fixture_with`], with the flow state of h1 and s1 opened (unlimited), as the stream
+    /// Like [`fixture_with`], with the flow state of h1 and s1 opened, as the stream
     /// task does before a session becomes current.
     fn fixture_with(config: Config, handler_cap: usize) -> Fixture {
         let f = fixture_unopened(config, handler_cap);
         for (id, service) in [("h1", "orders"), ("s1", "web")] {
             let token = f.sessions.token_of(&D, id).unwrap();
-            let _ = f.router.open_session(&D, id, token, service, None);
+            let _ = f.router.open_session(&D, id, token, service, PERMITS);
         }
         f
     }
 
     impl Fixture {
-        /// A new (unlimited) session for `id`, flow state first, as the stream task opens it.
+        /// A new session for `id`, flow state first, as the stream task opens it.
         fn connect(&self, id: &str, service: &str, cap: usize) -> Rx {
             let rx = fake(&self.sessions, id, service, cap);
             let token = self.sessions.token_of(&D, id).unwrap();
-            let _ = self.router.open_session(&D, id, token, service, None);
+            let _ = self.router.open_session(&D, id, token, service, PERMITS);
             rx
         }
     }
@@ -4282,12 +4172,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_handler_buffer_yields_handler_error_busy() {
+    async fn full_handler_buffer_yields_resource_exhausted() {
         let mut f = fixture_with(Config::default(), 1);
         f.sessions.send(&D, "h1", ServerMessage::default()).unwrap();
         f.router.route(&D, "s1", request("r1", "t.Cmd", 0));
-        let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::HandlerError);
-        assert_eq!(msg, "handler busy");
+        let msg = expect_error(&mut f.sender_rx, "r1", ErrorCode::ResourceExhausted);
+        assert_eq!(msg, "handler busy: outbound buffer full");
         assert_eq!(f.router.in_flight(), 0);
     }
 
@@ -4357,40 +4247,22 @@ mod tests {
         handler_token: u64,
     }
 
-    fn meta(flow_control: bool) -> crate::session::SessionMeta {
-        crate::session::SessionMeta {
-            protocol_version: 2,
-            flow_control,
-            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
-        }
+    fn meta() -> crate::session::SessionMeta {
+        crate::session::SessionMeta::default()
     }
 
-    /// h1 (service "orders", t.Cmd and t.Qry) with `permits` (None = unlimited); sender s1 shares
-    /// flow-control when `sender_flow`.
-    fn flow_fixture(config: Config, permits: Option<u32>, sender_flow: bool) -> FlowFx {
+    /// h1 (service "orders", t.Cmd and t.Qry) with `permits`; sender s1.
+    fn flow_fixture(config: Config, permits: u32) -> FlowFx {
         let registry = Arc::new(Registry::new(config.owner_grace));
         let sessions = Arc::new(Sessions::new());
         registry
             .register(&D, "h1", "orders", &["t.Cmd".into()], &["t.Qry".into()])
             .unwrap();
         let (tx, handler_rx) = mpsc::channel(64);
-        let handler_token = sessions.insert(
-            &D,
-            "h1",
-            "orders",
-            meta(permits.is_some()),
-            tx,
-            CancellationToken::new(),
-        );
+        let handler_token =
+            sessions.insert(&D, "h1", "orders", meta(), tx, CancellationToken::new());
         let (tx, sender_rx) = mpsc::channel(64);
-        sessions.insert(
-            &D,
-            "s1",
-            "web",
-            meta(sender_flow),
-            tx,
-            CancellationToken::new(),
-        );
+        sessions.insert(&D, "s1", "web", meta(), tx, CancellationToken::new());
         let router = Router::new(
             registry,
             sessions.clone(),
@@ -4427,7 +4299,7 @@ mod tests {
 
     #[tokio::test]
     async fn permits_limit_forwarding_and_permits_drain_the_queue() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         for id in ["r1", "r2", "r3"] {
             f.router.route(&D, "s1", unkeyed(id, 0, 0));
         }
@@ -4443,7 +4315,6 @@ mod tests {
         assert_eq!(
             view,
             FlowView {
-                flow_controlled: true,
                 permits_available: 1,
                 queued: 0
             }
@@ -4453,7 +4324,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_orders_by_priority_then_age() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.route(&D, "s1", unkeyed("first", 0, 0));
         for (id, p) in [
             ("low-1", 0),
@@ -4475,7 +4346,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_queued_request_keeps_its_own_deadline() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.route(&D, "s1", unkeyed("busy", 0, 10_000));
         f.router.route(&D, "s1", unkeyed("waits", 0, 100));
         assert_eq!(forwarded(&mut f.handler_rx), ["busy"]);
@@ -4492,12 +4363,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_queue_answers_resource_exhausted_to_a_flow_control_sender() {
+    async fn a_full_queue_answers_resource_exhausted() {
         let config = Config {
             queue_capacity_per_instance: 1,
             ..Config::default()
         };
-        let mut f = flow_fixture(config, Some(1), true);
+        let mut f = flow_fixture(config, 1);
         for id in ["r1", "r2", "r3"] {
             f.router.route(&D, "s1", unkeyed(id, 0, 0));
         }
@@ -4507,26 +4378,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_queue_answers_handler_busy_to_a_sender_without_flow_control() {
-        let config = Config {
-            queue_capacity_per_instance: 1,
-            ..Config::default()
-        };
-        let mut f = flow_fixture(config, Some(1), false);
-        for id in ["r1", "r2", "r3"] {
-            f.router.route(&D, "s1", unkeyed(id, 0, 0));
-        }
-        let msg = expect_error(&mut f.sender_rx, "r3", ErrorCode::HandlerError);
-        assert_eq!(msg, "handler busy");
-    }
-
-    #[tokio::test]
     async fn the_byte_cap_rejects_a_request_that_does_not_fit() {
         let config = Config {
             queue_bytes_per_instance: 200,
             ..Config::default()
         };
-        let mut f = flow_fixture(config, Some(1), true);
+        let mut f = flow_fixture(config, 1);
         f.router.route(&D, "s1", unkeyed("r1", 0, 0));
         f.router.route(&D, "s1", unkeyed("small", 0, 0));
         let mut big = unkeyed("big", 0, 0);
@@ -4544,7 +4401,7 @@ mod tests {
             queue_bytes_per_instance: 200,
             ..Config::default()
         };
-        let mut f = flow_fixture(config, Some(1), true);
+        let mut f = flow_fixture(config, 1);
         let mut big = unkeyed("big", 0, 0);
         big.payload = vec![b'x'; 300];
         f.router.route(&D, "s1", big);
@@ -4554,28 +4411,8 @@ mod tests {
         assert_eq!((view.permits_available, view.queued), (0, 0));
     }
 
-    #[tokio::test]
-    async fn an_unlimited_instance_gets_everything_at_once() {
-        let mut f = flow_fixture(Config::default(), None, true);
-        for i in 0..20 {
-            f.router.route(&D, "s1", unkeyed(&format!("r{i}"), 0, 0));
-        }
-        assert_eq!(forwarded(&mut f.handler_rx).len(), 20);
-        // Permits for a session without flow control change nothing.
-        f.router.on_permits(&D, "h1", f.handler_token, 3, 0);
-        let view = f.router.flow_by_instance().remove("h1").unwrap();
-        assert_eq!(
-            view,
-            FlowView {
-                flow_controlled: false,
-                permits_available: 0,
-                queued: 0
-            }
-        );
-    }
-
     /// Service "orders" (t.Cmd, t.Qry) with handler instances added by [`Cluster::join`]; sender
-    /// s1 ("web") shares flow-control.
+    /// s1 ("web").
     struct Cluster {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
@@ -4603,8 +4440,8 @@ mod tests {
                 metrics,
             );
             let (tx, sender_rx) = mpsc::channel(64);
-            let token = sessions.insert(&D, "s1", "web", meta(true), tx, CancellationToken::new());
-            let _ = router.open_session(&D, "s1", token, "web", None);
+            let token = sessions.insert(&D, "s1", "web", meta(), tx, CancellationToken::new());
+            let _ = router.open_session(&D, "s1", token, "web", PERMITS);
             Cluster {
                 registry,
                 sessions,
@@ -4615,7 +4452,7 @@ mod tests {
         }
 
         /// A handler instance connects like the stream task does: flow, session, registration.
-        fn join(&mut self, id: &'static str, permits: Option<u32>) {
+        fn join(&mut self, id: &'static str, permits: u32) {
             let token = self.sessions.allocate_token();
             assert!(
                 self.router
@@ -4629,7 +4466,7 @@ mod tests {
                     &D,
                     id,
                     "orders",
-                    meta(permits.is_some()),
+                    meta(),
                     tx,
                     CancellationToken::new(),
                     token,
@@ -4675,12 +4512,12 @@ mod tests {
     #[tokio::test]
     async fn queued_requests_of_a_departed_instance_go_to_another_one() {
         let mut c = Cluster::new();
-        c.join("h1", Some(1));
+        c.join("h1", 1);
         c.router.route(&D, "s1", unkeyed("sent", 0, 0));
         c.router.route(&D, "s1", request("q-keyed", "t.Cmd", 0));
         c.router.route(&D, "s1", unkeyed("q-unkeyed", 0, 0));
         assert_eq!(c.forwarded("h1"), ["sent"]);
-        c.join("h2", Some(1));
+        c.join("h2", 1);
         c.leave("h1");
         assert_eq!(
             c.errors(),
@@ -4696,7 +4533,7 @@ mod tests {
     #[tokio::test]
     async fn queued_requests_without_another_instance_end_with_no_handler() {
         let mut c = Cluster::new();
-        c.join("h1", Some(1));
+        c.join("h1", 1);
         c.router.route(&D, "s1", unkeyed("sent", 0, 0));
         c.router.route(&D, "s1", unkeyed("queued", 0, 0));
         c.leave("h1");
@@ -4714,12 +4551,12 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_takes_over_the_queue_of_the_session_it_replaced() {
         let mut c = Cluster::new();
-        c.join("h1", Some(1));
+        c.join("h1", 1);
         c.router.route(&D, "s1", unkeyed("sent", 0, 0));
         c.router.route(&D, "s1", unkeyed("q1", 0, 0));
         c.router.route(&D, "s1", unkeyed("q2", 0, 0));
         assert_eq!(c.forwarded("h1"), ["sent"]);
-        c.join("h1", Some(1)); // reconnect: a new stream with the same instance id
+        c.join("h1", 1); // reconnect: a new stream with the same instance id
         assert_eq!(
             c.errors(),
             [("sent".to_string(), ErrorCode::HandlerDisconnected)]
@@ -4732,10 +4569,10 @@ mod tests {
     #[tokio::test]
     async fn a_stopping_instance_hands_its_queue_over_and_draws_nothing_new() {
         let mut c = Cluster::new();
-        c.join("h1", Some(1));
+        c.join("h1", 1);
         c.router.route(&D, "s1", unkeyed("sent", 0, 0));
         c.router.route(&D, "s1", unkeyed("queued", 0, 0));
-        c.join("h2", Some(1));
+        c.join("h2", 1);
         // h1 stops gracefully: an empty Register, then it finishes what it has.
         let h1 = c.handlers["h1"].1;
         c.registry.register(&D, "h1", "orders", &[], &[]).unwrap();
@@ -4752,7 +4589,7 @@ mod tests {
 
     #[tokio::test]
     async fn permits_of_a_stale_token_are_ignored() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.route(&D, "s1", unkeyed("r1", 0, 0));
         f.router.route(&D, "s1", unkeyed("r2", 0, 0));
         f.router.on_permits(&D, "h1", f.handler_token + 1000, 5, 0);
@@ -4774,7 +4611,7 @@ mod tests {
     /// A request routed while its handler disconnects must not land in the dying flow.
     #[tokio::test]
     async fn a_request_routed_after_the_flow_closed_fails_at_once() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.on_disconnect(&D, "h1", f.handler_token);
         f.router.route(&D, "s1", unkeyed("late", 0, 0));
         expect_error(&mut f.sender_rx, "late", ErrorCode::HandlerDisconnected);
@@ -4784,17 +4621,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_handshake_never_replaces_a_newer_flow() {
-        let f = flow_fixture(Config::default(), Some(3), true);
-        let _ = f.router.open_session(&D, "h1", 1_000, "orders", Some(1));
+        let f = flow_fixture(Config::default(), 3);
+        let _ = f.router.open_session(&D, "h1", 1_000, "orders", 1);
         // A concurrent, older handshake of the same instance id opens its flow late.
-        let _ = f.router.open_session(&D, "h1", 999, "orders", Some(7));
+        let _ = f.router.open_session(&D, "h1", 999, "orders", 7);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(view.permits_available, 1, "the newer flow stays");
     }
 
     #[tokio::test]
     async fn permits_never_exceed_the_initial_grant() {
-        let f = flow_fixture(Config::default(), Some(2), true);
+        let f = flow_fixture(Config::default(), 2);
         f.router.on_permits(&D, "h1", f.handler_token, 5, 0);
         let view = f.router.flow_by_instance().remove("h1").unwrap();
         assert_eq!(view.permits_available, 2);
@@ -4803,7 +4640,7 @@ mod tests {
     /// A grant (multi-hub top-up) raises the cap first, so the added permits are kept.
     #[tokio::test]
     async fn a_grant_raises_the_cap_and_the_permits() {
-        let f = flow_fixture(Config::default(), Some(4), true);
+        let f = flow_fixture(Config::default(), 4);
         f.router.on_permits(&D, "h1", f.handler_token, 4, 8);
         let permits = |f: &FlowFx| {
             f.router
@@ -4820,7 +4657,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_grant_below_the_cap_changes_nothing() {
-        let mut f = flow_fixture(Config::default(), Some(4), true);
+        let mut f = flow_fixture(Config::default(), 4);
         for id in ["r1", "r2"] {
             f.router.route(&D, "s1", unkeyed(id, 0, 0));
         }
@@ -4834,26 +4671,11 @@ mod tests {
         assert_eq!(view.permits_available, 4, "cap still 4");
     }
 
-    #[tokio::test]
-    async fn a_grant_is_ignored_for_an_unlimited_session() {
-        let f = flow_fixture(Config::default(), None, true);
-        f.router.on_permits(&D, "h1", f.handler_token, 3, 8);
-        let view = f.router.flow_by_instance().remove("h1").unwrap();
-        assert_eq!(
-            view,
-            FlowView {
-                flow_controlled: false,
-                permits_available: 0,
-                queued: 0
-            }
-        );
-    }
-
     /// The raised cap is what the hub forwards up to: grant 3 with count 2 on top of the one
     /// initial permit lets three requests through at once.
     #[tokio::test]
     async fn a_raised_cap_lets_that_many_requests_through() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.on_permits(&D, "h1", f.handler_token, 2, 3);
         for id in ["r1", "r2", "r3", "r4"] {
             f.router.route(&D, "s1", unkeyed(id, 0, 0));
@@ -4882,7 +4704,7 @@ mod tests {
     /// The request ended (its timeout fired) between the pending insert and the dispatch.
     #[tokio::test]
     async fn a_request_that_ended_before_its_dispatch_leaves_no_queue_entry_or_assignment() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.route(&D, "s1", unkeyed("busy", 0, 0));
         f.router
             .dispatch(&D, "ghost", "h1", f.handler_token, unkeyed("ghost", 0, 0));
@@ -4897,7 +4719,7 @@ mod tests {
     /// moved to a new session) is dropped when it comes up, and its permit stays.
     #[tokio::test]
     async fn a_dequeued_entry_whose_request_ended_is_not_sent() {
-        let mut f = flow_fixture(Config::default(), Some(1), true);
+        let mut f = flow_fixture(Config::default(), 1);
         f.router.route(&D, "s1", unkeyed("busy", 0, 0));
         assert_eq!(forwarded(&mut f.handler_rx), ["busy"]);
         f.router
@@ -4921,7 +4743,7 @@ mod tests {
     async fn flow_gauges_are_right_after_queued_timeouts_departures_and_permits() {
         let m = crate::telemetry::test_support::test_metrics();
         let mut c = Cluster::with_metrics(Arc::clone(&m.metrics));
-        c.join("h1", Some(1));
+        c.join("h1", 1);
         let depth = |m: &crate::telemetry::test_support::TestMetrics| {
             (
                 m.gauge("kraken_hub_queue_depth", "orders"),
@@ -4941,8 +4763,8 @@ mod tests {
         let (tx, _rx2) = mpsc::channel(64);
         let s2 = c
             .sessions
-            .insert(&D, "s2", "web", meta(true), tx, CancellationToken::new());
-        let _ = c.router.open_session(&D, "s2", s2, "web", None);
+            .insert(&D, "s2", "web", meta(), tx, CancellationToken::new());
+        let _ = c.router.open_session(&D, "s2", s2, "web", PERMITS);
         c.router.route(&D, "s2", unkeyed("orphan", 0, 10_000));
         c.router.refresh_gauges();
         assert_eq!(depth(&m), (Some(1), Some(0)));
@@ -4981,8 +4803,8 @@ mod tests {
             ..Config::default()
         };
         let mut c = Cluster::with(config, Arc::clone(&m.metrics));
-        c.join("h1", Some(1));
-        c.join("h2", Some(1));
+        c.join("h1", 1);
+        c.join("h2", 1);
         for id in ["busy-1", "busy-2", "q1", "q2"] {
             c.router.route(&D, "s1", big(id));
         }
@@ -5098,12 +4920,11 @@ mod tests {
                 .register(&D, id, "orders", &["t.Cmd".into()], &[])
                 .unwrap();
             let (tx, rx) = mpsc::channel(64);
-            let token =
-                sessions.insert(&D, id, "orders", meta(false), tx, CancellationToken::new());
+            let token = sessions.insert(&D, id, "orders", meta(), tx, CancellationToken::new());
             rxs.insert(id, (rx, token));
         }
         let (tx, _sender_rx) = mpsc::channel(64);
-        sessions.insert(&D, "s1", "web", meta(false), tx, CancellationToken::new());
+        sessions.insert(&D, "s1", "web", meta(), tx, CancellationToken::new());
         let router = Router::new(
             registry,
             sessions,
@@ -5111,7 +4932,7 @@ mod tests {
             Metrics::noop(),
         );
         for (id, (_, token)) in &rxs {
-            let _ = router.open_session(&D, id, *token, "orders", None);
+            let _ = router.open_session(&D, id, *token, "orders", PERMITS);
         }
         // Six requests nobody answers: round-robin while equal, so three each.
         for i in 0..6 {
@@ -5137,17 +4958,8 @@ mod tests {
     use crate::proto::{ReplyEnd, ReplyPart, RequestMode};
     use crate::registry::RegisteredTypes;
 
-    fn scatter_meta(protocol_version: u32, scatter: bool) -> crate::session::SessionMeta {
-        crate::session::SessionMeta {
-            protocol_version,
-            scatter_gather: scatter,
-            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
-        }
-    }
-
     /// Owners A (a1) and B (b1, b2) of the shared query "q.Find"; X (x1) owns command "c.Do" and
-    /// exclusive query "q.Own"; sender s1 ("web", v2, scatter-gather), s-v1 (v1) and s-plain
-    /// (v2 without the capability).
+    /// exclusive query "q.Own"; sender s1 ("web").
     struct Gather {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
@@ -5177,28 +4989,20 @@ mod tests {
                 rx: HashMap::new(),
                 tokens: HashMap::new(),
             };
-            g.connect("s1", "web", scatter_meta(2, true), None);
-            g.connect("s-v1", "old", scatter_meta(0, false), None);
-            g.connect("s-plain", "plain", scatter_meta(2, false), None);
+            g.connect("s1", "web", PERMITS);
             for (id, service) in [("a1", "A"), ("b1", "B"), ("b2", "B")] {
-                g.connect(id, service, scatter_meta(0, false), None);
+                g.connect(id, service, PERMITS);
                 g.shared(id, service, &["q.Find"]);
             }
-            g.connect("x1", "X", scatter_meta(0, false), None);
+            g.connect("x1", "X", PERMITS);
             g.registry
                 .register(&D, "x1", "X", &["c.Do".into()], &["q.Own".into()])
                 .unwrap();
             g
         }
 
-        fn connect(
-            &mut self,
-            id: &'static str,
-            service: &str,
-            meta: crate::session::SessionMeta,
-            permits: Option<u32>,
-        ) {
-            self.connect_with_buffer(id, service, meta, permits, 64);
+        fn connect(&mut self, id: &'static str, service: &str, permits: u32) {
+            self.connect_with_buffer(id, service, permits, 64);
         }
 
         /// [`Gather::connect`] with an outbound buffer of `cap` messages.
@@ -5206,8 +5010,7 @@ mod tests {
             &mut self,
             id: &'static str,
             service: &str,
-            meta: crate::session::SessionMeta,
-            permits: Option<u32>,
+            permits: u32,
             cap: usize,
         ) {
             let token = self.sessions.allocate_token();
@@ -5217,6 +5020,7 @@ mod tests {
                     .is_ok()
             );
             let (tx, rx) = mpsc::channel(cap);
+            let meta = crate::session::SessionMeta::default();
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
                 .unwrap();
@@ -5424,7 +5228,7 @@ mod tests {
     async fn parts_and_the_end_reach_a_slow_sender_in_order() {
         let mut g = Gather::new();
         // A sender whose buffer holds one message: the first part fills it, the rest wait.
-        g.connect_with_buffer("s-slow", "web", scatter_meta(2, true), None, 1);
+        g.connect_with_buffer("s-slow", "web", PERMITS, 1);
         g.router.route(&D, "s-slow", scatter("g1", "q.Find", 0, 0));
         assert_eq!(
             g.requests("a1").len() + g.requests("b1").len() + g.requests("b2").len(),
@@ -5597,37 +5401,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modes_are_gated_by_version_capability_mode_and_kind() {
+    async fn modes_are_gated_by_mode_and_kind() {
         let mut g = Gather::new();
-        // A v1 session cannot know UNSUPPORTED: INVALID_REQUEST.
-        g.router.route(&D, "s-v1", scatter("v1", "q.Find", 0, 0));
-        assert_eq!(
-            g.messages("s-v1")
-                .iter()
-                .map(error_code)
-                .collect::<Vec<_>>(),
-            [("v1".to_string(), ErrorCode::InvalidRequest)]
-        );
-        // A v2 session that did not declare scatter-gather.
-        g.router.route(&D, "s-plain", scatter("p1", "q.Find", 0, 0));
-        assert_eq!(
-            error_code(&g.messages("s-plain")[0]),
-            ("p1".to_string(), ErrorCode::Unsupported)
-        );
-        // Modes this hub does not implement yet.
-        for (id, mode) in [
-            ("st", RequestMode::Streaming),
-            ("sub", RequestMode::Subscription),
-        ] {
-            g.router.route(
-                &D,
-                "s1",
-                Request {
-                    mode: mode as i32,
-                    ..scatter(id, "q.Find", 0, 0)
-                },
-            );
-        }
+        // A mode this hub does not know.
         g.router.route(
             &D,
             "s1",
@@ -5650,9 +5426,7 @@ mod tests {
         assert_eq!(
             codes,
             [
-                ("st".to_string(), ErrorCode::Unsupported),
-                ("sub".to_string(), ErrorCode::Unsupported),
-                ("weird".to_string(), ErrorCode::Unsupported),
+                ("weird".to_string(), ErrorCode::InvalidRequest),
                 ("cmd".to_string(), ErrorCode::InvalidRequest),
                 ("cmd-q".to_string(), ErrorCode::InvalidRequest),
             ]
@@ -5689,7 +5463,7 @@ mod tests {
         let mut g = Gather::new();
         g.leave("b2");
         // b3 has one permit, already taken by a unary query.
-        g.connect("b3", "B", scatter_meta(2, false), Some(1));
+        g.connect("b3", "B", 1);
         g.shared("b3", "B", &["q.Find"]);
         // A unary point query goes to one of a1, b1, b3; send until b3 holds its permit.
         let mut n = 0;
@@ -5743,11 +5517,15 @@ mod tests {
         assert_eq!(g.router.in_flight(), 0);
         assert!(g.router.in_flight_by_instance().0.is_empty());
         g.reply("a1", "g1#0", b"x");
-        for h in ["a1", "b1", "b2"] {
+        // Every target got its request, then a cancel for it; the late reply changes nothing.
+        for (h, target) in [("a1", "g1#0"), ("b1", "g1#1"), ("b2", "g1#2")] {
+            let got = g.messages(h);
             assert!(
-                g.messages(h)
-                    .iter()
-                    .all(|m| matches!(m, server_message::Message::Request(_)))
+                matches!(&got[..], [
+                    server_message::Message::Request(r),
+                    server_message::Message::Cancel(c),
+                ] if r.id == target && c.request_id == target),
+                "{h}: {got:?}"
             );
         }
     }
@@ -5756,7 +5534,7 @@ mod tests {
     async fn a_queued_target_whose_instance_leaves_fails_instead_of_moving() {
         let mut g = Gather::new();
         g.leave("b2");
-        g.connect("b3", "B", scatter_meta(2, false), Some(0));
+        g.connect("b3", "B", 0);
         g.shared("b3", "B", &["q.Find"]);
         g.router.route(&D, "s1", scatter("g1", "q.Find", 0, 0));
         assert_eq!(g.router.flow_by_instance()["b3"].queued, 1);
@@ -5780,14 +5558,14 @@ mod tests {
         for (h, id) in [("a1", "g1#0"), ("b1", "g1#1"), ("b2", "g1#2")] {
             g.reply(h, id, b"x");
         }
-        g.router.route(&D, "s-plain", scatter("p1", "q.Find", 0, 0));
+        g.router.route(&D, "s1", scatter("cmd", "c.Do", 0, 0));
         g.messages("s1");
         assert_eq!(
             m.counter("kraken_hub_requests_total", "mode", "scatter_gather"),
             Some(2)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            m.counter("kraken_hub_requests_total", "outcome", "invalid_request"),
             Some(1)
         );
         assert_eq!(
@@ -5816,20 +5594,11 @@ mod stream_tests {
 
     type Rx = mpsc::Receiver<Result<ServerMessage, Status>>;
 
-    fn meta(protocol_version: u32, streaming: bool) -> crate::session::SessionMeta {
-        crate::session::SessionMeta {
-            protocol_version,
-            scatter_gather: protocol_version >= 2,
-            streaming,
-            flow_control: protocol_version >= 2,
-            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
-        }
-    }
+    /// `Register.initial_permits` of a test session that should never run out.
+    const PERMITS: u32 = 1024;
 
-    /// Owners A (a1 streaming, a2 without) and B (b1 streaming) of the shared query "q.Find";
-    /// X (x1 streaming, x2 without) owns command "c.Do" and exclusive query "q.Own"; N (n1,
-    /// without streaming) owns "q.Legacy". Senders: s1 ("web", v2, streaming), s-v1 (v1) and
-    /// s-plain (v2 with scatter-gather but without streaming).
+    /// Owners A (a1, a2) and B (b1) of the shared query "q.Find"; X (x1, x2) owns command "c.Do"
+    /// and exclusive query "q.Own". Senders: s1 ("web") and s2 ("other").
     struct Streams {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
@@ -5859,37 +5628,23 @@ mod stream_tests {
                 rx: HashMap::new(),
                 tokens: HashMap::new(),
             };
-            f.connect("s1", "web", meta(2, true), None, 64);
-            f.connect("s-v1", "old", meta(0, false), None, 64);
-            f.connect("s-plain", "plain", meta(2, false), None, 64);
-            for (id, service, streaming) in
-                [("a1", "A", true), ("a2", "A", false), ("b1", "B", true)]
-            {
-                f.connect(id, service, meta(2, streaming), None, 64);
+            f.connect("s1", "web", PERMITS, 64);
+            f.connect("s2", "other", PERMITS, 64);
+            for (id, service) in [("a1", "A"), ("a2", "A"), ("b1", "B")] {
+                f.connect(id, service, PERMITS, 64);
                 f.shared(id, service, &["q.Find"]);
             }
-            for (id, streaming) in [("x1", true), ("x2", false)] {
-                f.connect(id, "X", meta(2, streaming), None, 64);
+            for id in ["x1", "x2"] {
+                f.connect(id, "X", PERMITS, 64);
                 f.registry
                     .register(&D, id, "X", &["c.Do".into()], &["q.Own".into()])
                     .unwrap();
             }
-            f.connect("n1", "N", meta(2, false), None, 64);
-            f.registry
-                .register(&D, "n1", "N", &[], &["q.Legacy".into()])
-                .unwrap();
             f
         }
 
         /// A session as the stream task opens it: flow state, session, started.
-        fn connect(
-            &mut self,
-            id: &'static str,
-            service: &str,
-            meta: crate::session::SessionMeta,
-            permits: Option<u32>,
-            cap: usize,
-        ) {
+        fn connect(&mut self, id: &'static str, service: &str, permits: u32, cap: usize) {
             let token = self.sessions.allocate_token();
             assert!(
                 self.router
@@ -5897,6 +5652,7 @@ mod stream_tests {
                     .is_ok()
             );
             let (tx, rx) = mpsc::channel(cap);
+            let meta = crate::session::SessionMeta::default();
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
                 .unwrap();
@@ -6110,13 +5866,13 @@ mod stream_tests {
     }
 
     #[tokio::test]
-    async fn a_streaming_query_goes_to_one_capable_instance_with_its_credit() {
+    async fn a_streaming_query_goes_to_one_owner_instance_with_its_credit() {
         let mut f = Streams::new();
         f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
         let (h, r) = f.target_of("st1");
         assert!(
-            ["a1", "b1"].contains(&h),
-            "a capable owner instance, got {h}"
+            ["a1", "a2", "b1"].contains(&h),
+            "an owner instance, got {h}"
         );
         assert_eq!(r.mode, RequestMode::Streaming as i32);
         assert_eq!(r.initial_credit, 64, "64 when the sender sent 0");
@@ -6124,43 +5880,27 @@ mod stream_tests {
         assert_eq!(r.payload, b"{\"q\":1}");
         assert_eq!(r.headers["traceparent"], "x");
         assert_eq!(r.r#type, "q.Find");
-        assert!(
-            f.requests("a2").is_empty(),
-            "a2 did not negotiate streaming"
-        );
         assert_eq!(f.router.in_flight(), 1, "a stream is one request in flight");
         let (by_instance, total) = f.router.in_flight_by_instance();
         assert_eq!(total, 1);
         assert_eq!(by_instance["s1"].as_sender, 1);
         assert_eq!(by_instance[h].as_handler, 1);
 
-        // The sender's credit is forwarded as is; the capable instances take turns.
+        // The sender's credit is forwarded as is; the instances take turns.
         f.router.route(&D, "s1", stream("st2", "q.Find", 0, 5, 0));
         let (h2, r2) = f.target_of("st2");
         assert_eq!(r2.initial_credit, 5);
-        assert_ne!(h, h2, "round-robin among the capable instances");
+        assert_ne!(h, h2, "round-robin among the instances");
 
-        // An exclusive type: the owner's capable instance.
+        // An exclusive type: one of the owner's instances.
         f.router.route(&D, "s1", stream("st3", "q.Own", 0, 0, 0));
-        assert_eq!(f.target_of("st3").0, "x1");
-        assert!(f.requests("x2").is_empty());
+        assert!(["x1", "x2"].contains(&f.target_of("st3").0));
         assert!(f.messages("s1").is_empty(), "nothing to the sender yet");
     }
 
     #[tokio::test]
-    async fn streaming_is_gated_by_version_capability_kind_and_targets() {
+    async fn streaming_is_gated_by_kind_and_targets() {
         let mut f = Streams::new();
-        f.router.route(&D, "s-v1", stream("v1", "q.Find", 0, 0, 0));
-        let got = f.messages("s-v1");
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(error_code(&got[0]).1, ErrorCode::InvalidRequest);
-
-        f.router
-            .route(&D, "s-plain", stream("p1", "q.Find", 0, 0, 0));
-        let (_, code, message) = error_code(&f.messages("s-plain")[0]);
-        assert_eq!(code, ErrorCode::Unsupported);
-        assert!(message.contains("\"streaming\""), "{message}");
-
         f.router
             .route(&D, "s1", stream("in-flight", "q.Find", 0, 0, 0));
         f.router.route(
@@ -6172,21 +5912,11 @@ mod stream_tests {
             },
         );
         f.router.route(&D, "s1", stream("cmd-q", "c.Do", 0, 0, 0));
-        f.router
-            .route(&D, "s1", stream("legacy", "q.Legacy", 0, 0, 0));
         f.router.route(&D, "s1", stream("nope", "q.Nope", 0, 0, 0));
         f.router
             .route(&D, "s1", stream("in-flight", "q.Find", 0, 0, 0));
         f.router
             .route(&D, "s1", stream("in-flight#1", "q.Find", 0, 0, 0));
-        f.router.route(
-            &D,
-            "s1",
-            Request {
-                mode: RequestMode::Subscription as i32,
-                ..stream("sub", "q.Find", 0, 0, 0)
-            },
-        );
         let got = f.messages("s1");
         let codes: Vec<(String, ErrorCode)> = got
             .iter()
@@ -6200,19 +5930,12 @@ mod stream_tests {
             [
                 ("cmd".to_string(), ErrorCode::InvalidRequest),
                 ("cmd-q".to_string(), ErrorCode::InvalidRequest),
-                ("legacy".to_string(), ErrorCode::Unsupported),
                 ("nope".to_string(), ErrorCode::NoHandler),
                 ("in-flight".to_string(), ErrorCode::InvalidRequest),
                 ("in-flight#1".to_string(), ErrorCode::InvalidRequest),
-                ("sub".to_string(), ErrorCode::Unsupported),
             ]
         );
-        let legacy = error_code(&got[2]).2;
-        assert!(
-            legacy.contains('N') && legacy.contains("streaming"),
-            "names the service and the capability: {legacy}"
-        );
-        for h in ["a2", "x1", "x2", "n1"] {
+        for h in ["x1", "x2"] {
             assert!(f.requests(h).is_empty(), "{h} got nothing");
         }
         assert_eq!(f.router.in_flight(), 1, "only the first stream");
@@ -6340,7 +6063,7 @@ mod stream_tests {
         f.part(h, "st1#1", 2, b"c");
         assert_eq!(f.messages("s1").len(), 3, "three parts within the credit");
         // Flows that are not the sender's, for an unknown stream, or empty are ignored.
-        f.flow("s-plain", "st1", 5);
+        f.flow("s2", "st1", 5);
         f.flow(h, "st1", 5);
         f.flow("s1", "ghost", 5);
         f.flow("s1", "st1", 0);
@@ -6464,7 +6187,7 @@ mod stream_tests {
     async fn parts_and_the_end_reach_a_slow_sender_in_order() {
         let mut f = Streams::new();
         // A sender whose buffer holds one message: the first part fills it, the rest wait.
-        f.connect("s-slow", "web", meta(2, true), None, 1);
+        f.connect("s-slow", "web", PERMITS, 1);
         f.router
             .route(&D, "s-slow", stream("st1", "q.Find", 0, 0, 0));
         let (h, _) = f.target_of("st1");
@@ -6501,7 +6224,7 @@ mod stream_tests {
         let (h, _) = f.target_of("st1");
         f.part(h, "st1#1", 0, b"a");
         // Cancels that are not the sender's or for an unknown stream are ignored.
-        f.cancel("s-plain", "st1", "not mine");
+        f.cancel("s2", "st1", "not mine");
         f.cancel(h, "st1", "not the handler's to cancel");
         f.cancel("s1", "ghost", "nothing");
         assert!(f.messages(h).is_empty());
@@ -6601,7 +6324,7 @@ mod stream_tests {
         for h in ["a1", "a2", "b1"] {
             f.leave(h);
         }
-        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.connect("b3", "B", 1, 64);
         f.shared("b3", "B", &["q.Find"]);
         let assigned = |f: &Streams| f.router.loads(&[candidate("b3")])["b3"].assigned;
         let unary = |id: &str| Request {
@@ -6703,7 +6426,7 @@ mod stream_tests {
         for h in ["a1", "a2", "b1"] {
             f.leave(h);
         }
-        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.connect("b3", "B", 1, 64);
         f.shared("b3", "B", &["q.Find"]);
         f.router.route(
             &D,
@@ -6784,7 +6507,7 @@ mod stream_tests {
         for h in ["a1", "a2", "b1"] {
             f.leave(h);
         }
-        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.connect("b3", "B", 1, 64);
         f.shared("b3", "B", &["q.Find"]);
         let token = f.tokens["b3"];
         f.router.route(
@@ -6803,7 +6526,7 @@ mod stream_tests {
         let ready = {
             let mut flows = f.router.flows.lock().unwrap();
             let flow = flows.get_mut("b3").unwrap();
-            flow.permits = Some(1);
+            flow.permits = 1;
             drain(flow)
         };
         let [item]: [Queued; 1] = ready.try_into().expect("the target");
@@ -6863,8 +6586,7 @@ mod stream_tests {
         f.part(h, "st1#1", 1, b"b");
         f.end(h, "st1#1", None);
         f.cancel("s1", "st2", "bye");
-        f.router
-            .route(&D, "s-plain", stream("p1", "q.Find", 0, 0, 0));
+        f.router.route(&D, "s1", stream("p1", "q.Nope", 0, 0, 0));
         assert_eq!(m.up_down("kraken_hub_streams_open", "instance", h), Some(0));
         assert_eq!(
             m.up_down("kraken_hub_streams_open", "instance", "x1"),
@@ -6883,7 +6605,7 @@ mod stream_tests {
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
@@ -6896,10 +6618,9 @@ mod stream_tests {
         );
     }
 
-    /// A gather that ends early tells the targets still working for it to stop, when their
-    /// session understands `Cancel` (a1 and b1 negotiated streaming, a2 did not).
+    /// A gather that ends early tells the targets still working for it to stop.
     #[tokio::test(start_paused = true)]
-    async fn a_gather_that_ends_early_cancels_its_capable_targets() {
+    async fn a_gather_that_ends_early_cancels_its_targets() {
         let mut f = Streams::new();
         let scatter = |id: &str, timeout_ms: u32, max_results: u32| Request {
             mode: RequestMode::ScatterGather as i32,
@@ -6936,8 +6657,11 @@ mod stream_tests {
             cancels(&mut f, "b1"),
             [("g1#2".to_string(), "max results".to_string())]
         );
-        assert!(f.messages("a2").is_empty(), "a2 cannot understand a cancel");
-        // The deadline: every unanswered capable target.
+        assert!(
+            f.messages("a2").is_empty(),
+            "a2 answered: nothing to cancel"
+        );
+        // The deadline: every unanswered target.
         f.router.route(&D, "s1", scatter("g2", 100, 0));
         tokio::time::sleep(Duration::from_millis(101)).await;
         assert_eq!(end(&f.messages("s1")[0]).timed_out, 3);
@@ -6949,7 +6673,10 @@ mod stream_tests {
             cancels(&mut f, "b1"),
             [("g2#2".to_string(), "deadline".to_string())]
         );
-        assert_eq!(f.messages("a2").len(), 1, "the request only");
+        assert_eq!(
+            cancels(&mut f, "a2"),
+            [("g2#1".to_string(), "deadline".to_string())]
+        );
         // The sender leaves.
         f.router.route(&D, "s1", scatter("g3", 0, 0));
         f.leave("s1");
@@ -6961,7 +6688,10 @@ mod stream_tests {
             cancels(&mut f, "b1"),
             [("g3#2".to_string(), "sender disconnected".to_string())]
         );
-        assert_eq!(f.messages("a2").len(), 1);
+        assert_eq!(
+            cancels(&mut f, "a2"),
+            [("g3#1".to_string(), "sender disconnected".to_string())]
+        );
     }
 
     use crate::telemetry::test_support::{capture_logs, logged};
@@ -7048,22 +6778,11 @@ mod subscription_tests {
     /// An update target: its handler, its target id and the request it got.
     type Target = (&'static str, String, Request);
 
-    /// A v2 session with scatter-gather and flow control; `subscription` as given, never
-    /// `streaming` (a subscription-only library must do).
-    fn meta(protocol_version: u32, subscription: bool) -> crate::session::SessionMeta {
-        crate::session::SessionMeta {
-            protocol_version,
-            scatter_gather: protocol_version >= 2,
-            subscription,
-            flow_control: protocol_version >= 2,
-            ..crate::session::SessionMeta::v1(Duration::from_secs(10))
-        }
-    }
+    /// `Register.initial_permits` of a test session that should never run out.
+    const PERMITS: u32 = 1024;
 
-    /// Owners A (a1 with subscription, a2 without) and B (b1 with) of the shared query
-    /// "q.Watch"; X (x1 with, x2 without) owns command "c.Do" and exclusive query "q.Own"; N
-    /// (n1, without) owns "q.Legacy". Senders: s1 ("web", v2, subscription), s-v1 (v1) and
-    /// s-stream (v2 with scatter-gather and streaming but without subscription).
+    /// Owners A (a1) and B (b1) of the shared query "q.Watch"; X (x1) owns command "c.Do" and
+    /// exclusive query "q.Own". Senders: s1 ("web") and s2 ("other").
     struct Subs {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
@@ -7093,46 +6812,21 @@ mod subscription_tests {
                 rx: HashMap::new(),
                 tokens: HashMap::new(),
             };
-            f.connect("s1", "web", meta(2, true), None, 64);
-            f.connect("s-v1", "old", meta(0, false), None, 64);
-            f.connect(
-                "s-stream",
-                "plain",
-                crate::session::SessionMeta {
-                    streaming: true,
-                    ..meta(2, false)
-                },
-                None,
-                64,
-            );
-            for (id, service, subscription) in
-                [("a1", "A", true), ("a2", "A", false), ("b1", "B", true)]
-            {
-                f.connect(id, service, meta(2, subscription), None, 64);
+            f.connect("s1", "web", PERMITS, 64);
+            f.connect("s2", "other", PERMITS, 64);
+            for (id, service) in [("a1", "A"), ("b1", "B")] {
+                f.connect(id, service, PERMITS, 64);
                 f.shared(id, service, &["q.Watch"]);
             }
-            for (id, subscription) in [("x1", true), ("x2", false)] {
-                f.connect(id, "X", meta(2, subscription), None, 64);
-                f.registry
-                    .register(&D, id, "X", &["c.Do".into()], &["q.Own".into()])
-                    .unwrap();
-            }
-            f.connect("n1", "N", meta(2, false), None, 64);
+            f.connect("x1", "X", PERMITS, 64);
             f.registry
-                .register(&D, "n1", "N", &[], &["q.Legacy".into()])
+                .register(&D, "x1", "X", &["c.Do".into()], &["q.Own".into()])
                 .unwrap();
             f
         }
 
         /// A session as the stream task opens it: flow state, session, started.
-        fn connect(
-            &mut self,
-            id: &'static str,
-            service: &str,
-            meta: crate::session::SessionMeta,
-            permits: Option<u32>,
-            cap: usize,
-        ) {
+        fn connect(&mut self, id: &'static str, service: &str, permits: u32, cap: usize) {
             let token = self.sessions.allocate_token();
             assert!(
                 self.router
@@ -7140,6 +6834,7 @@ mod subscription_tests {
                     .is_ok()
             );
             let (tx, rx) = mpsc::channel(cap);
+            let meta = crate::session::SessionMeta::default();
             self.sessions
                 .insert_with_token(&D, id, service, meta, tx, CancellationToken::new(), token)
                 .unwrap();
@@ -7411,15 +7106,12 @@ mod subscription_tests {
     }
 
     #[tokio::test]
-    async fn every_capable_instance_gets_a_subscription_request_and_one_gets_the_initial() {
+    async fn every_owner_instance_gets_a_subscription_request_and_one_gets_the_initial() {
         let mut f = Subs::new();
         f.router
             .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
         let ((h, initial), targets) = f.opened("w1");
-        assert!(
-            ["a1", "b1"].contains(&h),
-            "a capable owner instance, got {h}"
-        );
+        assert!(["a1", "b1"].contains(&h), "an owner instance, got {h}");
         assert_eq!(initial.mode, RequestMode::Unary as i32);
         assert_eq!((initial.initial_credit, initial.max_results), (0, 0));
         assert_eq!((initial.priority, initial.timeout_ms), (3, 0));
@@ -7445,10 +7137,6 @@ mod subscription_tests {
             );
             assert_eq!(r.headers["traceparent"], "x");
         }
-        assert!(
-            f.requests("a2").is_empty(),
-            "a2 did not negotiate subscription"
-        );
         assert_eq!(
             f.router.in_flight(),
             1,
@@ -7465,18 +7153,17 @@ mod subscription_tests {
         );
         assert!(f.messages("s1").is_empty(), "nothing to the sender yet");
 
-        // The initial target rotates among the capable instances.
+        // The initial target rotates among the instances.
         f.router
             .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
         let (h2, _) = f.open("w2");
-        assert_ne!(h, h2, "round-robin among the capable instances");
+        assert_ne!(h, h2, "round-robin among the instances");
 
-        // An exclusive type: the owner's capable instance, initial and update target alike.
+        // An exclusive type: the owner's instance, initial and update target alike.
         f.router.route(&D, "s1", subscribe("w3", "q.Own", 0, 0, 0));
         let (h3, targets) = f.open("w3");
         assert_eq!(h3, "x1");
         assert_eq!(targets, [("x1", "w3#1".to_string())]);
-        assert!(f.requests("x2").is_empty());
     }
 
     #[tokio::test]
@@ -7691,7 +7378,7 @@ mod subscription_tests {
             "the initial part took one credit, one update the other: {got:?}"
         );
         // Flows that are not the sender's, for an unknown id, or empty are ignored.
-        f.flow("s-stream", "w1", 5);
+        f.flow("s2", "w1", 5);
         f.flow("a1", "w1", 5);
         f.flow("s1", "ghost", 5);
         f.flow("s1", "w1", 0);
@@ -7809,7 +7496,7 @@ mod subscription_tests {
             .route(&D, "s1", subscribe("w1", "q.Watch", 0, 0, 0));
         let (h, targets) = f.open("w1");
         // Cancels that are not the sender's or for an unknown id are ignored.
-        f.cancel("s-stream", "w1", "not mine");
+        f.cancel("s2", "w1", "not mine");
         f.cancel("a1", "w1", "not the handler's to cancel");
         f.cancel("s1", "ghost", "nothing");
         assert!(f.cancels("a1").is_empty() && f.cancels("b1").is_empty());
@@ -8067,14 +7754,14 @@ mod subscription_tests {
         assert!(f.router.in_flight_by_instance().0.is_empty());
 
         // A new instance registering after the open is no target (at-most-once delivery).
-        f.connect("b9", "B", meta(2, true), None, 64);
+        f.connect("b9", "B", PERMITS, 64);
         f.shared("b9", "B", &["q.Watch"]);
         f.router
             .route(&D, "s1", subscribe("w2", "q.Watch", 0, 0, 0));
         let (h, targets) = f.open("w2");
         assert_eq!(h, "b9");
         assert_eq!(targets, [("b9", "w2#1".to_string())]);
-        f.connect("b10", "B", meta(2, true), None, 64);
+        f.connect("b10", "B", PERMITS, 64);
         f.shared("b10", "B", &["q.Watch"]);
         assert!(f.requests("b10").is_empty(), "registered after the open");
     }
@@ -8165,20 +7852,8 @@ mod subscription_tests {
     }
 
     #[tokio::test]
-    async fn subscriptions_are_gated_by_version_capability_kind_targets_and_duplicates() {
+    async fn subscriptions_are_gated_by_kind_targets_and_duplicates() {
         let mut f = Subs::new();
-        f.router
-            .route(&D, "s-v1", subscribe("v1", "q.Watch", 0, 0, 0));
-        let got = f.messages("s-v1");
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(error_code(&got[0]).1, ErrorCode::InvalidRequest);
-
-        f.router
-            .route(&D, "s-stream", subscribe("p1", "q.Watch", 0, 0, 0));
-        let (_, code, message) = error_code(&f.messages("s-stream")[0]);
-        assert_eq!(code, ErrorCode::Unsupported);
-        assert!(message.contains("\"subscription\""), "{message}");
-
         f.router
             .route(&D, "s1", subscribe("in-flight", "q.Watch", 0, 0, 0));
         f.router.route(
@@ -8191,8 +7866,6 @@ mod subscription_tests {
         );
         f.router
             .route(&D, "s1", subscribe("cmd-q", "c.Do", 0, 0, 0));
-        f.router
-            .route(&D, "s1", subscribe("legacy", "q.Legacy", 0, 0, 0));
         f.router
             .route(&D, "s1", subscribe("nope", "q.Nope", 0, 0, 0));
         f.router
@@ -8212,20 +7885,12 @@ mod subscription_tests {
             [
                 ("cmd".to_string(), ErrorCode::InvalidRequest),
                 ("cmd-q".to_string(), ErrorCode::InvalidRequest),
-                ("legacy".to_string(), ErrorCode::Unsupported),
                 ("nope".to_string(), ErrorCode::NoHandler),
                 ("in-flight".to_string(), ErrorCode::InvalidRequest),
                 ("in-flight#0".to_string(), ErrorCode::InvalidRequest),
             ]
         );
-        let legacy = error_code(&got[2]).2;
-        assert!(
-            legacy.contains('N') && legacy.contains("subscription"),
-            "names the service and the capability: {legacy}"
-        );
-        for h in ["a2", "x1", "x2", "n1"] {
-            assert!(f.requests(h).is_empty(), "{h} got nothing");
-        }
+        assert!(f.requests("x1").is_empty(), "x1 got nothing");
         assert_eq!(f.router.in_flight(), 1, "only the first subscription");
         f.open("in-flight");
         // An update target's id is no pending id (it is matched through its subscription): a
@@ -8254,7 +7919,7 @@ mod subscription_tests {
         let (h, _) = f.open("w1");
         f.reply(h, "w1#0", b"initial");
         f.messages("s1");
-        f.part("a2", "w1#1", 1, b"intruder");
+        f.part("x1", "w1#1", 1, b"intruder");
         f.part("b1", "w1#1", 1, b"the other target's id");
         f.end("b1", "w1#1", None);
         f.part("a1", "ghost#1", 1, b"ghost");
@@ -8277,7 +7942,7 @@ mod subscription_tests {
     async fn parts_and_the_end_reach_a_slow_sender_in_order() {
         let mut f = Subs::new();
         // A sender whose buffer holds one message: the initial part fills it, the rest wait.
-        f.connect("s-slow", "web", meta(2, true), None, 1);
+        f.connect("s-slow", "web", PERMITS, 1);
         f.router
             .route(&D, "s-slow", subscribe("w1", "q.Watch", 0, 0, 0));
         let (h, _) = f.open("w1");
@@ -8322,10 +7987,10 @@ mod subscription_tests {
     #[tokio::test]
     async fn the_initial_request_holds_a_permit_and_the_update_targets_hold_none() {
         let mut f = Subs::new();
-        for h in ["a1", "a2", "b1"] {
+        for h in ["a1", "b1"] {
             f.leave(h);
         }
-        f.connect("b3", "B", meta(2, true), Some(1), 64);
+        f.connect("b3", "B", 1, 64);
         f.shared("b3", "B", &["q.Watch"]);
         let assigned = |f: &Subs| f.router.loads(&[candidate("b3")])["b3"].assigned;
         f.router
@@ -8376,7 +8041,7 @@ mod subscription_tests {
     #[tokio::test]
     async fn a_target_that_cannot_be_written_at_the_open_is_left_out() {
         let mut f = Subs::new();
-        f.connect("b4", "B", meta(2, true), None, 1);
+        f.connect("b4", "B", PERMITS, 1);
         f.shared("b4", "B", &["q.Watch"]);
         // b4's one-slot buffer is full.
         f.sessions
@@ -8397,7 +8062,7 @@ mod subscription_tests {
         f.cancels("a1");
         f.cancels("b1");
         // No target written at all: the subscription ends at once.
-        for h in ["a1", "a2", "b1"] {
+        for h in ["a1", "b1"] {
             f.leave(h);
         }
         f.router
@@ -8481,10 +8146,9 @@ mod subscription_tests {
             m.counter("kraken_hub_requests_total", "outcome", "cancelled"),
             Some(1)
         );
-        f.router
-            .route(&D, "s-stream", subscribe("p1", "q.Watch", 0, 0, 0));
+        f.router.route(&D, "s1", subscribe("p1", "q.Nope", 0, 0, 0));
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "unsupported"),
+            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
@@ -8540,11 +8204,11 @@ mod auth_tests {
         let sessions = Arc::new(Sessions::new());
         let connect = |id: &str, service: &str, principal| {
             let (tx, rx) = mpsc::channel(16);
-            let mut meta = crate::session::SessionMeta::v1(Duration::from_secs(30));
-            meta.protocol_version = 2;
-            meta.streaming = true;
-            meta.principal = principal;
-            meta.auth = AuthStatus::Off;
+            let meta = crate::session::SessionMeta {
+                principal,
+                auth: AuthStatus::Off,
+                ..crate::session::SessionMeta::default()
+            };
             sessions.insert(&D, id, service, meta, tx, CancellationToken::new());
             rx
         };
@@ -8563,7 +8227,7 @@ mod auth_tests {
         );
         for (id, service) in [("h1", "orders"), ("s1", "web")] {
             let token = router.sessions.token_of(&D, id).unwrap();
-            let _ = router.open_session(&D, id, token, service, None);
+            let _ = router.open_session(&D, id, token, service, 1024);
         }
         Fx {
             router,
@@ -8666,7 +8330,7 @@ mod auth_tests {
     fn replace(f: &Fx, id: &str, service: &str) -> (u64, Result<(), OpenRefused>, Rx) {
         let (tx, rx) = mpsc::channel(16);
         let token = f.router.sessions.allocate_token();
-        let opened = f.router.open_session(&D, id, token, service, None);
+        let opened = f.router.open_session(&D, id, token, service, 1024);
         if opened.is_ok() {
             f.router
                 .sessions
@@ -8674,7 +8338,7 @@ mod auth_tests {
                     &D,
                     id,
                     service,
-                    crate::session::SessionMeta::v1(Duration::from_secs(30)),
+                    crate::session::SessionMeta::default(),
                     tx,
                     CancellationToken::new(),
                     token,

@@ -1,7 +1,7 @@
-//! Event processors, hub side (ADR 0022, P6a): a client that negotiated "instance-status" and
-//! "processors" reports its Kafka event processors in `InstanceStatus.processors`; the hub keeps
-//! the latest report per session (bounded, never an error), shows it in the topology (gRPC,
-//! `GET /topology`, `/api/v1/topology`) and aggregates it per service in `/api/v1/processors`.
+//! Event processors, hub side (ADR 0022): a client reports its Kafka event processors in
+//! `InstanceStatus.processors`; the hub keeps the latest report per session (bounded, never an
+//! error), shows it in the topology (gRPC, `/api/v1/topology`) and aggregates it per service in
+//! `/api/v1/processors`.
 
 mod common;
 
@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 use tonic::transport::Endpoint;
 
 const SHORT: Duration = Duration::from_millis(1500);
-const P6A: &[&str] = &["instance-status", "processors"];
 
 fn config() -> Config {
     Config {
@@ -116,14 +115,11 @@ fn processor(
 }
 
 #[tokio::test]
-async fn a_p6a_client_reports_processors_and_every_view_shows_them() {
+async fn a_client_reports_processors_and_every_view_shows_them() {
     let (grpc, http) = start_hub_with_http(config()).await;
     let http = http.unwrap();
-    let mut b1 = FakeClient::register_v2_with(grpc, "service-b", &["b.Do"], P6A).await;
-    let ack = expect_ack(&mut b1).await;
-    assert_eq!(ack.capabilities, ["instance-status", "processors"]);
-    let mut b2 = FakeClient::register_v2_with(grpc, "service-b", &["b.Do"], P6A).await;
-    expect_ack(&mut b2).await;
+    let mut b1 = FakeClient::register(grpc, "service-b", &["b.Do"], &[]).await;
+    let mut b2 = FakeClient::register(grpc, "service-b", &["b.Do"], &[]).await;
 
     let mut failing = processor(
         "orders",
@@ -171,22 +167,19 @@ async fn a_p6a_client_reports_processors_and_every_view_shows_them() {
     );
     assert_eq!(i1.processors[1].last_error, "handler failed: boom");
 
-    // `/topology` and `/api/v1/topology`: the same, as JSON.
-    for path in ["/topology", "/api/v1/topology"] {
-        let t = http_json(http, path).await;
-        let instances = t["services"][0]["instances"].as_array().unwrap();
-        let i1 = instances
-            .iter()
-            .find(|i| i["instanceId"] == b1.instance_id.as_str())
-            .unwrap();
-        assert_eq!(i1["processors"][1]["name"], "orders", "{path}");
-        assert_eq!(i1["processors"][1]["state"], "FAILING", "{path}");
-        assert_eq!(
-            i1["processors"][0]["partitions"][1],
-            json!({"partition": 2, "position": -1, "committed": -1, "highWatermark": -1, "lag": -1, "replayUntil": 0}),
-            "{path}"
-        );
-    }
+    // `/api/v1/topology`: the same, as JSON.
+    let t = http_json(http, "/api/v1/topology").await;
+    let instances = t["services"][0]["instances"].as_array().unwrap();
+    let i1 = instances
+        .iter()
+        .find(|i| i["instanceId"] == b1.instance_id.as_str())
+        .unwrap();
+    assert_eq!(i1["processors"][1]["name"], "orders");
+    assert_eq!(i1["processors"][1]["state"], "FAILING");
+    assert_eq!(
+        i1["processors"][0]["partitions"][1],
+        json!({"partition": 2, "position": -1, "committed": -1, "highWatermark": -1, "lag": -1, "replayUntil": 0})
+    );
 
     // `/api/v1/processors`: per service and processor, aggregated over the instances.
     let v = http_json(http, "/api/v1/processors").await;
@@ -238,8 +231,7 @@ async fn a_p6a_client_reports_processors_and_every_view_shows_them() {
 async fn an_oversized_report_is_cut_and_the_stream_stays_open() {
     let (grpc, http) = start_hub_with_http(config()).await;
     let http = http.unwrap();
-    let mut c = FakeClient::register_v2_with(grpc, "service-b", &[], P6A).await;
-    expect_ack(&mut c).await;
+    let mut c = FakeClient::register(grpc, "service-b", &[], &[]).await;
     let mut many: Vec<ProcessorStatus> = (0..40)
         .map(|i| {
             processor(
@@ -271,43 +263,10 @@ async fn an_oversized_report_is_cut_and_the_stream_stays_open() {
 }
 
 #[tokio::test]
-async fn processors_from_a_client_without_the_capability_are_ignored() {
-    let (grpc, http) = start_hub_with_http(config()).await;
-    let http = http.unwrap();
-    // A P5c client: "instance-status" only. Its ack does not list "processors"; a report that
-    // carried processors anyway keeps its hub ids and nothing else.
-    let mut p5c =
-        FakeClient::register_v2_with(grpc, "service-b", &[], &["flow-control", "instance-status"])
-            .await;
-    let ack = expect_ack(&mut p5c).await;
-    assert!(
-        !ack.capabilities.iter().any(|c| c == "processors"),
-        "{ack:?}"
-    );
-    p5c.status_with_processors(
-        &["hub-a"],
-        vec![processor(
-            "default",
-            ProcessorState::ProcessorRunning,
-            vec![],
-        )],
-    )
-    .await;
-    sync(&mut p5c, 1).await;
-    let t = rpc_topology(grpc).await;
-    let i = &t.services[0].instances[0];
-    assert_eq!(i.connected_hub_ids, ["hub-a"]);
-    assert!(i.processors.is_empty());
-    let v = http_json(http, "/api/v1/processors").await;
-    assert_eq!(v["services"], json!([]));
-}
-
-#[tokio::test]
 async fn a_new_report_replaces_the_list_and_a_reconnect_starts_without_one() {
     let (grpc, http) = start_hub_with_http(config()).await;
     let http = http.unwrap();
-    let mut c = FakeClient::register_v2_with(grpc, "service-b", &[], P6A).await;
-    expect_ack(&mut c).await;
+    let mut c = FakeClient::register(grpc, "service-b", &[], &[]).await;
     c.status_with_processors(
         &["hub-a"],
         vec![
@@ -337,15 +296,7 @@ async fn a_new_report_replaces_the_list_and_a_reconnect_starts_without_one() {
     drop(c);
     let mut again = FakeClient::connect(grpc).await;
     again.instance_id = id;
-    again
-        .send_raw_register(kraken_hub::proto::Register {
-            service_name: "service-b".to_string(),
-            instance_id: again.instance_id.clone(),
-            protocol_version: 2,
-            capabilities: P6A.iter().map(|c| c.to_string()).collect(),
-            ..Default::default()
-        })
-        .await;
+    again.send_register("service-b", &[], &[]).await;
     expect_ack(&mut again).await;
     sync(&mut again, 3).await;
     let v = http_json(http, "/api/v1/processors").await;

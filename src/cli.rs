@@ -1,5 +1,5 @@
 //! Command-line modes of the binary: argument parsing and the `--topology` table renderer (with
-//! each service's event processors since P6a, ADR 0022).
+//! each service's event processors, ADR 0022).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -334,7 +334,7 @@ pub fn render_table(t: &Topology) -> String {
                 ty.type_name,
                 kind,
                 // Every owner of a shared query type (ADR 0017), comma-separated.
-                ty.owners().join(","),
+                ty.owner_services.join(","),
                 fmt_duration_ms(ty.orphaned_for_ms)
             ));
         }
@@ -523,9 +523,7 @@ mod tests {
             in_flight_as_sender: flight.1,
             command_types: commands.iter().map(|s| s.to_string()).collect(),
             query_types: queries.iter().map(|s| s.to_string()).collect(),
-            protocol_version: 2,
             client_version: "kraken-messaging/0.1.0".into(),
-            flow_controlled: false,
             permits_available: 0,
             queued: 0,
             load_factor: 100,
@@ -581,22 +579,20 @@ mod tests {
                 TypeOwnership {
                     type_name: "Pay".into(),
                     kind: KindName::Command,
-                    owner_service: "billing".into(),
                     live_instances: 2,
                     orphaned: false,
                     orphaned_for_ms: 0,
                     shared: false,
-                    owner_services: vec![],
+                    owner_services: vec!["billing".into()],
                 },
                 TypeOwnership {
                     type_name: "Archive".into(),
                     kind: KindName::Command,
-                    owner_service: "legacy".into(),
                     live_instances: 0,
                     orphaned: true,
                     orphaned_for_ms: 125_000,
                     shared: false,
-                    owner_services: vec![],
+                    owner_services: vec!["archive".into()],
                 },
             ],
             totals: Totals {
@@ -623,7 +619,7 @@ service catalog (1 instances)
   c-1      | 2d03h         | 1s            | false | 0/0           | -        | Find
 
 orphaned types:
-  Archive COMMAND owner=legacy for 2m05s
+  Archive COMMAND owner=archive for 2m05s
 
 totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
 ";
@@ -695,7 +691,7 @@ service catalog (1 instances)
   c-1      | 2d03h         | 1s            | false | 0/0           | -        | Find
 
 orphaned types:
-  Archive COMMAND owner=legacy for 2m05s
+  Archive COMMAND owner=archive for 2m05s
 
 totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
 ";

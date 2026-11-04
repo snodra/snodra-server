@@ -91,7 +91,7 @@ async fn another_origin_gets_no_cors_header() {
 #[tokio::test]
 async fn paths_outside_the_api_get_no_cors_header() {
     let http = start(&[PEER]).await;
-    for path in ["/topology", "/ui/", "/"] {
+    for path in ["/ui/", "/"] {
         let r = get(http, path, Some(PEER)).await;
         assert_eq!(r.header("access-control-allow-origin"), None, "{path}");
     }

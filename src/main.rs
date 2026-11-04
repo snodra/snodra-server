@@ -37,11 +37,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Mode::Serve | Mode::AclHash { .. } => {}
     }
     let telemetry = kraken_hub::telemetry::init(&config)?;
-    for warning in config
-        .warnings()
-        .into_iter()
-        .chain(config.security_warnings())
-    {
+    for warning in config.security_warnings() {
         tracing::warn!("{warning}");
     }
     kraken_hub::reload_on_sighup();

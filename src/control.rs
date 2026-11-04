@@ -1,7 +1,7 @@
 //! Processor control (roadmap P6b, ADR 0023): the hub as a stateless control plane for the Kafka
 //! event processors of the libraries (ADR 0022).
 //!
-//! The hub asks instances to act (`ServerMessage.control`, capability "processor-control") and
+//! The hub asks instances to act (`ServerMessage.control`) and
 //! matches their answers (`ClientMessage.control_reply`) to the requests by `control_id`. It keeps
 //! nothing but the requests in flight and, per (service, processor), the reset running on this
 //! hub: a pause lives in the service's `processor_control` collection, which every instance reads,
@@ -106,7 +106,6 @@ pub enum Verdict {
     NotFound,
     Conflict,
     Failed,
-    Unavailable,
     Timeout,
 }
 
@@ -118,7 +117,6 @@ impl Verdict {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::Failed => "failed",
-            Self::Unavailable => "unavailable",
             Self::Timeout => "timeout",
         }
     }
@@ -131,11 +129,6 @@ pub enum Refusal {
     UnknownService,
     /// No session of the service reports the processor.
     UnknownProcessor,
-    /// Sessions report the processor, but none declared "processor-control".
-    NoCapableInstance,
-    /// A reset, while these instances report the processor without "processor-control": they
-    /// would keep consuming.
-    NotCapable(Vec<String>),
     /// A reset of the processor already runs on this hub (its operation id).
     Running(String),
 }
@@ -144,8 +137,7 @@ impl Refusal {
     pub fn verdict(&self) -> Verdict {
         match self {
             Self::UnknownService | Self::UnknownProcessor => Verdict::NotFound,
-            Self::NoCapableInstance => Verdict::Unavailable,
-            Self::NotCapable(_) | Self::Running(_) => Verdict::Conflict,
+            Self::Running(_) => Verdict::Conflict,
         }
     }
 
@@ -156,13 +148,6 @@ impl Refusal {
             Self::UnknownProcessor => {
                 format!("no instance of service {service} reports processor {processor}")
             }
-            Self::NoCapableInstance => format!(
-                "no instance of service {service} that runs processor {processor} accepts control (capability \"processor-control\")"
-            ),
-            Self::NotCapable(ids) => format!(
-                "instances without processor control run {processor} and would keep consuming: {}",
-                ids.join(", ")
-            ),
             Self::Running(op) => {
                 format!("a reset of {service}/{processor} is running on this hub (operation {op})")
             }
@@ -461,8 +446,6 @@ pub struct FanOutReport {
     pub failed: usize,
     /// Every instance asked, sorted by instance id.
     pub instances: Vec<InstanceAnswer>,
-    /// Instances that report the processor without "processor-control"; never asked.
-    pub not_capable: Vec<String>,
     #[serde(skip)]
     pub verdict: Verdict,
 }
@@ -896,14 +879,13 @@ impl Control {
         }
     }
 
-    /// The sessions of `service` that report `processor`, split into those that declared
-    /// "processor-control" and the ids of those that did not, each sorted by instance id.
+    /// The sessions of `service` that report `processor` (at least one), sorted by instance id.
     fn holders(
         &self,
         ctx: &ContextId,
         service: &str,
         processor: &str,
-    ) -> Result<(Vec<ProcessorHolder>, Vec<String>), Refusal> {
+    ) -> Result<Vec<ProcessorHolder>, Refusal> {
         let mut holders = self
             .sessions
             .processor_holders(ctx, service, processor)
@@ -912,12 +894,10 @@ impl Control {
             return Err(Refusal::UnknownProcessor);
         }
         holders.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
-        let (capable, not): (Vec<_>, Vec<_>) = holders.into_iter().partition(|h| h.capable);
-        Ok((capable, not.into_iter().map(|h| h.instance_id).collect()))
+        Ok(holders)
     }
 
-    /// Pauses (`paused`) or resumes `processor` on every instance of `service` that reports it
-    /// and accepts control. Instances without the capability are listed, not asked.
+    /// Pauses (`paused`) or resumes `processor` on every instance of `service` that reports it.
     pub async fn pause(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -925,17 +905,14 @@ impl Control {
         processor: &str,
         paused: bool,
     ) -> Result<FanOutReport, Refusal> {
-        let (capable, not_capable) = self.holders(ctx, service, processor)?;
-        if capable.is_empty() {
-            return Err(Refusal::NoCapableInstance);
-        }
+        let holders = self.holders(ctx, service, processor)?;
         let action = if paused {
             control_request::Action::Pause(proto::ProcessorPause {})
         } else {
             control_request::Action::Resume(proto::ProcessorResume {})
         };
         let answers = self
-            .ask_all(&capable, processor, action, self.timeouts.request)
+            .ask_all(&holders, processor, action, self.timeouts.request)
             .await;
         let acknowledged = answers
             .iter()
@@ -956,7 +933,7 @@ impl Control {
             action: if paused { "pause" } else { "resume" },
             acknowledged,
             failed: answers.len() - acknowledged,
-            instances: capable
+            instances: holders
                 .iter()
                 .zip(&answers)
                 .map(|(h, a)| InstanceAnswer {
@@ -964,12 +941,11 @@ impl Control {
                     answer: a.view(),
                 })
                 .collect(),
-            not_capable,
             verdict,
         })
     }
 
-    /// Runs a dead-letter call on the capable instance with the freshest status.
+    /// Runs a dead-letter call on the instance with the freshest status.
     pub async fn dead_letters(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -977,8 +953,8 @@ impl Control {
         processor: &str,
         call: &LetterCall,
     ) -> Result<LetterOutcome, Refusal> {
-        let (capable, _) = self.holders(ctx, service, processor)?;
-        let holder = freshest(&capable).ok_or(Refusal::NoCapableInstance)?;
+        let holders = self.holders(ctx, service, processor)?;
+        let holder = freshest(&holders).ok_or(Refusal::UnknownProcessor)?;
         let answer = self
             .ask(holder, processor, call.to_proto(), self.timeouts.request)
             .await;
@@ -1010,9 +986,8 @@ impl Control {
     /// Resets `processor` of `service` to `target` as a leased operation: prepare every instance
     /// that reports it, renew the lease every [`Timeouts::renew`] while the operation runs,
     /// execute on the prepared instance with the freshest status, finish on every prepared one
-    /// (aborted when the execute failed). Refused up front when an instance reports the processor
-    /// without "processor-control" (it would keep consuming) and while this hub runs a reset of
-    /// it already.
+    /// (aborted when the execute failed). Refused up front while this hub runs a reset of it
+    /// already.
     pub async fn reset(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -1020,10 +995,7 @@ impl Control {
         processor: &str,
         target: Target,
     ) -> Result<ResetReport, Refusal> {
-        let (holders, not_capable) = self.holders(ctx, service, processor)?;
-        if !not_capable.is_empty() {
-            return Err(Refusal::NotCapable(not_capable));
-        }
+        let holders = self.holders(ctx, service, processor)?;
         let operation_id = new_id();
         let _running = self.begin(service, processor, &operation_id)?;
         info!(
@@ -1315,17 +1287,10 @@ mod tests {
 
     type Rx = mpsc::Receiver<Result<ServerMessage, tonic::Status>>;
 
-    /// A session of `svc` that reports `audit`; `capable` says whether it declared
-    /// "processor-control".
-    fn session(sessions: &Sessions, id: &str, capable: bool) -> (u64, Rx) {
+    /// A session of `svc` that reports `audit`.
+    fn session(sessions: &Sessions, id: &str) -> (u64, Rx) {
         let (tx, rx) = mpsc::channel(16);
-        let meta = SessionMeta {
-            protocol_version: 2,
-            instance_status: true,
-            processors: true,
-            processor_control: capable,
-            ..SessionMeta::v1(Duration::from_secs(10))
-        };
+        let meta = SessionMeta::default();
         let token = sessions.insert(&D, id, "svc", meta, tx, CancellationToken::new());
         let report = InstanceStatus {
             connected_hub_ids: vec!["h".into()],
@@ -1374,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_reaches_the_request_it_answers_and_nothing_else() {
         let (sessions, control, m) = parts();
-        let (token, mut rx) = session(&sessions, "i1", true);
+        let (token, mut rx) = session(&sessions, "i1");
         let h = holder(&sessions, "i1");
         let ask = {
             let control = Arc::clone(&control);
@@ -1414,7 +1379,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_times_out_and_its_late_reply_is_unknown() {
         let (sessions, control, m) = parts();
-        let (token, mut rx) = session(&sessions, "i1", true);
+        let (token, mut rx) = session(&sessions, "i1");
         let h = holder(&sessions, "i1");
         let started = Instant::now();
         let answer = control
@@ -1435,8 +1400,8 @@ mod tests {
     #[tokio::test]
     async fn a_session_that_leaves_fails_its_pending_requests_at_once() {
         let (sessions, control, _m) = parts();
-        let (token, _rx) = session(&sessions, "i1", true);
-        let (_other_token, _rx2) = session(&sessions, "i2", true);
+        let (token, _rx) = session(&sessions, "i1");
+        let (_other_token, _rx2) = session(&sessions, "i2");
         let h1 = holder(&sessions, "i1");
         let h2 = holder(&sessions, "i2");
         let (c1, c2) = (Arc::clone(&control), Arc::clone(&control));
@@ -1469,7 +1434,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_to_a_gone_session_is_unsent() {
         let (sessions, control, _m) = parts();
-        let (token, rx) = session(&sessions, "i1", true);
+        let (token, rx) = session(&sessions, "i1");
         let h = holder(&sessions, "i1");
         sessions.remove_if(&D, "i1", token);
         drop(rx);
@@ -1684,13 +1649,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_freshest_capable_instance_answers_a_dead_letter_call() {
+    async fn the_freshest_instance_answers_a_dead_letter_call() {
         let (sessions, control, _m) = parts();
-        let (_t1, mut rx1) = session(&sessions, "a-old", true);
+        let (_t1, mut rx1) = session(&sessions, "a-old");
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let (t2, mut rx2) = session(&sessions, "b-fresh", true);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let (_t3, _rx3) = session(&sessions, "c-fresher-but-p6a", false);
+        let (t2, mut rx2) = session(&sessions, "b-fresh");
         let call = {
             let control = Arc::clone(&control);
             tokio::spawn(async move {
@@ -1740,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_reset_of_the_same_processor_is_refused_while_one_runs() {
         let (sessions, control, _m) = parts();
-        let _s = session(&sessions, "i1", true);
+        let _s = session(&sessions, "i1");
         let running = control.begin("svc", "audit", "op-1").unwrap();
         assert_eq!(
             control.reset(&D, "svc", "audit", Target::Latest).await,

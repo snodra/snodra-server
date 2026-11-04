@@ -1,11 +1,11 @@
 //! Flow control end to end (ADR 0014): permits, per-instance queues, priority, capacity
-//! rejections by sender capability, and unlimited v1 handlers.
+//! rejections, and a Register without permits.
 
 mod common;
 
 use std::time::Duration;
 
-use common::{FakeClient, start_hub};
+use common::{FakeClient, PERMITS, start_hub};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{
     ClientMessage, ErrorCode, Request, RequestKind, client_message, server_message,
@@ -66,14 +66,8 @@ fn request(id: &str, priority: i32) -> ClientMessage {
 async fn one_permit_serialises_three_concurrent_requests() {
     let addr = start_hub(config()).await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
-    match message(&mut handler).await {
-        server_message::Message::RegisterAck(ack) => {
-            assert_eq!(ack.capabilities, ["flow-control"]);
-        }
-        other => panic!("expected the ack, got {other:?}"),
-    }
     handshake(&mut handler, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
 
     for id in ["r1", "r2", "r3"] {
@@ -100,7 +94,7 @@ async fn queued_requests_leave_by_priority_then_age() {
     let addr = start_hub(config()).await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut handler, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
     sender.tx.send(request("blocker", 0)).await.unwrap();
     assert_eq!(expect_request(&mut handler).await.id, "blocker");
@@ -125,7 +119,7 @@ async fn a_permit_grant_raises_the_cap_over_the_wire() {
     let addr = start_hub(config()).await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 2, &[]).await;
     handshake(&mut handler, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
     handler.permits_with_grant(2, 4).await;
     handshake(&mut handler, 2).await;
@@ -141,22 +135,7 @@ async fn a_permit_grant_raises_the_cap_over_the_wire() {
 }
 
 #[tokio::test]
-async fn a_v1_handler_stays_unlimited() {
-    let addr = start_hub(config()).await;
-    let mut handler = FakeClient::register(addr, "svc-h", &["h.Do"], &[]).await;
-    handshake(&mut handler, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
-    handshake(&mut sender, 1).await;
-    for i in 0..5 {
-        sender.tx.send(request(&format!("r{i}"), 0)).await.unwrap();
-    }
-    for i in 0..5 {
-        assert_eq!(expect_request(&mut handler).await.id, format!("r{i}"));
-    }
-}
-
-#[tokio::test]
-async fn a_full_queue_is_resource_exhausted_for_flow_senders_and_busy_for_v1_senders() {
+async fn a_full_queue_is_resource_exhausted_for_every_sender() {
     let addr = start_hub(Config {
         queue_capacity_per_instance: 1,
         ..config()
@@ -164,35 +143,37 @@ async fn a_full_queue_is_resource_exhausted_for_flow_senders_and_busy_for_v1_sen
     .await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut handler, 1).await;
-    let mut v2 = FakeClient::register_flow(addr, "svc-s2", &[], 0, &[]).await;
-    handshake(&mut v2, 1).await;
-    let mut v1 = FakeClient::register(addr, "svc-s1", &[], &[]).await;
-    handshake(&mut v1, 1).await;
+    let mut one = FakeClient::register_flow(addr, "svc-s1", &[], PERMITS, &[]).await;
+    handshake(&mut one, 1).await;
+    let mut two = FakeClient::register(addr, "svc-s2", &[], &[]).await;
 
-    v2.tx.send(request("forwarded", 0)).await.unwrap();
+    one.tx.send(request("forwarded", 0)).await.unwrap();
     assert_eq!(expect_request(&mut handler).await.id, "forwarded");
-    v2.tx.send(request("queued", 0)).await.unwrap();
-    handshake(&mut v2, 2).await;
+    one.tx.send(request("queued", 0)).await.unwrap();
+    handshake(&mut one, 2).await;
 
-    v2.tx.send(request("v2-rejected", 0)).await.unwrap();
-    match message(&mut v2).await {
-        server_message::Message::Error(e) => {
-            assert_eq!(
-                (e.request_id.as_str(), e.code()),
-                ("v2-rejected", ErrorCode::ResourceExhausted)
-            );
+    for (sender, id) in [(&mut one, "one-rejected"), (&mut two, "two-rejected")] {
+        sender.tx.send(request(id, 0)).await.unwrap();
+        match message(sender).await {
+            server_message::Message::Error(e) => {
+                assert_eq!(
+                    (e.request_id.as_str(), e.code()),
+                    (id, ErrorCode::ResourceExhausted)
+                );
+                assert_eq!(e.message, "handler busy: queue full");
+            }
+            other => panic!("expected RESOURCE_EXHAUSTED, got {other:?}"),
         }
-        other => panic!("expected RESOURCE_EXHAUSTED, got {other:?}"),
     }
-    v1.tx.send(request("v1-rejected", 0)).await.unwrap();
-    match message(&mut v1).await {
-        server_message::Message::Error(e) => {
-            assert_eq!(e.request_id, "v1-rejected");
-            assert_eq!(e.code(), ErrorCode::HandlerError);
-            assert_eq!(e.message, "handler busy");
-        }
-        other => panic!("expected HANDLER_ERROR, got {other:?}"),
-    }
+}
+
+#[tokio::test]
+async fn a_register_without_permits_is_invalid_argument() {
+    let addr = start_hub(config()).await;
+    let mut c = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 0, &[]).await;
+    let status = c.expect_closed().await;
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("initial_permits"), "{status:?}");
 }
 
 /// The next request `c` gets, skipping acks and heartbeat echoes.
@@ -218,7 +199,7 @@ async fn a_disconnecting_handler_fails_what_it_had_and_its_queue_finds_no_handle
     let addr = start_hub(config()).await;
     let mut handler = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut handler, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
     sender.tx.send(request("forwarded", 0)).await.unwrap();
     sender.tx.send(request("queued", 0)).await.unwrap();
@@ -243,7 +224,7 @@ async fn queued_commands_survive_a_reconnect_of_their_handler() {
     let addr = start_hub(config()).await;
     let mut old = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut old, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
     for id in ["forwarded", "q1", "q2"] {
         sender.tx.send(request(id, 0)).await.unwrap();
@@ -267,7 +248,7 @@ async fn a_rolling_restart_hands_queued_commands_over_and_the_stopping_instance_
     let addr = start_hub(config()).await;
     let mut a = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 1, &[]).await;
     handshake(&mut a, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[]).await;
+    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[]).await;
     handshake(&mut sender, 1).await;
     for id in ["on-a", "q1", "q2"] {
         sender.tx.send(request(id, 0)).await.unwrap();
@@ -305,11 +286,14 @@ async fn a_rolling_restart_hands_queued_commands_over_and_the_stopping_instance_
 #[tokio::test]
 async fn unkeyed_requests_prefer_the_instance_with_matching_tags() {
     let addr = start_hub(config()).await;
-    let mut z1 = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 0, &[("zone", "z1")]).await;
+    let mut z1 =
+        FakeClient::register_flow(addr, "svc-h", &["h.Do"], PERMITS, &[("zone", "z1")]).await;
     handshake(&mut z1, 1).await;
-    let mut z2 = FakeClient::register_flow(addr, "svc-h", &["h.Do"], 0, &[("zone", "z2")]).await;
+    let mut z2 =
+        FakeClient::register_flow(addr, "svc-h", &["h.Do"], PERMITS, &[("zone", "z2")]).await;
     handshake(&mut z2, 1).await;
-    let mut sender = FakeClient::register_flow(addr, "svc-s", &[], 0, &[("zone", "z2")]).await;
+    let mut sender =
+        FakeClient::register_flow(addr, "svc-s", &[], PERMITS, &[("zone", "z2")]).await;
     handshake(&mut sender, 1).await;
     for i in 0..4 {
         sender.tx.send(request(&format!("r{i}"), 0)).await.unwrap();

@@ -338,11 +338,8 @@ async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
         let client = FakeClient::connect(grpc).await;
         client
             .send_raw_register(kraken_hub::proto::Register {
-                service_name: service.to_string(),
-                instance_id: client.instance_id.clone(),
                 shared_query_types: vec!["search.FindAnything".to_string()],
-                protocol_version: 2,
-                ..Default::default()
+                ..client.register_message(service, &[], &[])
             })
             .await;
         owners.push(client);
@@ -502,8 +499,8 @@ async fn a_flood_of_types_and_edges_renders_bounded_and_in_time() {
     let _ = std::fs::remove_dir_all(&profiles);
 }
 
-/// Registers `instance_id` of `service` on the hub at `grpc` as a v2 client with the
-/// "instance-status" capability, reports `connected` hub ids, and waits for the ack.
+/// Registers `instance_id` of `service` on the hub at `grpc`, waits for the ack and reports
+/// `connected` hub ids.
 async fn register_reporting(
     grpc: SocketAddr,
     service: &str,
@@ -513,22 +510,8 @@ async fn register_reporting(
 ) -> FakeClient {
     let mut client = FakeClient::connect(grpc).await;
     client.instance_id = instance_id.to_string();
-    client
-        .send_raw_register(kraken_hub::proto::Register {
-            service_name: service.to_string(),
-            instance_id: instance_id.to_string(),
-            command_types: commands.iter().map(|c| c.to_string()).collect(),
-            protocol_version: 2,
-            capabilities: vec!["instance-status".to_string()],
-            ..Default::default()
-        })
-        .await;
-    match client.next().await {
-        Some(Ok(ServerMessage {
-            message: Some(server_message::Message::RegisterAck(_)),
-        })) => {}
-        other => panic!("expected the ack, got {other:?}"),
-    }
+    client.send_register(service, commands, &[]).await;
+    client.expect_ack().await;
     client.status(connected, 0).await;
     client
 }
@@ -668,26 +651,12 @@ fn processor(
     }
 }
 
-/// Registers `instance_id` of `service` as a P6a client ("instance-status" and "processors") and
-/// waits for the ack.
-async fn register_p6a(grpc: SocketAddr, service: &str, instance_id: &str) -> FakeClient {
+/// Registers `instance_id` of `service` and waits for the ack.
+async fn register_as(grpc: SocketAddr, service: &str, instance_id: &str) -> FakeClient {
     let mut client = FakeClient::connect(grpc).await;
     client.instance_id = instance_id.to_string();
-    client
-        .send_raw_register(kraken_hub::proto::Register {
-            service_name: service.to_string(),
-            instance_id: instance_id.to_string(),
-            protocol_version: 2,
-            capabilities: vec!["instance-status".to_string(), "processors".to_string()],
-            ..Default::default()
-        })
-        .await;
-    match client.next().await {
-        Some(Ok(ServerMessage {
-            message: Some(server_message::Message::RegisterAck(_)),
-        })) => {}
-        other => panic!("expected the ack, got {other:?}"),
-    }
+    client.send_register(service, &[], &[]).await;
+    client.expect_ack().await;
     client
 }
 
@@ -703,8 +672,8 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
     };
     let (grpc, http) = common::start_hub_with_http(config()).await;
     let http: SocketAddr = http.unwrap();
-    let b1 = register_p6a(grpc, "service-b", "b-1").await;
-    let b2 = register_p6a(grpc, "service-b", "b-2").await;
+    let b1 = register_as(grpc, "service-b", "b-1").await;
+    let b2 = register_as(grpc, "service-b", "b-2").await;
     let _a = FakeClient::register(grpc, "service-a", &[], &[]).await;
     let mut orders = processor(
         "orders",
@@ -832,9 +801,9 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
                 .unwrap();
         });
     }
-    let on_a = register_p6a(ga, "service-b", "b-both").await;
-    let on_b = register_p6a(gb, "service-b", "b-both").await;
-    let only_b = register_p6a(gb, "service-b", "b-only-on-b").await;
+    let on_a = register_as(ga, "service-b", "b-both").await;
+    let on_b = register_as(gb, "service-b", "b-both").await;
+    let only_b = register_as(gb, "service-b", "b-only-on-b").await;
     on_a.status_with_processors(
         &["hub-a", "hub-b"],
         vec![processor(
@@ -912,7 +881,7 @@ async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the
     };
     let (grpc, http) = common::start_hub_with_http(config()).await;
     let http: SocketAddr = http.unwrap();
-    let b1 = register_p6a(grpc, "service-b", "b-1").await;
+    let b1 = register_as(grpc, "service-b", "b-1").await;
     let mut replaying = processor(
         "default",
         ProcessorState::ProcessorRunning,
@@ -1001,7 +970,7 @@ async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
         parked_at_ms: 1_762_250_000_000,
         last_attempt_at_ms: 1_762_250_001_000,
     };
-    let b1 = ControlClient::p6b(
+    let b1 = ControlClient::new(
         grpc,
         "service-b",
         "b-1",
