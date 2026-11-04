@@ -69,18 +69,17 @@ cargo run
 |---|---|---|
 | `KRAKEN_HUB_ID` | hostname + `-` + 8 random hex digits | identifies this hub process in `RegisterAck.hub_id` and the topology (`hubId`) |
 | `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
-| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for `GET /topology`, the dashboard and its API; empty disables the HTTP listener |
+| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for the dashboard and its API; empty disables the HTTP listener |
 | `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
 | `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
 | `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
 | `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` on types without an override |
 | `KRAKEN_HUB_TIMEOUT_OVERRIDES` | none | per-type timeouts, `type=ms,type=ms` (for example `files.Upload=120000`); see [Request timeouts](#request-timeouts) |
-| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to v2 clients in `RegisterAck`; `KRAKEN_HUB_HEARTBEAT_TIMEOUT` must be at least twice it |
-| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold for v2 sessions (`10`, `10s` or `500ms`) |
-| `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` | `30s` | dead-instance threshold for v1 sessions (`Register.protocol_version` 0, clients that heartbeat every 10 s) |
-| `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one flow-controlled instance before new ones are rejected |
-| `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one flow-controlled instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
-| `KRAKEN_HUB_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all flow-controlled instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
+| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to clients in `RegisterAck`; `KRAKEN_HUB_HEARTBEAT_TIMEOUT` must be at least twice it |
+| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold (`10`, `10s` or `500ms`) |
+| `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one instance before new ones are rejected |
+| `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
+| `KRAKEN_HUB_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
 | `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
 | `KRAKEN_HUB_MAX_STREAM_DURATION` | `10m` | a [streaming query](#query-modes) open for longer ends with `ReplyEnd{error = CANCELLED}` and its handler is cancelled; at least `1s` |
 | `KRAKEN_HUB_SUBSCRIPTION_BUFFER` | `256` | updates of a [subscription](#query-modes) the hub holds while its sender owes credit; one more ends it with `ReplyEnd{error = RESOURCE_EXHAUSTED}`; positive |
@@ -118,7 +117,7 @@ cargo run
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
-The topology view (`GET /topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view),
+The topology view (`GET /api/v1/topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view),
 the dashboard in [Dashboard](#dashboard).
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
@@ -126,14 +125,14 @@ the dashboard in [Dashboard](#dashboard).
   for `cargo run` without a collector. (For every other variable an empty value means "unset".)
 - **Builder call:** `KRAKEN_HUB_HANDSHAKE_TIMEOUT` (default `10s`): a stream that sends nothing,
   or no `Register`, within it is closed with `DEADLINE_EXCEEDED` `no Register within 10s`. A
-  `Register` with an empty `instance_id` or `service_name` is closed with `INVALID_ARGUMENT`.
+  `Register` with an empty `instance_id` or `service_name`, or with `initial_permits` 0, is closed
+  with `INVALID_ARGUMENT`.
 - Startup fails on a malformed `KRAKEN_HUB_TIMEOUT_OVERRIDES` (entry without `=`, empty type,
   non-numeric, zero or above `u32::MAX` milliseconds, a type listed twice) and when
   `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is less than twice `KRAKEN_HUB_HEARTBEAT_INTERVAL` (one late
-  heartbeat would evict). A `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` below 20 s is accepted with a
-  startup warning: v1 clients heartbeat every 10 s.
+  heartbeat would evict).
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
-  AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the topology HTTP port; map the compose
+  AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the dashboard's HTTP port; map the compose
   host port accordingly).
 
 ## Topology view
@@ -145,7 +144,7 @@ three ways:
 
 ```sh
 grpcurl -plaintext -import-path proto -proto hub.proto localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
-curl localhost:7001/topology                                   # HTTP JSON
+curl localhost:7001/api/v1/topology                            # HTTP JSON (the dashboard API)
 kraken-hub --topology [--json]                                 # CLI inside the container
 ```
 
@@ -154,9 +153,10 @@ docker exec kraken-hub /app/kraken-hub --topology
 docker exec kraken-hub /app/kraken-hub --topology --json
 ```
 
-- `GET /topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as `COMMAND` or
-  `QUERY`), unchanged by the dashboard and served even when the dashboard is disabled. Besides
-  the dashboard paths (`/`, `/ui`, `/ui/...`, `/api/v1/...`) every other path is 404.
+- `GET /api/v1/topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as
+  `COMMAND` or `QUERY`) with the rest of the [dashboard API](#dashboard). Besides the dashboard
+  paths (`/`, `/ui`, `/ui/...`, `/api/v1/...`) every path is 404, and with
+  `KRAKEN_HUB_DASHBOARD_ENABLED=false` every path is: the gRPC call and the CLI remain.
   **Builder call:** the HTTP endpoint is a second port (7001), because the gRPC port speaks only
   HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
 - `kraken-hub --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
@@ -167,10 +167,10 @@ docker exec kraken-hub /app/kraken-hub --topology --json
   With nothing connected it prints `no services connected` and a totals line.
 - Without `KRAKEN_HUB_DASHBOARD_TOKEN` the topology has no authentication, like the rest of the
   port-7000 surface, except that with `KRAKEN_HUB_AUTH_MODE=enforce` the gRPC call needs an ACL token;
-  with the token, the gRPC call and `GET /topology` need it (see [Security](#security)).
+  with the token, the gRPC call and `GET /api/v1/topology` need it (see [Security](#security)).
 - The hub has no gRPC server reflection, hence the `-proto` flags. grpcurl's proto-JSON prints
   int64 as strings and omits default values, so its output differs textually from
-  `curl :7001/topology`.
+  `curl :7001/api/v1/topology`.
 
 ### Snapshot fields
 
@@ -181,7 +181,7 @@ Top level:
 | `hubId` | string | `KRAKEN_HUB_ID` |
 | `hubStartedAtMs` | int64 | hub start, epoch milliseconds |
 | `nowMs` | int64 | snapshot time, epoch milliseconds |
-| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (v2 sessions), in ms |
+| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, in ms |
 | `services` | list | one entry per service with at least one live session |
 | `types` | list | one entry per owned type, including orphaned ones |
 | `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight`, `queued` (all counts; `inFlight` includes queued requests) |
@@ -193,22 +193,20 @@ Top level:
 | `instanceId` | string | instance id from `Register` |
 | `connectedSinceMs` | int64 | when the session started, epoch ms |
 | `lastHeartbeatAgeMs` | int64 | time since the last heartbeat, ms |
-| `stale` | bool | `lastHeartbeatAgeMs` > a third of this session's own eviction threshold (see below) |
+| `stale` | bool | `lastHeartbeatAgeMs` > a third of the eviction threshold (see below) |
 | `inFlightAsHandler` | uint32 | requests currently being handled by this instance |
 | `inFlightAsSender` | uint32 | requests this instance sent that have no terminal message yet |
 | `commandTypes` | list of string | command types this instance registered |
 | `queryTypes` | list of string | query types this instance registered (shared ones included) |
 | `sharedQueryTypes` | list of string | the query types it registered as shared (`Register.shared_query_types`) |
-| `protocolVersion` | uint32 | `Register.protocol_version` of the session's first `Register` (0 = v1) |
-| `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty for v1 clients |
-| `flowControlled` | bool | the hub forwards to this instance only with permits |
-| `permitsAvailable` | uint32 | permits left (0 when not flow-controlled) |
+| `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty when the client sent none |
+| `permitsAvailable` | uint32 | permits left: requests the hub may still forward before the next `Permits` |
 | `queued` | uint32 | requests waiting in the hub's queue for this instance |
 | `loadFactor` | uint32 | `Register.load_factor` as applied (0 reads as 100) |
 | `tags` | map | `Register.tags` |
 | `connectedHubIds` | list of string | `InstanceStatus.connected_hub_ids` as last reported: the hubs the instance holds a stream to; empty when never reported |
-| `statusAgeMs` | int64 | time since that report, ms; `-1` when never reported (also when a JSON snapshot from an older hub lacks the field) |
-| `processors` | list | `InstanceStatus.processors` of that report, as kept (see [Event processors](#event-processors)): `name`, `groupId`, `topic`, `state`, `partitions[]` (`partition`, `position`, `committed`, `highWatermark`, `lag`), `processedTotal`, `failedTotal`, `deadLetters`, `lastError`, `lastErrorAtMs`, `eventTypes`, `deadLetterMode`; `[]` when never reported, from a session without the `processors` capability, or from an older hub's JSON |
+| `statusAgeMs` | int64 | time since that report, ms; `-1` when never reported |
+| `processors` | list | `InstanceStatus.processors` of that report, as kept (see [Event processors](#event-processors)): `name`, `groupId`, `topic`, `state`, `partitions[]` (`partition`, `position`, `committed`, `highWatermark`, `lag`), `processedTotal`, `failedTotal`, `deadLetters`, `lastError`, `lastErrorAtMs`, `eventTypes`, `deadLetterMode`; `[]` when never reported |
 
 `types[]`:
 
@@ -216,7 +214,6 @@ Top level:
 |---|---|---|
 | `type` | string | the command or query type name |
 | `kind` | string | `COMMAND` or `QUERY` |
-| `ownerService` | string | the service that owns the type (the first owner of a shared type) |
 | `ownerServices` | list of string | every owning service, sorted (one for an exclusive type) |
 | `shared` | bool | a shared query type: many services may own it |
 | `liveInstances` | uint32 | live instances of the owner (of all owners) that registered it |
@@ -236,8 +233,8 @@ types and in-flight counts are attached by instance id (empty or zero when absen
 
 ### Staleness
 
-**Builder call:** an instance is `stale` when its last heartbeat is older than a third of its own
-eviction threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT` for v2 sessions, the legacy timeout for v1).
+**Builder call:** an instance is `stale` when its last heartbeat is older than a third of the
+eviction threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT`).
 It is still connected and still receives requests; the flag is an early warning before the hub
 evicts it at the full timeout. A brief `stale: true` right before a heartbeat arrives is normal.
 
@@ -270,7 +267,7 @@ calls whom and how that goes, and controls the services' event processors. Decis
 umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 
 > **Authentication is opt-in for reads.** Without `KRAKEN_HUB_DASHBOARD_TOKEN` the dashboard and
-> the reads of `/api/v1/` are open to anyone who reaches port 7001, like `GET /topology`: keep the
+> the reads of `/api/v1/` are open to anyone who reaches port 7001: keep the
 > port on the private network (the page footer says the same). With the token set the page asks
 > for it and every data endpoint needs it; see [Security](#security). The only writes, the
 > [processor controls](#processor-control), always need the write token or an ACL credential with
@@ -279,9 +276,9 @@ umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 | Page | Shows |
 |---|---|
 | Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
-| Services | every service with its event processors (a count linking to the Processors page and a dead-letter badge) and its live instances: instance id, client and protocol version, permits (or unlimited), queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
+| Services | every service with its event processors (a count linking to the Processors page and a dead-letter badge) and its live instances: instance id, client version, permits, queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
 | Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
-| Settings | hub id, version, protocol and capabilities, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
+| Settings | hub id, version, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
 | Processors | every (service, processor): group, topic, worst state over its instances, instances, partitions, lag (sum of the known lags), dead letters (or the mode `topic` / `log`), the latest error with its age; a row opens to every instance's report and partitions (position, committed, high watermark, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
 | Dead letters | the processors that keep letters, and per processor (`#/dead-letters?service=…&processor=…`) its letters as one instance lists them through the hub (no payloads); with a write credential Retry, Retry all and Discard (confirmed). Read on demand, not live |
 | Events | placeholder: available from phase 7 |
@@ -306,11 +303,11 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 
 | Path | Body |
 |---|---|
-| `topology` | the topology snapshot, as `GET /topology` |
+| `topology` | the topology snapshot, as the gRPC `Topology` returns it |
 | `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
-| `version` | `hubId`, `version`, `protocolVersion`, `capabilities`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
+| `version` | `hubId`, `version`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
 | `processors` | the event processors per service, aggregated over the instances (see [Event processors](#event-processors)) |
 | `services/{service}/processors/{processor}/dead-letters?limit=` | a processor's dead letters, listed by one instance; the mutating routes under `services/` are in [Processor control](#processor-control) |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
@@ -320,8 +317,8 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 - **Builder call:** all streams read one shared summary, recomputed every 0.5 s only while at
   least one stream is open (edge totals are kept as requests arrive, so this does not walk the
   edges); without a stream nothing is computed.
-- **Builder call:** `revision` hashes services, instances, their registrations, flow-control
-  and stale flags and reported hubs, type ownership and the set of edges, not counters or ages, so a page can
+- **Builder call:** `revision` hashes services, instances, their registrations, stale flags and
+  reported hubs, type ownership and the set of edges, not counters or ages, so a page can
   refresh at once on a structural change.
 
 ### Edge statistics
@@ -371,15 +368,13 @@ package manager and no build step; the files are compiled into the binary with `
 ### Multiple hubs
 
 Decision record: umbrella `docs/adr/0016-multi-hub-ha-without-hub-to-hub-traffic.md`. Hubs never
-talk to each other; each instance connects to every hub (the client libraries' P3 slice). The
-hub side:
+talk to each other; each instance connects to every hub. The hub side:
 
-- **`instance-status` capability.** A v2 client that declares it gets it back in the ack and may
-  send `ClientMessage.status` (`InstanceStatus{connected_hub_ids, handlers_in_flight}`, every
-  5 s). The hub keeps the latest report per session, replaced by each and dropped with the
-  session, and shows it as `connectedHubIds` / `statusAgeMs`. **Builder call:** at most 64 ids of
-  at most 128 bytes are kept; empty, over-long (ignored, never cut) and duplicate ids are
-  dropped. Reports from a v1 session or one without the capability are ignored.
+- **Instance status.** A client sends `ClientMessage.status`
+  (`InstanceStatus{connected_hub_ids, handlers_in_flight}`, every 5 s). The hub keeps the latest
+  report per session, replaced by each and dropped with the session, and shows it as
+  `connectedHubIds` / `statusAgeMs`. **Builder call:** at most 64 ids of at most 128 bytes are
+  kept; empty, over-long (ignored, never cut) and duplicate ids are dropped.
 - **Dashboard peers.** The page reads `/api/v1/topology` of every `KRAKEN_HUB_PEERS` entry from
   the browser (3 s timeout each; on every refresh of a merging page, otherwise every 5 s for the
   header) and, under "All hubs", merges them: the Services page by instance id with "Seen by",
@@ -391,7 +386,7 @@ hub side:
 - **CORS.** `/api/v1/*` answers an `Origin` that is exactly one of `KRAKEN_HUB_PEERS` with
   `Access-Control-Allow-Origin: <that origin>` (and `Vary: Origin` whenever peers are set), never
   a wildcard, never credentials; a preflight is `204` (`GET` only) for such an origin and `403`
-  otherwise. Other origins, the page, its assets and `/topology` get no CORS header.
+  otherwise. Other origins, the page and its assets get no CORS header.
 
 Developing the page: edit `ui/`, `cargo run` (assets are embedded in debug builds too) and
 reload. `tests/dashboard_ui.rs` checks that every referenced asset and every import resolves,
@@ -400,23 +395,21 @@ picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Event processors
 
-Decision record: umbrella `docs/adr/0022-named-event-processors-status-and-dead-letters.md` (roadmap P6a). Each
+Decision record: umbrella `docs/adr/0022-named-event-processors-status-and-dead-letters.md`. Each
 service instance runs its Kafka event handlers in event processors (`default`, plus one per named processing group,
-each its own consumer group) and, with the client libraries' P6a slice, reports them every 5 s in
-`InstanceStatus.processors`. The hub reads no Kafka and stores nothing else: it keeps the latest report per session
+each its own consumer group) and reports them every 5 s in `InstanceStatus.processors`. The hub reads no Kafka and stores nothing else: it keeps the latest report per session
 and shows it.
 
-- **`processors` capability.** A v2 client that declares it (next to `instance-status`) gets it back in the ack and
-  fills `InstanceStatus.processors` (`ProcessorStatus{name, group_id, topic, state, partitions[], processed_total,
-  failed_total, dead_letters, last_error, last_error_at_ms, event_types, dead_letter_mode}`, `PartitionStatus{partition,
-  position, committed, high_watermark, lag}`, `-1` for unknown offsets). The processors are kept only for a session that
-  shares both capabilities; each report replaces the list; it is dropped with the session.
+- **The report.** A client fills `InstanceStatus.processors` (`ProcessorStatus{name, group_id, topic, state,
+  partitions[], processed_total, failed_total, dead_letters, last_error, last_error_at_ms, event_types,
+  dead_letter_mode, replaying, operation_id}`, `PartitionStatus{partition, position, committed, high_watermark, lag,
+  replay_until}`, `-1` for unknown offsets). Each report replaces the list; it is dropped with the session.
 - **Builder call: bounds.** At most 32 processors per report, 1024 partitions and 256 event types each; names are cut
   at 64 bytes, group id and topic at 256, the last error at 512, an event type at 256, the mode at 32, always at a
   UTF-8 boundary; an empty or repeated name, a negative or repeated partition and empty event types are dropped;
   offsets below -1 read as -1; an unknown state number reads as `UNSPECIFIED`. Never an error to the client.
-- **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /topology` and
-  `/api/v1/topology`, and under each service in `kraken-hub --topology` a table with one row per (processor,
+- **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /api/v1/topology`, and
+  under each service in `kraken-hub --topology` a table with one row per (processor,
   instance): state, group, topic, partitions as ranges (`0-2,5`), the known lag, processed, failed, dead letters (or
   `(topic)` / `(log)`), the last error (60 characters) with its age.
 - **`GET /api/v1/processors`** (dashboard token, CORS for the peers, off with the dashboard):
@@ -439,34 +432,33 @@ and shows it.
   recent; group, topic and mode come from the freshest report. Services without a processor are not listed.
 - **Dashboard.** The Processors page re-aggregates `instances[]` in the browser with the same rules
   (`ui/processors.js`), over every reachable peer under "All hubs": an instance two hubs hold counts once, with its
-  freshest report (lowest `statusAgeMs`); a peer that answers 404 (it predates P6a) is named as older, not
-  unreachable. Since P6b a report also carries `replaying`, `operationId` and per partition `replayUntil`; the page
-  shows PAUSED and STOPPED (with the reset's operation id) and a replaying badge, and with a write credential Pause,
+  freshest report (lowest `statusAgeMs`); a peer that does not answer is unreachable. A report also carries
+  `replaying`, `operationId` and per partition `replayUntil`; the page shows PAUSED and STOPPED (with the reset's operation id) and a replaying badge, and with a write credential Pause,
   Resume and Reset (see [Processor control](#processor-control)).
 
 ## Processor control
 
-Decision record: umbrella `docs/adr/0023-hub-control-plane-for-event-processors.md` (roadmap P6b; the operator guide
-with every JSON body is the umbrella's `docs/05-services/hub.md`, "Processor control"). The hub is a stateless control
-plane: `src/control.rs` sends `ServerMessage.control` to every live session of the service that declared the
-capability `processor-control` and whose latest status lists the processor, matches each `ClientMessage.control_reply`
+Decision record: umbrella `docs/adr/0023-hub-control-plane-for-event-processors.md` (the operator guide with every
+JSON body is the umbrella's `docs/05-services/hub.md`, "Processor control"). The hub is a stateless control plane:
+`src/control.rs` sends `ServerMessage.control` to every live session of the service whose latest status lists the
+processor, matches each `ClientMessage.control_reply`
 to its request by `control_id` and session, times requests out (`KRAKEN_HUB_CONTROL_TIMEOUT`, 10 s; a reset's execute
 `KRAKEN_HUB_RESET_TIMEOUT`, 120 s), fails them at once when the session leaves, and drops (and counts) replies nobody
 waits for. The state lives in each service's MongoDB (`processor_control`), not in the hub.
 
 | Route under `/api/v1/services/{service}/processors/{processor}/` | Credential | Does |
 |---|---|---|
-| `POST pause`, `POST resume` | write | on every capable instance; 200 with the counts when at least one persisted it |
-| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"offsets":[{"partition":0,"offset":12}]}}` (at most 4 KiB, 1024 offsets) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while an instance reports the processor without the capability |
-| `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the freshest capable instance |
+| `POST pause`, `POST resume` | write | on every instance that reports the processor; 200 with the counts when at least one persisted it |
+| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"offsets":[{"partition":0,"offset":12}]}}` (at most 4 KiB, 1024 offsets) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while this hub runs a reset of the processor |
+| `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the instance with the freshest status |
 | `POST dead-letters/{id}/retry`, `POST dead-letters/retry-all`, `DELETE dead-letters/{id}` | write | the library's retry, retry all and discard |
 
 - **Write credential:** `Authorization: Bearer` with `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` (constant-time against its
   digest) or a static ACL token or JWT whose ACL entry has `control = true`. Neither configured: every write is 403
   `controls are disabled`. The dashboard token never writes; the write token also reads.
 - **Status codes:** 400 bad body, 401 no or an unknown credential, 403 no right or disabled, 404 unknown service or
-  processor, 409 locked, refused or an instance without the capability, 502 an instance failed, 503 no capable
-  instance, 504 timeout. A refused execute is not always "nothing changed": after the reset handlers ran the
+  processor (no instance reports it), 409 locked, refused or a reset already running, 502 an instance failed, 504
+  timeout. A refused execute is not always "nothing changed": after the reset handlers ran the
   instance's message says what changed, and an execute that timed out (504) or whose instance left (502) may still
   finish or may already have run reset handlers or deleted markers (its `error.message` says so). The finish goes out
   once the lease renewals in flight are answered, so a late renewal never re-takes the lock.
@@ -483,9 +475,9 @@ curl -s -X POST -H "Authorization: Bearer $KRAKEN_HUB_DASHBOARD_WRITE_TOKEN" -H 
 
 ## Security
 
-Roadmap P5a, P5b and P5c, decision records: umbrella `docs/adr/0018-hub-access-control.md`,
+Decision records: umbrella `docs/adr/0018-hub-access-control.md`,
 `docs/adr/0019-hub-jwt-authentication.md` and `docs/adr/0020-hub-mutual-tls.md`; operator how-to:
-umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) behaves as before.
+umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) checks nothing.
 
 **Service tokens and the ACL.** With `KRAKEN_HUB_AUTH_MODE=enforce` a service must send a static
 token in `Register.credentials.token`. The ACL file (`KRAKEN_HUB_ACL_FILE`) holds one `[[token]]`
@@ -499,13 +491,13 @@ handle  = ["billing.*"]              # types it may handle: commands, queries, s
 send    = ["orders.*"]               # types it may send, in every request mode
 ```
 
-Patterns are an exact type, `prefix.*` or `*`. `control` is reserved for P6b and `contexts` only
-accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
+Patterns are an exact type, `prefix.*` or `*`. `control = true` lets the entry's credentials call the
+[processor controls](#processor-control); `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
 `printf %s "$TOKEN" | kraken-hub acl hash -` (or `kraken-hub acl hash <token>`).
 
 | Violation | `enforce` | `permissive` |
 |---|---|---|
-| no credentials (a v1 client sends none), unknown token | stream closed with `UNAUTHENTICATED` | logged, counted, allowed |
+| no credentials, unknown token | stream closed with `UNAUTHENTICATED` | logged, counted, allowed |
 | `jwt` credentials with no `KRAKEN_HUB_JWT_ISSUER` | `UNAUTHENTICATED` "jwt credentials are not configured on this hub" | same |
 | an invalid JWT (expired, wrong issuer or audience, bad signature, `none`/`HS*`, an ID or refresh token) | `UNAUTHENTICATED` with a short reason, never the token | logged, counted (`jwt_invalid`), allowed as unauthenticated |
 | a JWT for another service (`azp` differs), or for a service with no `[[service]]` table | `PERMISSION_DENIED` "token azp `<a>` is not service `<b>`" / "no ACL entry for service `<a>`" | logged, counted, allowed |
@@ -517,7 +509,7 @@ accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it 
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
 | the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
 
-A reconnect of the **same** service takes over its instance id as before (also between two ACL
+A reconnect of the **same** service takes over its instance id (also between two ACL
 entries of one service, as in a token rotation). With `off` an instance id may change service.
 
 The ACL reloads when the file changes (5 s poll, or SIGHUP); a file that does not parse keeps the
@@ -531,7 +523,7 @@ then "and N more"), a client-chosen service name or type is cut to 128 character
 messages, and each reason logs at most 10 lines per 10 s, then one notice and, when the next window
 opens, how many lines were dropped. The metric counts every refusal regardless.
 
-**JWT credentials (P5b).** Decision record: umbrella `docs/adr/0019-hub-jwt-authentication.md`. A
+**JWT credentials.** Decision record: umbrella `docs/adr/0019-hub-jwt-authentication.md`. A
 service may register with a Keycloak client-credentials access token in
 `Register.credentials.jwt` instead of a static token. Set `KRAKEN_HUB_JWT_ISSUER` (and an auth
 mode other than `off`); the keys are fetched from `KRAKEN_HUB_JWT_JWKS_URI` in the background, at
@@ -565,7 +557,7 @@ audience mapper and set `KRAKEN_HUB_JWT_AUDIENCE`; a user's access token (`azp` 
 client) must never get a `[[service]]` table. A token is never logged. The gRPC `Topology` call
 in `enforce` also accepts a valid JWT, or a client certificate, of a service that has a table.
 
-**Client certificates (P5c).** Decision record: umbrella `docs/adr/0020-hub-mutual-tls.md`. Set
+**Client certificates.** Decision record: umbrella `docs/adr/0020-hub-mutual-tls.md`. Set
 `KRAKEN_HUB_TLS_CLIENT_CA` (with the gRPC pair) and the gRPC listener asks for client certificates
 (`KRAKEN_HUB_TLS_CLIENT_AUTH`: `optional` by default, `required` to refuse a client without one; a
 certificate that is presented must always verify against the bundle, or the handshake fails). A
@@ -612,7 +604,7 @@ in flight the file on disk is new before the hub has reloaded it (up to one
 local healthcheck can be red for up to one poll. Let the healthcheck's `retries` cover that, and
 rotate the pair by replacing the key and the certificate together. Client certificates: see above.
 
-**Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/topology`, `/api/v1/*`, the event stream
+**Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/api/v1/*`, the event stream
 and the gRPC `Topology` call; the page and its assets stay public. In `enforce` mode the gRPC
 `Topology` call also accepts any ACL token (`authorization: Bearer <token>` metadata) and, with no
 dashboard token set, refuses everything else; the HTTP topology is then still open, and the hub
@@ -626,9 +618,9 @@ poll and the old one stops working at once. Peers
 reads what the dashboard token reads; an ACL entry with `control = true` authorizes them too. Serve the HTTP port over
 TLS when it is set (the hub warns otherwise).
 
-Both libraries send the token (P5a), with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
-`KRAKEN_HUB_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT (P5b), or present a
-client certificate (P5c: Kotlin `kraken.messaging.hub.tls.client-cert-file` and `client-key-file`, Rust
+Both libraries send the token, with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
+`KRAKEN_HUB_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT, or present a
+client certificate (Kotlin `kraken.messaging.hub.tls.client-cert-file` and `client-key-file`, Rust
 `KRAKEN_HUB_TLS_CLIENT_CERT` and `KRAKEN_HUB_TLS_CLIENT_KEY`; they read the files again and roll their
 connections over to a renewed pair without a restart), so `enforce` works with every service that has a
 `[[token]]` entry or a `[[service]]` table; a refused service waits the reconnect backoff cap between
@@ -637,8 +629,8 @@ attempts. The JWT and mTLS sandboxes are the umbrella's `infra/compose.jwt.yaml`
 ## Protocol summary
 
 A service connects with `Hub.Connect`, sends `Register` (service name, instance id, handled
-command and query types; v2 clients add `protocol_version`, `capabilities`, `client_version`
-and optionally `credentials`) and then `Heartbeat` messages. A `Request` (kind, type, id, payload,
+command and query types, `initial_permits`, `client_version` and optionally `credentials`),
+waits for the `RegisterAck` and then sends `Heartbeat` messages. A `Request` (kind, type, id, payload,
 optional `timeout_ms`) is routed to one live instance of the service that owns the type; the
 handler answers with a `Reply` carrying the same id, which the hub relays to the sender. Each
 request id gets exactly one terminal message: a `Reply` or a hub-produced error; a
@@ -651,71 +643,62 @@ Error codes:
 
 - Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, **Builder call:**
   `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
-  `Request.id`), `RESOURCE_EXHAUSTED` (full queue or session buffer; only to senders that
-  share `flow-control`, other senders get `HANDLER_ERROR` `handler busy`; also a subscription
-  refused by `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` or ended by a full
-  `KRAKEN_HUB_SUBSCRIPTION_BUFFER`), `UNSUPPORTED` (a v2 sender using a request mode it did not
-  declare, one this hub does not implement, or a streaming query or subscription whose owners
-  have no instance with the capability) and `CANCELLED` (as `ReplyEnd.error` of a stream that
+  `Request.id`, or a request mode this hub does not know), `RESOURCE_EXHAUSTED` (full queue or
+  session buffer; also a subscription refused by `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` or
+  ended by a full `KRAKEN_HUB_SUBSCRIPTION_BUFFER`), `UNAUTHENTICATED` or `PERMISSION_DENIED` (a
+  request access control refuses, see [Security](#security)) and `CANCELLED` (as `ReplyEnd.error` of a stream that
   outlived `KRAKEN_HUB_MAX_STREAM_DURATION` or a subscription that outlived
   `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`).
 - Handler-produced codes in a `Reply{error}`, a `ReplyPart.error` or a `ReplyEnd.error` are
   forwarded unchanged.
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
-`invalid_request`, `resource_exhausted`, `unsupported` and `cancelled` (a stream or subscription
+`invalid_request`, `resource_exhausted`, `denied` and `cancelled` (a stream or subscription
 the sender cancelled, or one that outlived its max duration); `kraken_hub_requests_total` and
 `kraken_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
 `streaming`, `subscription`), so a gather's or stream's latency (to its `ReplyEnd`) and a
 subscription's (to its initial part) stay apart from the unary latency of the same type.
 **Builder call:** any handler `Reply{error}` counts as
 `handler_error`, whatever its code; a capacity rejection by the hub (full queue or session
-buffer) counts as `resource_exhausted` whichever code the sender got.
+buffer) counts as `resource_exhausted`.
 
 The generated client stubs are built with `build_transport(false)`; Rust clients create the stub
 with `HubClient::new(channel)`.
 
-### Protocol versions
+### Handshake
 
-Decision record: umbrella `docs/adr/0013-hub-protocol-versioning.md`.
-
-| | v1 session (`protocol_version` 0, every client before P0) | v2 session (`protocol_version` >= 2) |
-|---|---|---|
-| `RegisterAck` | never | after every accepted `Register`; the first one is queued before the echo of the heartbeat that follows the `Register` |
-| Heartbeat timeout | `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` (30 s) | `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s), announced with the 3 s interval |
-| Messages and codes | only the v1 set (`Request`, `Reply`, `Error` codes 1-7, `Heartbeat`) | v1 set plus `RegisterAck`; `RESOURCE_EXHAUSTED` with `flow-control`; `UNSUPPORTED`; `ReplyPart` and `ReplyEnd` with `scatter-gather`; those plus `Flow`, `Cancel`, `CANCELLED` and requests with `mode = STREAMING` with `streaming`; the same set and requests with `mode = SUBSCRIPTION` with `subscription` |
-
-- The version, capabilities and client version are read from the first `Register` of a stream; a
-  later `Register` cannot change them. `protocol_version` 1 was never defined and reads as v1;
-  anything above 2 is answered as 2.
-- The ack carries `hub_id`, the negotiated version, the shared capabilities (`flow-control`,
-  `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`, `processors`, `processor-control`), `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`,
-  `context` (`default`) and `type_timeouts_ms` (the overrides). A new client that sees the echo
-  before any ack knows it talks to an older hub and runs in legacy mode.
+- The first `Register` of a stream fixes `client_version`, `credentials`, `initial_permits`,
+  `load_factor` and `tags`; a later `Register` replaces the handled types only. A `Register` with
+  `initial_permits` 0 is closed with `INVALID_ARGUMENT`.
+- Every accepted `Register` is answered with a `RegisterAck`; the ack of the first one is queued
+  before the echo of the heartbeat that follows the `Register`, and a client waits for it to know
+  it is registered (the ack of a later `Register` is dropped, like a heartbeat echo, when the
+  session's outbound buffer is full). It carries `hub_id`, `heartbeat_interval_ms`,
+  `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`, `context` (`default`) and
+  `type_timeouts_ms` (the overrides).
+- A session is evicted after `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s) without a heartbeat; clients
+  heartbeat at the announced interval (3 s).
 - `credentials` (static token or JWT) is checked in `permissive` and `enforce` and ignored in
-  `off`; it is never logged. A client that declared `credentials-refresh` may send
-  `ClientMessage.credentials` to replace its session's credential before a JWT expires
-  ([Security](#security)).
-- `ErrorCode.UNSUPPORTED` (10) answers a request mode the session did not declare or the hub
-  does not implement yet (v2 sessions only; a v1 session gets `INVALID_REQUEST`). `CANCELLED` (9)
-  ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION` (or a subscription that outlived
-  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`). The client-sent `ReplyPart`, `ReplyEnd`, `Flow` and
-  `Cancel` are read from sessions that negotiated `streaming` or `subscription` and ignored
-  from any other.
-- `tests/compat.rs` is the compatibility suite: a raw v1 client gets no ack, only v1 messages and
-  the legacy timeout; a v2 client gets the ack with the configured values before the echo.
+  `off`; it is never logged. A client may send `ClientMessage.credentials` to replace its
+  session's credential before a JWT expires ([Security](#security)).
+- Every message of the protocol is read from every session: `InstanceStatus` (kept, see
+  [Multiple hubs](#multiple-hubs)), `Permits`, the multi-part `ReplyPart`, `ReplyEnd`, `Flow` and
+  `Cancel` (see [Query modes](#query-modes)) and `ControlReply` (see
+  [Processor control](#processor-control)). A request `mode` this file does not define is
+  `INVALID_REQUEST`; `CANCELLED` (9) ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION`
+  (or a subscription that outlived `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`).
 
 ### Flow control
 
 Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
 
-- A v2 session that declares the `flow-control` capability and sends `Register.initial_permits > 0`
-  is **flow-controlled**: the hub forwards it a request only while it has a permit (one per
+- Every session is **flow-controlled** with the `Register.initial_permits` it sent (at least 1):
+  the hub forwards it a request only while it has a permit (one per
   forward) and adds permits on every `Permits{count}` it sends, never beyond its cap. The cap
   starts at `initial_permits`; a `Permits.grant > 0` from the session first raises it to
   `max(cap, grant)` (a grant never lowers it), which is how a multi-hub client moves a departed
-  hub's share to the surviving hubs (umbrella ADR 0016). Every other session (`initial_permits`
-  0, no capability, v1) is unlimited exactly as before P1; it ignores grants. A stream opens its flow state before its session becomes current, so a
+  hub's share to the surviving hubs (umbrella ADR 0016). A stream opens its flow state before its
+  session becomes current, so a
   request for the session always finds it; a request for a session whose flow is gone fails with
   `HANDLER_DISCONNECTED` instead of going out unmetered. Of two concurrent handshakes of one
   instance id the newer stream wins.
@@ -733,8 +716,7 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
 - A full queue (`KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` entries or
   `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), a hub whose queues together hold
   `KRAKEN_HUB_QUEUE_BYTES_TOTAL` bytes, like a full session buffer, answers
-  `RESOURCE_EXHAUSTED` to a sender that shares `flow-control` and `HANDLER_ERROR` `handler busy`
-  to any other sender, so no session gets a code it did not declare.
+  `RESOURCE_EXHAUSTED`.
 - Permits, load factor and tags are read from the first `Register` of a stream.
 
 ### Routing
@@ -746,7 +728,7 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
   the request rather than rerouting it.
 - **Unkeyed commands and all queries** go to the instance with the best tag-match score (number
   of `Register.tags` pairs equal to the sender's), then among those to instances that can take
-  a request now (unlimited, or a permit and an empty queue), then to the least
+  a request now (a permit and an empty queue), then to the least
   `(queued + forwarded) / load_factor`, round-robin among ties.
 - Consequences worth knowing: the ring saturates the load factor (clamped to 8..1024 virtual
   nodes, so 800 and 5000 weigh the same for keys) while the least-loaded choice uses the raw
@@ -763,30 +745,28 @@ umbrella `docs/05-services/hub.md` (Query modes).
   (exclusive `query_types` keep the one-owner rule). A point query on a shared type goes to one
   live instance of any owner: one pool over every owner, then the routing above, with one
   round-robin rotation per type.
-- **Scatter-gather.** A v2 sender that declared `scatter-gather` sends a query with
+- **Scatter-gather.** A sender sends a query with
   `Request.mode = SCATTER_GATHER`. Every live instance of every owner that lists the type (on an
   exclusive type, those instances of its owner; an old instance of a rolling deploy that adds the
-  type is no target) gets an ordinary unary `Request` with id `<id>#<n>`: v1 handlers serve it
-  unchanged, and flow control, queues and priority apply per target. Each answer reaches
+  type is no target) gets an ordinary unary `Request` with id `<id>#<n>`, and flow control,
+  queues and priority apply per target. Each answer reaches
   the sender as a `ReplyPart` (`request_id` = the sender's id, `seq` in send order, responder
   service and instance, payload or error), then one `ReplyEnd{parts, failed, timed_out}` once
   every target answered, `max_results > 0` successful parts arrived, or the deadline passed.
   Answers after the end are dropped. A gather that ends early (`max_results`, the deadline,
-  the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-forwarded target whose session
-  negotiated `streaming` or `subscription` (`max results`, `deadline`, `sender disconnected`);
-  other targets keep working and their late answers are dropped.
-- **Errors:** no live target is an ordinary `NO_HANDLER`; a command is `INVALID_REQUEST`; a v2
-  sender without the capability gets `UNSUPPORTED`; a v1 sender `INVALID_REQUEST`. A target that leaves, also while its request is still queued, is a failed
-  part (`HANDLER_DISCONNECTED`).
+  the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-forwarded target (`max results`,
+  `deadline`, `sender disconnected`); a late answer is dropped.
+- **Errors:** no live target is an ordinary `NO_HANDLER`; a command is `INVALID_REQUEST`. A
+  target that leaves, also while its request is still queued, is a failed part
+  (`HANDLER_DISCONNECTED`).
 - **Accounting:** a scatter-gather is one request in flight, on its edge (latency to the
   `ReplyEnd`, an error when no part succeeded) and in `kraken_hub_requests_total{mode="scatter_gather"}`;
   `kraken_hub_scatter_targets{type}` records its targets.
-- `tests/scatter_gather.rs` drives it over gRPC with raw v2 and v1 clients.
-- **Streaming.** A v2 sender that declared `streaming` sends a query with
+- `tests/scatter_gather.rs` drives it over gRPC with raw clients.
+- **Streaming.** A sender sends a query with
   `Request.mode = STREAMING` (and `initial_credit`, `max_results`, `timeout_ms`). The hub picks
   **one** instance as for a point query (exclusive or shared owner, tags, load, round-robin), but
-  only among the live instances that list the type and negotiated `streaming` themselves
-  (handlers must understand the multi-part messages). That instance gets
+  only among the live instances that list the type. That instance gets
   `Request{id = <id>#1, mode = STREAMING, initial_credit = <credit>}` (the sender's credit, 64
   when it sent 0; `max_results` is the hub's to enforce, the handler gets 0), through flow
   control, queues and priority like any request. The handler answers with
@@ -814,12 +794,10 @@ umbrella `docs/05-services/hub.md` (Query modes).
   shutdown closes every session (as for unary requests). **Builder call:** a unary `Reply` to a
   streaming target is relayed as one part (`seq` 1, as a streaming handler numbers its first
   part) and the end (`Reply{error}` as `ReplyEnd{error}`).
-- **Streaming errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `streaming`
-  `UNSUPPORTED`; a command by request kind `INVALID_REQUEST`; no owner, or no live instance that
-  lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; owners with
-  instances but none that negotiated `streaming` `UNSUPPORTED` (the message names the services
-  and the capability); a duplicate id (`<id>` or `<id>#1`) `INVALID_REQUEST`. The gates apply in
-  that order.
+- **Streaming errors:** a request mode the hub does not know `INVALID_REQUEST`; a command by
+  request kind `INVALID_REQUEST`; no owner, or no live instance that lists the type,
+  `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; a duplicate id (`<id>` or
+  `<id>#1`) `INVALID_REQUEST`. The gates apply in that order.
 - **Streaming accounting:** one request in flight (the sender's `inFlightAsSender`, the
   handler's `inFlightAsHandler`, one handler permit from the forward to the end, released on
   every ending path); one count on its edge with the latency to the end (an error when the end
@@ -830,10 +808,10 @@ umbrella `docs/05-services/hub.md` (Query modes).
   libraries' READMEs: [kraken-messaging, Streaming queries](../kraken-messaging/README.md#streaming-queries)
   (Kotlin) and [kraken-messaging-rs, Streaming queries](../kraken-messaging-rs/README.md#streaming-queries)
   (Rust).
-- **Subscription.** A v2 sender that declared `subscription` sends a query with
+- **Subscription.** A sender sends a query with
   `Request.mode = SUBSCRIPTION` (and `initial_credit`, `max_results`, `timeout_ms`). The targets
-  are **every** live instance of every owner (exclusive or shared) that lists the type and
-  negotiated `subscription` itself, as they are at the open: an instance registering later is
+  are **every** live instance of every owner (exclusive or shared) that lists the type, as they
+  are at the open: an instance registering later is
   not added (updates are delivered at most once; the hub never resubscribes). Each target gets
   `Request{id = <id>#n, mode = SUBSCRIPTION}` (`n` = 1, 2, ... in target order: service, then
   instance id; `initial_credit` and `max_results` 0) **written directly**: a subscription is
@@ -879,11 +857,9 @@ umbrella `docs/05-services/hub.md` (Query modes).
   subscription duration (<d>) exceeded"}` and a `Cancel` with that reason. There is no idle
   timeout: a subscription without updates is a quiet one. The hub's shutdown closes every
   session (as for unary requests).
-- **Subscription errors:** a v1 sender `INVALID_REQUEST`; a v2 sender without `subscription`
-  `UNSUPPORTED`; a command by request kind `INVALID_REQUEST`; no owner, or no live instance that
-  lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; owners with
-  instances but none that negotiated `subscription` `UNSUPPORTED` (the message names the services
-  and the capability); a duplicate id (`<id>`, `<id>#0`, or a pending `<id>#n`) `INVALID_REQUEST`;
+- **Subscription errors:** a command by request kind `INVALID_REQUEST`; no owner, or no live
+  instance that lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; a
+  duplicate id (`<id>`, `<id>#0`, or a pending `<id>#n`) `INVALID_REQUEST`;
   a target already serving `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024) subscriptions
   `RESOURCE_EXHAUSTED`. The gates apply in that order, all before anything is sent. **Builder
   call:** an update target's id is no pending id (it is matched through its subscription), so a
@@ -897,8 +873,8 @@ umbrella `docs/05-services/hub.md` (Query modes).
   and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
   the max duration before the initial part; `kraken_hub_subscription_updates_total{service,type}`
   per update relayed. A subscription that ends after its initial part counts nothing more.
-- `tests/subscription.rs` drives it over gRPC with raw clients. The client libraries declare
-  `subscription` and implement the sender and handler sides; their READMEs:
+- `tests/subscription.rs` drives it over gRPC with raw clients. The client libraries implement
+  the sender and handler sides; their READMEs:
   [kraken-messaging, Subscription queries](../kraken-messaging/README.md#subscription-queries)
   (Kotlin) and [kraken-messaging-rs, Subscription queries](../kraken-messaging-rs/README.md#subscription-queries)
   (Rust).
@@ -912,23 +888,21 @@ With `override` the `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for the request's type:
 | `> 0` | `min(timeout_ms, override or KRAKEN_HUB_MAX_TIMEOUT_MS)` |
 | `0` | `override or KRAKEN_HUB_DEFAULT_TIMEOUT_MS` |
 
-An override thus also moves the clamp for its type, up (long-running commands) or down. v2
-clients send `timeout_ms = 0` unless their caller chose a timeout, so an override applies to them
-without any client change; v1 clients always send a timeout, so for them an override only clamps.
+An override thus also moves the clamp for its type, up (long-running commands) or down. Clients
+send `timeout_ms = 0` unless their caller chose a timeout, so an override applies to them without
+any client change.
 
 ## Routing and limitations
 
 - **Builder call:** routing is per service. The hub routes to any live instance of the owning
   service and assumes all instances of a service handle the same types (Axon-style). During a
-  mixed-version rollout a request may reach an instance that dropped the type; that instance's
+  rolling deploy of a service a request may reach an instance that dropped the type; that instance's
   library answers `NO_HANDLER` and the sender sees a transient error.
 - Single hub instance; no clustering or failover.
 - No authentication or authorization on the gRPC port unless `KRAKEN_HUB_AUTH_MODE` is `permissive`
   or `enforce` (see [Security](#security)).
 - Not durable: registrations, in-flight and queued requests and sessions are in memory only.
   Clients re-register after a reconnect.
-- A scatter-gather cancels only the targets whose session negotiated `streaming` or
-  `subscription`; the others keep working for answers that are dropped.
 - A subscription's targets are fixed at its open: an instance that registers later never
   serves it (updates are at most once), and the hub never resubscribes on its behalf.
 
@@ -936,11 +910,10 @@ without any client change; v1 clients always send a timeout, so for them an over
 
 - **Builder call:** HTTP/2 keepalive PINGs every 10 s, the connection is dropped when a PING is
   not answered within 20 s; TCP keepalive is 30 s. These are constants in `src/lib.rs`.
-- A stream that misses heartbeats for its session's threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT`
-  for v2, `KRAKEN_HUB_LEGACY_HEARTBEAT_TIMEOUT` for v1) is evicted: its session is removed, its
+- A stream that misses heartbeats for `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is evicted: its session is removed, its
   stream task stops at once (even if the client no longer reads), its registration is dropped and
   its in-flight requests fail with `HANDLER_DISCONNECTED`. **Builder call:** the watchdog checks
-  every tenth of the shorter threshold (10 ms to 1 s), so an eviction lands at most about a
+  every tenth of the threshold (10 ms to 1 s), so an eviction lands at most about a
   second after the threshold.
 - A `Register` with an instance id that already has a live stream replaces the old stream (logged
   at `info` as `session replaced by a new stream`); the old stream is closed. Requests forwarded
@@ -1023,7 +996,7 @@ src/lib.rs        crate root, proto module, serve()
 src/main.rs       thin binary: config, telemetry, serve
 src/config.rs     KRAKEN_HUB_* parsing, effective request timeout, per-version heartbeat timeout
 src/context.rs    ContextId (always "default")
-src/protocol.rs   version negotiation, RegisterAck
+src/protocol.rs   the RegisterAck, a Debug for credentials that never prints them
 src/registry.rs   service/type ownership and instance selection
 src/session.rs    per-connection outbound buffers and the latest InstanceStatus (hub ids, processors)
 src/router.rs     request forwarding, flow control, candidate choice, timeouts, reply relay, one terminal message per id
@@ -1035,17 +1008,17 @@ src/cli.rs        --health-check, --topology and `acl hash` modes
 src/auth.rs       auth modes, ACL parsing and lookup, Principal, Register, refresh, expiry and request checks, constant-time compare
 src/jwt.rs        JWT validation and the JWKS cache and fetch (the tests' key and server helpers are src/jwt_test_support.rs)
 src/reload.rs     mtime polling and SIGHUP for the ACL and the TLS pairs
-src/tls.rs        rustls listeners, reloadable certificate, the client CA store (mTLS, P5c)
+src/tls.rs        rustls listeners, reloadable certificate, the client CA store (mTLS)
 src/mtls.rs       the service a client certificate names (kraken://service/<name>), notAfter, fingerprint
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
-src/http.rs       the HTTP port: /topology, /api/v1 (JSON, the summary stream, the processor controls and their write credential), security headers
+src/http.rs       the HTTP port: /api/v1 (JSON, the summary stream, the processor controls and their write credential), security headers
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
-src/processors.rs event processor reports (bounds) and the per-service view of /api/v1/processors (P6a)
-src/control.rs    processor control (P6b): request/reply correlation, pause and resume, the leased reset, dead letters, audit
+src/processors.rs event processor reports (bounds) and the per-service view of /api/v1/processors
+src/control.rs    processor control: request/reply correlation, pause and resume, the leased reset, dead letters, audit
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (compat.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake P6b instance of tests/common/control.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (connect.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake instance of tests/common/control.rs, proto_sync.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
