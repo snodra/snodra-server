@@ -491,35 +491,65 @@ impl Config {
     }
 
     /// Re-reads the token files into the live tokens. A file that cannot be read or holds an
-    /// invalid token keeps the previous token (an error is logged, never the content). Returns
-    /// whether any token changed.
+    /// invalid token keeps the previous token (an error is logged, never the content); so do both
+    /// when the write token would equal the dashboard token. Returns whether any token changed.
     pub fn reload_token_files(&self) -> bool {
+        let read = |var: &str, file: &Option<PathBuf>, slot: &Option<Secret>| {
+            let (Some(file), Some(_)) = (file, slot) else {
+                return None;
+            };
+            match read_token_file(var, file) {
+                Ok(token) => Some((file.clone(), token)),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "{var} reload failed; keeping the previous token");
+                    None
+                }
+            }
+        };
+        let dashboard = read(
+            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            &self.dashboard_token_file,
+            &self.dashboard_token,
+        );
+        let write = read(
+            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+            &self.dashboard_write_token_file,
+            &self.dashboard_write_token,
+        );
+        // The tokens as they would be: equal ones would let the read-only token write.
+        let equal = match (
+            &dashboard,
+            &write,
+            &self.dashboard_token,
+            &self.dashboard_write_token,
+        ) {
+            (Some((_, d)), Some((_, w)), _, _) => d == w,
+            (Some((_, d)), None, _, Some(w)) => w.matches(Some(d)),
+            (None, Some((_, w)), Some(d), _) => d.matches(Some(w)),
+            _ => false,
+        };
+        if equal {
+            tracing::error!("{TOKENS_EQUAL}; keeping the previous tokens");
+            return false;
+        }
         let mut changed = false;
-        for (var, file, slot) in [
+        for (var, new, slot) in [
             (
                 "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
-                &self.dashboard_token_file,
+                dashboard,
                 &self.dashboard_token,
             ),
             (
                 "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
-                &self.dashboard_write_token_file,
+                write,
                 &self.dashboard_write_token,
             ),
         ] {
-            let (Some(file), Some(secret)) = (file, slot) else {
-                continue;
-            };
-            match read_token_file(var, file) {
-                Ok(token) => {
-                    if secret.set(&token) {
-                        tracing::info!(file = %file.display(), "{var} reloaded");
-                        changed = true;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "{var} reload failed; keeping the previous token");
-                }
+            if let (Some((file, token)), Some(secret)) = (new, slot)
+                && secret.set(&token)
+            {
+                tracing::info!(file = %file.display(), "{var} reloaded");
+                changed = true;
             }
         }
         changed
@@ -570,6 +600,9 @@ impl Config {
         }
         if self.heartbeat_interval.is_zero() {
             bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
+        }
+        if self.dashboard_token.is_some() && self.dashboard_token == self.dashboard_write_token {
+            bail!("{TOKENS_EQUAL}");
         }
         if self.tls_handshake_timeout.is_zero() {
             bail!("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT must be positive");
@@ -834,6 +867,9 @@ fn path_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf
         .map(|v| PathBuf::from(v.trim()))
         .filter(|p| !p.as_os_str().is_empty())
 }
+
+/// Why equal dashboard and write tokens are refused (never the value).
+const TOKENS_EQUAL: &str = "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN (or _FILE) equals KRAKEN_HUB_DASHBOARD_TOKEN (or _FILE): the read-only token would pause and reset processors; give the write token its own value";
 
 /// The token in `file`, trimmed (a mounted secret ends with a newline) and checked like the
 /// variable. The error names the variable and the file, never the content.
@@ -1868,6 +1904,58 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(!c.reload_token_files());
         assert!(held.matches(Some("second-token-0123456789abcdef")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_token_equal_to_the_dashboard_token_is_refused_at_start_and_on_a_reload() {
+        let same = "same-token-0123456789abcdef";
+        let dir = scratch(&[
+            ("dash", "same-token-0123456789abcdef\n"),
+            ("write", "write-token-0123456789abcdef\n"),
+        ]);
+        let path = |n: &str| dir.join(n).display().to_string();
+        for vars in [
+            vec![
+                ("KRAKEN_HUB_DASHBOARD_TOKEN", same),
+                ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", same),
+            ],
+            // Through a file on one side: the values are compared, whatever their source.
+            vec![
+                ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
+                ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", same),
+            ],
+        ] {
+            let err = with_env(&vars).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")
+                    && text.contains("KRAKEN_HUB_DASHBOARD_TOKEN "),
+                "{text}"
+            );
+            assert!(!text.contains(same), "never the value: {text}");
+        }
+
+        // A rotation that makes them equal keeps both previous tokens.
+        let c = with_env(&[
+            ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
+            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
+        ])
+        .unwrap();
+        let (read, write) = (
+            c.dashboard_token.clone().unwrap(),
+            c.dashboard_write_token.clone().unwrap(),
+        );
+        std::fs::write(dir.join("write"), "same-token-0123456789abcdef\n").unwrap();
+        assert!(!c.reload_token_files());
+        assert!(write.matches(Some("write-token-0123456789abcdef")));
+        assert!(!write.matches(Some(same)), "the read token never writes");
+        assert!(read.matches(Some(same)));
+        // Both rotated at once, to different values: taken.
+        std::fs::write(dir.join("dash"), "new-read-0123456789abcdef\n").unwrap();
+        assert!(c.reload_token_files());
+        assert!(read.matches(Some("new-read-0123456789abcdef")));
+        assert!(write.matches(Some(same)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
