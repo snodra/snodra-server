@@ -970,8 +970,10 @@ async fn an_acl_credential_controls_only_with_control_set() {
             hash_token("tok-ops-0123456789")
         ),
     );
+    // A dashboard token guards the reads; the controls judge their own credential.
     let (grpc, http) = hub(Config {
         dashboard_write_token: None,
+        dashboard_token: Some(Secret::new(READ)),
         auth_mode: AuthMode::Enforce,
         acl_file: Some(acl),
         ..config()
@@ -996,6 +998,16 @@ async fn an_acl_credential_controls_only_with_control_set() {
     let (code, body) = status(http, "POST", PAUSE, Some("tok-ops-0123456789"), "").await;
     assert_eq!(code, 403, "an entry without control = true");
     assert!(body.contains("may not control"), "{body}");
+    let (code, body) = status(http, "POST", PAUSE, Some(READ), "").await;
+    assert_eq!(code, 403);
+    assert!(body.contains("read-only"), "{body}");
+    // An ACL credential does not read the HTTP API.
+    assert_eq!(
+        status(http, "GET", LETTERS, Some("tok-svc-0123456789"), "")
+            .await
+            .0,
+        401
+    );
     assert_eq!(
         status(http, "POST", PAUSE, Some("tok-unknown-0123456789"), "")
             .await
