@@ -8,6 +8,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod control;
 pub mod edges;
 pub mod http;
 pub mod jwt;

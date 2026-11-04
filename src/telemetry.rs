@@ -200,6 +200,8 @@ pub struct Metrics {
     jwks_fetches: Counter<u64>,
     jwks_keys: Gauge<u64>,
     credentials_refreshes: Counter<u64>,
+    control: Counter<u64>,
+    control_unknown_replies: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -330,6 +332,14 @@ impl Metrics {
                 .u64_counter("kraken_hub_credentials_refreshes_total")
                 .with_description("ClientMessage.credentials refreshes, per result: ok, refused, wrong_service, throttled, unavailable")
                 .build(),
+            control: meter
+                .u64_counter("kraken_hub_control_total")
+                .with_description("Processor control calls of the HTTP API (ADR 0023), per action (pause, resume, reset, dead_letter_list, dead_letter_retry, dead_letter_retry_all, dead_letter_discard) and outcome (ok, bad_request, not_found, conflict, failed, unavailable, timeout, unauthenticated, forbidden, disabled)")
+                .build(),
+            control_unknown_replies: meter
+                .u64_counter("kraken_hub_control_unknown_replies_total")
+                .with_description("ControlReply messages dropped because no request waits for them (unknown id, a reply after the timeout, or from another session than the one asked)")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -343,6 +353,22 @@ impl Metrics {
                 KeyValue::new("service", service.to_string()),
             ],
         );
+    }
+
+    /// One processor control call of the HTTP API (ADR 0023).
+    pub fn control(&self, action: &'static str, outcome: &'static str) {
+        self.control.add(
+            1,
+            &[
+                KeyValue::new("action", action),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
+    /// A `ControlReply` nobody waited for, dropped.
+    pub fn control_unknown_reply(&self) {
+        self.control_unknown_replies.add(1, &[]);
     }
 
     pub fn acl_generation_set(&self, generation: u64) {

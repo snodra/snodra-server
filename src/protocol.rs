@@ -292,7 +292,11 @@ mod tests {
         assert!(ack.capabilities.iter().any(|c| c == "processor-control"));
         // A P6a client never sees it in its ack, so it never answers control.
         let p6a = ["instance-status".to_string(), "processors".to_string()];
-        assert!(shared_capabilities(&p6a).iter().all(|c| c != PROCESSOR_CONTROL));
+        assert!(
+            shared_capabilities(&p6a)
+                .iter()
+                .all(|c| c != PROCESSOR_CONTROL)
+        );
     }
 
     #[test]

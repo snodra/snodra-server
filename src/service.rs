@@ -765,7 +765,16 @@ async fn run_stream(
                     _ => unreachable!("matched above"),
                 }
             }
-            Some(client_message::Message::ControlReply(_)) => {}
+            Some(client_message::Message::ControlReply(reply)) => {
+                // Only a session that negotiated "processor-control" was ever asked (ADR 0023).
+                if !processor_control {
+                    debug!(instance = %instance_id, "ControlReply without the processor-control capability ignored");
+                    continue;
+                }
+                ctx.router
+                    .control()
+                    .on_reply(&ctx.context, &instance_id, token, reply)
+            }
             Some(client_message::Message::Credentials(new)) => {
                 // `off` checks nothing, so there is nothing to refresh.
                 if ctx.auth.mode() == AuthMode::Off {

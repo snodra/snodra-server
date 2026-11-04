@@ -601,7 +601,10 @@ mod tests {
         assert!(kept.replaying);
         assert_eq!(kept.operation_id, "o".repeat(MAX_OPERATION_ID_BYTES - 1));
         assert_eq!(kept.partitions[0].replay_until, 450);
-        assert_eq!(kept.partitions[1].replay_until, 0, "negative reads as not replaying");
+        assert_eq!(
+            kept.partitions[1].replay_until, 0,
+            "negative reads as not replaying"
+        );
         let json = serde_json::to_value(kept).unwrap();
         assert_eq!(json["replaying"], true);
         assert_eq!(json["operationId"], kept.operation_id.as_str());
@@ -626,12 +629,18 @@ mod tests {
             ],
         );
         assert!(a.replaying);
-        assert_eq!(a.operation_id, "op-fresh", "the freshest report that names one");
+        assert_eq!(
+            a.operation_id, "op-fresh",
+            "the freshest report that names one"
+        );
         let quiet = aggregate("default", vec![instance("a", 0, report(Running, &[]))]);
         assert!(!quiet.replaying);
         assert_eq!(quiet.operation_id, "");
         let json = serde_json::to_value(&a).unwrap();
-        assert_eq!((json["replaying"].clone(), json["operationId"].clone()), (true.into(), "op-fresh".into()));
+        assert_eq!(
+            (json["replaying"].clone(), json["operationId"].clone()),
+            (true.into(), "op-fresh".into())
+        );
     }
 
     #[test]

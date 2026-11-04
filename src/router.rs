@@ -54,6 +54,7 @@ use tonic::Status;
 use crate::auth::{AuthMode, Authorizer};
 use crate::config::Config;
 use crate::context::ContextId;
+use crate::control::{Control, Timeouts};
 use crate::edges::EdgeStats;
 use crate::proto::{
     Cancel, ErrorCode, Flow as FlowMsg, Reply, ReplyEnd, ReplyPart, Request, RequestKind,
@@ -555,6 +556,8 @@ pub struct Router {
     auth: Arc<Authorizer>,
     /// `(sender service, type)` statistics for the dashboard; `None` with the dashboard off.
     edges: Option<EdgeStats>,
+    /// Processor control (ADR 0023): its requests in flight end with the sessions they went to.
+    control: Arc<Control>,
 }
 
 pub fn error_message(
@@ -660,9 +663,15 @@ impl Router {
         metrics: Arc<Metrics>,
         auth: Arc<Authorizer>,
     ) -> Arc<Self> {
+        let control = Control::new(
+            Arc::clone(&sessions),
+            Arc::clone(&metrics),
+            Timeouts::from_config(&config),
+        );
         Arc::new(Self {
             registry,
             sessions,
+            control,
             pending: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             queued_bytes: TotalBytes::new(config.queue_bytes_total),
@@ -678,6 +687,11 @@ impl Router {
     /// The edge statistics, `None` when the dashboard is disabled.
     pub fn edges(&self) -> Option<&EdgeStats> {
         self.edges.as_ref()
+    }
+
+    /// The processor control plane (ADR 0023).
+    pub fn control(&self) -> &Arc<Control> {
+        &self.control
     }
 
     /// Counts a request that reached its terminal state on its `(sender service, type)` edge.
@@ -1507,6 +1521,8 @@ impl Router {
     /// HANDLER_DISCONNECTED and drops the pending requests it sent. Entries of a newer session
     /// with the same instance id are untouched.
     pub fn on_disconnect(&self, ctx: &ContextId, instance_id: &str, token: u64) {
+        // Control requests the session was asked fail at once ("instance left").
+        self.control.on_disconnect(ctx, instance_id, token);
         // The flow state goes first: a request routed concurrently then either finds no flow and
         // fails at once, or was assigned before and is among the pending entries collected below.
         let waiting = {

@@ -51,6 +51,8 @@ hyper = { version = "1", default-features = false, features = ["client", "http1"
 http-body-util = "0.1"
 base64 = "0.22"
 x509-parser = { version = "0.18", default-features = false }
+# Control and reset operation ids (ADR 0023).
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.8"

@@ -124,8 +124,10 @@ pub struct Config {
     /// `Authorization: Bearer <token>`. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_TOKEN`,
     /// at least 16 characters. Unrelated to the ACL tokens.
     pub dashboard_token: Option<Secret>,
-    /// Reserved for the processor controls of roadmap P6 (a second, stronger token for mutating
-    /// calls); parsed and kept, nothing reads it yet. `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`.
+    /// The processor controls' token (ADR 0023): the mutating calls under `/api/v1/services/`
+    /// accept it, or an ACL credential whose entry has `control = true`; it also reads everything
+    /// the dashboard token reads. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, at
+    /// least 16 characters.
     pub dashboard_write_token: Option<Secret>,
     /// The files the two tokens above are read from; each is read at startup and again on the
     /// reload poll, and wins over the variable when both are set (like the client libraries'
@@ -162,6 +164,20 @@ pub struct Config {
     /// An extra CA (PEM) trusted for the JWKS fetch, on top of the platform roots.
     /// `KRAKEN_HUB_JWT_JWKS_CA`.
     pub jwt_jwks_ca: Option<PathBuf>,
+    /// How long a control call waits for an instance's answer (pause, resume, the prepare and
+    /// finish of a reset, dead letters; ADR 0023). `KRAKEN_HUB_CONTROL_TIMEOUT`, default 10 s,
+    /// positive.
+    pub control_timeout: Duration,
+    /// How long the instance that executes a reset may take (its reset handlers, the marker
+    /// deletion and the offset commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
+    pub reset_timeout: Duration,
+    /// The lease a reset's prepare asks for: an instance that hears nothing more for this long
+    /// releases the operation lock and consumes again. Not an environment variable: 30 s,
+    /// shortened by tests.
+    pub control_lease: Duration,
+    /// How often a running reset renews the lease; below [`Config::control_lease`]. Not an
+    /// environment variable: 10 s, shortened by tests.
+    pub control_lease_renew: Duration,
     /// At most one key-set fetch per this long is made because a token names an unknown `kid`.
     /// Not an environment variable: 30 s, shortened by tests.
     pub jwks_refetch_interval: Duration,
@@ -221,6 +237,10 @@ impl Default for Config {
             jwt_expiry_grace: Duration::from_secs(30),
             jwks_refresh: Duration::from_secs(300),
             jwt_jwks_ca: None,
+            control_timeout: Duration::from_secs(10),
+            reset_timeout: Duration::from_secs(120),
+            control_lease: Duration::from_secs(30),
+            control_lease_renew: Duration::from_secs(10),
             jwks_refetch_interval: Duration::from_secs(30),
             jwks_fetch_timeout: Duration::from_secs(10),
         }
@@ -389,6 +409,12 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_JWT_EXPIRY_GRACE") {
             c.jwt_expiry_grace = parse_duration(&v).context("KRAKEN_HUB_JWT_EXPIRY_GRACE")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_CONTROL_TIMEOUT") {
+            c.control_timeout = parse_duration(&v).context("KRAKEN_HUB_CONTROL_TIMEOUT")?;
+        }
+        if let Some(v) = var("KRAKEN_HUB_RESET_TIMEOUT") {
+            c.reset_timeout = parse_duration(&v).context("KRAKEN_HUB_RESET_TIMEOUT")?;
+        }
         if let Some(v) = var("KRAKEN_HUB_JWKS_REFRESH") {
             c.jwks_refresh = parse_duration(&v).context("KRAKEN_HUB_JWKS_REFRESH")?;
         }
@@ -551,6 +577,19 @@ impl Config {
         if self.reload_interval.is_zero() {
             bail!("KRAKEN_HUB_RELOAD_INTERVAL must be positive");
         }
+        if self.control_timeout.is_zero() {
+            bail!("KRAKEN_HUB_CONTROL_TIMEOUT must be positive");
+        }
+        if self.reset_timeout.is_zero() {
+            bail!("KRAKEN_HUB_RESET_TIMEOUT must be positive");
+        }
+        if self.control_lease_renew.is_zero() || self.control_lease_renew >= self.control_lease {
+            bail!(
+                "the reset lease renewal ({:?}) must be positive and shorter than the lease ({:?})",
+                self.control_lease_renew,
+                self.control_lease
+            );
+        }
         if self.auth_mode != AuthMode::Off && self.acl_file.is_none() {
             bail!(
                 "KRAKEN_HUB_AUTH_MODE={} needs KRAKEN_HUB_ACL_FILE",
@@ -657,6 +696,12 @@ impl Config {
                 out.push("the dashboard token is set but the HTTP port has no TLS: the token travels in clear text".to_string());
             }
         }
+        if self.dashboard_write_token.is_some()
+            && self.http_tls().is_none()
+            && self.http_listen.is_some_and(open)
+        {
+            out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is set but the HTTP port has no TLS: the token that pauses and resets processors travels in clear text".to_string());
+        }
         if self.jwt_issuer.is_some() && self.auth_mode == AuthMode::Off {
             out.push(
                 "KRAKEN_HUB_JWT_ISSUER is set but KRAKEN_HUB_AUTH_MODE=off: no credentials are checked, JWT or token; set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
@@ -685,9 +730,6 @@ impl Config {
                 "KRAKEN_HUB_TLS_CLIENT_CA is set but KRAKEN_HUB_AUTH_MODE=off: the client certificate is checked in the TLS handshake and authenticates nothing beyond it (no service, no ACL); set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
                     .to_string(),
             );
-        }
-        if self.dashboard_write_token.is_some() {
-            out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is reserved for the processor controls of roadmap P6 and has no effect yet".to_string());
         }
         out
     }
@@ -1841,7 +1883,7 @@ mod tests {
         assert!(err.to_string().contains("at least 16"), "{err:#}");
         assert!(!format!("{err:#}").contains("short\""));
         assert!(with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "has a space in it, 16+")]).is_err());
-        // The write token is parsed and kept; nothing reads it yet.
+        // The write token is parsed and kept like the dashboard token.
         let c = with_env(&[
             ("KRAKEN_HUB_DASHBOARD_TOKEN", token),
             ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", "fedcba9876543210-write"),
@@ -1853,6 +1895,66 @@ mod tests {
                 .matches(Some("fedcba9876543210-write"))
         );
         assert!(with_env(&[]).unwrap().dashboard_token.is_none());
+    }
+
+    #[test]
+    fn the_control_timeouts_parse_and_must_be_positive() {
+        let c = with_env(&[]).unwrap();
+        assert_eq!(
+            (c.control_timeout, c.reset_timeout),
+            (Duration::from_secs(10), Duration::from_secs(120))
+        );
+        assert_eq!(
+            (c.control_lease, c.control_lease_renew),
+            (Duration::from_secs(30), Duration::from_secs(10)),
+            "not variables: the lease the hub asks for and how often it renews it"
+        );
+        let c = with_env(&[
+            ("KRAKEN_HUB_CONTROL_TIMEOUT", "3s"),
+            ("KRAKEN_HUB_RESET_TIMEOUT", "5m"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (c.control_timeout, c.reset_timeout),
+            (Duration::from_secs(3), Duration::from_secs(300))
+        );
+        for var in ["KRAKEN_HUB_CONTROL_TIMEOUT", "KRAKEN_HUB_RESET_TIMEOUT"] {
+            let err = with_env(&[(var, "0")]).unwrap_err();
+            assert!(err.to_string().contains(var), "{err:#}");
+            assert!(with_env(&[(var, "soon")]).is_err());
+        }
+        let renew_too_slow = Config {
+            control_lease_renew: Duration::from_secs(30),
+            ..Config::default()
+        };
+        assert!(
+            renew_too_slow.validate().is_err(),
+            "renewing no faster than the lease"
+        );
+    }
+
+    #[test]
+    fn the_write_token_has_an_effect_and_warns_only_without_tls() {
+        let c =
+            with_env(&[("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", "fedcba9876543210-write")]).unwrap();
+        let w = c.security_warnings();
+        assert!(w.iter().all(|w| !w.contains("no effect")), "{w:?}");
+        assert!(
+            w.iter()
+                .any(|w| w.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN") && w.contains("clear text")),
+            "an open HTTP port without TLS: {w:?}"
+        );
+        let local = Config {
+            http_listen: Some(SocketAddr::from(([127, 0, 0, 1], 7001))),
+            ..c
+        };
+        assert!(
+            local
+                .security_warnings()
+                .iter()
+                .all(|w| !w.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")),
+            "loopback only"
+        );
     }
 
     #[test]
