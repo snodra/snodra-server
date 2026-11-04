@@ -8,6 +8,7 @@ import * as hubs from './hubs.js';
 import { startLive } from './live.js';
 import { showLogin } from './login.js';
 import overview from './pages/overview.js';
+import processors from './pages/processors.js';
 import services from './pages/services.js';
 import settings from './pages/settings.js';
 import types from './pages/types.js';
@@ -29,14 +30,11 @@ const PAGES = [
   overview,
   services,
   types,
+  processors,
   settings,
   upcoming({
-    id: 'processors', title: 'Processors', phase: 6,
-    text: 'Event processors per service: state, partitions with positions and lag, pause, resume and replay.',
-  }),
-  upcoming({
-    id: 'dead-letters', title: 'Dead letters', phase: 6,
-    text: 'Events a handler failed on, parked per key, with retry and delete.',
+    id: 'dead-letters', title: 'Dead letters', phase: '6b',
+    text: 'The letters themselves, parked per key, with retry and discard from the dashboard. Until then the Processors page counts them per processor, and each library\'s DeadLetters admin API lists, retries and discards them.',
   }),
   upcoming({
     id: 'events', title: 'Events', phase: 7,

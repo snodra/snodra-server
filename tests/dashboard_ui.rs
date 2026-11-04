@@ -293,7 +293,8 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
         ("services", "Instances of service-b"),
         ("types", "examples.CountGreetings"),
         ("settings", "KRAKEN_HUB_EDGE_STATS_WINDOW"),
-        ("processors", "Available from phase 6."),
+        ("processors", "No service reports event processors"),
+        ("dead-letters", "Available from phase 6b."),
     ];
     let mut checks = Vec::new();
     for (page, marker) in pages {
@@ -627,6 +628,273 @@ async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
     assert!(!row.contains("not registered"), "{row}");
     assert!(!row.contains("reports no connection"), "{row}");
     let _ = std::fs::remove_dir_all(&profiles);
+}
+
+// ---- processors (ADR 0022) ---------------------------------------------------------------
+
+fn partition(
+    partition: i32,
+    position: i64,
+    committed: i64,
+    hw: i64,
+) -> kraken_hub::proto::PartitionStatus {
+    kraken_hub::proto::PartitionStatus {
+        partition,
+        position,
+        committed,
+        high_watermark: hw,
+        lag: hw - committed,
+    }
+}
+
+fn processor(
+    name: &str,
+    state: kraken_hub::proto::ProcessorState,
+    partitions: Vec<kraken_hub::proto::PartitionStatus>,
+) -> kraken_hub::proto::ProcessorStatus {
+    kraken_hub::proto::ProcessorStatus {
+        name: name.to_string(),
+        group_id: if name == "default" {
+            "service-b".to_string()
+        } else {
+            format!("service-b.{name}")
+        },
+        topic: "kraken.events".to_string(),
+        state: state as i32,
+        partitions,
+        dead_letter_mode: "collection".to_string(),
+        ..Default::default()
+    }
+}
+
+/// Registers `instance_id` of `service` as a P6a client ("instance-status" and "processors") and
+/// waits for the ack.
+async fn register_p6a(grpc: SocketAddr, service: &str, instance_id: &str) -> FakeClient {
+    let mut client = FakeClient::connect(grpc).await;
+    client.instance_id = instance_id.to_string();
+    client
+        .send_raw_register(kraken_hub::proto::Register {
+            service_name: service.to_string(),
+            instance_id: instance_id.to_string(),
+            protocol_version: 2,
+            capabilities: vec!["instance-status".to_string(), "processors".to_string()],
+            ..Default::default()
+        })
+        .await;
+    match client.next().await {
+        Some(Ok(ServerMessage {
+            message: Some(server_message::Message::RegisterAck(_)),
+        })) => {}
+        other => panic!("expected the ack, got {other:?}"),
+    }
+    client
+}
+
+/// The Processors page: one row per (service, processor) with its aggregate, a row opened from
+/// the URL shows every instance's partitions; the Services page counts the processors and shows
+/// the dead letters.
+#[tokio::test]
+async fn the_processors_page_aggregates_and_expands_to_partitions() {
+    use kraken_hub::proto::ProcessorState;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let b1 = register_p6a(grpc, "service-b", "b-1").await;
+    let b2 = register_p6a(grpc, "service-b", "b-2").await;
+    let _a = FakeClient::register(grpc, "service-a", &[], &[]).await;
+    let mut orders = processor(
+        "orders",
+        ProcessorState::ProcessorFailing,
+        vec![partition(1, 10, 8, 20)],
+    );
+    orders.dead_letters = 2;
+    orders.failed_total = 1;
+    orders.last_error = "handler failed: boom".to_string();
+    orders.last_error_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 65_000;
+    b1.status_with_processors(
+        &["hub"],
+        vec![
+            processor(
+                "default",
+                ProcessorState::ProcessorRunning,
+                vec![partition(0, 5, 5, 5)],
+            ),
+            orders,
+        ],
+    )
+    .await;
+    let mut other = processor(
+        "orders",
+        ProcessorState::ProcessorRunning,
+        vec![partition(0, 3, 3, 4)],
+    );
+    other.dead_letters = 2;
+    b2.status_with_processors(&["hub"], vec![other]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _slots = take_stream_slots(http).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-processors-{}", std::process::id()));
+    let (dom, _) = rendered(
+        &browser,
+        http,
+        "processors?open=service-b%2Forders",
+        &profiles.join("processors"),
+    )
+    .await;
+    for marker in [
+        "aria-label=\"Processors\"",
+        "service-b.orders",
+        ">FAILING</span>",
+        ">RUNNING</span>",
+        "handler failed: boom",
+        "Partitions of orders on b-1",
+        "Partitions of orders on b-2",
+        "High watermark",
+        "aria-expanded=\"true\"",
+        "2 processors in 1 service",
+    ] {
+        assert!(
+            dom.contains(marker),
+            "processors: {marker:?} missing in {dom}"
+        );
+    }
+    assert!(
+        !dom.contains("Partitions of default on"),
+        "a closed row shows no partitions"
+    );
+    // The error's age: 65 s before the report, plus however long the page took to load.
+    let error = &dom[dom.find("handler failed: boom").unwrap()..];
+    let error = &error[..error.find("</td>").unwrap()];
+    assert!(
+        error.contains(">1 m ") && error.contains(" s ago<"),
+        "{error}"
+    );
+    // The orders row: 2 instances, 2 partitions, lag 12 + 1, 2 dead letters (the max).
+    let row = &dom[dom.find("service-b.orders").unwrap()..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    for cell in [">2</td>", ">13</td>", ">2 dead letters</span>"] {
+        assert!(row.contains(cell), "{cell:?} missing in {row}");
+    }
+
+    let (dom, _) = rendered(&browser, http, "services", &profiles.join("services")).await;
+    for marker in ["2 processors", "2 dead letters"] {
+        assert!(
+            dom.contains(marker),
+            "services: {marker:?} missing in {dom}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop((b1, b2));
+}
+
+/// Two hubs: one instance reports to both, the report hub-b got later says FAILING, the older one
+/// hub-a holds says STARTING. Hub-a's page merges them: the instance counts once and the fresher
+/// report wins; a second instance only hub-b knows is added.
+#[tokio::test]
+async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
+    use kraken_hub::proto::ProcessorState;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
+    let (grpc_a, http_a, grpc_b, http_b) = (
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+        bind().await.unwrap(),
+    );
+    let (ga, ha, gb, hb) = (
+        grpc_a.local_addr().unwrap(),
+        http_a.local_addr().unwrap(),
+        grpc_b.local_addr().unwrap(),
+        http_b.local_addr().unwrap(),
+    );
+    let peers = vec![format!("http://{ha}"), format!("http://{hb}")];
+    for (id, grpc, http) in [("hub-a", grpc_a, http_a), ("hub-b", grpc_b, http_b)] {
+        let config = Config {
+            hub_id: id.to_string(),
+            peers: peers.clone(),
+            ..config()
+        };
+        tokio::spawn(async move {
+            kraken_hub::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
+                .await
+                .unwrap();
+        });
+    }
+    let on_a = register_p6a(ga, "service-b", "b-both").await;
+    let on_b = register_p6a(gb, "service-b", "b-both").await;
+    let only_b = register_p6a(gb, "service-b", "b-only-on-b").await;
+    on_a.status_with_processors(
+        &["hub-a", "hub-b"],
+        vec![processor(
+            "orders",
+            ProcessorState::ProcessorStarting,
+            vec![],
+        )],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let mut fresh = processor(
+        "orders",
+        ProcessorState::ProcessorFailing,
+        vec![partition(0, 1, 1, 8)],
+    );
+    fresh.last_error = "fresh failure".to_string();
+    on_b.status_with_processors(&["hub-a", "hub-b"], vec![fresh])
+        .await;
+    only_b
+        .status_with_processors(
+            &["hub-a", "hub-b"],
+            vec![processor(
+                "orders",
+                ProcessorState::ProcessorRunning,
+                vec![partition(1, 4, 4, 6)],
+            )],
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _slots = take_stream_slots(ha).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-proc-peers-{}", std::process::id()));
+    let (dom, _) = rendered(
+        &browser,
+        ha,
+        "processors?open=service-b%2Forders",
+        &profiles.join("processors"),
+    )
+    .await;
+    for marker in [
+        "on 2 reachable hubs",
+        ">FAILING</span>",
+        "fresh failure",
+        "Partitions of orders on b-both",
+        "Partitions of orders on b-only-on-b",
+    ] {
+        assert!(dom.contains(marker), "{marker:?} missing in {dom}");
+    }
+    assert!(
+        !dom.contains(">STARTING</span>"),
+        "the older report lost: {dom}"
+    );
+    let row = &dom[dom.find("service-b.orders").unwrap()..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    // 2 instances (b-both once), 2 partitions, lag 7 + 2.
+    for cell in [">2</td>", ">9</td>"] {
+        assert!(row.contains(cell), "{cell:?} missing in {row}");
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop((on_a, on_b, only_b));
 }
 
 #[test]

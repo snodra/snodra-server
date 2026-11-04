@@ -57,6 +57,14 @@ function headers(accept) {
   return h;
 }
 
+/** An Error carrying the HTTP status of the answer (`status`), so a caller can tell a hub that
+ * predates an endpoint (404) from one that failed. */
+function httpError(message, status) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
 function unauthorized(name) {
   for (const fn of listeners) fn();
   return new AuthError(name);
@@ -70,7 +78,7 @@ async function getJson(url, name, { signal, own }) {
     signal,
   });
   if (response.status === 401 && own) throw unauthorized(name);
-  if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+  if (!response.ok) throw httpError(`${name}: HTTP ${response.status}`, response.status);
   return response.json();
 }
 
@@ -81,7 +89,8 @@ export function get(name, { signal } = {}) {
 
 /**
  * GET <origin>/api/v1/<name> on a peer hub; `origin` comes from this hub's KRAKEN_HUB_PEERS
- * (validated at its startup). Throws on an error answer, a network error or a timeout.
+ * (validated at its startup). Throws on an error answer (with its `status`), a network error or
+ * a timeout.
  */
 export async function getFrom(origin, name) {
   const controller = new AbortController();
@@ -89,7 +98,8 @@ export async function getFrom(origin, name) {
   try {
     return await getJson(new URL(`api/v1/${name}`, `${origin}/`), name, { signal: controller.signal, own: false });
   } catch (error) {
-    throw new Error(controller.signal.aborted ? `no answer within ${PEER_TIMEOUT_MS / 1000} s` : error.message);
+    if (controller.signal.aborted) throw new Error(`no answer within ${PEER_TIMEOUT_MS / 1000} s`);
+    throw httpError(error.message, error.status);
   } finally {
     clearTimeout(timer);
   }

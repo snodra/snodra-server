@@ -4,6 +4,7 @@
 import { badge, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
 import * as fmt from '../format.js';
 import { STATUS_STALE_MS } from '../hubs.js';
+import { serviceSummary } from '../processors.js';
 
 function typeLinks(label, names) {
   if (!names.length) return null;
@@ -149,10 +150,20 @@ export default {
         const commands = [...new Set(svc.instances.flatMap((i) => i.commandTypes))].sort();
         const queries = [...new Set(svc.instances.flatMap((i) => i.queryTypes))].sort();
         const handles = commands.length + queries.length;
+        // Event processors the instances report (ADR 0022); nothing for clients before P6a.
+        const processors = serviceSummary(svc.instances);
         return h('section', { class: 'card', 'aria-label': `Service ${svc.serviceName}` },
           h('div', { class: 'card-head' },
             h('h2', null, svc.serviceName),
             h('span', { class: 'meta' }, `${svc.instances.length} instance${svc.instances.length === 1 ? '' : 's'}, handles ${handles} type${handles === 1 ? '' : 's'}`),
+            processors.processors
+              ? h('a', { class: 'chip', href: `#/processors?q=${encodeURIComponent(svc.serviceName)}`, title: 'The event processors of this service' },
+                `${processors.processors} processor${processors.processors === 1 ? '' : 's'}`)
+              : null,
+            processors.deadLetters
+              ? badge('crit', `${processors.deadLetters} dead letter${processors.deadLetters === 1 ? '' : 's'}`,
+                'Letters in the service\'s dead_letters collection, over its processors')
+              : null,
             stale ? badge('warn', `${stale} stale`) : null,
             disagreeing ? badge('crit', `hubs disagree on ${disagreeing}`) : null),
           handles
