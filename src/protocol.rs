@@ -67,6 +67,12 @@ pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
 /// session that shares both.
 pub const PROCESSORS: &str = "processors";
 
+/// Capability of processor control (ADR 0023, P6b): the hub may send the client
+/// `ServerMessage.control` (pause, resume, the steps of a reset, dead-letter calls) and the client
+/// answers each with one `ClientMessage.control_reply`. A session is sent control only for a
+/// processor its latest status lists, so in practice it rides on "processors".
+pub const PROCESSOR_CONTROL: &str = "processor-control";
+
 /// Optional protocol features this hub supports.
 pub const HUB_CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
@@ -76,6 +82,7 @@ pub const HUB_CAPABILITIES: &[&str] = &[
     SUBSCRIPTION,
     CREDENTIALS_REFRESH,
     PROCESSORS,
+    PROCESSOR_CONTROL,
 ];
 
 /// True when the client declared `capability` and this hub supports it.
@@ -262,6 +269,30 @@ mod tests {
         // A client of P5c (no "processors") never sees it in its ack.
         let p5c = ["flow-control".to_string(), "instance-status".to_string()];
         assert!(shared_capabilities(&p5c).iter().all(|c| c != PROCESSORS));
+    }
+
+    #[test]
+    fn processor_control_is_shared_when_declared() {
+        assert_eq!(PROCESSOR_CONTROL, "processor-control");
+        let client = [
+            "processor-control".to_string(),
+            "processors".to_string(),
+            "instance-status".to_string(),
+        ];
+        assert_eq!(
+            shared_capabilities(&client),
+            ["instance-status", "processors", "processor-control"]
+        );
+        assert!(shares(&client, PROCESSOR_CONTROL));
+        let Some(server_message::Message::RegisterAck(ack)) =
+            register_ack(&Config::default(), &ContextId::default(), 2, &client).message
+        else {
+            panic!("not an ack");
+        };
+        assert!(ack.capabilities.iter().any(|c| c == "processor-control"));
+        // A P6a client never sees it in its ack, so it never answers control.
+        let p6a = ["instance-status".to_string(), "processors".to_string()];
+        assert!(shared_capabilities(&p6a).iter().all(|c| c != PROCESSOR_CONTROL));
     }
 
     #[test]

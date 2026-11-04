@@ -1,6 +1,7 @@
 //! Event processors (ADR 0022, roadmap P6a): what each instance reports about its Kafka event
 //! processors in `InstanceStatus.processors` (capability "processors"), bounded as the hub keeps
-//! it, and the per-service view the dashboard and `GET /api/v1/processors` show.
+//! it, and the per-service view the dashboard and `GET /api/v1/processors` show. Since P6b (ADR
+//! 0023) a report also says whether the processor replays and which reset holds its lock.
 //!
 //! The hub only relays and aggregates what the libraries report: it reads no Kafka, keeps no
 //! history and stores nothing beyond the latest report of each live session (in the session's
@@ -29,6 +30,8 @@ pub const MAX_LAST_ERROR_BYTES: usize = 512;
 pub const MAX_EVENT_TYPE_BYTES: usize = 256;
 /// Longest dead-letter mode kept, in bytes (the defined modes are at most 10).
 pub const MAX_MODE_BYTES: usize = 32;
+/// Longest reset operation id kept, in bytes (the hub's are UUIDs, 36).
+pub const MAX_OPERATION_ID_BYTES: usize = 64;
 
 /// `ProcessorState` as the hub shows it (JSON: `"RUNNING"` and so on, without the
 /// `PROCESSOR_` prefix). A number this hub does not know reads as `Unspecified`.
@@ -102,6 +105,8 @@ pub struct PartitionReport {
     pub committed: i64,
     pub high_watermark: i64,
     pub lag: i64,
+    /// The end (exclusive) of the partition's open replay range (ADR 0023); 0 when none.
+    pub replay_until: i64,
 }
 
 /// One processor of one instance as the hub keeps it (`ProcessorStatus`, bounded).
@@ -125,6 +130,10 @@ pub struct ProcessorReport {
     pub event_types: Vec<String>,
     /// `collection`, `topic` or `log` as reported.
     pub dead_letter_mode: String,
+    /// A replay range is open on this instance's partitions (ADR 0023).
+    pub replaying: bool,
+    /// The reset operation holding the processor's lock; empty when none.
+    pub operation_id: String,
 }
 
 /// `s` cut to at most `max` bytes at a UTF-8 character boundary.
@@ -163,6 +172,7 @@ impl ProcessorReport {
                 committed: offset(part.committed),
                 high_watermark: offset(part.high_watermark),
                 lag: offset(part.lag),
+                replay_until: part.replay_until.max(0),
             });
         }
         partitions.sort_by_key(|p| p.partition);
@@ -189,6 +199,8 @@ impl ProcessorReport {
             last_error_at_ms: p.last_error_at_ms.max(0),
             event_types: event_types.into_iter().collect(),
             dead_letter_mode: truncate_utf8(&p.dead_letter_mode, MAX_MODE_BYTES),
+            replaying: p.replaying,
+            operation_id: truncate_utf8(&p.operation_id, MAX_OPERATION_ID_BYTES),
         }
     }
 
@@ -207,6 +219,7 @@ impl ProcessorReport {
                     committed: p.committed,
                     high_watermark: p.high_watermark,
                     lag: p.lag,
+                    replay_until: p.replay_until,
                 })
                 .collect(),
             processed_total: self.processed_total,
@@ -216,6 +229,8 @@ impl ProcessorReport {
             last_error_at_ms: self.last_error_at_ms,
             event_types: self.event_types.clone(),
             dead_letter_mode: self.dead_letter_mode.clone(),
+            replaying: self.replaying,
+            operation_id: self.operation_id.clone(),
         }
     }
 }
@@ -287,6 +302,10 @@ pub struct ProcessorAggregate {
     pub event_types: Vec<String>,
     /// The most recent last error of its instances; `None` when none reported one.
     pub last_error: Option<LastError>,
+    /// Some instance replays (ADR 0023).
+    pub replaying: bool,
+    /// The reset operation of the freshest report that names one; empty when none does.
+    pub operation_id: String,
     /// Sorted by instance id.
     pub instances: Vec<ProcessorInstance>,
 }
@@ -361,6 +380,12 @@ pub fn aggregate(name: &str, mut instances: Vec<ProcessorInstance>) -> Processor
         .iter()
         .flat_map(|i| &i.report.event_types)
         .collect();
+    let operation_id = by_freshness
+        .iter()
+        .map(|i| &i.report.operation_id)
+        .find(|op| !op.is_empty())
+        .cloned()
+        .unwrap_or_default();
     ProcessorAggregate {
         name: name.to_string(),
         group_id: freshest.group_id,
@@ -383,6 +408,8 @@ pub fn aggregate(name: &str, mut instances: Vec<ProcessorInstance>) -> Processor
             .fold(0u64, |a, i| a.saturating_add(i.report.failed_total)),
         event_types: event_types.into_iter().cloned().collect(),
         last_error,
+        replaying: instances.iter().any(|i| i.report.replaying),
+        operation_id,
         instances,
     }
 }
@@ -443,6 +470,7 @@ mod tests {
             committed,
             high_watermark: hw,
             lag,
+            replay_until: 0,
         }
     }
 
@@ -527,14 +555,16 @@ mod tests {
                     position: -1,
                     committed: -1,
                     high_watermark: -1,
-                    lag: -1
+                    lag: -1,
+                    replay_until: 0,
                 },
                 PartitionReport {
                     partition: 2,
                     position: 10,
                     committed: 8,
                     high_watermark: 12,
-                    lag: 4
+                    lag: 4,
+                    replay_until: 0,
                 },
             ],
             "a negative partition and a repeated one dropped, below -1 reads as unknown"
@@ -558,6 +588,53 @@ mod tests {
     }
 
     #[test]
+    fn the_control_fields_are_kept_bounded() {
+        let mut p = status("audit", proto::ProcessorState::ProcessorStopped);
+        p.replaying = true;
+        p.operation_id = format!("{}é", "o".repeat(MAX_OPERATION_ID_BYTES - 1));
+        let mut replaying = part(0, 5, 4, 9, 5);
+        replaying.replay_until = 450;
+        let mut odd = part(1, 1, 1, 1, 0);
+        odd.replay_until = -3;
+        p.partitions = vec![replaying, odd];
+        let kept = &bound(&[p])[0];
+        assert!(kept.replaying);
+        assert_eq!(kept.operation_id, "o".repeat(MAX_OPERATION_ID_BYTES - 1));
+        assert_eq!(kept.partitions[0].replay_until, 450);
+        assert_eq!(kept.partitions[1].replay_until, 0, "negative reads as not replaying");
+        let json = serde_json::to_value(kept).unwrap();
+        assert_eq!(json["replaying"], true);
+        assert_eq!(json["operationId"], kept.operation_id.as_str());
+        assert_eq!(json["partitions"][0]["replayUntil"], 450);
+    }
+
+    #[test]
+    fn a_processor_replays_when_any_instance_does_and_shows_the_freshest_operation() {
+        use ProcessorStateName::{Running, Stopped};
+        let mut old = report(Stopped, &[]);
+        old.operation_id = "op-old".into();
+        let mut fresh = report(Stopped, &[]);
+        fresh.operation_id = "op-fresh".into();
+        let mut replaying = report(Running, &[]);
+        replaying.replaying = true;
+        let a = aggregate(
+            "default",
+            vec![
+                instance("a", 3000, old),
+                instance("b", 100, fresh),
+                instance("c", 50, replaying),
+            ],
+        );
+        assert!(a.replaying);
+        assert_eq!(a.operation_id, "op-fresh", "the freshest report that names one");
+        let quiet = aggregate("default", vec![instance("a", 0, report(Running, &[]))]);
+        assert!(!quiet.replaying);
+        assert_eq!(quiet.operation_id, "");
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!((json["replaying"].clone(), json["operationId"].clone()), (true.into(), "op-fresh".into()));
+    }
+
+    #[test]
     fn proto_round_trip_keeps_a_bounded_report() {
         let mut p = status("orders", proto::ProcessorState::ProcessorFailing);
         p.partitions = vec![part(0, 5, 4, 9, 5), part(1, -1, -1, -1, -1)];
@@ -567,6 +644,9 @@ mod tests {
         p.last_error = "boom".into();
         p.last_error_at_ms = 1234;
         p.event_types = vec!["a.B".into()];
+        p.replaying = true;
+        p.operation_id = "op-1".into();
+        p.partitions[0].replay_until = 9;
         let kept = bound(std::slice::from_ref(&p));
         assert_eq!(kept[0].to_proto(), p);
         assert_eq!(bound(&[kept[0].to_proto()]), kept);
@@ -594,6 +674,7 @@ mod tests {
                     committed: 0,
                     high_watermark: 0,
                     lag: *lag,
+                    replay_until: 0,
                 })
                 .collect(),
             dead_letter_mode: "collection".into(),
@@ -808,6 +889,8 @@ mod tests {
             "eventTypes",
             "lastError",
             "instances",
+            "replaying",
+            "operationId",
         ] {
             assert!(p.get(key).is_some(), "{key} missing in {p}");
         }
@@ -829,12 +912,14 @@ mod tests {
             "groupId",
             "topic",
             "deadLetterMode",
+            "replaying",
+            "operationId",
         ] {
             assert!(i.get(key).is_some(), "{key} missing in {i}");
         }
         assert_eq!(
             i["partitions"][0],
-            serde_json::json!({"partition": 0, "position": 0, "committed": 0, "highWatermark": 0, "lag": 1})
+            serde_json::json!({"partition": 0, "position": 0, "committed": 0, "highWatermark": 0, "lag": 1, "replayUntil": 0})
         );
         assert_eq!(serde_json::from_value::<ProcessorsView>(json).unwrap(), v);
     }

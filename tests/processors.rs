@@ -91,6 +91,7 @@ fn part(partition: i32, position: i64, committed: i64, high_watermark: i64) -> P
         } else {
             high_watermark - position
         },
+        replay_until: 0,
     }
 }
 

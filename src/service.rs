@@ -466,6 +466,9 @@ async fn run_stream(
     let subscription = v2 && protocol::shares(&first.capabilities, protocol::SUBSCRIPTION);
     // And whether its InstanceStatus carries event processors (ADR 0022).
     let processors = v2 && protocol::shares(&first.capabilities, protocol::PROCESSORS);
+    // And whether it answers processor control (ADR 0023).
+    let processor_control =
+        v2 && protocol::shares(&first.capabilities, protocol::PROCESSOR_CONTROL);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -487,6 +490,7 @@ async fn run_stream(
         streaming,
         subscription,
         processors,
+        processor_control,
         principal: principal.clone(),
         auth: admission.status.clone(),
     };
@@ -761,6 +765,7 @@ async fn run_stream(
                     _ => unreachable!("matched above"),
                 }
             }
+            Some(client_message::Message::ControlReply(_)) => {}
             Some(client_message::Message::Credentials(new)) => {
                 // `off` checks nothing, so there is nothing to refresh.
                 if ctx.auth.mode() == AuthMode::Off {

@@ -52,6 +52,10 @@ message ClientMessage {
     // Register's and, for a JWT, moves the session's expiry; a refused refresh closes the stream in
     // enforce. Sent only to a hub whose RegisterAck lists "credentials-refresh".
     Credentials credentials = 11;
+    // Processor control (capability "processor-control", P6b, ADR 0023): the answer to a
+    // ServerMessage.control, matched by control_id. Sent only to a hub whose RegisterAck lists
+    // "processor-control".
+    ControlReply control_reply = 12;
   }
 }
 
@@ -78,6 +82,10 @@ message ServerMessage {
     ReplyEnd end = 7;
     Flow flow = 8;
     Cancel cancel = 9;
+    // Processor control (capability "processor-control", P6b, ADR 0023): the hub asks this
+    // instance to act on one of its event processors. Sent only to a session whose first Register
+    // declared "processor-control"; exactly one ClientMessage.control_reply answers it.
+    ControlRequest control = 10;
   }
 }
 
@@ -114,8 +122,9 @@ message Register {
   // Optional protocol features this client supports; unknown names are ignored by the hub.
   // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED),
   // "instance-status" (ClientMessage.status), "scatter-gather" (Request.mode SCATTER_GATHER,
-  // ReplyPart, ReplyEnd), "credentials-refresh" (ClientMessage.credentials) and "processors"
-  // (InstanceStatus.processors, ADR 0022).
+  // ReplyPart, ReplyEnd), "credentials-refresh" (ClientMessage.credentials), "processors"
+  // (InstanceStatus.processors, ADR 0022) and "processor-control" (ServerMessage.control,
+  // ClientMessage.control_reply, ADR 0023).
   repeated string capabilities = 6;
   // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
@@ -172,7 +181,7 @@ message InstanceStatus {
   // "processors" (an older hub never gets the field). The hub keeps the latest list per session,
   // bounded: at most 32 processors, 1024 partitions and 256 event types each; longer strings are
   // cut at a UTF-8 boundary (name 64 bytes, group_id and topic 256, last_error 512, an event type
-  // 256); the excess is dropped, never an error to the client.
+  // 256, operation_id 64); the excess is dropped, never an error to the client.
   repeated ProcessorStatus processors = 3;
 }
 
@@ -188,9 +197,11 @@ enum ProcessorState {
   PROCESSOR_RUNNING = 2;
   // A record exhausted its attempts in the last 60 s, or the consumer reports an error.
   PROCESSOR_FAILING = 3;
-  // Stopping or stopped (shutdown).
+  // Stopping or stopped (shutdown), or stopped for a reset (P6b, ADR 0023): out of the consumer
+  // group while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
   PROCESSOR_STOPPED = 4;
-  // Allocated to P6b (paused from the hub's control plane). Never sent in P6a.
+  // Paused from the hub's control plane (P6b, ADR 0023): still in the consumer group, consuming
+  // nothing. Allocated in P6a, which never sent it.
   PROCESSOR_PAUSED = 5;
 }
 
@@ -230,6 +241,11 @@ message ProcessorStatus {
   // Where a record goes once its attempts are exhausted: "collection" (the dead_letters
   // collection, the default), "topic" (<topic>.dlt) or "log" (logged and skipped).
   string dead_letter_mode = 12;
+  // A replay range is open on this instance's partitions (P6b, ADR 0023): records below a
+  // partition's replay_until are handled again.
+  bool replaying = 13;
+  // The reset operation holding the processor's lock (P6b, ADR 0023); empty when none.
+  string operation_id = 14;
 }
 
 // One partition assigned to an event processor on one instance (ADR 0022). Offsets are Kafka
@@ -246,6 +262,214 @@ message PartitionStatus {
   // high_watermark - committed (high_watermark - position when committed is -1); -1 when
   // unknown; never negative otherwise.
   int64 lag = 5;
+  // The end (exclusive) of the partition's open replay range (P6b, ADR 0023): its records below
+  // this offset are a replay; 0 when the partition is not replaying.
+  int64 replay_until = 6;
+}
+
+// The hub asks this instance to act on one of its event processors (capability
+// "processor-control", ADR 0023). Exactly one ControlReply with the same control_id answers it;
+// the hub gives up after its control timeout (10 s, reset_execute 120 s) and drops a late reply.
+// An instance handles control requests off its stream's read loop, one at a time per processor,
+// and logs each at INFO.
+message ControlRequest {
+  // Unique per request, chosen by the hub (UUID).
+  string control_id = 1;
+  // The processor's name ("default" included).
+  string processor = 2;
+  oneof action {
+    ProcessorPause pause = 10;
+    ProcessorResume resume = 11;
+    ResetPrepare reset_prepare = 12;
+    ResetExecute reset_execute = 13;
+    ResetFinish reset_finish = 14;
+    DeadLetterList dead_letter_list = 15;
+    DeadLetterRetry dead_letter_retry = 16;
+    DeadLetterRetryAll dead_letter_retry_all = 17;
+    DeadLetterDiscard dead_letter_discard = 18;
+  }
+}
+
+// Persist "paused" in the service's processor_control collection and stop consuming without
+// leaving the consumer group. Answered with ok.
+message ProcessorPause {}
+
+// Persist "not paused" and consume again. Answered with ok.
+message ProcessorResume {}
+
+// Stop consuming (leave the consumer group) and hold the operation lock until lease_ms from now.
+// Re-sent with the same operation_id to renew the lease. Answered with ok once the instance has
+// left the group; LOCKED when another operation holds the lock.
+message ResetPrepare {
+  string operation_id = 1;
+  int64 lease_ms = 2;
+}
+
+// Move the consumer group's committed offsets to the target; sent to one instance that holds
+// operation_id. Answered with reset.
+message ResetExecute {
+  string operation_id = 1;
+  ResetTarget target = 2;
+}
+
+// Release the lock and start consuming again (the operation ended, or was aborted). Answered with
+// ok, also when nothing is held; NOT_PREPARED when another operation is held.
+message ResetFinish {
+  string operation_id = 1;
+  bool aborted = 2;
+}
+
+// Where a reset moves the group's offsets. Anything but latest is a replay of the records between
+// the target and the committed offsets before the reset.
+message ResetTarget {
+  oneof to {
+    // The partitions' low watermarks.
+    bool earliest = 1;
+    // The partitions' high watermarks; never a replay.
+    bool latest = 2;
+    // The first offset at or after this time, epoch milliseconds (the high watermark where no
+    // record is that late).
+    int64 timestamp_ms = 3;
+    // Explicit offsets; a partition not listed keeps its committed offset.
+    PartitionOffsets offsets = 4;
+  }
+}
+
+message PartitionOffsets {
+  repeated PartitionOffset offsets = 1;
+}
+
+message PartitionOffset {
+  int32 partition = 1;
+  int64 offset = 2;
+}
+
+// List the processor's dead letters, oldest first, without payloads or headers.
+message DeadLetterList {
+  // 1..100; the hub clamps.
+  uint32 limit = 1;
+}
+
+message DeadLetterRetry {
+  string letter_id = 1;
+}
+
+message DeadLetterRetryAll {}
+
+message DeadLetterDiscard {
+  string letter_id = 1;
+}
+
+// The answer to a ControlRequest. The hub bounds what it keeps of it as it bounds a status (strings
+// cut at a UTF-8 boundary, at most 100 letters, 1024 ranges).
+message ControlReply {
+  // The ControlRequest.control_id this answers.
+  string control_id = 1;
+  oneof result {
+    // pause, resume, reset_prepare, reset_finish, dead_letter_discard (the letter existed).
+    ControlOk ok = 10;
+    // The instance would not or could not act; nothing changed.
+    ControlRefused refused = 11;
+    // reset_execute succeeded.
+    ResetOutcome reset = 12;
+    // dead_letter_list.
+    DeadLetterPage dead_letters = 13;
+    // dead_letter_retry.
+    DeadLetterRetryOutcome retry = 14;
+    // dead_letter_retry_all.
+    DeadLetterRetryAllOutcome retry_all = 15;
+  }
+}
+
+message ControlOk {
+  // Free text for the operator, at most 512 bytes.
+  string detail = 1;
+}
+
+message ControlRefused {
+  ControlRefusal code = 1;
+  // At most 512 bytes, never a payload.
+  string message = 2;
+}
+
+enum ControlRefusal {
+  // A value this hub does not know reads as this.
+  CONTROL_REFUSAL_UNSPECIFIED = 0;
+  // No such processor on this instance. To a prepare or a finish it means "not involved".
+  CONTROL_REFUSAL_UNKNOWN_PROCESSOR = 1;
+  // Another operation holds the processor's lock (the message names it).
+  CONTROL_REFUSAL_LOCKED = 2;
+  // reset_execute or reset_finish for an operation this instance does not hold.
+  CONTROL_REFUSAL_NOT_PREPARED = 3;
+  // Kafka refused: the consumer group still has members (the message lists their client ids).
+  CONTROL_REFUSAL_GROUP_NOT_EMPTY = 4;
+  // A @ResetHandler threw; nothing changed.
+  CONTROL_REFUSAL_RESET_HANDLER_FAILED = 5;
+  // A bad target, a bad letter id, a dead-letter mode other than "collection", a limit out of
+  // range.
+  CONTROL_REFUSAL_INVALID = 6;
+  // Anything else (a MongoDB or Kafka error); the message says what.
+  CONTROL_REFUSAL_FAILED = 7;
+  // A retry or discard of a letter that does not exist.
+  CONTROL_REFUSAL_NOT_FOUND = 8;
+}
+
+message ResetOutcome {
+  // One per partition that replays; empty for "latest".
+  repeated ReplayRange ranges = 1;
+  uint64 markers_deleted = 2;
+  // How many @ResetHandler ran.
+  uint32 reset_handlers = 3;
+}
+
+// Records of `partition` with from <= offset < until are a replay.
+message ReplayRange {
+  int32 partition = 1;
+  int64 from = 2;
+  int64 until = 3;
+}
+
+message DeadLetterPage {
+  // At most DeadLetterList.limit letters, oldest first.
+  repeated DeadLetterSummary letters = 1;
+  // Every letter of the processor.
+  uint64 total = 2;
+}
+
+// One dead letter without its payload or headers (ADR 0022).
+message DeadLetterSummary {
+  string id = 1;
+  string processor = 2;
+  string topic = 3;
+  int32 partition = 4;
+  int64 offset = 5;
+  string key = 6;
+  string event_id = 7;
+  string event_type = 8;
+  // HANDLER_FAILED, SEQUENCED or INVALID.
+  string reason = 9;
+  string error_type = 10;
+  // At most 512 bytes.
+  string error_message = 11;
+  // SEQUENCED: the id of the letter of the same key this one waits behind.
+  string blocked_by = 12;
+  uint32 attempts = 13;
+  int64 parked_at_ms = 14;
+  int64 last_attempt_at_ms = 15;
+}
+
+message DeadLetterRetryOutcome {
+  // Retried, Duplicate, Failed, Blocked, NotRetriable or NotFound.
+  string result = 1;
+  // Failed: the error (at most 512 bytes); Blocked: the head letter's id.
+  string detail = 2;
+}
+
+message DeadLetterRetryAllOutcome {
+  uint64 retried = 1;
+  uint64 failed = 2;
+  uint64 blocked = 3;
+  uint64 skipped = 4;
 }
 
 // How a client authenticates itself to the hub. Carried on Register (ADR 0018) and on

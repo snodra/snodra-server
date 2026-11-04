@@ -191,6 +191,20 @@ fn partition_ranges(partitions: &[i32]) -> String {
 /// Longest last error the table shows, in characters; longer ones end with `...`.
 const LAST_ERROR_CHARS: usize = 60;
 
+/// The state of a processor as the table shows it: the state, then `replaying` while a replay
+/// range is open and `op <first 8>` of the reset holding its lock (ADR 0023).
+fn state_cell(p: &crate::processors::ProcessorReport) -> String {
+    let mut cell = p.state.as_str().to_string();
+    if p.replaying {
+        cell.push_str(" replaying");
+    }
+    if !p.operation_id.is_empty() {
+        cell.push_str(" op ");
+        cell.extend(p.operation_id.chars().take(8));
+    }
+    cell
+}
+
 /// One row per (processor, instance) of a service whose instances report processors (ADR
 /// 0022), sorted by processor name, then instance id.
 fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String>> {
@@ -239,7 +253,7 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
                 vec![
                     p.name.clone(),
                     i.instance_id.clone(),
-                    p.state.as_str().to_string(),
+                    state_cell(p),
                     p.group_id.clone(),
                     p.topic.clone(),
                     partition_ranges(&partitions),
@@ -627,6 +641,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
                     committed: 0,
                     high_watermark: 0,
                     lag: *lag,
+                    replay_until: 0,
                 })
                 .collect::<Vec<_>>()
         };
@@ -685,6 +700,41 @@ orphaned types:
 totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
 ";
         assert_eq!(render_table(&t), want);
+    }
+
+    #[test]
+    fn the_state_cell_shows_a_replay_and_the_reset_holding_the_lock() {
+        use crate::processors::{ProcessorReport, ProcessorStateName};
+        let report = |name: &str, state, replaying, op: &str| ProcessorReport {
+            name: name.into(),
+            state,
+            replaying,
+            operation_id: op.into(),
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        };
+        let mut t = fixture();
+        t.services[0].instances[0].processors = vec![
+            report("audit", ProcessorStateName::Paused, false, ""),
+            report(
+                "orders",
+                ProcessorStateName::Stopped,
+                false,
+                "0f3c9a1e-7d2b-4c1a-9e8f-5a6b7c8d9e0f",
+            ),
+            report("default", ProcessorStateName::Running, true, ""),
+        ];
+        let table = render_table(&t);
+        let row = |name: &str| {
+            table
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing in {table}"))
+                .to_string()
+        };
+        assert!(row("audit").contains("| PAUSED "), "{table}");
+        assert!(row("orders").contains("| STOPPED op 0f3c9a1e "), "{table}");
+        assert!(row("default").contains("| RUNNING replaying "), "{table}");
     }
 
     #[test]

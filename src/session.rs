@@ -123,6 +123,9 @@ pub struct SessionMeta {
     /// The session is v2 and shares the "processors" capability: the `processors` of its
     /// `InstanceStatus` reports are kept (ADR 0022). Needs `instance_status` too.
     pub processors: bool,
+    /// The session is v2 and shares the "processor-control" capability: the hub may send it
+    /// `ServerMessage.control` and reads its `ControlReply` (ADR 0023).
+    pub processor_control: bool,
     /// Who the session's credentials speak for, when their ACL entry existed (ADR 0018, 0019);
     /// every later request is judged against the current ACL entry this names.
     pub principal: Option<Arc<Principal>>,
@@ -146,6 +149,7 @@ impl SessionMeta {
             streaming: false,
             subscription: false,
             processors: false,
+            processor_control: false,
             principal: None,
             auth: AuthStatus::Off,
         }
@@ -214,6 +218,19 @@ pub struct SessionDetail {
     pub auth: AuthStatus,
     /// Who its credentials speak for: the kind and, for a JWT, the expiry the topology shows.
     pub principal: Option<Arc<Principal>>,
+}
+
+/// A session whose latest status lists an event processor: where a control request for it can go
+/// (ADR 0023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessorHolder {
+    pub context: ContextId,
+    pub instance_id: InstanceId,
+    pub token: u64,
+    /// The session shares "processor-control"; one that does not is never sent a request.
+    pub capable: bool,
+    /// When the hub received the status that lists the processor.
+    pub reported_at: Instant,
 }
 
 /// What the ACL check of a reload needs to know about a session.
@@ -654,6 +671,36 @@ impl Sessions {
             .collect()
     }
 
+    /// The sessions of `service` in `ctx` whose latest status lists `processor`; `None` when the
+    /// service has no session at all.
+    pub fn processor_holders(
+        &self,
+        ctx: &ContextId,
+        service: &str,
+        processor: &str,
+    ) -> Option<Vec<ProcessorHolder>> {
+        let inner = self.inner.lock().unwrap();
+        let mut known = false;
+        let mut holders = Vec::new();
+        for (id, s) in inner.iter() {
+            if s.context != *ctx || s.service != service {
+                continue;
+            }
+            known = true;
+            let Some(status) = &s.status else { continue };
+            if status.processors.iter().any(|p| p.name == processor) {
+                holders.push(ProcessorHolder {
+                    context: s.context.clone(),
+                    instance_id: id.clone(),
+                    token: s.token,
+                    capable: s.meta.processor_control,
+                    reported_at: status.at,
+                });
+            }
+        }
+        known.then_some(holders)
+    }
+
     pub fn count_by_service(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
         for s in self.inner.lock().unwrap().values() {
@@ -1010,6 +1057,44 @@ mod tests {
         let only = sessions.insert(&D, "only", "svc", only, tx, CancellationToken::new());
         assert!(!sessions.set_status(&D, "only", only, &report, Instant::now()));
         assert_eq!(status_of(&sessions, "only"), None);
+    }
+
+    #[test]
+    fn the_holders_of_a_processor_are_the_sessions_whose_latest_status_lists_it() {
+        let sessions = Sessions::new();
+        let mut rxs = Vec::new();
+        let mut insert = |id: &str, service: &str, capable: bool, names: &[&str]| {
+            let (tx, rx) = mpsc::channel(1);
+            rxs.push(rx);
+            let meta = SessionMeta {
+                processors: true,
+                processor_control: capable,
+                ..with_status_capability()
+            };
+            let token = sessions.insert(&D, id, service, meta, tx, CancellationToken::new());
+            let mut report = status(&["h1"], 0);
+            report.processors = names.iter().map(|n| processor(n)).collect();
+            assert!(sessions.set_status(&D, id, token, &report, Instant::now()));
+            token
+        };
+        let a = insert("a", "svc", true, &["audit", "default"]);
+        insert("b", "svc", false, &["audit"]);
+        insert("c", "svc", true, &["default"]);
+        insert("d", "other", true, &["audit"]);
+        let mut holders = sessions.processor_holders(&D, "svc", "audit").unwrap();
+        holders.sort_by(|x, y| x.instance_id.cmp(&y.instance_id));
+        let seen: Vec<(&str, bool)> = holders
+            .iter()
+            .map(|h| (h.instance_id.as_str(), h.capable))
+            .collect();
+        assert_eq!(seen, [("a", true), ("b", false)]);
+        assert_eq!(holders[0].token, a);
+        assert_eq!(
+            sessions.processor_holders(&D, "svc", "orders"),
+            Some(vec![]),
+            "a known service, an unknown processor"
+        );
+        assert_eq!(sessions.processor_holders(&D, "ghost", "audit"), None);
     }
 
     #[test]

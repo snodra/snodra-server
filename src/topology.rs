@@ -759,6 +759,7 @@ mod tests {
                     committed: 5,
                     high_watermark: 9,
                     lag: 4,
+                    replay_until: 8,
                 }],
                 processed_total: 6,
                 failed_total: 1,
@@ -767,6 +768,8 @@ mod tests {
                 last_error_at_ms: 42,
                 event_types: vec!["a.Happened".into()],
                 dead_letter_mode: "collection".into(),
+                replaying: true,
+                operation_id: "op-1".into(),
             }],
         };
         assert!(
@@ -809,6 +812,10 @@ mod tests {
         assert_eq!(reported["partitions"][0]["highWatermark"], 9);
         assert_eq!(reported["lastErrorAtMs"], 42);
         assert_eq!(reported["deadLetterMode"], "collection");
+        // The control plane's fields (ADR 0023) ride along.
+        assert_eq!(reported["replaying"], true);
+        assert_eq!(reported["operationId"], "op-1");
+        assert_eq!(reported["partitions"][0]["replayUntil"], 8);
         assert_eq!(
             json["services"][0]["instances"][1]["processors"],
             serde_json::json!([])

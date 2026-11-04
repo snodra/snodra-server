@@ -644,6 +644,7 @@ fn partition(
         committed,
         high_watermark: hw,
         lag: hw - committed,
+        replay_until: 0,
     }
 }
 

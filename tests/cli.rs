@@ -71,6 +71,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
                 committed: 4,
                 high_watermark: 6,
                 lag: 2,
+                replay_until: 0,
             }],
             dead_letter_mode: "collection".to_string(),
             ..Default::default()
