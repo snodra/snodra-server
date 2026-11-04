@@ -40,6 +40,66 @@ async fn topology_probe_against_test_hub() {
     assert!(kraken_hub::cli::render_table(&topology).contains("service billing (1 instances)"));
 }
 
+/// The probe reads the processors over gRPC (`InstanceTopology.processors`, ADR 0022) and the
+/// table shows them under their service.
+#[tokio::test]
+async fn topology_probe_shows_the_processors_an_instance_reports() {
+    use kraken_hub::proto::{PartitionStatus, ProcessorState, ProcessorStatus};
+    let addr = start_hub(Config {
+        otlp_endpoint: None,
+        ..Config::default()
+    })
+    .await;
+    let mut c = FakeClient::register_v2_with(
+        addr,
+        "billing",
+        &["Pay"],
+        &["instance-status", "processors"],
+    )
+    .await;
+    let _ack = c.next().await;
+    c.status_with_processors(
+        &["hub"],
+        vec![ProcessorStatus {
+            name: "invoices".to_string(),
+            group_id: "billing.invoices".to_string(),
+            topic: "kraken.events".to_string(),
+            state: ProcessorState::ProcessorRunning as i32,
+            partitions: vec![PartitionStatus {
+                partition: 0,
+                position: 4,
+                committed: 4,
+                high_watermark: 6,
+                lag: 2,
+            }],
+            dead_letter_mode: "collection".to_string(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    let topology = tokio::time::timeout(BOUND, async {
+        loop {
+            let t = kraken_hub::topology_probe(addr).await.unwrap();
+            if t.services
+                .first()
+                .is_some_and(|s| !s.instances[0].processors.is_empty())
+            {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("processors never appeared in topology");
+    let text = kraken_hub::cli::render_table(&topology);
+    assert!(text.contains("processor | instance"), "{text}");
+    assert!(
+        text.contains("invoices  | ")
+            && text.contains("| RUNNING | billing.invoices | kraken.events | 0          | 2 "),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn acl_hash_prints_the_digest_and_never_the_token() {
     use tokio::io::AsyncWriteExt;

@@ -61,7 +61,13 @@ pub const SUBSCRIPTION: &str = "subscription";
 /// to replace its session's credential before it expires.
 pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
 
-/// Optional protocol features this hub supports. A later phase adds `processors`.
+/// Capability of event processor status (ADR 0022, P6a): the client reports its Kafka event
+/// processors in `InstanceStatus.processors`, and the hub shows the latest report in the
+/// topology and the processors view. Rides on "instance-status": a report is kept only for a
+/// session that shares both.
+pub const PROCESSORS: &str = "processors";
+
+/// Optional protocol features this hub supports.
 pub const HUB_CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
     INSTANCE_STATUS,
@@ -69,6 +75,7 @@ pub const HUB_CAPABILITIES: &[&str] = &[
     STREAMING,
     SUBSCRIPTION,
     CREDENTIALS_REFRESH,
+    PROCESSORS,
 ];
 
 /// True when the client declared `capability` and this hub supports it.
@@ -234,6 +241,27 @@ mod tests {
             panic!("an ack")
         };
         assert!(ack.capabilities.iter().any(|c| c == "credentials-refresh"));
+    }
+
+    #[test]
+    fn processors_is_shared_when_declared() {
+        assert_eq!(PROCESSORS, "processors");
+        let client = ["processors".to_string(), "instance-status".to_string()];
+        assert_eq!(
+            shared_capabilities(&client),
+            ["instance-status", "processors"]
+        );
+        assert!(shares(&client, PROCESSORS));
+        assert!(!shares(&["instance-status".to_string()], PROCESSORS));
+        let Some(server_message::Message::RegisterAck(ack)) =
+            register_ack(&Config::default(), &ContextId::default(), 2, &client).message
+        else {
+            panic!("not an ack");
+        };
+        assert!(ack.capabilities.iter().any(|c| c == "processors"));
+        // A client of P5c (no "processors") never sees it in its ack.
+        let p5c = ["flow-control".to_string(), "instance-status".to_string()];
+        assert!(shared_capabilities(&p5c).iter().all(|c| c != PROCESSORS));
     }
 
     #[test]

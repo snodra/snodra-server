@@ -12,6 +12,7 @@ pub mod edges;
 pub mod http;
 pub mod jwt;
 pub mod mtls;
+pub mod processors;
 pub mod protocol;
 pub mod queue;
 pub mod registry;

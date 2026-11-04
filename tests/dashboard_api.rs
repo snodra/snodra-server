@@ -294,7 +294,8 @@ async fn types_topology_settings_and_version_have_their_shape() {
             "scatter-gather",
             "streaming",
             "subscription",
-            "credentials-refresh"
+            "credentials-refresh",
+            "processors"
         ])
     );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));
@@ -431,6 +432,7 @@ async fn a_disabled_dashboard_is_404_and_topology_stays() {
         "/api/v1/settings",
         "/api/v1/version",
         "/api/v1/stream",
+        "/api/v1/processors",
     ] {
         assert_eq!(http_get(http, path).await.0, 404, "{path}");
     }

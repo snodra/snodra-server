@@ -1,4 +1,5 @@
-//! Command-line modes of the binary: argument parsing and the `--topology` table renderer.
+//! Command-line modes of the binary: argument parsing and the `--topology` table renderer (with
+//! each service's event processors since P6a, ADR 0022).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -163,6 +164,98 @@ fn instance_row(i: &InstanceTopology, now_ms: i64) -> Vec<String> {
     ]
 }
 
+/// Partition numbers (sorted) with runs collapsed: `0-2,5,7-8`; `-` when none.
+fn partition_ranges(partitions: &[i32]) -> String {
+    let mut runs: Vec<(i32, i32)> = Vec::new();
+    for &p in partitions {
+        match runs.last_mut() {
+            Some((_, end)) if p == end.saturating_add(1) => *end = p,
+            _ => runs.push((p, p)),
+        }
+    }
+    if runs.is_empty() {
+        return "-".into();
+    }
+    runs.iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Longest last error the table shows, in characters; longer ones end with `...`.
+const LAST_ERROR_CHARS: usize = 60;
+
+/// One row per (processor, instance) of a service whose instances report processors (ADR
+/// 0022), sorted by processor name, then instance id.
+fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String>> {
+    let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
+    for i in instances {
+        for p in &i.processors {
+            let known: Vec<i64> = p
+                .partitions
+                .iter()
+                .map(|x| x.lag)
+                .filter(|l| *l >= 0)
+                .collect();
+            let lag = if known.is_empty() {
+                "-".to_string()
+            } else {
+                known
+                    .iter()
+                    .fold(0i64, |a, l| a.saturating_add(*l))
+                    .to_string()
+            };
+            let dead_letters =
+                if p.dead_letter_mode == "collection" || p.dead_letter_mode.is_empty() {
+                    p.dead_letters.to_string()
+                } else {
+                    format!("({})", p.dead_letter_mode)
+                };
+            let last_error = if p.last_error.is_empty() {
+                "-".to_string()
+            } else {
+                let mut text: String = p.last_error.chars().take(LAST_ERROR_CHARS).collect();
+                if p.last_error.chars().count() > LAST_ERROR_CHARS {
+                    text.push_str("...");
+                }
+                if p.last_error_at_ms > 0 {
+                    text.push_str(&format!(
+                        " ({} ago)",
+                        fmt_duration_ms(now_ms - p.last_error_at_ms)
+                    ));
+                }
+                text
+            };
+            let partitions: Vec<i32> = p.partitions.iter().map(|x| x.partition).collect();
+            rows.push((
+                p.name.clone(),
+                i.instance_id.clone(),
+                vec![
+                    p.name.clone(),
+                    i.instance_id.clone(),
+                    p.state.as_str().to_string(),
+                    p.group_id.clone(),
+                    p.topic.clone(),
+                    partition_ranges(&partitions),
+                    lag,
+                    p.processed_total.to_string(),
+                    p.failed_total.to_string(),
+                    dead_letters,
+                    last_error,
+                ],
+            ));
+        }
+    }
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows.into_iter().map(|(_, _, row)| row).collect()
+}
+
 /// Human-readable topology. Every duration derives from `t.now_ms`, never the local clock.
 pub fn render_table(t: &Topology) -> String {
     let mut out = String::new();
@@ -190,6 +283,28 @@ pub fn render_table(t: &Topology) -> String {
         ];
         rows.extend(service.instances.iter().map(|i| instance_row(i, t.now_ms)));
         out.push_str(&table(&rows));
+        let processors = processor_rows(&service.instances, t.now_ms);
+        if !processors.is_empty() {
+            let mut rows = vec![
+                [
+                    "processor",
+                    "instance",
+                    "state",
+                    "group",
+                    "topic",
+                    "partitions",
+                    "lag",
+                    "processed",
+                    "failed",
+                    "dead letters",
+                    "last error",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ];
+            rows.extend(processors);
+            out.push_str(&table(&rows));
+        }
         out.push('\n');
     }
     let orphans: Vec<_> = t.types.iter().filter(|ty| ty.orphaned).collect();
@@ -409,6 +524,7 @@ mod tests {
             auth_kind: None,
             expires_at: None,
             cert_fingerprint: None,
+            processors: vec![],
         }
     }
 
@@ -498,6 +614,84 @@ orphaned types:
 totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
 ";
         assert_eq!(render_table(&fixture()), want);
+    }
+
+    #[test]
+    fn render_table_lists_the_processors_of_a_service_that_reports_them() {
+        use crate::processors::{PartitionReport, ProcessorReport, ProcessorStateName};
+        let parts = |list: &[(i32, i64)]| {
+            list.iter()
+                .map(|(p, lag)| PartitionReport {
+                    partition: *p,
+                    position: 0,
+                    committed: 0,
+                    high_watermark: 0,
+                    lag: *lag,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut t = fixture();
+        t.services[0].instances[0].processors = vec![
+            ProcessorReport {
+                name: "default".into(),
+                group_id: "billing".into(),
+                topic: "kraken.events".into(),
+                state: ProcessorStateName::Running,
+                partitions: parts(&[(0, 2), (1, -1), (2, 10), (5, 0)]),
+                processed_total: 120,
+                dead_letters: 3,
+                dead_letter_mode: "collection".into(),
+                ..Default::default()
+            },
+            ProcessorReport {
+                name: "invoices".into(),
+                group_id: "billing.invoices".into(),
+                topic: "kraken.events".into(),
+                state: ProcessorStateName::Failing,
+                partitions: parts(&[(3, -1)]),
+                processed_total: 7,
+                failed_total: 2,
+                last_error: format!("handler failed: {}", "x".repeat(80)),
+                last_error_at_ms: 200_000_000 - 125_000,
+                dead_letter_mode: "topic".into(),
+                ..Default::default()
+            },
+        ];
+        t.services[0].instances[1].processors = vec![ProcessorReport {
+            name: "default".into(),
+            group_id: "billing".into(),
+            topic: "kraken.events".into(),
+            state: ProcessorStateName::Starting,
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        }];
+        let want = "\
+service billing (2 instances)
+  instance | connected for | heartbeat age | stale | in-flight h/s | commands   | queries
+  b-1      | 1h05m         | 800ms         | false | 0/1           | Pay,Refund | GetInvoice
+  b-2      | 3m05s         | 45s           | true  | 2/0           | -          | -
+  processor | instance | state    | group            | topic         | partitions | lag | processed | failed | dead letters | last error
+  default   | b-1      | RUNNING  | billing          | kraken.events | 0-2,5      | 12  | 120       | 0      | 3            | -
+  default   | b-2      | STARTING | billing          | kraken.events | -          | -   | 0         | 0      | 0            | -
+  invoices  | b-1      | FAILING  | billing.invoices | kraken.events | 3          | -   | 7         | 2      | (topic)      | handler failed: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (2m05s ago)
+
+service catalog (1 instances)
+  instance | connected for | heartbeat age | stale | in-flight h/s | commands | queries
+  c-1      | 2d03h         | 1s            | false | 0/0           | -        | Find
+
+orphaned types:
+  Archive COMMAND owner=legacy for 2m05s
+
+totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
+";
+        assert_eq!(render_table(&t), want);
+    }
+
+    #[test]
+    fn partition_lists_collapse_runs() {
+        assert_eq!(partition_ranges(&[]), "-");
+        assert_eq!(partition_ranges(&[4]), "4");
+        assert_eq!(partition_ranges(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
     }
 
     #[test]

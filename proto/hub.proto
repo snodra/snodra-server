@@ -114,7 +114,8 @@ message Register {
   // Optional protocol features this client supports; unknown names are ignored by the hub.
   // Defined: "flow-control" (Permits, Register.initial_permits, RESOURCE_EXHAUSTED),
   // "instance-status" (ClientMessage.status), "scatter-gather" (Request.mode SCATTER_GATHER,
-  // ReplyPart, ReplyEnd) and "credentials-refresh" (ClientMessage.credentials).
+  // ReplyPart, ReplyEnd), "credentials-refresh" (ClientMessage.credentials) and "processors"
+  // (InstanceStatus.processors, ADR 0022).
   repeated string capabilities = 6;
   // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
@@ -166,8 +167,85 @@ message InstanceStatus {
   repeated string connected_hub_ids = 1;
   // Handlers of this instance running now, over all its hubs.
   uint32 handlers_in_flight = 2;
-  // Field 3 is allocated to a later roadmap phase (event processor status).
-  reserved 3;
+  // Event processors (capability "processors", ADR 0022): one entry per Kafka event processor
+  // this instance started, as of this report. Sent only to a hub whose RegisterAck lists
+  // "processors" (an older hub never gets the field). The hub keeps the latest list per session,
+  // bounded: at most 32 processors, 1024 partitions and 256 event types each; longer strings are
+  // cut at a UTF-8 boundary (name 64 bytes, group_id and topic 256, last_error 512, an event type
+  // 256); the excess is dropped, never an error to the client.
+  repeated ProcessorStatus processors = 3;
+}
+
+// The state of one event processor on one instance (ADR 0022). When the hub aggregates a
+// processor over its instances it shows the worst state, ranked FAILING, unknown (UNSPECIFIED or
+// a value it does not know), STARTING, PAUSED, STOPPED, RUNNING.
+enum ProcessorState {
+  // Never sent on purpose; a value this hub does not know reads as this.
+  PROCESSOR_STATE_UNSPECIFIED = 0;
+  // Started, but no partition is assigned to it yet, or a rebalance is in progress.
+  PROCESSOR_STARTING = 1;
+  // Partitions assigned and records flowing (or none waiting).
+  PROCESSOR_RUNNING = 2;
+  // A record exhausted its attempts in the last 60 s, or the consumer reports an error.
+  PROCESSOR_FAILING = 3;
+  // Stopping or stopped (shutdown).
+  PROCESSOR_STOPPED = 4;
+  // Allocated to P6b (paused from the hub's control plane). Never sent in P6a.
+  PROCESSOR_PAUSED = 5;
+}
+
+// One event processor of one instance (ADR 0022): a Kafka consumer with its own consumer group
+// on the events topic, running the handlers of one processing group. Counters are since the
+// instance started; never payloads, keys or headers.
+message ProcessorStatus {
+  // The processor's name: "default" for the handlers without a processing group, else the
+  // group name ([a-z0-9][a-z0-9-]{0,47}).
+  string name = 1;
+  // The Kafka consumer group: the service's group for "default", "<that group>.<name>" for a
+  // named processor.
+  string group_id = 2;
+  // The Kafka topic the processor consumes.
+  string topic = 3;
+  // See ProcessorState.
+  ProcessorState state = 4;
+  // The partitions assigned to this instance, sorted by partition; empty while none is.
+  repeated PartitionStatus partitions = 5;
+  // Records whose stage 1 (the processor's event handlers) completed, handled or found to be a
+  // duplicate.
+  uint64 processed_total = 6;
+  // Records that exhausted their attempts: parked as a dead letter, sent to the dead-letter
+  // topic or skipped (mode "log").
+  uint64 failed_total = 7;
+  // The processor's letters in the service's dead_letters collection, over all instances,
+  // sampled every 30 s; 0 when dead_letter_mode is not "collection".
+  uint64 dead_letters = 8;
+  // The message of the latest failure (never a payload or a stack trace), at most 512 bytes
+  // (cut at a UTF-8 boundary); empty when none.
+  string last_error = 9;
+  // When last_error happened, epoch milliseconds; 0 when none.
+  int64 last_error_at_ms = 10;
+  // The event types the processor's handlers handle (stage 1), sorted; "default" also lists the
+  // event types its sagas handle.
+  repeated string event_types = 11;
+  // Where a record goes once its attempts are exhausted: "collection" (the dead_letters
+  // collection, the default), "topic" (<topic>.dlt) or "log" (logged and skipped).
+  string dead_letter_mode = 12;
+}
+
+// One partition assigned to an event processor on one instance (ADR 0022). Offsets are Kafka
+// offsets; -1 means unknown or none.
+message PartitionStatus {
+  // The partition number.
+  int32 partition = 1;
+  // The next offset this instance will process; -1 when unknown.
+  int64 position = 2;
+  // The consumer group's committed offset; -1 when none.
+  int64 committed = 3;
+  // The partition's high watermark (the offset of the next record written); -1 when unknown.
+  int64 high_watermark = 4;
+  // high_watermark - committed (high_watermark - position when committed is -1); -1 when
+  // unknown; never negative otherwise.
+  int64 lag = 5;
 }
 
 // How a client authenticates itself to the hub. Carried on Register (ADR 0018) and on
@@ -449,6 +527,9 @@ message InstanceTopology {
   int64 status_age_ms = 17;
   // Sorted; the query types of query_types this instance registered as shared (ADR 0017).
   repeated string shared_query_types = 18;
+  // InstanceStatus.processors of the latest report, as the hub keeps them (bounded, ADR 0022);
+  // empty when never reported or the session did not negotiate "processors".
+  repeated ProcessorStatus processors = 19;
 }
 
 message TypeOwnership {

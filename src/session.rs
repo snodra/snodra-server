@@ -17,6 +17,7 @@ use tracing::info;
 
 use crate::auth::{AuthStatus, Principal};
 use crate::context::ContextId;
+use crate::processors::{self, ProcessorReport};
 use crate::proto::{InstanceStatus, ServerMessage};
 use crate::registry::{InstanceId, Placement};
 
@@ -51,12 +52,15 @@ pub struct StatusDetail {
     /// [`MAX_STATUS_HUB_IDS`], in the reported order.
     pub connected_hub_ids: Vec<String>,
     pub handlers_in_flight: u32,
+    /// `processors` as reported, bounded ([`crate::processors::bound`], ADR 0022); empty unless
+    /// the session negotiated "processors".
+    pub processors: Vec<ProcessorReport>,
     /// When the hub received the report.
     pub at: Instant,
 }
 
 impl StatusDetail {
-    fn from_report(report: &InstanceStatus, at: Instant) -> Self {
+    fn from_report(report: &InstanceStatus, at: Instant, keep_processors: bool) -> Self {
         let mut ids: Vec<String> = Vec::new();
         for id in &report.connected_hub_ids {
             if ids.len() == MAX_STATUS_HUB_IDS {
@@ -70,6 +74,11 @@ impl StatusDetail {
         Self {
             connected_hub_ids: ids,
             handlers_in_flight: report.handlers_in_flight,
+            processors: if keep_processors {
+                processors::bound(&report.processors)
+            } else {
+                Vec::new()
+            },
             at,
         }
     }
@@ -111,6 +120,9 @@ pub struct SessionMeta {
     /// mode SUBSCRIPTION, is a target for them, and sends and receives the multi-part messages
     /// (ADR 0017, P4c).
     pub subscription: bool,
+    /// The session is v2 and shares the "processors" capability: the `processors` of its
+    /// `InstanceStatus` reports are kept (ADR 0022). Needs `instance_status` too.
+    pub processors: bool,
     /// Who the session's credentials speak for, when their ACL entry existed (ADR 0018, 0019);
     /// every later request is judged against the current ACL entry this names.
     pub principal: Option<Arc<Principal>>,
@@ -133,6 +145,7 @@ impl SessionMeta {
             scatter_gather: false,
             streaming: false,
             subscription: false,
+            processors: false,
             principal: None,
             auth: AuthStatus::Off,
         }
@@ -516,7 +529,8 @@ impl Sessions {
 
     /// Keeps `report` (bounded) as the latest `InstanceStatus` of the session `token`, replacing
     /// the previous one. Ignored (`false`) unless that session is still the current one for
-    /// `instance_id` and negotiated "instance-status" (so never for a v1 session).
+    /// `instance_id` and negotiated "instance-status" (so never for a v1 session); its
+    /// `processors` are kept only when the session also negotiated "processors" (ADR 0022).
     pub fn set_status(
         &self,
         ctx: &ContextId,
@@ -532,7 +546,11 @@ impl Sessions {
         else {
             return false;
         };
-        session.status = Some(StatusDetail::from_report(report, now));
+        session.status = Some(StatusDetail::from_report(
+            report,
+            now,
+            session.meta.processors,
+        ));
         true
     }
 
@@ -820,6 +838,7 @@ mod tests {
         InstanceStatus {
             connected_hub_ids: ids.iter().map(|s| s.to_string()).collect(),
             handlers_in_flight: handlers,
+            processors: vec![],
         }
     }
 
@@ -919,6 +938,7 @@ mod tests {
         let report = InstanceStatus {
             connected_hub_ids: ids,
             handlers_in_flight: 7,
+            processors: vec![],
         };
         assert!(sessions.set_status(&D, "a", token, &report, Instant::now()));
         let kept = status_of(&sessions, "a").unwrap().connected_hub_ids;
@@ -931,6 +951,65 @@ mod tests {
             kept[MAX_STATUS_HUB_IDS - 1],
             format!("hub-{}", MAX_STATUS_HUB_IDS - 3)
         );
+    }
+
+    fn processor(name: &str) -> crate::proto::ProcessorStatus {
+        crate::proto::ProcessorStatus {
+            name: name.to_string(),
+            group_id: "svc".into(),
+            topic: "kraken.events".into(),
+            state: crate::proto::ProcessorState::ProcessorRunning as i32,
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn processors_are_kept_bounded_only_for_a_session_that_negotiated_them() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let both = SessionMeta {
+            processors: true,
+            ..with_status_capability()
+        };
+        let token = sessions.insert(&D, "p6a", "svc", both, tx, CancellationToken::new());
+        let mut report = status(&["h1"], 0);
+        report.processors = (0..40).map(|i| processor(&format!("p{i}"))).collect();
+        assert!(sessions.set_status(&D, "p6a", token, &report, Instant::now()));
+        let kept = status_of(&sessions, "p6a").unwrap();
+        assert_eq!(kept.connected_hub_ids, ["h1"]);
+        assert_eq!(kept.processors.len(), crate::processors::MAX_PROCESSORS);
+        assert_eq!(kept.processors[0].name, "p0");
+
+        // The next report replaces the list (an empty one clears it).
+        assert!(sessions.set_status(&D, "p6a", token, &status(&["h1"], 0), Instant::now()));
+        assert!(status_of(&sessions, "p6a").unwrap().processors.is_empty());
+
+        // A P5c session ("instance-status" only): its hub ids are kept, processors never.
+        let (tx, _rx) = mpsc::channel(1);
+        let p5c = sessions.insert(
+            &D,
+            "p5c",
+            "svc",
+            with_status_capability(),
+            tx,
+            CancellationToken::new(),
+        );
+        assert!(sessions.set_status(&D, "p5c", p5c, &report, Instant::now()));
+        let kept = status_of(&sessions, "p5c").unwrap();
+        assert_eq!(kept.connected_hub_ids, ["h1"]);
+        assert!(kept.processors.is_empty());
+
+        // "processors" without "instance-status": the report is not kept at all, as before.
+        let (tx, _rx) = mpsc::channel(1);
+        let only = SessionMeta {
+            protocol_version: 2,
+            processors: true,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        };
+        let only = sessions.insert(&D, "only", "svc", only, tx, CancellationToken::new());
+        assert!(!sessions.set_status(&D, "only", only, &report, Instant::now()));
+        assert_eq!(status_of(&sessions, "only"), None);
     }
 
     #[test]

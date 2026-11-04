@@ -37,6 +37,7 @@ const JSON_PATHS: &[&str] = &[
     "/api/v1/graph",
     "/api/v1/settings",
     "/api/v1/version",
+    "/api/v1/processors",
 ];
 
 #[tokio::test]

@@ -49,6 +49,7 @@ async fn an_allowed_origin_is_echoed_on_every_api_get() {
         "/api/v1/types",
         "/api/v1/graph",
         "/api/v1/settings",
+        "/api/v1/processors",
     ] {
         let r = get(http, path, Some(PEER)).await;
         assert_eq!(r.status, 200, "{path}");

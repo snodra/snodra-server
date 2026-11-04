@@ -3,6 +3,7 @@
 //!
 //! - v1: no `RegisterAck`, the legacy heartbeat timeout, only v1 message types.
 //! - v2: a `RegisterAck` with the configured values before the echo of the first heartbeat.
+//! - P6a: a v1 or P5c client never gets or stores processors; a P6a client does (ADR 0022).
 
 mod common;
 
@@ -357,4 +358,81 @@ async fn senders_without_flow_control_never_get_resource_exhausted() {
     }
     let seen = assert_only_v1_messages(&mut v1, Duration::from_millis(200)).await;
     assert!(seen.is_empty(), "{seen:?}");
+}
+
+// ---- P6a (ADR 0022): event processors ------------------------------------------------------
+
+fn a_processor() -> kraken_hub::proto::ProcessorStatus {
+    kraken_hub::proto::ProcessorStatus {
+        name: "default".to_string(),
+        group_id: "svc".to_string(),
+        topic: "kraken.events".to_string(),
+        state: kraken_hub::proto::ProcessorState::ProcessorRunning as i32,
+        dead_letter_mode: "collection".to_string(),
+        ..Default::default()
+    }
+}
+
+/// A raw v1 client that sends an `InstanceStatus` with processors (it never would) changes
+/// nothing: no ack, only v1 messages, the stream stays open, nothing in the topology.
+#[tokio::test]
+async fn a_v1_client_status_with_processors_is_ignored() {
+    let addr = start_hub(config()).await;
+    let mut c = FakeClient::register(addr, "svc-v1", &["v1.Do"], &[]).await;
+    c.status_with_processors(&["hub"], vec![a_processor()])
+        .await;
+    c.heartbeat(21).await;
+    expect_echo(&mut c, 21).await;
+    assert!(
+        assert_only_v1_messages(&mut c, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    let t = topology(addr).await;
+    let i = &t.services[0].instances[0];
+    assert!(i.processors.is_empty());
+    assert_eq!(i.status_age_ms, -1);
+}
+
+/// A client with P5c's capabilities is answered exactly as by the P5c hub: the ack lists its
+/// six capabilities and not "processors", and its status reports keep working.
+#[tokio::test]
+async fn a_p5c_client_is_answered_as_before_and_never_offered_processors() {
+    let addr = start_hub(config()).await;
+    let p5c = [
+        "flow-control",
+        "instance-status",
+        "scatter-gather",
+        "streaming",
+        "subscription",
+        "credentials-refresh",
+    ];
+    let mut c = FakeClient::register_v2_with(addr, "svc-p5c", &["p5c.Do"], &p5c).await;
+    let ack = expect_ack(&mut c).await;
+    assert_eq!(ack.capabilities, p5c);
+    c.status(&["hub-x"], 1).await;
+    c.heartbeat(22).await;
+    expect_echo(&mut c, 22).await;
+    let t = topology(addr).await;
+    let i = &t.services[0].instances[0];
+    assert_eq!(i.connected_hub_ids, ["hub-x"]);
+    assert!(i.status_age_ms >= 0);
+    assert!(i.processors.is_empty());
+}
+
+/// A P6a client declares "processors" next to "instance-status" and gets both in the ack.
+#[tokio::test]
+async fn a_p6a_client_gets_processors_in_its_ack() {
+    let addr = start_hub(config()).await;
+    let mut c =
+        FakeClient::register_v2_with(addr, "svc-p6a", &[], &["instance-status", "processors"])
+            .await;
+    let ack = expect_ack(&mut c).await;
+    assert_eq!(ack.capabilities, ["instance-status", "processors"]);
+    c.status_with_processors(&["hub-x"], vec![a_processor()])
+        .await;
+    c.heartbeat(23).await;
+    expect_echo(&mut c, 23).await;
+    let t = topology(addr).await;
+    assert_eq!(t.services[0].instances[0].processors, [a_processor()]);
 }

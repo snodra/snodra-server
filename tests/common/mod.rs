@@ -300,6 +300,23 @@ impl FakeClient {
             message: Some(client_message::Message::Status(InstanceStatus {
                 connected_hub_ids: connected_hub_ids.iter().map(|s| s.to_string()).collect(),
                 handlers_in_flight,
+                processors: vec![],
+            })),
+        };
+        self.tx.send(msg).await.unwrap();
+    }
+
+    /// Sends an `InstanceStatus` with event processors (ADR 0022).
+    pub async fn status_with_processors(
+        &self,
+        connected_hub_ids: &[&str],
+        processors: Vec<kraken_hub::proto::ProcessorStatus>,
+    ) {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::Status(InstanceStatus {
+                connected_hub_ids: connected_hub_ids.iter().map(|s| s.to_string()).collect(),
+                handlers_in_flight: 0,
+                processors,
             })),
         };
         self.tx.send(msg).await.unwrap();

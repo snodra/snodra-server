@@ -962,6 +962,7 @@ mod tests {
             auth_kind: None,
             expires_at: None,
             cert_fingerprint: None,
+            processors: vec![],
         }
     }
 

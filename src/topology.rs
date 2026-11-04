@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::processors::ProcessorReport;
 use crate::proto;
 use crate::registry::{DEFAULT_LOAD_FACTOR, Kind, Registry};
 use crate::router::Router;
@@ -125,6 +126,10 @@ pub struct InstanceTopology {
     /// (ADR 0020); absent otherwise. Never the certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_fingerprint: Option<String>,
+    /// `InstanceStatus.processors` of the latest report, bounded (ADR 0022); empty when never
+    /// reported or the session did not negotiate "processors".
+    #[serde(default)]
+    pub processors: Vec<ProcessorReport>,
 }
 
 fn never_reported() -> i64 {
@@ -212,12 +217,13 @@ pub fn snapshot(
             })
             .unwrap_or_else(|| (vec![], vec![], vec![], DEFAULT_LOAD_FACTOR, BTreeMap::new()));
         let flow = flows.get(&d.instance_id).copied().unwrap_or_default();
-        let (connected_hub_ids, status_age_ms) = match d.status {
+        let (connected_hub_ids, status_age_ms, processors) = match d.status {
             Some(st) => (
                 st.connected_hub_ids,
                 ms(now.saturating_duration_since(st.at)),
+                st.processors,
             ),
-            None => (vec![], never_reported()),
+            None => (vec![], never_reported(), vec![]),
         };
         let flight = in_flight.get(&d.instance_id).copied().unwrap_or_default();
         by_service
@@ -257,6 +263,7 @@ pub fn snapshot(
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                 cert_fingerprint: d.principal.as_deref().and_then(|p| p.fingerprint.clone()),
+                processors,
                 instance_id: d.instance_id,
             });
     }
@@ -350,6 +357,7 @@ impl Topology {
                             connected_hub_ids: i.connected_hub_ids.clone(),
                             status_age_ms: i.status_age_ms,
                             shared_query_types: i.shared_query_types.clone(),
+                            processors: i.processors.iter().map(|p| p.to_proto()).collect(),
                         })
                         .collect(),
                 })
@@ -424,6 +432,8 @@ impl Topology {
                             auth_kind: None,
                             expires_at: None,
                             cert_fingerprint: None,
+                            // Data from another hub is bounded like a report.
+                            processors: crate::processors::bound(&i.processors),
                         })
                         .collect(),
                 })
@@ -682,6 +692,7 @@ mod tests {
         let report = proto::InstanceStatus {
             connected_hub_ids: vec!["hub-x".into(), "hub-y".into()],
             handlers_in_flight: 2,
+            processors: vec![],
         };
         assert!(f.sessions.set_status(&D, "reported", token, &report, at));
         let t = snap(
@@ -722,6 +733,89 @@ mod tests {
         assert_eq!(p.services[0].instances[1].status_age_ms, -1);
     }
 
+    #[tokio::test]
+    async fn snapshot_reports_the_latest_processors() {
+        let f = fx();
+        let meta = SessionMeta {
+            protocol_version: 2,
+            instance_status: true,
+            processors: true,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        };
+        connect_with(&f, "p", "svc", meta);
+        connect(&f, "silent", "svc");
+        let token = f.sessions.token_of(&D, "p").unwrap();
+        let report = proto::InstanceStatus {
+            connected_hub_ids: vec!["hub-x".into()],
+            handlers_in_flight: 0,
+            processors: vec![proto::ProcessorStatus {
+                name: "default".into(),
+                group_id: "svc".into(),
+                topic: "kraken.events".into(),
+                state: proto::ProcessorState::ProcessorFailing as i32,
+                partitions: vec![proto::PartitionStatus {
+                    partition: 0,
+                    position: 7,
+                    committed: 5,
+                    high_watermark: 9,
+                    lag: 4,
+                }],
+                processed_total: 6,
+                failed_total: 1,
+                dead_letters: 1,
+                last_error: "boom".into(),
+                last_error_at_ms: 42,
+                event_types: vec!["a.Happened".into()],
+                dead_letter_mode: "collection".into(),
+            }],
+        };
+        assert!(
+            f.sessions
+                .set_status(&D, "p", token, &report, Instant::now())
+        );
+        let t = snap(
+            &f,
+            f.anchor.instant,
+            Duration::from_secs(10),
+            Instant::now(),
+        );
+        let by_id = |id: &str| {
+            t.services[0]
+                .instances
+                .iter()
+                .find(|i| i.instance_id == id)
+                .unwrap()
+                .clone()
+        };
+        let p = by_id("p");
+        assert_eq!(p.processors.len(), 1);
+        assert_eq!(p.processors[0].name, "default");
+        assert_eq!(
+            p.processors[0].state,
+            crate::processors::ProcessorStateName::Failing
+        );
+        assert!(by_id("silent").processors.is_empty());
+
+        let wire = t.to_proto();
+        assert_eq!(wire.services[0].instances[0].processors, report.processors);
+        assert!(wire.services[0].instances[1].processors.is_empty());
+        assert_eq!(Topology::from_proto(&wire), t);
+
+        let json = serde_json::to_value(&t).unwrap();
+        let reported = &json["services"][0]["instances"][0]["processors"][0];
+        assert_eq!(reported["name"], "default");
+        assert_eq!(reported["state"], "FAILING");
+        assert_eq!(reported["groupId"], "svc");
+        assert_eq!(reported["partitions"][0]["highWatermark"], 9);
+        assert_eq!(reported["lastErrorAtMs"], 42);
+        assert_eq!(reported["deadLetterMode"], "collection");
+        assert_eq!(
+            json["services"][0]["instances"][1]["processors"],
+            serde_json::json!([])
+        );
+        assert_eq!(serde_json::from_value::<Topology>(json).unwrap(), t);
+    }
+
     #[test]
     fn json_without_the_status_fields_reads_as_never_reported() {
         let json = serde_json::json!({
@@ -733,6 +827,10 @@ mod tests {
         let i: InstanceTopology = serde_json::from_value(json).unwrap();
         assert!(i.connected_hub_ids.is_empty());
         assert_eq!(i.status_age_ms, -1);
+        assert!(
+            i.processors.is_empty(),
+            "an older hub's JSON has no processors"
+        );
     }
 
     fn sample() -> Topology {

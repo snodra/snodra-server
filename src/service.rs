@@ -464,6 +464,8 @@ async fn run_stream(
     let streaming = v2 && protocol::shares(&first.capabilities, protocol::STREAMING);
     // And subscription queries (ADR 0017, P4c).
     let subscription = v2 && protocol::shares(&first.capabilities, protocol::SUBSCRIPTION);
+    // And whether its InstanceStatus carries event processors (ADR 0022).
+    let processors = v2 && protocol::shares(&first.capabilities, protocol::PROCESSORS);
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -484,6 +486,7 @@ async fn run_stream(
         scatter_gather,
         streaming,
         subscription,
+        processors,
         principal: principal.clone(),
         auth: admission.status.clone(),
     };

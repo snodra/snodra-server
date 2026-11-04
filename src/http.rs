@@ -1,6 +1,7 @@
 //! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): `GET /topology` for the CLI and the
 //! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the read-only dashboard
-//! (`/ui/`, see [`crate::assets`]) and its API under `/api/v1/` (roadmap P2). Every route is
+//! (`/ui/`, see [`crate::assets`]) and its API under `/api/v1/` (roadmap P2; `processors` since
+//! P6a, ADR 0022). Every route is
 //! read-only. With `KRAKEN_HUB_DASHBOARD_TOKEN` set (ADR 0018), `/topology` and everything under
 //! `/api/v1/` (the event stream included) need `Authorization: Bearer <token>`; the page and its
 //! assets stay public, because the page is what asks for the token.
@@ -30,7 +31,7 @@ use crate::registry::Registry;
 use crate::router::Router;
 use crate::session::Sessions;
 use crate::topology::{self, ClockAnchor, Topology};
-use crate::{api, assets};
+use crate::{api, assets, processors};
 
 /// The shared live summary is recomputed this often while a stream is open; each stream sends
 /// it when it changed...
@@ -133,6 +134,7 @@ pub fn app(state: HttpState) -> axum::Router {
             .route("/api/v1/graph", get(api_graph))
             .route("/api/v1/settings", get(api_settings))
             .route("/api/v1/version", get(api_version))
+            .route("/api/v1/processors", get(api_processors))
             .route("/api/v1/stream", get(api_stream));
         // The token check sits inside the CORS layer: a peer's preflight carries no
         // `Authorization` header and must be answered, and a 401 must still carry the CORS
@@ -293,6 +295,11 @@ async fn api_settings(State(s): State<HttpState>) -> Response {
 
 async fn api_version(State(s): State<HttpState>) -> Response {
     fresh_json(api::version(&s.config, &s.topology(), &s.build_id))
+}
+
+/// The event processors of every service, aggregated over its instances (ADR 0022).
+async fn api_processors(State(s): State<HttpState>) -> Response {
+    fresh_json(processors::view(&s.topology()))
 }
 
 type SharedSummary = Option<Arc<api::Summary>>;
