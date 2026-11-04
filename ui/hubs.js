@@ -63,10 +63,9 @@ function looksLikeTopology(t) {
 /**
  * Reads /api/v1/<name> from every peer and updates each peer's state. Returns `views`, one
  * `{ hubId, data }` per reachable peer other than this hub (each answer must pass `valid` and
- * name its hub in `hubId`), and `older`: with `optional`, peers that answered 404, hubs that
- * predate the endpoint, which keep their state (they are reachable, just older).
+ * name its hub in `hubId`).
  */
-async function fetchPeers(name, valid, { optional = false } = {}) {
+async function fetchPeers(name, valid) {
   const results = await Promise.all(peers.map(async (peer) => {
     try {
       return { peer, data: await getFrom(peer.origin, name) };
@@ -76,12 +75,7 @@ async function fetchPeers(name, valid, { optional = false } = {}) {
   }));
   const seen = new Set([own]);
   const views = [];
-  const older = [];
   for (const { peer, data, error } of results) {
-    if (optional && error && error.status === 404) {
-      if (peer.state !== 'self' && peer.state !== 'duplicate') older.push(peer.hubId || peer.origin);
-      continue;
-    }
     if (error || !valid(data)) {
       peer.state = 'unreachable';
       peer.error = error ? error.message : `the answer is not a hub's ${name}`;
@@ -100,7 +94,7 @@ async function fetchPeers(name, valid, { optional = false } = {}) {
     }
   }
   notify();
-  return { views, older };
+  return { views };
 }
 
 /** Refreshes the peers' states (for the header) without merging. */
@@ -116,12 +110,11 @@ export async function merged(ownTopology) {
 
 /**
  * /api/v1/<name> of every reachable peer other than this hub, for a page that merges a view
- * other than the topology (the Processors page, ADR 0022): `{ views: [{ hubId, data }], older }`,
- * `older` naming the peers that predate the endpoint (404).
+ * other than the topology (the Processors page, ADR 0022): `{ views: [{ hubId, data }] }`.
  */
 export async function collect(name, valid) {
-  if (!enabled()) return { views: [], older: [] };
-  return fetchPeers(name, valid, { optional: true });
+  if (!enabled()) return { views: [] };
+  return fetchPeers(name, valid);
 }
 
 const typesKey = (i) => JSON.stringify([[...arr(i.commandTypes)].sort(), [...arr(i.queryTypes)].sort()]);
@@ -157,10 +150,8 @@ export function merge(ownTopology, remote, peerStates) {
       typeNames.add(type);
       let byOwner = owners.get(type);
       if (!byOwner) owners.set(type, byOwner = new Map());
-      // A shared query type (ADR 0017) is owned by the whole set; older hubs send one owner.
-      const owner = Array.isArray(t.ownerServices) && t.ownerServices.length
-        ? t.ownerServices.map(str).join(' + ')
-        : str(t.ownerService);
+      // A shared query type (ADR 0017) is owned by the whole set.
+      const owner = arr(t.ownerServices).map(str).join(' + ');
       if (!byOwner.has(owner)) byOwner.set(owner, []);
       byOwner.get(owner).push(v.hubId);
     }

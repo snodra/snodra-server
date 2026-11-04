@@ -15,7 +15,7 @@ function typeLinks(label, names) {
  * the report is older than STATUS_STALE_MS. */
 function hubsCell(i, hubId) {
   if (!(i.statusAgeMs >= 0)) {
-    return { class: 'dim', content: 'not reported', title: 'The client sends no InstanceStatus (single-hub or older client)' };
+    return { class: 'dim', content: 'not reported', title: 'The client has not sent an InstanceStatus yet' };
   }
   const ids = Array.isArray(i.connectedHubIds) ? i.connectedHubIds : [];
   const missing = !ids.includes(hubId);
@@ -47,11 +47,8 @@ function instanceRows(service, data) {
         i.stale ? [' ', badge('warn', 'stale', 'Heartbeat older than a third of the eviction timeout; still routed')] : null,
         merged ? (i.flags || []).map((f) => [' ', badge('crit', f.text, 'The reachable hubs disagree about this instance')]) : null,
       ] },
-      i.clientVersion ? { class: 'mono nowrap', content: i.clientVersion, title: i.clientVersion } : { class: 'dim', content: 'none (v1)', title: 'v1 clients send no client version' },
-      i.protocolVersion >= 2 ? `v${i.protocolVersion}` : { class: 'dim', content: 'v1' },
-      i.flowControlled
-        ? num(i.permitsAvailable === 0 ? badge('warn', '0', 'No permit left: new requests wait in the queue') : fmt.int(i.permitsAvailable))
-        : num(h('span', { class: 'dim' }, 'unlimited'), 'Not flow-controlled'),
+      i.clientVersion ? { class: 'mono nowrap', content: i.clientVersion, title: i.clientVersion } : { class: 'dim', content: 'none', title: 'The client sent no client version' },
+      num(i.permitsAvailable === 0 ? badge('warn', '0', 'No permit left: new requests wait in the queue') : fmt.int(i.permitsAvailable)),
       num(i.queued ? fmt.int(i.queued) : h('span', { class: 'dim' }, '0')),
       num(`${fmt.int(i.inFlightAsHandler)} / ${fmt.int(i.inFlightAsSender)}`),
       num(fmt.int(i.loadFactor)),
@@ -75,8 +72,8 @@ function instanceRows(service, data) {
 }
 
 const HEADERS = [
-  'Instance', 'Client', 'Protocol',
-  { label: 'Permits', class: 'num', title: 'Permits left for a flow-controlled instance' },
+  'Instance', 'Client',
+  { label: 'Permits', class: 'num', title: 'Requests the hub may still forward before the instance returns permits' },
   { label: 'Queued', class: 'num', title: 'Requests waiting in the hub for this instance' },
   { label: 'In flight', class: 'num', title: 'Handling / sent and not answered yet' },
   { label: 'Load factor', class: 'num' },

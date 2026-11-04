@@ -173,7 +173,6 @@ function renderHeader(summary) {
   fill($('hub-meta'),
     fact('hub', h('span', { class: 'mono', title: 'KRAKEN_HUB_ID' }, version.hubId)),
     fact('version', version.version),
-    fact('protocol', `v${version.protocolVersion}`),
     fact('up', fmt.span(now - version.startedAtMs)));
   const grafana = $('grafana');
   if (version.grafanaUrl) {

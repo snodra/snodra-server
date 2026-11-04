@@ -156,10 +156,8 @@ function outcomeText(action, service, name, data) {
       + (data.replay ? `replaying ${plural(ranges.length, 'partition')}, ${fmt.int(data.markersDeleted)} markers deleted, ${plural(data.resetHandlers, 'reset handler')} run.` : 'no replay.');
   }
   const done = action === 'pause' ? 'Paused' : 'Resumed';
-  const skipped = (data.notCapable || []).length;
   return `${done} ${name} of ${service} on ${plural(data.acknowledged, 'instance')}`
-    + (data.failed ? `; ${data.failed} did not confirm` : '')
-    + (skipped ? `; ${plural(skipped, 'instance')} without processor control kept consuming` : '') + '.';
+    + (data.failed ? `; ${data.failed} did not confirm` : '') + '.';
 }
 
 /** Every instance of an open row: a line about it and its partitions. */
@@ -198,18 +196,12 @@ export default {
   load: async (ctx) => {
     const own = await ctx.api.get('processors');
     const views = [{ hubId: own.hubId, data: own }];
-    let older = [];
-    if (ctx.allHubs) {
-      const peers = await ctx.hubs.collect('processors', looksLikeProcessors);
-      views.push(...peers.views);
-      older = peers.older;
-    }
+    if (ctx.allHubs) views.push(...(await ctx.hubs.collect('processors', looksLikeProcessors)).views);
     return {
       ...merge(views),
       scope: ctx.allHubs ? 'all' : 'this',
       nowMs: own.nowMs,
       hubs: views.map((v) => v.hubId),
-      older,
     };
   },
 
@@ -283,10 +275,9 @@ export default {
       const all = last.services.flatMap((s) => s.processors.map((p) => ({ service: s.serviceName, p })));
       const merged = last.scope === 'all';
       meta.textContent = `${plural(all.length, 'processor')} in ${plural(last.services.length, 'service')}`
-        + (merged ? ` on ${plural(last.hubs.length, 'reachable hub')}` : '')
-        + (last.older.length ? `; ${last.older.join(', ')} predate${last.older.length === 1 ? 's' : ''} processor status` : '');
+        + (merged ? ` on ${plural(last.hubs.length, 'reachable hub')}` : '');
       if (!all.length) {
-        fill(body, h('p', { class: 'empty' }, 'No service reports event processors. Instances report them once their kraken-messaging library has event processor status (capability "processors", phase 6a).'));
+        fill(body, h('p', { class: 'empty' }, 'No service reports event processors: no connected instance runs one.'));
         return;
       }
       const shown = all.filter(({ service, p }) => matches(service, p, q) && (!problemsOnly || problem(p)));

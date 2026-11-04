@@ -53,7 +53,6 @@ async function index(ctx) {
 
 const WHY = {
   404: 'No instance of the service reports this processor now.',
-  503: 'No instance that runs this processor accepts control: they predate processor control (phase 6b), so their letters can only be read through the library\'s admin API.',
 };
 
 /** The letters of the processor the URL names, else the processors that keep dead letters. */

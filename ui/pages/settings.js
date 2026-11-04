@@ -37,7 +37,6 @@ export default {
         fill(hub,
           fact('Hub id', h('span', { class: 'mono' }, v.hubId)),
           fact('Version', v.version),
-          fact('Protocol', `v${v.protocolVersion}${v.capabilities.length ? `, capabilities: ${v.capabilities.join(', ')}` : ''}`),
           fact('Started', `${fmt.time(v.startedAtMs)} (up ${fmt.span(v.nowMs - v.startedAtMs)})`),
           fact('Dashboard build', h('span', { class: 'mono' }, v.buildId)),
           fact('Grafana', v.grafanaUrl ? h('a', { href: v.grafanaUrl, target: '_blank', rel: 'noopener noreferrer' }, v.grafanaUrl) : h('span', { class: 'dim' }, 'not configured (KRAKEN_HUB_GRAFANA_URL)')));

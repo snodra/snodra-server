@@ -78,8 +78,8 @@ function headers(accept) {
   return h;
 }
 
-/** An Error carrying the HTTP status of the answer (`status`), so a caller can tell a hub that
- * predates an endpoint (404) from one that failed. */
+/** An Error carrying the HTTP status of the answer (`status`), so a caller can tell an answer
+ * that names nothing (404) from a failure. */
 function httpError(message, status) {
   const error = new Error(message);
   error.status = status;
