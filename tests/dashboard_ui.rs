@@ -294,7 +294,7 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
         ("types", "examples.CountGreetings"),
         ("settings", "KRAKEN_HUB_EDGE_STATS_WINDOW"),
         ("processors", "No service reports event processors"),
-        ("dead-letters", "Available from phase 6b."),
+        ("dead-letters", "No processor keeps dead letters"),
     ];
     let mut checks = Vec::new();
     for (page, marker) in pages {
@@ -896,6 +896,171 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
     }
     let _ = std::fs::remove_dir_all(&profiles);
     drop((on_a, on_b, only_b));
+}
+
+// ---- processor control (ADR 0023) -------------------------------------------------------
+
+/// The Processors page shows a paused processor, one stopped for a reset with its operation id
+/// and one that replays (with the end of each partition's replay range); without a write
+/// credential it offers the write-token field and no control buttons.
+#[tokio::test]
+async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the_write_token() {
+    use kraken_hub::proto::ProcessorState;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let b1 = register_p6a(grpc, "service-b", "b-1").await;
+    let mut replaying = processor(
+        "default",
+        ProcessorState::ProcessorRunning,
+        vec![partition(0, 30, 30, 90), partition(1, 5, 5, 5)],
+    );
+    replaying.replaying = true;
+    replaying.partitions[0].replay_until = 77;
+    let mut stopped = processor("orders", ProcessorState::ProcessorStopped, vec![]);
+    stopped.operation_id = "0f3c9a1e-7d2b-4c1a-9e8f-5a6b7c8d9e0f".to_string();
+    b1.status_with_processors(
+        &["hub"],
+        vec![
+            processor("audit", ProcessorState::ProcessorPaused, vec![]),
+            stopped,
+            replaying,
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _slots = take_stream_slots(http).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-controls-{}", std::process::id()));
+    let (dom, _) = rendered(
+        &browser,
+        http,
+        "processors?open=service-b%2Fdefault",
+        &profiles.join("processors"),
+    )
+    .await;
+    for marker in [
+        ">PAUSED</span>",
+        ">STOPPED</span>",
+        ">replaying</span>",
+        ">op 0f3c9a1e</span>",
+        "Replay until",
+        ">77</td>",
+        "id=\"write-token\"",
+        ">Write token</label>",
+        "a control goes to the hub that served this page",
+        "href=\"#/dead-letters?service=service-b&amp;processor=audit\"",
+    ] {
+        assert!(dom.contains(marker), "{marker:?} missing in {dom}");
+    }
+    for absent in [
+        ">Pause</button>",
+        ">Resume</button>",
+        ">Reset…</button>",
+        ">Actions</th>",
+    ] {
+        assert!(
+            !dom.contains(absent),
+            "{absent:?} without a write credential: {dom}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop(b1);
+}
+
+/// The Dead letters page: the processors that keep letters, and one processor's letters as an
+/// instance lists them through the hub, without retry or discard buttons until a write
+/// credential is held.
+#[tokio::test]
+async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
+    use common::control::{ControlClient, Reaction};
+    use kraken_hub::proto::{DeadLetterPage, DeadLetterSummary, control_reply, control_request};
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let letter = |id: &str, reason: &str, blocked_by: &str| DeadLetterSummary {
+        id: id.to_string(),
+        processor: "audit".to_string(),
+        topic: "kraken.events".to_string(),
+        partition: 2,
+        offset: 41,
+        key: "order-7".to_string(),
+        event_id: "evt-1".to_string(),
+        event_type: "examples.OrderPlaced".to_string(),
+        reason: reason.to_string(),
+        error_type: "IllegalStateException".to_string(),
+        error_message: "boom <b>not markup</b>".to_string(),
+        blocked_by: blocked_by.to_string(),
+        attempts: 3,
+        parked_at_ms: 1_762_250_000_000,
+        last_attempt_at_ms: 1_762_250_001_000,
+    };
+    let b1 = ControlClient::p6b(
+        grpc,
+        "service-b",
+        "b-1",
+        &["audit"],
+        std::sync::Arc::new(
+            move |req: &kraken_hub::proto::ControlRequest| match &req.action {
+                Some(control_request::Action::DeadLetterList(_)) => {
+                    Reaction::Reply(control_reply::Result::DeadLetters(DeadLetterPage {
+                        letters: vec![
+                            letter("letter-1", "HANDLER_FAILED", ""),
+                            letter("letter-2", "SEQUENCED", "letter-1"),
+                        ],
+                        total: 2,
+                    }))
+                }
+                _ => Reaction::Reply(common::control::ok()),
+            },
+        ),
+    )
+    .await;
+    let _slots = take_stream_slots(http).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-letters-{}", std::process::id()));
+    let (dom, _) = rendered(
+        &browser,
+        http,
+        "dead-letters?service=service-b&processor=audit",
+        &profiles.join("letters"),
+    )
+    .await;
+    for marker in [
+        "aria-label=\"Dead letters\"",
+        "audit of service-b",
+        ">letter-1</td>",
+        ">letter-2</td>",
+        ">HANDLER_FAILED</span>",
+        ">SEQUENCED</span>",
+        "boom &lt;b&gt;not markup&lt;/b&gt;",
+        "2 letters; listed by instance b-1",
+        "id=\"write-token\"",
+    ] {
+        assert!(dom.contains(marker), "{marker:?} missing in {dom}");
+    }
+    for absent in [
+        ">Retry</button>",
+        ">Discard</button>",
+        ">Retry all</button>",
+        "<b>not markup",
+    ] {
+        assert!(!dom.contains(absent), "{absent:?}: {dom}");
+    }
+    let (dom, _) = rendered(&browser, http, "dead-letters", &profiles.join("index")).await;
+    assert!(dom.contains("Show the letters"), "{dom}");
+    assert!(
+        dom.contains("1 processor with a dead-letter collection"),
+        "{dom}"
+    );
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop(b1);
 }
 
 #[test]

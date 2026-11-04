@@ -406,3 +406,106 @@ console.log('ok');
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The dashboard's control calls (`ui/api.js`, ADR 0023), run by Node against a real hub: the
+/// write credential is kept under its own key, goes out as a header on control calls only, never
+/// in a URL, and a refused write credential does not sign the page out. Skipped when Node is not
+/// installed.
+#[tokio::test]
+async fn the_dashboard_sends_the_write_token_only_on_control_calls_and_never_in_a_url() {
+    const WRITE: &str = "write-0123456789abcdef0123456789";
+    let hub = start(Config {
+        dashboard_write_token: Some(Secret::new(WRITE)),
+        ..config()
+    })
+    .await;
+    let dir = common::TempDir::new();
+    let api = dir.path("api.mjs");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/api.js"), &api).unwrap();
+    let script = dir.write(
+        "control.mjs",
+        r#"
+import assert from 'node:assert/strict';
+const [hub, token, write, apiPath] = process.argv.slice(2);
+globalThis.document = { baseURI: `${hub}/ui/` };
+const store = new Map();
+globalThis.sessionStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => store.set(k, v),
+  removeItem: (k) => store.delete(k),
+};
+const sent = [];
+const realFetch = globalThis.fetch;
+globalThis.fetch = (url, init) => { sent.push({ url: String(url), init }); return realFetch(url, init); };
+const api = await import(apiPath);
+let unauthorized = 0;
+api.onUnauthorized(() => { unauthorized += 1; });
+api.setToken(token);
+
+// Without a write credential: the hub says 401, the page stays signed in.
+assert.equal(api.hasWriteToken(), false);
+let r = await api.control('POST', 'services/svc/processors/audit/pause');
+assert.equal(r.status, 401);
+assert.equal(r.ok, false);
+assert.equal(unauthorized, 0, 'a refused write credential is not the dashboard token');
+
+// The dashboard token never writes.
+api.setWriteToken(token);
+r = await api.control('POST', 'services/svc/processors/audit/pause');
+assert.equal(r.status, 403);
+assert.match(r.data.error, /read-only/);
+
+// The write token: the call reaches the control plane (no instance here: 404, as JSON).
+api.setWriteToken(`  ${write}\n`);
+assert.equal(api.hasWriteToken(), true);
+assert.equal(store.get('kraken-hub.write-token'), write, 'its own key, trimmed');
+assert.equal(store.get('kraken-hub.token'), token, 'the dashboard token is kept apart');
+r = await api.control('POST', 'services/svc/processors/audit/reset', { to: 'earliest' });
+assert.equal(r.status, 404);
+assert.match(r.data.error, /no instance of service svc/);
+const reset = sent[sent.length - 1];
+assert.equal(reset.init.method, 'POST');
+assert.equal(reset.init.headers.authorization, `Bearer ${write}`);
+assert.equal(reset.init.headers['content-type'], 'application/json');
+assert.equal(reset.init.body, '{"to":"earliest"}');
+assert.ok(reset.url.startsWith(`${hub}/api/v1/`), 'to this hub');
+r = await api.control('DELETE', 'services/svc/processors/audit/dead-letters/l-1');
+assert.equal(r.status, 404);
+
+// Reads carry the dashboard token, never the write token.
+const before = sent.length;
+await api.get('version');
+assert.equal(sent[before].init.headers.authorization, `Bearer ${token}`);
+
+api.clearWriteToken();
+assert.equal(api.hasWriteToken(), false);
+assert.equal(store.has('kraken-hub.write-token'), false);
+for (const { url } of sent) {
+  assert.ok(!url.includes(write) && !url.includes(token) && !url.includes('token='), `a token in a URL: ${url}`);
+}
+console.log('ok');
+"#,
+    );
+    let node = tokio::process::Command::new("node")
+        .arg(&script)
+        .arg(format!("http://{hub}"))
+        .arg(TOKEN)
+        .arg(WRITE)
+        .arg(format!("file://{}", api.display()))
+        .output()
+        .await;
+    let out = match node {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("node not found: dashboard control check skipped");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

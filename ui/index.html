@@ -33,8 +33,9 @@
     <p class="empty">Loading</p>
   </main>
   <footer class="foot">
-    Read-only dashboard. Without KRAKEN_HUB_DASHBOARD_TOKEN it has no authentication: keep the hub's
-    HTTP port on the private network, or set the token.
+    Without KRAKEN_HUB_DASHBOARD_TOKEN the dashboard's reads have no authentication: keep the hub's
+    HTTP port on the private network, or set the token. Its processor controls always need the write
+    token or an ACL credential with control = true.
   </footer>
   <noscript><p class="empty">The dashboard needs JavaScript. The same data is at <code>/api/v1/topology</code>.</p></noscript>
 </body>

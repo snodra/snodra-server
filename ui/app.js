@@ -1,9 +1,11 @@
-// kraken-hub dashboard: hash routing, the header, live updates. Read-only; no third-party code.
+// kraken-hub dashboard: hash routing, the header, live updates; the processor controls need a
+// write credential (ADR 0023). No third-party code.
 
 import * as api from './api.js';
 import { badge, fill, h } from './dom.js';
 import * as fmt from './format.js';
 import { hideTip } from './graph.js';
+import deadLetters from './pages/deadletters.js';
 import * as hubs from './hubs.js';
 import { startLive } from './live.js';
 import { showLogin } from './login.js';
@@ -31,11 +33,8 @@ const PAGES = [
   services,
   types,
   processors,
+  deadLetters,
   settings,
-  upcoming({
-    id: 'dead-letters', title: 'Dead letters', phase: '6b',
-    text: 'The letters themselves, parked per key, with retry and discard from the dashboard. Until then the Processors page counts them per processor, and each library\'s DeadLetters admin API lists, retries and discards them.',
-  }),
   upcoming({
     id: 'events', title: 'Events', phase: 7,
     text: 'A read-only browser over the Kafka events topic: search by time, type, key and headers, consumer-group lag.',
@@ -99,7 +98,7 @@ function setParams(values) {
   history.replaceState(null, '', `#/${route.page.id}${query ? `?${query}` : ''}`);
 }
 
-const ctx = () => ({ api, params: route.params, setParams, version, hubs, allHubs: allHubs() });
+const ctx = () => ({ api, params: route.params, setParams, version, hubs, allHubs: allHubs(), refresh: () => refresh() });
 
 function renderNav() {
   const items = [];

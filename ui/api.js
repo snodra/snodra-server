@@ -4,9 +4,12 @@
 // keeps it in sessionStorage (this tab only, gone when it closes) and never puts it in a URL, a
 // cookie or a log line. Peer hubs (KRAKEN_HUB_PEERS, ADR 0016) are read with `getFrom`,
 // cross-origin, without cookies, with the same token (the hubs of one deployment share it).
+// The processor controls (ADR 0023) send a second credential, the write token, kept the same way
+// under its own key, only on `control` calls and only to this hub (it reaches every instance).
 
 const BASE = new URL('../api/v1/', document.baseURI);
 const TOKEN_KEY = 'kraken-hub.token';
+const WRITE_TOKEN_KEY = 'kraken-hub.write-token';
 
 /** A peer that does not answer within this long counts as unreachable. */
 const PEER_TIMEOUT_MS = 3000;
@@ -19,15 +22,26 @@ export class AuthError extends Error {
   }
 }
 
-function readToken() {
+function readStored(key) {
   try {
-    return sessionStorage.getItem(TOKEN_KEY) || '';
+    return sessionStorage.getItem(key) || '';
   } catch {
     return '';
   }
 }
 
-let token = readToken();
+/** Keeps `value` under `key` for this tab (sessionStorage when it is available, else memory). */
+function store(key, value) {
+  try {
+    if (value) sessionStorage.setItem(key, value);
+    else sessionStorage.removeItem(key);
+  } catch {
+    // Storage may be blocked: the token then lives until the page is reloaded.
+  }
+}
+
+let token = readStored(TOKEN_KEY);
+let writeToken = readStored(WRITE_TOKEN_KEY);
 const listeners = new Set();
 
 /** True when a token is held for this tab. */
@@ -36,15 +50,22 @@ export const hasToken = () => token !== '';
 /** Keeps `value` for this tab (sessionStorage when it is available, else memory). */
 export function setToken(value) {
   token = value.trim();
-  try {
-    if (token) sessionStorage.setItem(TOKEN_KEY, token);
-    else sessionStorage.removeItem(TOKEN_KEY);
-  } catch {
-    // Storage may be blocked: the token then lives until the page is reloaded.
-  }
+  store(TOKEN_KEY, token);
 }
 
 export const clearToken = () => setToken('');
+
+/** True when a write credential (the write token or an ACL credential with control = true) is
+ * held for this tab: the pages then show their controls. */
+export const hasWriteToken = () => writeToken !== '';
+
+/** Keeps the write credential for this tab, like the dashboard token. */
+export function setWriteToken(value) {
+  writeToken = value.trim();
+  store(WRITE_TOKEN_KEY, writeToken);
+}
+
+export const clearWriteToken = () => setWriteToken('');
 
 /** Calls `fn()` whenever the hub answers 401 to one of its own calls. */
 export function onUnauthorized(fn) {
@@ -103,6 +124,30 @@ export async function getFrom(origin, name) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * A processor control call (ADR 0023): `method` (POST or DELETE) on /api/v1/<path> of this hub,
+ * with the write credential as the Authorization header and `body` as JSON when given. Resolves
+ * to `{ ok, status, data }` for every answer (`data`: its JSON, null when it has none), so the
+ * page can show why the hub refused; a 401 here never signs the page out (the write credential
+ * is not the dashboard token). Throws on a network error.
+ */
+export async function control(method, path, body) {
+  const init = { method, headers: { accept: 'application/json' }, cache: 'no-store', credentials: 'omit' };
+  if (writeToken) init.headers.authorization = `Bearer ${writeToken}`;
+  if (body !== undefined) {
+    init.headers['content-type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(new URL(path, BASE), init);
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+  return { ok: response.ok, status: response.status, data };
 }
 
 /** True when this browser can read the event stream with fetch. */

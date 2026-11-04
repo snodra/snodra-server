@@ -1,5 +1,6 @@
 // Event processors (ADR 0022): the merge of /api/v1/processors over the reachable hubs and the
-// per-processor aggregate, with the rules of the hub's processors.rs. The page always
+// per-processor aggregate, with the rules of the hub's processors.rs (since P6b, ADR 0023, also
+// whether a processor replays and the reset operation holding its lock). The page always
 // re-aggregates from the per-instance reports, so one hub and many hubs take the same path. An
 // instance seen by several hubs counts once: its freshest report (lowest statusAgeMs) wins.
 // Everything a hub sends is data: it is checked for shape and rendered as text by the page.
@@ -46,8 +47,11 @@ function instanceOf(i) {
         committed: offset(p.committed),
         highWatermark: offset(p.highWatermark),
         lag: offset(p.lag),
+        replayUntil: count(p.replayUntil),
       }))
       .sort((a, b) => a.partition - b.partition),
+    replaying: i.replaying === true,
+    operationId: str(i.operationId),
     seenBy: arr(i.seenBy),
   };
 }
@@ -84,6 +88,8 @@ export function aggregate(name, instances) {
     failedTotal: list.reduce((a, i) => a + i.failedTotal, 0),
     eventTypes: [...new Set(list.flatMap((i) => i.eventTypes))].sort(),
     lastError,
+    replaying: list.some((i) => i.replaying),
+    operationId: (byFreshness.find((i) => i.operationId) || { operationId: '' }).operationId,
     instances: list,
   };
 }
