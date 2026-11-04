@@ -331,7 +331,7 @@ pub struct AclEntry {
     pub handle: Vec<Pattern>,
     /// Types it may send, in every request mode.
     pub send: Vec<Pattern>,
-    /// Reserved for processor control (roadmap P6); parsed and kept, not used yet.
+    /// The token may also call the hub's processor controls (ADR 0023).
     pub control: bool,
     /// Free text for the operator ("rotation 2026-11"); never used for decisions.
     pub label: Option<String>,
@@ -343,6 +343,7 @@ impl AclEntry {
             service: &self.service,
             handle: &self.handle,
             send: &self.send,
+            control: self.control,
         }
     }
 }
@@ -354,6 +355,8 @@ pub struct Rights<'a> {
     pub service: &'a str,
     pub handle: &'a [Pattern],
     pub send: &'a [Pattern],
+    /// The processor controls of the HTTP API (ADR 0023).
+    pub control: bool,
 }
 
 /// The ACL entry a credential resolves through.
@@ -461,7 +464,7 @@ pub struct ServiceEntry {
     pub name: String,
     pub handle: Vec<Pattern>,
     pub send: Vec<Pattern>,
-    /// Reserved for processor control (roadmap P6); parsed and kept, not used yet.
+    /// The service's JWTs may also call the hub's processor controls (ADR 0023).
     pub control: bool,
 }
 
@@ -471,6 +474,7 @@ impl ServiceEntry {
             service: &self.name,
             handle: &self.handle,
             send: &self.send,
+            control: self.control,
         }
     }
 }
@@ -811,6 +815,17 @@ pub struct Admission {
     pub status: AuthStatus,
     /// Set only in mode `enforce`: close the stream with it.
     pub refused: Option<Denied>,
+}
+
+/// What a bearer credential may do with the hub's processor controls (ADR 0023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlRight {
+    /// An ACL credential whose entry has `control = true`; the service it names.
+    Granted(String),
+    /// A valid ACL credential whose entry does not grant control; the service it names.
+    Denied(String),
+    /// Not an ACL credential this hub accepts (or access control is off).
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1544,6 +1559,48 @@ impl Authorizer {
             );
         }
         Ok(())
+    }
+
+    /// True when some ACL entry grants the processor controls (ADR 0023). Never in `off`, which
+    /// reads no ACL. Asked per call, so a reload that adds or removes `control` applies at once.
+    pub fn controls_configured(&self) -> bool {
+        if self.mode == AuthMode::Off {
+            return false;
+        }
+        let acl = self.acl();
+        acl.entries().iter().any(|e| e.control) || acl.services().iter().any(|e| e.control)
+    }
+
+    /// What the bearer credential `presented` may do with the processor controls: a static token
+    /// or, with JWT credentials configured, a JWT, resolved as `Register` resolves it (a rotated
+    /// key must have been fetched first, see [`Authorizer::prepare_bearer`]). The token lookup
+    /// compares every entry in constant time.
+    pub fn control_right(&self, presented: &str) -> ControlRight {
+        if self.mode == AuthMode::Off || presented.is_empty() {
+            return ControlRight::Unknown;
+        }
+        let acl = self.acl();
+        if let Some(entry) = acl.lookup(&digest_of(presented)) {
+            return if entry.control {
+                ControlRight::Granted(entry.service.clone())
+            } else {
+                ControlRight::Denied(entry.service.clone())
+            };
+        }
+        let Some(jwt) = &self.jwt else {
+            return ControlRight::Unknown;
+        };
+        if !looks_like_jwt(presented) {
+            return ControlRight::Unknown;
+        }
+        let Ok(verified) = jwt.verify(presented) else {
+            return ControlRight::Unknown;
+        };
+        match acl.rights(&AclKey::Service(verified.azp.clone())) {
+            Some(rights) if rights.control => ControlRight::Granted(verified.azp),
+            Some(_) => ControlRight::Denied(verified.azp),
+            None => ControlRight::Unknown,
+        }
     }
 
     /// The denial for a `Register` that names an instance id held by a session of another
@@ -2531,6 +2588,57 @@ contexts = ["default"]
         assert!("strict".parse::<AuthMode>().is_err());
     }
 
+    // ---- processor control (ADR 0023) ----
+
+    #[test]
+    fn only_an_acl_entry_with_control_may_control_processors() {
+        for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+            let (a, _m) = authorizer(mode);
+            assert!(a.controls_configured());
+            assert_eq!(
+                a.control_right("tok-billing"),
+                ControlRight::Granted("billing".into())
+            );
+            assert_eq!(
+                a.control_right("tok-orders"),
+                ControlRight::Denied("orders".into()),
+                "an entry without control = true"
+            );
+            assert_eq!(a.control_right("tok-unknown"), ControlRight::Unknown);
+            assert_eq!(a.control_right(""), ControlRight::Unknown);
+        }
+        // `off` reads no ACL, so no ACL credential controls anything.
+        let off = Authorizer::off(test_metrics().metrics);
+        assert!(!off.controls_configured());
+        assert_eq!(off.control_right("tok-billing"), ControlRight::Unknown);
+        // An ACL whose entries all lack `control`: nothing to grant with.
+        let plain = format!(
+            "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"orders\"\n",
+            hex("tok-orders")
+        );
+        let a = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse(&plain).unwrap(),
+            test_metrics().metrics,
+        );
+        assert!(!a.controls_configured());
+        assert_eq!(
+            a.control_right("tok-orders"),
+            ControlRight::Denied("orders".into())
+        );
+    }
+
+    #[test]
+    fn the_control_right_lookup_compares_every_entry_in_constant_time() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        let before = ct::COMPARISONS.with(|c| c.get());
+        a.control_right("tok-unknown");
+        assert_eq!(
+            ct::COMPARISONS.with(|c| c.get()) - before,
+            a.acl().entries().len()
+        );
+    }
+
     // ---- [[service]] tables (ADR 0019) ----
 
     fn service_acl_text() -> String {
@@ -2728,6 +2836,26 @@ handle = ["*"]
             .auth
             .admit(Some(&creds), true, "billing", &types(&["x.Only"]));
         assert_eq!(adm.refused.expect("refused").reason, "handle_denied");
+    }
+
+    #[tokio::test]
+    async fn a_jwt_controls_with_the_right_of_its_service_table() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let bearer = |azp: &str, exp_in: i64| match fx.token(azp, exp_in).kind {
+            Some(credentials::Kind::Jwt(t)) => t,
+            _ => unreachable!(),
+        };
+        assert!(fx.auth.controls_configured());
+        for (azp, exp_in, want) in [
+            ("billing", 300, ControlRight::Granted("billing".into())),
+            ("orders", 300, ControlRight::Denied("orders".into())),
+            ("ghost", 300, ControlRight::Unknown),
+            ("billing", -600, ControlRight::Unknown),
+        ] {
+            let token = bearer(azp, exp_in);
+            fx.auth.prepare_bearer(Some(&token)).await;
+            assert_eq!(fx.auth.control_right(&token), want, "{azp} {exp_in}");
+        }
     }
 
     #[tokio::test]

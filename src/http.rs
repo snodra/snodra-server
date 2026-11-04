@@ -1,10 +1,13 @@
 //! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): `GET /topology` for the CLI and the
-//! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the read-only dashboard
-//! (`/ui/`, see [`crate::assets`]) and its API under `/api/v1/` (roadmap P2; `processors` since
-//! P6a, ADR 0022). Every route is
-//! read-only. With `KRAKEN_HUB_DASHBOARD_TOKEN` set (ADR 0018), `/topology` and everything under
-//! `/api/v1/` (the event stream included) need `Authorization: Bearer <token>`; the page and its
-//! assets stay public, because the page is what asks for the token.
+//! smoke tests, and, unless `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see
+//! [`crate::assets`]) and its API under `/api/v1/` (roadmap P2; `processors` since P6a, ADR 0022;
+//! the processor controls under `/api/v1/services/` since P6b, ADR 0023). With
+//! `KRAKEN_HUB_DASHBOARD_TOKEN` set (ADR 0018), `/topology` and every read under `/api/v1/` (the
+//! event stream included) need `Authorization: Bearer <token>` (the dashboard token, or the write
+//! token, which reads too); the page and its assets stay public, because the page is what asks
+//! for the token. The mutating control calls need the write token or an ACL credential whose
+//! entry has `control = true`, whatever the dashboard token; with neither configured they answer
+//! 403 `controls are disabled`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -13,19 +16,24 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use serde::Serialize;
+use axum::routing::{delete, get, post};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{self, Secret};
+use crate::auth::{self, Authorizer, ControlRight, Secret};
 use crate::config::Config;
+use crate::context::ContextId;
+use crate::control::{
+    Action, Answer, AnswerView, LetterCall, LetterPage, RetryAllView, RetryView, Target, Verdict,
+};
 use crate::edges::{EdgeSnapshot, WindowTotals};
 use crate::registry::Registry;
 use crate::router::Router;
@@ -65,6 +73,9 @@ pub struct HttpState {
     pub sessions: Arc<Sessions>,
     pub router: Arc<Router>,
     pub config: Arc<Config>,
+    /// Access control (ADR 0018): an ACL credential with `control = true` may call the
+    /// processor controls.
+    pub auth: Arc<Authorizer>,
     pub anchor: ClockAnchor,
     pub started: Instant,
     /// Content hash of the dashboard assets, reported by `version` and the stream.
@@ -115,11 +126,16 @@ impl HttpState {
 /// The HTTP routes: `/topology` always; the dashboard (`/`, `/ui` redirect to `/ui/`) and its
 /// API when enabled. Unknown paths are 404. The API answers CORS for the peer origins only.
 pub fn app(state: HttpState) -> axum::Router {
-    let guard: Option<Arc<Secret>> = state.config.dashboard_token.clone().map(Arc::new);
+    let guard: Option<Arc<ReadGuard>> = state.config.dashboard_token.clone().map(|read| {
+        Arc::new(ReadGuard {
+            read,
+            write: state.config.dashboard_write_token.clone(),
+        })
+    });
     let mut app = axum::Router::new().route("/topology", get(get_topology));
-    if let Some(secret) = &guard {
+    if let Some(guard) = &guard {
         app = app.route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(secret),
+            Arc::clone(guard),
             require_token,
         ));
     }
@@ -135,17 +151,38 @@ pub fn app(state: HttpState) -> axum::Router {
             .route("/api/v1/settings", get(api_settings))
             .route("/api/v1/version", get(api_version))
             .route("/api/v1/processors", get(api_processors))
+            .route(&format!("{PROCESSOR}/dead-letters"), get(api_dead_letters))
             .route("/api/v1/stream", get(api_stream));
         // The token check sits inside the CORS layer: a peer's preflight carries no
         // `Authorization` header and must be answered, and a 401 must still carry the CORS
         // headers or the peer's page could not tell a wrong token from a network error.
-        if let Some(secret) = &guard {
+        if let Some(guard) = &guard {
             api = api.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(secret),
+                Arc::clone(guard),
                 require_token,
             ));
         }
-        let api = api.layer(axum::middleware::from_fn_with_state(peers, cors));
+        // The mutating control calls (ADR 0023) judge the write credential themselves, so the
+        // dashboard token's guard does not apply to them.
+        let controls = axum::Router::new()
+            .route(&format!("{PROCESSOR}/pause"), post(api_pause))
+            .route(&format!("{PROCESSOR}/resume"), post(api_resume))
+            .route(&format!("{PROCESSOR}/reset"), post(api_reset))
+            .route(
+                &format!("{PROCESSOR}/dead-letters/retry-all"),
+                post(api_retry_all),
+            )
+            .route(
+                &format!("{PROCESSOR}/dead-letters/{{letter}}/retry"),
+                post(api_retry),
+            )
+            .route(
+                &format!("{PROCESSOR}/dead-letters/{{letter}}"),
+                delete(api_discard),
+            );
+        let api = api
+            .merge(controls)
+            .layer(axum::middleware::from_fn_with_state(peers, cors));
         let site = axum::Router::new()
             .route("/", get(assets::to_index))
             .route("/ui", get(assets::to_index))
@@ -175,38 +212,65 @@ pub fn security_headers(mut response: Response, csp: HeaderValue) -> Response {
     response
 }
 
-/// The dashboard token check (ADR 0018). A missing, malformed or wrong token is the same bare
-/// 401: no detail in the body, and the same work done (both sides are hashed and compared in
-/// constant time), so the answer does not tell which.
-async fn require_token(
-    State(secret): State<Arc<Secret>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let presented = request
-        .headers()
+/// The tokens that read: the dashboard token and, when set, the write token (ADR 0023).
+pub struct ReadGuard {
+    read: Secret,
+    write: Option<Secret>,
+}
+
+/// Who made a read, as the audit line of a dead-letter list names it.
+#[derive(Debug, Clone, Copy)]
+struct Reader(&'static str);
+
+/// The bare 401 of every refused credential: no detail in the body.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+    )
+        .into_response()
+}
+
+fn presented(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(auth::bearer);
-    if secret.matches(presented) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [
-                (header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer")),
-                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-            ],
-        )
-            .into_response()
+        .and_then(auth::bearer)
+}
+
+/// The dashboard token check (ADR 0018). A missing, malformed or wrong token is the same bare
+/// 401: no detail in the body, and the same work done (both sides are hashed and compared in
+/// constant time), so the answer does not tell which. The write token reads too.
+async fn require_token(
+    State(guard): State<Arc<ReadGuard>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let presented = presented(request.headers());
+    let read = guard.read.matches(presented);
+    let write = guard.write.as_ref().is_some_and(|w| w.matches(presented));
+    if !(read || write) {
+        return unauthorized();
     }
+    let reader = if write {
+        "write-token"
+    } else {
+        "dashboard-token"
+    };
+    request.extensions_mut().insert(Reader(reader));
+    next.run(request).await
 }
 
 /// CORS for `/api/v1/*` (ADR 0016): a request whose `Origin` is exactly one of the peer origins
 /// gets it back in `Access-Control-Allow-Origin` (never a wildcard, never credentials), so a
 /// peer hub's dashboard can merge this hub in the browser. A preflight (`OPTIONS` with
 /// `Access-Control-Request-Method`) is answered 204 for a peer asking for `GET`, else 403. Other
-/// origins get no CORS header, so the browser keeps the answer from their scripts.
+/// origins get no CORS header, so the browser keeps the answer from their scripts. `POST` and
+/// `DELETE` (the processor controls, ADR 0023) are allowed like `GET`: the page sends its control
+/// calls to the hub that served it, but a peer's page or a tool in a peer's origin may too.
 async fn cors(
     State(peers): State<Arc<[String]>>,
     request: axum::extract::Request,
@@ -223,23 +287,24 @@ async fn cors(
             .headers()
             .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
     let mut response = if preflight {
-        let wants_get = request
+        let allowed = request
             .headers()
             .get(header::ACCESS_CONTROL_REQUEST_METHOD)
-            .is_some_and(|m| m == "GET");
-        if origin.is_none() || !wants_get {
+            .is_some_and(|m| m == "GET" || m == "POST" || m == "DELETE");
+        if origin.is_none() || !allowed {
             return StatusCode::FORBIDDEN.into_response();
         }
         let mut r = StatusCode::NO_CONTENT.into_response();
         let h = r.headers_mut();
         h.insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET"),
+            HeaderValue::from_static("GET, POST, DELETE"),
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            // `authorization`: the page forwards the dashboard token to its peers (ADR 0018).
-            HeaderValue::from_static("accept, authorization"),
+            // `authorization`: the page forwards the dashboard token to its peers (ADR 0018);
+            // `content-type`: a reset's JSON body (ADR 0023).
+            HeaderValue::from_static("accept, authorization, content-type"),
         );
         h.insert(
             header::ACCESS_CONTROL_MAX_AGE,
@@ -300,6 +365,490 @@ async fn api_version(State(s): State<HttpState>) -> Response {
 /// The event processors of every service, aggregated over its instances (ADR 0022).
 async fn api_processors(State(s): State<HttpState>) -> Response {
     fresh_json(processors::view(&s.topology()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Processor control (ADR 0023)
+
+/// Every control route starts here.
+const PROCESSOR: &str = "/api/v1/services/{service}/processors/{processor}";
+/// The largest body a control call takes (a reset with its offsets).
+pub const MAX_CONTROL_BODY: usize = 4096;
+
+/// The status code of a verdict.
+fn status_of(verdict: Verdict) -> StatusCode {
+    match verdict {
+        Verdict::Ok => StatusCode::OK,
+        Verdict::BadRequest => StatusCode::BAD_REQUEST,
+        Verdict::NotFound => StatusCode::NOT_FOUND,
+        Verdict::Conflict => StatusCode::CONFLICT,
+        Verdict::Failed => StatusCode::BAD_GATEWAY,
+        Verdict::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        Verdict::Timeout => StatusCode::GATEWAY_TIMEOUT,
+    }
+}
+
+/// The body of a call that failed: why, and the answer of the instance when one decided it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorBody<'a> {
+    error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: Option<&'a str>,
+    #[serde(flatten)]
+    answer: Option<AnswerView>,
+}
+
+fn answer_json<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(value),
+    )
+        .into_response()
+}
+
+fn error_json(status: StatusCode, error: &str) -> Response {
+    answer_json(
+        status,
+        &ErrorBody {
+            error,
+            instance_id: None,
+            answer: None,
+        },
+    )
+}
+
+/// Runs a control call to the end even when the caller hangs up (a reset half done would hold
+/// every instance until the lease ran out), then answers.
+async fn detached(call: impl Future<Output = Response> + Send + 'static) -> Response {
+    tokio::spawn(call).await.unwrap_or_else(|_| {
+        error_json(StatusCode::INTERNAL_SERVER_ERROR, "the control call failed")
+    })
+}
+
+/// Judges the write credential of a mutating control call and reads its body (at most
+/// [`MAX_CONTROL_BODY`] bytes). `Ok` carries the caller as the audit line names it: `write-token`
+/// or the service of the ACL entry. A refusal is counted, never logged.
+async fn admit_control(
+    s: &HttpState,
+    action: Action,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(String, Bytes), Box<Response>> {
+    let control = s.router.control();
+    let write = s.config.dashboard_write_token.as_ref();
+    if write.is_none() && !s.auth.controls_configured() {
+        control.refused(action, "disabled");
+        return Err(Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "controls are disabled",
+        )));
+    }
+    let presented = presented(headers);
+    let write_ok = write.is_some_and(|w| w.matches(presented));
+    let caller = if write_ok {
+        "write-token".to_string()
+    } else {
+        let Some(token) = presented else {
+            control.refused(action, "unauthenticated");
+            return Err(Box::new(unauthorized()));
+        };
+        // A service's JWT is judged like at Register; its rotated key is fetched first.
+        s.auth.prepare_bearer(Some(token)).await;
+        match s.auth.control_right(token) {
+            ControlRight::Granted(service) => service,
+            ControlRight::Denied(_) => {
+                control.refused(action, "forbidden");
+                return Err(Box::new(error_json(
+                    StatusCode::FORBIDDEN,
+                    "this credential may not control processors (its ACL entry has no control = true)",
+                )));
+            }
+            ControlRight::Unknown => {
+                let read = s.config.dashboard_token.as_ref();
+                if read.is_some_and(|r| r.matches(Some(token))) {
+                    control.refused(action, "forbidden");
+                    return Err(Box::new(error_json(
+                        StatusCode::FORBIDDEN,
+                        "the dashboard token is read-only; controls need KRAKEN_HUB_DASHBOARD_WRITE_TOKEN or an ACL credential with control = true",
+                    )));
+                }
+                control.refused(action, "unauthenticated");
+                return Err(Box::new(unauthorized()));
+            }
+        }
+    };
+    match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
+        Ok(bytes) => Ok((caller, bytes)),
+        Err(_) => {
+            control.refused(action, Verdict::BadRequest.as_str());
+            Err(Box::new(error_json(
+                StatusCode::BAD_REQUEST,
+                &format!("the body is larger than {MAX_CONTROL_BODY} bytes, or unreadable"),
+            )))
+        }
+    }
+}
+
+async fn api_pause(
+    State(s): State<HttpState>,
+    Path((service, processor)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    fan_out(s, Action::Pause, service, processor, headers, body).await
+}
+
+async fn api_resume(
+    State(s): State<HttpState>,
+    Path((service, processor)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    fan_out(s, Action::Resume, service, processor, headers, body).await
+}
+
+/// Pause or resume on every capable instance that runs the processor: 200 with the counts when
+/// at least one persisted it.
+async fn fan_out(
+    s: HttpState,
+    action: Action,
+    service: String,
+    processor: String,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let started = Instant::now();
+    let (caller, _) = match admit_control(&s, action, &headers, body).await {
+        Ok(admitted) => admitted,
+        Err(refused) => return *refused,
+    };
+    detached(async move {
+        let control = Arc::clone(s.router.control());
+        let paused = action == Action::Pause;
+        let (verdict, response) = match control
+            .pause(&ContextId::default(), &service, &processor, paused)
+            .await
+        {
+            Ok(report) => (
+                report.verdict,
+                answer_json(status_of(report.verdict), &report),
+            ),
+            Err(refusal) => (
+                refusal.verdict(),
+                error_json(
+                    status_of(refusal.verdict()),
+                    &refusal.message(&service, &processor),
+                ),
+            ),
+        };
+        control.audit(
+            &caller,
+            &service,
+            &processor,
+            action,
+            verdict.as_str(),
+            started,
+            None,
+        );
+        response
+    })
+    .await
+}
+
+/// A reset to the body's target, as a leased operation (see [`crate::control::Control::reset`]).
+async fn api_reset(
+    State(s): State<HttpState>,
+    Path((service, processor)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let started = Instant::now();
+    let (caller, body) = match admit_control(&s, Action::Reset, &headers, body).await {
+        Ok(admitted) => admitted,
+        Err(refused) => return *refused,
+    };
+    let control = Arc::clone(s.router.control());
+    let target = match Target::parse(&body) {
+        Ok(target) => target,
+        Err(why) => {
+            let outcome = Verdict::BadRequest.as_str();
+            control.audit(
+                &caller,
+                &service,
+                &processor,
+                Action::Reset,
+                outcome,
+                started,
+                None,
+            );
+            return error_json(StatusCode::BAD_REQUEST, &why);
+        }
+    };
+    detached(async move {
+        let (verdict, operation, response) = match control
+            .reset(&ContextId::default(), &service, &processor, target)
+            .await
+        {
+            Ok(report) => (
+                report.verdict,
+                Some(report.operation_id.clone()),
+                answer_json(status_of(report.verdict), &report),
+            ),
+            Err(refusal) => (
+                refusal.verdict(),
+                None,
+                error_json(
+                    status_of(refusal.verdict()),
+                    &refusal.message(&service, &processor),
+                ),
+            ),
+        };
+        let outcome = verdict.as_str();
+        control.audit(
+            &caller,
+            &service,
+            &processor,
+            Action::Reset,
+            outcome,
+            started,
+            operation.as_deref(),
+        );
+        response
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<String>,
+}
+
+/// The answer of a dead-letter call that an instance answered.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LetterReport<'a> {
+    service: &'a str,
+    processor: &'a str,
+    instance_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    letter_id: Option<&'a str>,
+    #[serde(flatten)]
+    body: LetterBody,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum LetterBody {
+    Page(LetterPage),
+    Retry(RetryView),
+    RetryAll(RetryAllView),
+    Discarded { discarded: bool },
+}
+
+/// Why an instance's answer is a failure, for the caller.
+fn describe(answer: &Answer) -> String {
+    match answer {
+        Answer::Refused { message, .. } => format!("the instance refused: {message}"),
+        Answer::Timeout => "the instance did not answer in time".to_string(),
+        Answer::Left => "the instance left before it answered".to_string(),
+        Answer::Unsent(why) => format!("the request could not be sent: {why}"),
+        _ => "the instance sent an answer of another kind".to_string(),
+    }
+}
+
+/// A dead-letter call on the capable instance with the freshest status.
+async fn letters(
+    s: HttpState,
+    caller: String,
+    service: String,
+    processor: String,
+    call: LetterCall,
+    started: Instant,
+) -> Response {
+    detached(async move {
+        let control = Arc::clone(s.router.control());
+        let action = call.action();
+        let (verdict, response) = match control
+            .dead_letters(&ContextId::default(), &service, &processor, &call)
+            .await
+        {
+            Err(refusal) => (
+                refusal.verdict(),
+                error_json(
+                    status_of(refusal.verdict()),
+                    &refusal.message(&service, &processor),
+                ),
+            ),
+            Ok(outcome) => {
+                let verdict = outcome.answer.verdict();
+                let letter_id = match &call {
+                    LetterCall::Retry(id) | LetterCall::Discard(id) => Some(id.as_str()),
+                    _ => None,
+                };
+                let body = match (&outcome.answer, &call) {
+                    (Answer::Letters(page), _) => Some(LetterBody::Page(page.clone())),
+                    (Answer::Retry(r), _) => Some(LetterBody::Retry(r.clone())),
+                    (Answer::RetryAll(r), _) => Some(LetterBody::RetryAll(r.clone())),
+                    (Answer::Ok(_), LetterCall::Discard(_)) => {
+                        Some(LetterBody::Discarded { discarded: true })
+                    }
+                    _ => None,
+                };
+                let response = match body {
+                    Some(body) => answer_json(
+                        status_of(verdict),
+                        &LetterReport {
+                            service: &service,
+                            processor: &processor,
+                            instance_id: &outcome.instance_id,
+                            letter_id,
+                            body,
+                        },
+                    ),
+                    None => answer_json(
+                        status_of(verdict),
+                        &ErrorBody {
+                            error: &describe(&outcome.answer),
+                            instance_id: Some(&outcome.instance_id),
+                            answer: Some(outcome.answer.view()),
+                        },
+                    ),
+                };
+                (verdict, response)
+            }
+        };
+        control.audit(
+            &caller,
+            &service,
+            &processor,
+            action,
+            verdict.as_str(),
+            started,
+            None,
+        );
+        response
+    })
+    .await
+}
+
+/// True for a letter id an instance could hold: 1 to 128 bytes, no control characters.
+fn valid_letter_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= crate::control::MAX_ID_BYTES && !id.chars().any(char::is_control)
+}
+
+/// `GET .../dead-letters?limit=n`: a read (the dashboard token, or the write token).
+async fn api_dead_letters(
+    State(s): State<HttpState>,
+    Path((service, processor)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+    reader: Option<axum::Extension<Reader>>,
+) -> Response {
+    let started = Instant::now();
+    let caller = reader.map_or("anonymous", |r| r.0.0).to_string();
+    let limit = match query.limit.as_deref().map(str::parse::<u32>) {
+        None => crate::control::DEFAULT_LETTERS,
+        Some(Ok(n)) => n.clamp(1, crate::control::MAX_LETTERS),
+        Some(Err(_)) => {
+            let outcome = Verdict::BadRequest.as_str();
+            s.router.control().audit(
+                &caller,
+                &service,
+                &processor,
+                Action::DeadLetterList,
+                outcome,
+                started,
+                None,
+            );
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "limit must be a number from 1 to 100",
+            );
+        }
+    };
+    letters(
+        s,
+        caller,
+        service,
+        processor,
+        LetterCall::List(limit),
+        started,
+    )
+    .await
+}
+
+async fn api_retry(
+    State(s): State<HttpState>,
+    Path((service, processor, letter)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    letter_call(
+        s,
+        service,
+        processor,
+        LetterCall::Retry(letter),
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn api_retry_all(
+    State(s): State<HttpState>,
+    Path((service, processor)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    letter_call(s, service, processor, LetterCall::RetryAll, headers, body).await
+}
+
+async fn api_discard(
+    State(s): State<HttpState>,
+    Path((service, processor, letter)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    letter_call(
+        s,
+        service,
+        processor,
+        LetterCall::Discard(letter),
+        headers,
+        body,
+    )
+    .await
+}
+
+/// A mutating dead-letter call: the write credential, the letter id, then the instance.
+async fn letter_call(
+    s: HttpState,
+    service: String,
+    processor: String,
+    call: LetterCall,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let started = Instant::now();
+    let action = call.action();
+    let (caller, _) = match admit_control(&s, action, &headers, body).await {
+        Ok(admitted) => admitted,
+        Err(refused) => return *refused,
+    };
+    if let LetterCall::Retry(id) | LetterCall::Discard(id) = &call
+        && !valid_letter_id(id)
+    {
+        let outcome = Verdict::BadRequest.as_str();
+        s.router.control().audit(
+            &caller, &service, &processor, action, outcome, started, None,
+        );
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "a letter id is 1 to 128 bytes without control characters",
+        );
+    }
+    letters(s, caller, service, processor, call, started).await
 }
 
 type SharedSummary = Option<Arc<api::Summary>>;
@@ -452,6 +1001,7 @@ mod tests {
             sessions,
             router,
             config,
+            auth: Authorizer::off(Metrics::new(opentelemetry::global::meter("test"))),
             anchor,
             started: anchor.instant,
             build_id: "test".into(),
@@ -563,6 +1113,96 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(auth::ct::COMPARISONS.with(|c| c.get()) - before, 3);
+    }
+
+    /// One audit line per control call that got past the credential check, naming the caller,
+    /// the call and its outcome; none for a refused credential (it is only counted).
+    #[tokio::test]
+    async fn a_control_call_writes_one_audit_line() {
+        use crate::proto::{
+            ControlOk, ControlReply, InstanceStatus, ProcessorStatus, control_reply, server_message,
+        };
+        use crate::session::SessionMeta;
+        use tower::ServiceExt;
+        crate::telemetry::test_support::capture_logs();
+        let mut s = state();
+        s.config = Arc::new(Config {
+            otlp_endpoint: None,
+            dashboard_write_token: Some(Secret::new("write-0123456789abcdef")),
+            ..Config::default()
+        });
+        let ctx = ContextId::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let meta = SessionMeta {
+            protocol_version: 2,
+            instance_status: true,
+            processors: true,
+            processor_control: true,
+            ..SessionMeta::v1(Duration::from_secs(10))
+        };
+        let token = s
+            .sessions
+            .insert(&ctx, "b-1", "svc", meta, tx, CancellationToken::new());
+        let report = InstanceStatus {
+            connected_hub_ids: vec![],
+            handlers_in_flight: 0,
+            processors: vec![ProcessorStatus {
+                name: "audit".into(),
+                ..Default::default()
+            }],
+        };
+        assert!(
+            s.sessions
+                .set_status(&ctx, "b-1", token, &report, Instant::now())
+        );
+        let control = Arc::clone(s.router.control());
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = rx.recv().await {
+                if let Some(server_message::Message::Control(req)) = msg.message {
+                    let result = control_reply::Result::Ok(ControlOk::default());
+                    let reply = ControlReply {
+                        control_id: req.control_id,
+                        result: Some(result),
+                    };
+                    control.on_reply(&ContextId::default(), "b-1", token, reply);
+                }
+            }
+        });
+        let app = app(s);
+        let pause = |auth: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/services/svc/processors/audit/pause")
+                .header(header::AUTHORIZATION, auth)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let r = app
+            .clone()
+            .oneshot(pause("Bearer nope-nope-nope"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = app
+            .clone()
+            .oneshot(pause("Bearer write-0123456789abcdef"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let lines: Vec<_> = crate::telemetry::test_support::logged()
+            .into_iter()
+            .filter(|l| l.message == "control")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for (field, value) in [
+            ("caller", "write-token"),
+            ("service", "svc"),
+            ("processor", "audit"),
+            ("action", "pause"),
+            ("outcome", "ok"),
+        ] {
+            assert_eq!(lines[0].field(field), Some(value), "{field}");
+        }
     }
 
     #[test]

@@ -116,21 +116,25 @@ async fn preflight_is_answered_for_peers_only() {
     let ok = preflight(PEER).await;
     assert_eq!(ok.status, 204);
     assert_eq!(ok.header("access-control-allow-origin"), Some(PEER));
-    assert_eq!(ok.header("access-control-allow-methods"), Some("GET"));
+    // POST and DELETE are the processor controls (ADR 0023).
+    assert_eq!(
+        ok.header("access-control-allow-methods"),
+        Some("GET, POST, DELETE")
+    );
     assert_eq!(ok.header("access-control-allow-credentials"), None);
     let no = preflight("http://evil.example").await;
     assert_eq!(no.status, 403);
     assert_eq!(no.header("access-control-allow-origin"), None);
     // A preflight for another method is refused even from a peer.
-    let post = http_request(
+    let put = http_request(
         http,
         "OPTIONS",
         "/api/v1/topology",
-        &[("Origin", PEER), ("Access-Control-Request-Method", "POST")],
+        &[("Origin", PEER), ("Access-Control-Request-Method", "PUT")],
     )
     .await;
-    assert_eq!(post.status, 403);
-    assert_eq!(post.header("access-control-allow-origin"), None);
+    assert_eq!(put.status, 403);
+    assert_eq!(put.header("access-control-allow-origin"), None);
 }
 
 #[tokio::test]

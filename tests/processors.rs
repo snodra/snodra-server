@@ -183,7 +183,7 @@ async fn a_p6a_client_reports_processors_and_every_view_shows_them() {
         assert_eq!(i1["processors"][1]["state"], "FAILING", "{path}");
         assert_eq!(
             i1["processors"][0]["partitions"][1],
-            json!({"partition": 2, "position": -1, "committed": -1, "highWatermark": -1, "lag": -1}),
+            json!({"partition": 2, "position": -1, "committed": -1, "highWatermark": -1, "lag": -1, "replayUntil": 0}),
             "{path}"
         );
     }

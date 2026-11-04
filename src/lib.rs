@@ -214,6 +214,7 @@ pub async fn serve_with_shutdown(
             sessions: Arc::clone(&sessions),
             router: Arc::clone(&router),
             config: Arc::clone(&config),
+            auth: Arc::clone(&auth),
             anchor,
             started: anchor.instant,
             build_id: assets::build_id().to_string(),

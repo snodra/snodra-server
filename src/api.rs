@@ -850,14 +850,28 @@ pub fn settings(c: &Config) -> SettingsView {
             path(&c.dashboard_write_token_file),
             Some(path(&d.dashboard_write_token_file)),
             Plain,
-            "file holding the reserved write token; no effect yet",
+            "file holding the write token (the path, never its content); wins over KRAKEN_HUB_DASHBOARD_WRITE_TOKEN and is reloaded when it changes",
         ),
         setting(
             "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
             String::new(),
             None,
             Sensitivity::Secret,
-            "reserved for the processor controls of roadmap P6; no effect yet",
+            "bearer token of the processor controls (pause, resume, reset, dead letters); also reads; unset with no ACL control entry: controls are disabled",
+        ),
+        setting(
+            "KRAKEN_HUB_CONTROL_TIMEOUT",
+            fmt_duration(c.control_timeout),
+            Some(fmt_duration(d.control_timeout)),
+            Plain,
+            "how long a control call waits for an instance's answer",
+        ),
+        setting(
+            "KRAKEN_HUB_RESET_TIMEOUT",
+            fmt_duration(c.reset_timeout),
+            Some(fmt_duration(d.reset_timeout)),
+            Plain,
+            "how long the instance that executes a reset may take",
         ),
     ];
     SettingsView { settings: s }
@@ -1238,8 +1252,20 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 46);
+        assert_eq!(v.settings.len(), 48);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
+        let control = get("KRAKEN_HUB_CONTROL_TIMEOUT");
+        assert_eq!(
+            (control.value.as_deref(), control.default.as_deref()),
+            (Some("10s"), Some("10s"))
+        );
+        assert_eq!(get("KRAKEN_HUB_RESET_TIMEOUT").value.as_deref(), Some("2m"));
+        assert!(
+            v.settings
+                .iter()
+                .all(|s| !s.description.contains("no effect")),
+            "the write token has an effect"
+        );
         assert_eq!(
             get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
             Some("10m")

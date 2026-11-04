@@ -1,6 +1,8 @@
 //! Shared helpers for the integration tests: an in-process hub and a fake service instance.
 #![allow(dead_code)]
 
+pub mod control;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -83,23 +85,41 @@ pub async fn http_request(
     path: &str,
     headers: &[(&str, &str)],
 ) -> HttpResponse {
+    http_send(addr, method, path, headers, b"", Duration::from_secs(3)).await
+}
+
+/// [`http_request`] with a body (sent with its `Content-Length` when not empty), bounded to
+/// `bound`.
+pub async fn http_send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    bound: Duration,
+) -> HttpResponse {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let extra: String = headers
+    let mut extra: String = headers
         .iter()
         .map(|(n, v)| format!("{n}: {v}\r\n"))
         .collect();
+    if !body.is_empty() {
+        extra.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     let fut = async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request =
             format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
+        // The server may answer (and close) before it read a body it refuses.
+        let _ = stream.write_all(body).await;
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
+        let _ = stream.read_to_end(&mut raw).await;
         String::from_utf8(raw).unwrap()
     };
-    let raw = tokio::time::timeout(Duration::from_secs(3), fut)
+    let raw = tokio::time::timeout(bound, fut)
         .await
-        .expect("http_get timed out");
+        .expect("http request timed out");
     let (head, body) = raw.split_once("\r\n\r\n").expect("malformed HTTP response");
     let mut lines = head.split("\r\n");
     let status = lines

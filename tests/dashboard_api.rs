@@ -295,7 +295,8 @@ async fn types_topology_settings_and_version_have_their_shape() {
             "streaming",
             "subscription",
             "credentials-refresh",
-            "processors"
+            "processors",
+            "processor-control"
         ])
     );
     assert!(v["hubId"].as_str().is_some_and(|id| !id.is_empty()));
