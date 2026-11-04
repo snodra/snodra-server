@@ -559,6 +559,47 @@ async fn the_lease_is_renewed_while_the_reset_runs_and_never_after_the_finish() 
     }
 }
 
+/// A renewal sent just before the execute's reply is answered before any finish is sent: a
+/// renewal that reached an instance after its finish would find the lock free.
+#[tokio::test]
+async fn the_finish_waits_for_the_renewals_in_flight() {
+    let (grpc, http) = hub(Config {
+        control_lease: Duration::from_millis(2000),
+        control_lease_renew: Duration::from_millis(200),
+        ..config()
+    })
+    .await;
+    // (what, when): a renewal is answered 500 ms after it arrives, the execute 300 ms after.
+    let log: Arc<std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>> = Arc::default();
+    let behaviour = {
+        let log = Arc::clone(&log);
+        answering(move |req| {
+            let mut log = log.lock().unwrap();
+            let now = std::time::Instant::now();
+            if is(req, "prepare") {
+                let renewal = log.iter().any(|(what, _)| *what == "prepare");
+                log.push((if renewal { "renewal" } else { "prepare" }, now));
+                return renewal
+                    .then(|| Reaction::After(Duration::from_millis(500), default_result(req)));
+            }
+            log.push((action_of(req), now));
+            is(req, "execute")
+                .then(|| Reaction::After(Duration::from_millis(300), default_result(req)))
+        })
+    };
+    let _b1 = ControlClient::p6b(grpc, "svc", "b-1", &["audit"], behaviour).await;
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let log = log.lock().unwrap().clone();
+    let at = |what: &str| log.iter().find(|(w, _)| *w == what).map(|(_, t)| *t);
+    let (renewal, finish) = (at("renewal").expect("a renewal"), at("finish").unwrap());
+    assert!(
+        finish >= renewal + Duration::from_millis(450),
+        "the finish went {:?} after the renewal, before its reply",
+        finish - renewal
+    );
+}
+
 #[tokio::test]
 async fn a_reset_is_refused_up_front_while_an_instance_lacks_the_capability() {
     let (grpc, http) = hub(config()).await;

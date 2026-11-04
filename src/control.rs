@@ -679,6 +679,14 @@ struct Waiter {
     tx: oneshot::Sender<Answer>,
 }
 
+/// The lease renewals of one reset: set `stopped` (under the lock) and no renewal follows;
+/// `replies` are the waits of those sent and not yet answered.
+#[derive(Default)]
+struct Renewals {
+    stopped: bool,
+    replies: Vec<tokio::task::JoinHandle<()>>,
+}
+
 /// Removes the reset of its (service, processor) from [`Control::resets`] when the operation
 /// ends, however it ends.
 struct Running {
@@ -1118,8 +1126,19 @@ impl Control {
         let executed = self
             .ask(&executor, processor, execute, self.timeouts.reset)
             .await;
-        // No renewal may be sent after a finish: the instance would take the lock again.
-        *renewing.lock().unwrap() = true;
+        // No renewal may be sent after a finish, nor be in flight while it is sent: a renewal
+        // that reached an instance after its finish would find the lock free.
+        let in_flight = {
+            let mut renewing = renewing.lock().unwrap();
+            renewing.stopped = true;
+            std::mem::take(&mut renewing.replies)
+        };
+        let _ = tokio::time::timeout(self.timeouts.request, async {
+            for reply in in_flight {
+                let _ = reply.await;
+            }
+        })
+        .await;
         let aborted = !matches!(executed, Answer::Reset(_));
         self.finish_all(&holders, &involved, processor, finish(aborted), &mut report)
             .await;
@@ -1175,16 +1194,17 @@ impl Control {
     }
 
     /// Renews the lease of `prepared` every [`Timeouts::renew`] from `since` until the returned
-    /// flag is set. The flag is checked under its lock while the renewals are sent, so once it is
-    /// set no renewal follows (a renewal after the finish would take the lock again).
+    /// [`Renewals::stopped`] is set. The flag is checked under its lock while the renewals are
+    /// sent and their reply waits recorded, so once it is set no renewal follows and the waits of
+    /// those in flight are known (a renewal after the finish would take the lock again).
     fn renew(
         self: &Arc<Self>,
         prepared: Vec<ProcessorHolder>,
         processor: &str,
         prepare: control_request::Action,
         since: tokio::time::Instant,
-    ) -> Arc<Mutex<bool>> {
-        let stopped = Arc::new(Mutex::new(false));
+    ) -> Arc<Mutex<Renewals>> {
+        let stopped = Arc::new(Mutex::new(Renewals::default()));
         let (this, flag, processor) = (
             Arc::clone(self),
             Arc::clone(&stopped),
@@ -1196,30 +1216,26 @@ impl Control {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let sent: Vec<(String, String, oneshot::Receiver<Answer>)> = {
-                    let stopped = flag.lock().unwrap();
-                    if *stopped {
-                        return;
-                    }
-                    prepared
-                        .iter()
-                        .filter_map(|h| match this.send(h, &processor, prepare.clone()) {
-                            Ok((id, rx)) => Some((h.instance_id.clone(), id, rx)),
-                            Err(answer) => {
-                                warn!(instance = %h.instance_id, answer = ?answer.view(), "reset: lease renewal not sent");
-                                None
-                            }
-                        })
-                        .collect()
-                };
-                for (instance, id, rx) in sent {
-                    let this = Arc::clone(&this);
-                    tokio::spawn(async move {
+                let mut renewals = flag.lock().unwrap();
+                if renewals.stopped {
+                    return;
+                }
+                renewals.replies.retain(|reply| !reply.is_finished());
+                for h in &prepared {
+                    let (id, rx) = match this.send(h, &processor, prepare.clone()) {
+                        Ok(sent) => sent,
+                        Err(answer) => {
+                            warn!(instance = %h.instance_id, answer = ?answer.view(), "reset: lease renewal not sent");
+                            continue;
+                        }
+                    };
+                    let (this, instance) = (Arc::clone(&this), h.instance_id.clone());
+                    renewals.replies.push(tokio::spawn(async move {
                         let answer = this.wait(&id, rx, this.timeouts.request).await;
                         if !matches!(answer, Answer::Ok(_)) {
                             warn!(instance = %instance, answer = ?answer.view(), "reset: lease renewal not acknowledged");
                         }
-                    });
+                    }));
                 }
             }
         });
