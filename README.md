@@ -1,3 +1,7 @@
+<p align="center">
+  <img alt="kraken hub mascot" src="https://gitlab.damoreira.ml/kraken-org/kraken/-/raw/main/docs/assets/brand/svg/kraken-hub.svg" width="160">
+</p>
+
 <h1 align="center">kraken-hub</h1>
 
 <p align="center">
