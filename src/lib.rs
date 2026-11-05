@@ -10,6 +10,7 @@ pub mod config;
 pub mod context;
 pub mod control;
 pub mod edges;
+pub mod events;
 pub mod http;
 pub mod jwt;
 pub mod mtls;
