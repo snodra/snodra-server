@@ -138,5 +138,7 @@ version:
         echo "DRY_RUN: not tagging"
         exit 0
       fi
+      git config user.name "kraken-org CI"
+      git config user.email "ci@damoreira.ml"
       git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
       git push "$CI_REPOSITORY_URL" "$NEXT"
