@@ -211,6 +211,46 @@ async fn search_matches_every_filter_newest_first_and_pages_with_a_cursor() {
     drop(broker);
 }
 
+/// Producers set `CreateTime`, so a partition's timestamps need not rise: `to` still finds a
+/// record written after a later-stamped one (within [`kraken_hub::browser::TO_SKEW`]), and `from`
+/// and `to` hold for every record.
+#[tokio::test]
+async fn from_and_to_find_records_with_out_of_order_timestamps() {
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("skew");
+    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
+    kafka::produce(
+        &broker.bootstrap,
+        &topic,
+        &[
+            library(0, 10, "k", "s.A", "e-10"),
+            library(0, 100, "k", "s.A", "e-100"),
+            library(0, 20, "k", "s.A", "e-20"),
+            library(0, 60_000, "k", "s.A", "e-60000"),
+            library(0, 30, "k", "s.A", "e-30"),
+            library(0, 5, "k", "s.A", "e-5"),
+        ],
+    )
+    .await;
+    let (_g, http) = hub(config(&broker.bootstrap, &[&topic])).await;
+    for (query, want) in [
+        (
+            format!("to={}", T + 50),
+            vec!["e-5", "e-30", "e-20", "e-10"],
+        ),
+        (
+            format!("from={}&to={}", T + 15, T + 50),
+            vec!["e-30", "e-20"],
+        ),
+        (format!("from={}", T + 50), vec!["e-60000", "e-100"]),
+    ] {
+        let (status, page) = get(http, &format!("/api/v1/events?{query}"), None).await;
+        assert_eq!(status, 200, "{query}: {page}");
+        assert_eq!(ids(&page), want, "{query}");
+    }
+    drop(broker);
+}
+
 /// Many partitions read at once: every page of a search with a cursor continues the last, and
 /// together they are the whole list, newest first, nothing twice.
 #[tokio::test]

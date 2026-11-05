@@ -35,6 +35,9 @@ use crate::telemetry::Metrics;
 
 /// The prefix of the `group.id` every browser consumer carries (never joined, never committed).
 pub const BROWSER_GROUP_PREFIX: &str = "kraken-hub-browser-";
+/// How far before a later-stamped record `to` still looks for a record of its range, in ms:
+/// producers set `CreateTime`, so a partition's timestamps need not rise.
+pub const TO_SKEW: i64 = 5 * 60 * 1000;
 /// The consumer-group view lists at most this many groups (`truncated` beyond).
 pub const MAX_GROUPS: usize = 500;
 /// Summaries a tail holds for a reader that is behind; one more ends it (`slowReader`).
@@ -583,9 +586,14 @@ impl Browser {
                 .from
                 .map(|ts| offsets_for(&c, &topic, &parts, ts, deadline))
                 .transpose()?;
+            // The first record stamped after `to` + TO_SKEW bounds the range; every record is
+            // still compared with `to` itself.
             let highest = filters
                 .to
-                .map(|ts| offsets_for(&c, &topic, &parts, ts.saturating_add(1), deadline))
+                .map(|ts| {
+                    let bound = ts.saturating_add(TO_SKEW).saturating_add(1);
+                    offsets_for(&c, &topic, &parts, bound, deadline)
+                })
                 .transpose()?;
             let mut ranges = Vec::with_capacity(parts.len());
             for (i, p) in parts.iter().enumerate() {
