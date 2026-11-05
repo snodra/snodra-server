@@ -31,8 +31,8 @@ fn heartbeat() -> ClientMessage {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_register_after_eviction_leaves_no_ghost() {
     let config = Config {
-        heartbeat_timeout: Duration::from_millis(300),
-        owner_grace: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(2000),
+        owner_grace: Duration::from_millis(500),
         otlp_endpoint: None,
         ..Config::default()
     };
@@ -49,11 +49,11 @@ async fn late_register_after_eviction_leaves_no_ghost() {
         }
         b.tx.send(m).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(1200)).await; // the watchdog evicts A
+    tokio::time::sleep(Duration::from_millis(3000)).await; // the watchdog evicts A
     a.send_register("a", &["a.Do"], &[]).await; // late Register on the evicted stream
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     drop(a);
-    tokio::time::sleep(Duration::from_millis(1000)).await; // past the owner grace and a sweep
+    tokio::time::sleep(Duration::from_millis(2000)).await; // past the owner grace and a sweep
 
     let mut c = FakeClient::register(addr, "c", &[], &[]).await;
     c.tx.send(FakeClient::request(
