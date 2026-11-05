@@ -498,7 +498,7 @@ the rules: filters, the cursor, the newest-first merge, the record views and the
 
 | Route under `/api/v1/` | Answer |
 |---|---|
-| `GET events?topic=&from=&to=&type=&key=&source=&correlationId=&userId=&eventId=&q=&limit=&cursor=` | a page of summaries, newest first (partitions read backwards in chunks of 500, merged by record timestamp; ties partition, offset), `{topic, missing?, results, scanned, exhausted, stoppedBy, cursor}` |
+| `GET events?topic=&from=&to=&type=&key=&source=&correlationId=&userId=&eventId=&q=&limit=&cursor=` | a page of summaries, newest first (every partition read backwards at once, in chunks of 50 records growing to 500, their matches merged by record timestamp; ties partition, offset), `{topic, missing?, results, scanned, exhausted, stoppedBy, cursor}` |
 | `GET events/{topic}/{partition}/{offset}` | the summary, every header (`allHeaders`), and `payload` / `payloadBase64` or `payload.hidden` |
 | `GET events/tail?topic=&<filters>` | server-sent `start`, `record` (summaries), `heartbeat` (15 s), `end` (`maxDuration`, `slowReader`, `shutdown`) |
 | `GET consumer-groups?topic=` | every group with committed offsets on the topic: `groupId`, `state`, `members`, `partitions[{partition, committed, highWatermark, lag}]`, `lag`; by lag; `truncated` |

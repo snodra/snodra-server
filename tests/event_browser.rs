@@ -211,6 +211,61 @@ async fn search_matches_every_filter_newest_first_and_pages_with_a_cursor() {
     drop(broker);
 }
 
+/// Many partitions read at once: every page of a search with a cursor continues the last, and
+/// together they are the whole list, newest first, nothing twice.
+#[tokio::test]
+async fn many_partitions_page_newest_first_without_skipping_or_repeating() {
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("wide");
+    kafka::create_topic(&broker.bootstrap, &topic, 24).await;
+    let records: Vec<Rec> = (0..24 * 30)
+        .map(|i| {
+            let ty = if i % 3 == 0 { "w.Hit" } else { "w.Miss" };
+            // Rising within a partition, interleaved across them.
+            let ts = (i / 24) * 100 + (i % 24) * 37 % 100;
+            library(i % 24, ts as i64, "k", ty, &format!("e-{i}"))
+        })
+        .collect();
+    kafka::produce(&broker.bootstrap, &topic, &records).await;
+    let (_g, http) = hub(Config {
+        event_search_max_results: 1000,
+        ..config(&broker.bootstrap, &[&topic])
+    })
+    .await;
+
+    let (status, all) = get(http, "/api/v1/events?type=w.Hit&limit=1000", None).await;
+    assert_eq!(status, 200, "{all}");
+    assert_eq!(all["exhausted"], true, "{all}");
+    let whole = ids(&all);
+    assert_eq!(whole.len(), 24 * 10);
+    let times: Vec<i64> = all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["timestamp"].as_i64().unwrap())
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] >= w[1]), "{times:?}");
+
+    let mut got = Vec::new();
+    let mut cursor: Option<String> = None;
+    for pages in 1.. {
+        assert!(pages <= 40, "{} of {} found", got.len(), whole.len());
+        let path = match &cursor {
+            Some(c) => format!("/api/v1/events?type=w.Hit&limit=7&cursor={c}"),
+            None => "/api/v1/events?type=w.Hit&limit=7".to_string(),
+        };
+        let (status, page) = get(http, &path, None).await;
+        assert_eq!(status, 200, "{page}");
+        got.extend(ids(&page));
+        match page["cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(got, whole);
+    drop(broker);
+}
+
 #[tokio::test]
 async fn budgets_stop_a_search_and_concurrency_is_bounded() {
     let broker = kafka::kafka().await;

@@ -39,8 +39,11 @@ pub const MAX_PAYLOAD: usize = 256 * 1024;
 pub const MAX_FILTER: usize = 1024;
 /// Results a search page returns when it names no `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
-/// Records a partition is read backwards by, per Kafka read.
+/// Records a partition is read backwards by, per Kafka read, at most...
 pub const CHUNK: usize = 500;
+/// ...and at first in a page: each next chunk of a partition is twice the last, so every
+/// partition has its newest records in hand early even on a slow link.
+pub const FIRST_CHUNK: usize = 50;
 /// The longest cursor accepted, in characters.
 pub const MAX_CURSOR: usize = 64 * 1024;
 
@@ -686,19 +689,26 @@ pub struct Examined {
     pub hit: Option<Summary>,
 }
 
+/// A chunk a search reads: the records of `partition` from `start` up to (not including) `end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Want {
+    pub partition: i32,
+    pub start: i64,
+    pub end: i64,
+}
+
 /// Reads records for a search.
 pub trait Chunks {
     type Error;
-    /// The records of `partition` from `start` up to (not including) `end` in offset order, each
-    /// examined against the filters; offsets with no record (compacted, transaction markers) are
-    /// simply absent. `Ok(None)` when `deadline` passed before the chunk was complete.
+    /// The records of every chunk of `wants`, read at once: per chunk, in its order, the
+    /// records in offset order, each examined against the filters (offsets with no record,
+    /// compacted or transaction markers, are simply absent), or `None` when `deadline` passed
+    /// before that chunk was complete.
     fn read(
         &mut self,
-        partition: i32,
-        start: i64,
-        end: i64,
+        wants: &[Want],
         deadline: Instant,
-    ) -> Result<Option<Vec<Examined>>, Self::Error>;
+    ) -> Result<Vec<Option<Vec<Examined>>>, Self::Error>;
 }
 
 /// Why a search page ended before every partition reached its lower bound.
@@ -735,12 +745,15 @@ pub struct Budget {
 
 struct Lane {
     range: Range,
-    /// Every offset at or above it was examined (it is the next page's upper bound).
+    /// Every offset at or above it was examined and its match, if any, returned: the next
+    /// page's upper bound.
     next: i64,
     /// The start of the chunk in `buffer`.
     loaded_from: i64,
-    /// The chunk not yet examined, oldest first (popped from the end).
+    /// The matches of the chunk not yet returned, oldest first (popped from the end).
     buffer: Vec<Examined>,
+    /// Records the next chunk reads, at most.
+    size: i64,
 }
 
 impl Lane {
@@ -754,16 +767,30 @@ impl Lane {
             .last()
             .map(|e| (e.timestamp, self.range.partition, e.offset))
     }
+
+    /// Where the next page starts: just above the newest match not yet returned, else the
+    /// chunk's start (the offsets between were examined and match nothing).
+    fn settle(&mut self) {
+        self.next = self
+            .buffer
+            .last()
+            .map_or(self.loaded_from, |e| e.offset + 1);
+    }
 }
 
-/// Reads `ranges` backwards in chunks of at most [`CHUNK`] records and merges them newest first
-/// (record timestamp; ties by partition, then offset, descending) until `budget.limit` results,
-/// `budget.max_scanned` records read or `budget.deadline`, whichever comes first.
+/// Reads `ranges` backwards in chunks (of [`FIRST_CHUNK`] records first, then twice the last,
+/// up to [`CHUNK`]), every partition that needs one in the same read, and merges their matches
+/// newest first (record timestamp; ties by partition, then offset, descending) until
+/// `budget.limit` results, `budget.max_scanned` records read or `budget.deadline`, whichever
+/// comes first. A page that ends before it returns anything still moves on: a partition whose
+/// chunk arrived is positioned just above its newest match (below the chunk when it has none).
 pub fn merge<C: Chunks>(
     reader: &mut C,
     ranges: &[Range],
     budget: Budget,
 ) -> Result<Page, C::Error> {
+    // Enough per chunk that one round over the partitions fits the scan budget.
+    let chunk = (budget.max_scanned / (ranges.len().max(1) as u64)).clamp(1, CHUNK as u64) as i64;
     let mut lanes: Vec<Lane> = ranges
         .iter()
         .map(|r| Lane {
@@ -771,64 +798,73 @@ pub fn merge<C: Chunks>(
             next: r.upper.max(r.lower),
             loaded_from: r.upper.max(r.lower),
             buffer: Vec::new(),
+            size: chunk.min(FIRST_CHUNK as i64),
         })
         .collect();
-    // Enough per chunk that one round over the partitions fits the scan budget.
-    let chunk = (budget.max_scanned / (lanes.len().max(1) as u64)).clamp(1, CHUNK as u64) as i64;
     let mut results = Vec::new();
     let mut scanned = 0u64;
     let mut stopped_by = None;
-    'pages: loop {
-        // Every partition that is not done needs a record in hand before the newest is known.
-        for lane in lanes
-            .iter_mut()
-            .filter(|l| l.buffer.is_empty() && !l.done())
-        {
+    loop {
+        // Every partition that is not done needs a match in hand before the newest is known.
+        let needy: Vec<usize> = (0..lanes.len())
+            .filter(|i| lanes[*i].buffer.is_empty() && !lanes[*i].done())
+            .collect();
+        if !needy.is_empty() {
             if scanned >= budget.max_scanned {
                 stopped_by = Some(StoppedBy::ScanBudget);
-                break 'pages;
+                break;
             }
             if Instant::now() >= budget.deadline {
                 stopped_by = Some(StoppedBy::TimeBudget);
-                break 'pages;
+                break;
             }
-            let left = (budget.max_scanned - scanned).min(chunk as u64) as i64;
-            let start = (lane.next - left).max(lane.range.lower);
-            let Some(read) =
-                reader.read(lane.range.partition, start, lane.next, budget.deadline)?
-            else {
-                stopped_by = Some(StoppedBy::TimeBudget);
-                break 'pages;
-            };
-            scanned += read.len() as u64;
-            lane.loaded_from = start;
-            lane.buffer = read
-                .into_iter()
-                .filter(|e| (start..lane.next).contains(&e.offset))
-                .collect();
-            if lane.buffer.is_empty() {
-                // Nothing in the chunk: on to the next one down.
-                lane.next = start;
-            }
-            // This page emits at most `wanted` more results, so no partition needs a summary
-            // beyond its newest `wanted` hits: the older part of the chunk is let go (and read
-            // again by the next page), which bounds a page's memory by partitions x limit.
-            let wanted = budget.limit - results.len();
-            if let Some(oldest_kept) = lane
-                .buffer
+            // The scan budget left, shared by the partitions of this read (one record each
+            // at least, so fewer partitions when fewer records are left).
+            let left = budget.max_scanned - scanned;
+            let needy = &needy[..needy.len().min(left as usize)];
+            let share = (left / needy.len() as u64) as i64;
+            let wants: Vec<Want> = needy
                 .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, e)| e.hit.is_some())
-                .nth(wanted.saturating_sub(1))
-                .map(|(i, _)| i)
-                && oldest_kept > 0
-            {
-                lane.loaded_from = lane.buffer[oldest_kept].offset;
-                lane.buffer.drain(..oldest_kept);
+                .map(|i| {
+                    let lane = &lanes[*i];
+                    Want {
+                        partition: lane.range.partition,
+                        start: (lane.next - lane.size.min(share)).max(lane.range.lower),
+                        end: lane.next,
+                    }
+                })
+                .collect();
+            let chunks = reader.read(&wants, budget.deadline)?;
+            let mut late = false;
+            for ((i, want), read) in needy.iter().zip(&wants).zip(chunks) {
+                let Some(read) = read else {
+                    late = true;
+                    continue;
+                };
+                scanned += read.len() as u64;
+                let lane = &mut lanes[*i];
+                lane.size = (lane.size * 2).min(chunk);
+                lane.loaded_from = want.start;
+                lane.buffer = read
+                    .into_iter()
+                    .filter(|e| e.hit.is_some() && (want.start..want.end).contains(&e.offset))
+                    .collect();
+                // This page returns at most `wanted` more results, so no partition needs a
+                // summary beyond its newest `wanted` matches: the older ones are let go (and
+                // read again by the next page), which bounds a page's memory by partitions x
+                // limit.
+                let wanted = budget.limit - results.len();
+                if lane.buffer.len() > wanted {
+                    let cut = lane.buffer.len() - wanted;
+                    lane.loaded_from = lane.buffer[cut].offset;
+                    lane.buffer.drain(..cut);
+                }
+                lane.settle();
             }
-        }
-        if lanes.iter().any(|l| l.buffer.is_empty() && !l.done()) {
+            if late {
+                stopped_by = Some(StoppedBy::TimeBudget);
+                break;
+            }
             continue;
         }
         let Some(lane) = lanes
@@ -839,17 +875,11 @@ pub fn merge<C: Chunks>(
             break;
         };
         let examined = lane.buffer.pop().expect("a lane with a head");
-        lane.next = if lane.buffer.is_empty() {
-            lane.loaded_from
-        } else {
-            examined.offset
-        };
-        if let Some(hit) = examined.hit {
-            results.push(hit);
-            if results.len() >= budget.limit {
-                stopped_by = Some(StoppedBy::Limit);
-                break;
-            }
+        lane.settle();
+        results.push(examined.hit.expect("only matches are kept"));
+        if results.len() >= budget.limit {
+            stopped_by = Some(StoppedBy::Limit);
+            break;
         }
     }
     let exhausted = lanes.iter().all(Lane::done);
@@ -1229,6 +1259,8 @@ mod tests {
         partitions: BTreeMap<i32, Records>,
         reads: usize,
         slow_after: Option<usize>,
+        /// A slow link: records it delivers before the time budget runs out (`None`: no limit).
+        allowance: Option<usize>,
     }
 
     impl Fake {
@@ -1237,6 +1269,7 @@ mod tests {
                 partitions: partitions.iter().cloned().collect(),
                 reads: 0,
                 slow_after: None,
+                allowance: None,
             }
         }
 
@@ -1256,35 +1289,49 @@ mod tests {
         type Error = ();
         fn read(
             &mut self,
-            partition: i32,
-            start: i64,
-            end: i64,
+            wants: &[Want],
             _deadline: Instant,
-        ) -> Result<Option<Vec<Examined>>, ()> {
+        ) -> Result<Vec<Option<Vec<Examined>>>, ()> {
             self.reads += 1;
             if self.slow_after.is_some_and(|n| self.reads > n) {
-                return Ok(None);
+                return Ok(vec![None; wants.len()]);
             }
-            Ok(Some(
-                self.partitions[&partition]
+            // A slow link shares what it delivers between the chunks read at once.
+            let share = self.allowance.map(|a| a / wants.len());
+            let mut out = Vec::new();
+            for w in wants {
+                let records: Vec<&(i64, i64, bool)> = self.partitions[&w.partition]
                     .iter()
-                    .filter(|(o, ..)| (start..end).contains(o))
-                    .map(|(offset, ts, hit)| Examined {
-                        offset: *offset,
-                        timestamp: *ts,
-                        hit: hit.then(|| Summary {
-                            topic: "t".into(),
-                            partition,
+                    .filter(|(o, ..)| (w.start..w.end).contains(o))
+                    .collect();
+                if share.is_some_and(|share| records.len() > share) {
+                    out.push(None);
+                    continue;
+                }
+                if let Some(allowance) = &mut self.allowance {
+                    *allowance -= records.len();
+                }
+                out.push(Some(
+                    records
+                        .into_iter()
+                        .map(|(offset, ts, hit)| Examined {
                             offset: *offset,
-                            timestamp: Some(*ts),
-                            key: None,
-                            key_truncated: false,
-                            headers: BTreeMap::new(),
-                            size: 0,
-                        }),
-                    })
-                    .collect(),
-            ))
+                            timestamp: *ts,
+                            hit: hit.then(|| Summary {
+                                topic: "t".into(),
+                                partition: w.partition,
+                                offset: *offset,
+                                timestamp: Some(*ts),
+                                key: None,
+                                key_truncated: false,
+                                headers: BTreeMap::new(),
+                                size: 0,
+                            }),
+                        })
+                        .collect(),
+                ));
+            }
+            Ok(out)
         }
     }
 
@@ -1395,6 +1442,55 @@ mod tests {
         }
     }
 
+    /// Many partitions on a slow link: the time budget ends every page long before one chunk
+    /// of each partition arrives one by one. Every page still moves on, and the pages together
+    /// are the whole list, in order, nothing twice.
+    #[test]
+    fn many_partitions_on_a_slow_link_make_progress_page_by_page() {
+        let data: Vec<(i32, Records)> = (0..24)
+            .map(|p| {
+                let records = (0..300)
+                    .map(|o| (o, (o * 24 + p as i64) * 10, (o + p as i64) % 5 == 0))
+                    .collect();
+                (p, records)
+            })
+            .collect();
+        let expected = places(&run(&mut Fake::new(&data), budget(10_000, 10_000_000)));
+        assert_eq!(expected.len(), 24 * 60);
+
+        let mut fake = Fake::new(&data);
+        let mut ranges = fake.ranges();
+        let mut got = Vec::new();
+        for pages in 1.. {
+            assert!(pages < 1000, "{} of {} found", got.len(), expected.len());
+            fake.allowance = Some(2_000);
+            let page = merge(&mut fake, &ranges, budget(50, 50_000)).unwrap();
+            got.extend(places(&page));
+            if page.exhausted {
+                break;
+            }
+            let next: Vec<Range> = ranges
+                .iter()
+                .map(|r| Range {
+                    upper: page
+                        .positions
+                        .iter()
+                        .find(|(p, _)| *p == r.partition)
+                        .unwrap()
+                        .1,
+                    ..*r
+                })
+                .collect();
+            assert!(
+                !page.results.is_empty() || next != ranges,
+                "page {pages} made no progress: {:?}",
+                page.positions
+            );
+            ranges = next;
+        }
+        assert_eq!(got, expected);
+    }
+
     /// A chunk full of matches keeps only the summaries the page can still return (here 3 of
     /// 400 per partition); the rest is read again by the next page, so nothing is lost.
     #[test]
@@ -1451,8 +1547,8 @@ mod tests {
         fake.slow_after = Some(1);
         let page = run(&mut fake, budget(5000, 1_000_000));
         assert_eq!(page.stopped_by, Some(StoppedBy::TimeBudget));
-        assert_eq!(page.results.len(), CHUNK);
-        assert_eq!(page.positions, vec![(0, 2000 - CHUNK as i64)]);
+        assert_eq!(page.results.len(), FIRST_CHUNK);
+        assert_eq!(page.positions, vec![(0, 2000 - FIRST_CHUNK as i64)]);
 
         let mut fake = Fake::new(&[(0, vec![(0, 0, true)])]);
         let past = Budget {

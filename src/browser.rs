@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::events::{
-    Budget, Chunks, Cursor, Detail, Examined, Filters, Hidden, Range, RecordView, StoppedBy,
-    Summary, merge,
+    Budget, CHUNK, Chunks, Cursor, Detail, Examined, Filters, Hidden, Range, RecordView, StoppedBy,
+    Summary, Want, merge,
 };
 use crate::telemetry::Metrics;
 
@@ -317,8 +317,8 @@ fn assign(c: &Client, topic: &str, partition: i32, offset: i64) -> Result<(), Re
     c.assign(&tpl).map_err(unavailable)
 }
 
-/// Reads the chunks of a search: each is one `assign` of its partition at the chunk's start,
-/// read forward to its end.
+/// Reads the chunks of a search: one `assign` of every chunk's partition at the chunk's start,
+/// then the records as the broker sends them, until every chunk reached its end.
 struct Reader<'a> {
     consumer: &'a Client,
     topic: &'a str,
@@ -331,43 +331,58 @@ impl Chunks for Reader<'_> {
 
     fn read(
         &mut self,
-        partition: i32,
-        start: i64,
-        end: i64,
+        wants: &[Want],
         deadline: Instant,
-    ) -> Result<Option<Vec<Examined>>, Refusal> {
-        assign(self.consumer, self.topic, partition, start)?;
-        let mut out = Vec::with_capacity((end - start).clamp(0, 1024) as usize);
-        loop {
+    ) -> Result<Vec<Option<Vec<Examined>>>, Refusal> {
+        let mut tpl = TopicPartitionList::new();
+        for w in wants {
+            tpl.add_partition_offset(self.topic, w.partition, Offset::Offset(w.start))
+                .map_err(unavailable)?;
+        }
+        self.consumer.assign(&tpl).map_err(unavailable)?;
+        let mut chunks: Vec<Vec<Examined>> = wants
+            .iter()
+            .map(|w| Vec::with_capacity((w.end - w.start).clamp(0, CHUNK as i64) as usize))
+            .collect();
+        let mut complete = vec![false; wants.len()];
+        let mut open = wants.len();
+        let at = |partition: i32| wants.iter().position(|w| w.partition == partition);
+        while open > 0 {
             let wait = deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
-                return Ok(None);
+                break;
             }
-            match self.consumer.poll(wait.min(POLL)) {
-                None => {}
-                Some(Ok(m)) => {
-                    if m.partition() != partition || m.offset() < start {
-                        continue;
+            let ended = match self.consumer.poll(wait.min(POLL)) {
+                None => None,
+                Some(Ok(m)) => match at(m.partition()) {
+                    Some(i) if !complete[i] && m.offset() >= wants[i].start => {
+                        if m.offset() < wants[i].end {
+                            chunks[i].push(with_view(&m, |r| Examined {
+                                offset: r.offset,
+                                timestamp: r.timestamp.unwrap_or(-1),
+                                hit: self.filters.matches(r).then(|| Summary::of(self.topic, r)),
+                            }));
+                        }
+                        (m.offset() >= wants[i].end - 1).then_some(i)
                     }
-                    if m.offset() >= end {
-                        return Ok(Some(out));
-                    }
-                    out.push(with_view(&m, |r| Examined {
-                        offset: r.offset,
-                        timestamp: r.timestamp.unwrap_or(-1),
-                        hit: self.filters.matches(r).then(|| Summary::of(self.topic, r)),
-                    }));
-                    if m.offset() >= end - 1 {
-                        return Ok(Some(out));
-                    }
+                    _ => None,
+                },
+                Some(Err(KafkaError::PartitionEOF(p))) => at(p).filter(|i| !complete[*i]),
+                Some(Err(e)) => {
+                    self.warnings.warn("fetch", &e.to_string());
+                    None
                 }
-                Some(Err(KafkaError::PartitionEOF(p))) if p == partition => {
-                    return Ok(Some(out));
-                }
-                Some(Err(KafkaError::PartitionEOF(_))) => {}
-                Some(Err(e)) => self.warnings.warn("fetch", &e.to_string()),
+            };
+            if let Some(i) = ended {
+                complete[i] = true;
+                open -= 1;
             }
         }
+        Ok(chunks
+            .into_iter()
+            .zip(complete)
+            .map(|(chunk, complete)| complete.then_some(chunk))
+            .collect())
     }
 }
 
