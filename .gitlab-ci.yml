@@ -20,7 +20,7 @@ variables:
   CARGO_TERM_COLOR: always
 
 before_script:
-  - apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null
+  - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler > /dev/null
 
 fmt:
   stage: fmt
@@ -45,7 +45,8 @@ clippy:
 
 test:
   stage: test
-  # The hub's integration tests run an in-process hub; no Docker needed.
+  # The hub's integration tests run an in-process hub; the event browser's start Kafka in a
+  # Testcontainer, so the runner needs Docker on the same host (the tests reach it on 127.0.0.1).
   script:
     - cargo test --all-features
 

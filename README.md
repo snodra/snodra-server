@@ -34,6 +34,7 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 - [Dashboard](#dashboard)
 - [Event processors](#event-processors)
 - [Processor control](#processor-control)
+- [Event browser](#event-browser)
 - [Security](#security)
 - [Protocol summary](#protocol-summary)
 - [Routing and limitations](#routing-and-limitations)
@@ -47,7 +48,9 @@ implementation decisions that are not yet in the umbrella spec; the spec is upda
 
 ## Build and test
 
-Requires Rust 1.99.1 (`rust-toolchain.toml` pins it) and `protoc`. `cmake` is not needed.
+Requires Rust 1.99.1 (`rust-toolchain.toml` pins it), `protoc` and `cmake` (librdkafka is built from source for the
+[event browser](#event-browser)). The event browser's tests (`tests/event_browser.rs`, one test in `src/http.rs` and
+one in `tests/dashboard_ui.rs`) start a Kafka Testcontainer, so `cargo test` needs Docker.
 
 ```sh
 cargo build
@@ -57,7 +60,7 @@ cargo fmt --check
 ```
 
 Unit tests live next to the code in `src/`; integration tests in `tests/` start a real hub on an
-ephemeral port and drive it over gRPC.
+ephemeral port and drive it over gRPC (and over HTTP, with Kafka in a container for the event browser).
 
 ## Running locally
 
@@ -114,6 +117,15 @@ cargo run
 | `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | at least 16 characters; the [processor controls](#processor-control)' token (`Authorization: Bearer <token>` on the mutating calls), which also reads what the dashboard token reads; the file variant is read and reloaded like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`. Equal to the dashboard token (whatever the source) is a config error at start, and a reload that would make them equal keeps both previous tokens. Unset and no ACL entry with `control = true`: the controls answer 403 `controls are disabled` |
 | `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters) |
 | `KRAKEN_HUB_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
+| `KRAKEN_HUB_KAFKA_BOOTSTRAP` | none | Kafka bootstrap servers the [event browser](#event-browser) reads (plaintext); unset: the event browser and the consumer groups are off (404) and their pages hidden |
+| `KRAKEN_HUB_EVENT_TOPICS` | `kraken.events` | the only topics the event browser and its tail read, comma-separated, the first the default; a `<topic>.dlt` is browsable when listed |
+| `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS` | `false` | serve event payloads (record detail, `q`) to a request that presents the dashboard or write token (a token must be configured too) |
+| `KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED` | `50000` | records one search reads from Kafka at most |
+| `KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS` | `100` | results one search page returns at most (1 to 1000) |
+| `KRAKEN_HUB_EVENT_SEARCH_TIMEOUT` | `10s` | time budget of one search, record read or consumer-group listing, Kafka calls included |
+| `KRAKEN_HUB_EVENT_MAX_SEARCHES` | `4` | searches, record reads and group listings at once; one more is 429 |
+| `KRAKEN_HUB_EVENT_MAX_TAILS` | `4` | event tails at once; one more is 429 |
+| `KRAKEN_HUB_EVENT_TAIL_DURATION` | `15m` | a tail ends (`maxDuration`) after this long; at least `1s` |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -281,7 +293,8 @@ umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 | Settings | hub id, version, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
 | Processors | every (service, processor): group, topic, worst state over its instances, instances, partitions, lag (sum of the known lags), dead letters (or the mode `topic` / `log`), the latest error with its age; a row opens to every instance's report and partitions (position, committed, high watermark, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
 | Dead letters | the processors that keep letters, and per processor (`#/dead-letters?service=…&processor=…`) its letters as one instance lists them through the hub (no payloads); with a write credential Retry, Retry all and Discard (confirmed). Read on demand, not live |
-| Events | placeholder: available from phase 7 |
+| Events | only where the hub reads Kafka: a search form (topic, time presets or from/to, type with `*` prefixes, key, source, correlation id, user id, event id, payload text where payloads are served), results newest first with "Load more" and the scan statistics, a record's headers and payload (pretty-printed JSON) or the reason it is hidden, a tail (at most 500 rows, pause); type and correlation id link to a search. This hub only. See [Event browser](#event-browser) |
+| Consumer groups | only where the hub reads Kafka: every group with committed offsets on a topic, by lag, opening to its partitions; a group without members highlighted. The Processors page links each group here |
 
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
 `KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana. With `KRAKEN_HUB_PEERS` set the header
@@ -307,7 +320,8 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
-| `version` | `hubId`, `version`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers) |
+| `version` | `hubId`, `version`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers), `eventBrowser` (`enabled`, `payloads`, `topics`) |
+| `events`, `events/{topic}/{partition}/{offset}`, `events/tail`, `consumer-groups` | the [event browser](#event-browser) |
 | `processors` | the event processors per service, aggregated over the instances (see [Event processors](#event-processors)) |
 | `services/{service}/processors/{processor}/dead-letters?limit=` | a processor's dead letters, listed by one instance; the mutating routes under `services/` are in [Processor control](#processor-control) |
 | `stream` | server-sent events: `summary` (`hubId`, `buildId`, `nowMs`, `totals`, `staleInstances`, `requests`, `errors`, `revision`) at once, within 0.5 s of a change and at least every 2 s; the page refreshes its view on each and polls `topology` every 2 s while the stream is unavailable |
@@ -471,6 +485,43 @@ waits for. The state lives in each service's MongoDB (`processor_control`), not 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $KRAKEN_HUB_DASHBOARD_WRITE_TOKEN" -H 'Content-Type: application/json' \
   -d '{"to":"earliest"}' http://localhost:7001/api/v1/services/service-b/processors/audit/reset
+```
+
+## Event browser
+
+Decision record: umbrella `docs/adr/0025-hub-event-browser-reads-kafka.md` (the operator guide with request and
+response examples is the umbrella's `docs/05-services/hub.md`, "Event browser"). With `KRAKEN_HUB_KAFKA_BOOTSTRAP`
+set, `src/browser.rs` reads the topics of `KRAKEN_HUB_EVENT_TOPICS` with rdkafka: short-lived consumers that assign and
+seek, never subscribe or commit (no consumer group exists for the hub), every call on the blocking pool under the
+search budget, so Kafka never holds the router or another handler and the hub starts without it. `src/events.rs` holds
+the rules: filters, the cursor, the newest-first merge, the record views and the payload access.
+
+| Route under `/api/v1/` | Answer |
+|---|---|
+| `GET events?topic=&from=&to=&type=&key=&source=&correlationId=&userId=&eventId=&q=&limit=&cursor=` | a page of summaries, newest first (partitions read backwards in chunks of 500, merged by record timestamp; ties partition, offset), `{topic, missing?, results, scanned, exhausted, stoppedBy, cursor}` |
+| `GET events/{topic}/{partition}/{offset}` | the summary, every header (`allHeaders`), and `payload` / `payloadBase64` or `payload.hidden` |
+| `GET events/tail?topic=&<filters>` | server-sent `start`, `record` (summaries), `heartbeat` (15 s), `end` (`maxDuration`, `slowReader`, `shutdown`) |
+| `GET consumer-groups?topic=` | every group with committed offsets on the topic: `groupId`, `state`, `members`, `partitions[{partition, committed, highWatermark, lag}]`, `lag`; by lag; `truncated` |
+
+- **Reads** like every `/api/v1/` read: the dashboard token, or the write token. Unset bootstrap: 404 `event browser
+  disabled: set KRAKEN_HUB_KAFKA_BOOTSTRAP`; Kafka down or slow: 503; unconfigured topic, bad filter, cursor of another
+  search: 400; slots taken: 429 with `Retry-After: 1`.
+- **Payloads** (the detail, `q`) only with `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS=true`, a dashboard or write token
+  configured, and one presented; otherwise `"payload": {"hidden": "payloads-off" | "no-token-configured" |
+  "no-token-presented", "reason": "..."}` and `q` is 403. Each payload served: one `info` line `event payload served`
+  (caller, topic, partition, offset, size) and `kraken_hub_event_payload_views_total`. Never logged, cached, in a metric,
+  a result, the tail or an error.
+- **Bounds:** 50 000 records read, 100 results, 10 s per search; 4 searches (record reads and group listings included)
+  and 4 tails per hub; a tail lasts 15 min and holds 256 records for a slow reader (then `end` `slowReader`); 500 groups.
+- **Metrics:** `kraken_hub_event_browser_requests_total{kind,outcome}`, `kraken_hub_event_browser_scanned_records`,
+  `kraken_hub_event_tails`, `kraken_hub_event_payload_views_total`.
+
+```bash
+H="Authorization: Bearer $KRAKEN_HUB_DASHBOARD_TOKEN"
+curl -s -H "$H" 'http://localhost:7001/api/v1/events?correlationId=c-7f1e&limit=20'
+curl -s -H "$H" 'http://localhost:7001/api/v1/events/kraken.events/3/1841'
+curl -sN -H "$H" 'http://localhost:7001/api/v1/events/tail?type=orders.*'
+curl -s -H "$H" 'http://localhost:7001/api/v1/consumer-groups'
 ```
 
 ## Security
@@ -947,7 +998,9 @@ any client change.
   `kraken_hub_subscriptions_open{service,instance}` (subscription targets open per handler
   instance; with `streams_open` the only metrics with an instance label) and
   `kraken_hub_subscription_updates_total{service,type}` (updates relayed), `kraken_hub_control_total{action,outcome}`
-  (processor control calls) and `kraken_hub_control_unknown_replies_total` (control replies nobody waited for). Queue depth and
+  (processor control calls), `kraken_hub_control_unknown_replies_total` (control replies nobody waited for), and for
+  the [event browser](#event-browser) `kraken_hub_event_browser_requests_total{kind,outcome}`,
+  `kraken_hub_event_browser_scanned_records`, `kraken_hub_event_tails` and `kraken_hub_event_payload_views_total`. Queue depth and
   permits are refreshed by the watchdog every tick (at most a second), not per request.
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
@@ -962,7 +1015,8 @@ docker build -t kraken-hub:dev .
 docker run --rm -p 7000:7000 -p 7001:7001 -e KRAKEN_HUB_OTLP_ENDPOINT= kraken-hub:dev
 ```
 
-The image is distroless (no shell, no curl), so its `HEALTHCHECK` runs the binary's own probe:
+The builder installs `cmake` and `protobuf-compiler`; librdkafka and zlib are linked into the binary, so the runtime
+stays distroless (no shell, no curl, no extra library). Its `HEALTHCHECK` runs the binary's own probe:
 `HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/kraken-hub", "--health-check"]`.
 In compose, `depends_on` can wait for it:
 
@@ -1012,13 +1066,15 @@ src/tls.rs        rustls listeners, reloadable certificate, the client CA store 
 src/mtls.rs       the service a client certificate names (kraken://service/<name>), notAfter, fingerprint
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
-src/http.rs       the HTTP port: /api/v1 (JSON, the summary stream, the processor controls and their write credential), security headers
+src/http.rs       the HTTP port: /api/v1 (JSON, the summary stream, the processor controls and their write credential, the event browser), security headers
+src/browser.rs    the event browser's Kafka reads (rdkafka): search, record, tail, consumer groups; slots and deadlines
+src/events.rs     the event browser's rules: filters, cursor, newest-first merge, summaries and details, payload access
 src/api.rs        dashboard API views (types, graph, settings, version, summary)
 src/processors.rs event processor reports (bounds) and the per-service view of /api/v1/processors
 src/control.rs    processor control: request/reply correlation, pause and resume, the leased reset, dead letters, audit
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (connect.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake instance of tests/common/control.rs, proto_sync.rs)
+tests/            integration tests over a real gRPC connection (connect.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake instance of tests/common/control.rs, proto_sync.rs; event_browser.rs against a Kafka Testcontainer from tests/common/kafka.rs)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
