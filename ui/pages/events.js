@@ -191,7 +191,7 @@ export default {
       type: 'search', 'aria-label': label, placeholder: `${label}: ${placeholder}`, value: ctx.params.get(name) || '', spellcheck: 'false',
     })]);
     const payload = eb.payloads
-      ? h('input', { type: 'search', 'aria-label': 'Payload text', placeholder: 'Payload text (exact, case-sensitive)', value: ctx.params.get('q') || '', spellcheck: 'false' })
+      ? h('input', { type: 'search', 'aria-label': 'Payload text', placeholder: 'Payload text (contains, case-sensitive)', value: ctx.params.get('q') || '', spellcheck: 'false' })
       : null;
     const form = h('form', { class: 'controls event-form', role: 'search' },
       topic, range, custom, inputs.map(([, el]) => el), payload,
