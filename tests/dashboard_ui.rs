@@ -15,9 +15,12 @@ use common::{FakeClient, http_get, http_get_full};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{RequestKind, ServerMessage, server_message};
 
+/// The fake instances never send a heartbeat: a long timeout keeps them registered however long
+/// the headless loads take on a busy machine (ten pages load at once).
 fn config() -> Config {
     Config {
         otlp_endpoint: None,
+        heartbeat_timeout: Duration::from_secs(300),
         ..Config::default()
     }
 }
