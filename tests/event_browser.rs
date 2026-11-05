@@ -740,6 +740,42 @@ async fn an_aborted_tail_keeps_its_slot_until_its_kafka_setup_ends() {
     assert_eq!(status, 503, "{body}");
 }
 
+/// A broker that accepts connections and never answers: every call is 503 at its budget, and its
+/// consumer closes within the close grace, so the slot is free again by the budget plus the grace.
+#[tokio::test]
+async fn a_silent_broker_frees_every_slot_within_the_budget_and_the_close_grace() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bootstrap = silent.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in silent.incoming() {
+            held.push(stream);
+        }
+    });
+    let budget = Duration::from_secs(2);
+    let (_g, http) = hub(Config {
+        event_search_timeout: budget,
+        event_max_searches: 1,
+        event_max_tails: 1,
+        ..config(&bootstrap, &["kraken.events"])
+    })
+    .await;
+    for path in [
+        "/api/v1/events",
+        "/api/v1/events/kraken.events/0/0",
+        "/api/v1/consumer-groups",
+        "/api/v1/events/tail",
+    ] {
+        let started = Instant::now();
+        let (status, body) = get(http, path, None).await;
+        assert_eq!(status, 503, "{path}: {body}");
+        let freed = started + budget + kraken_hub::browser::CLOSE_GRACE;
+        tokio::time::sleep_until(freed.into()).await;
+        let (status, body) = get(http, path, None).await;
+        assert_eq!(status, 503, "{path}: the slot is free again: {body}");
+    }
+}
+
 #[tokio::test]
 async fn without_a_bootstrap_the_browser_is_off() {
     let (_g, http) = hub(Config {

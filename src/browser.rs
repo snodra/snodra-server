@@ -46,7 +46,8 @@ const WARN_EVERY: Duration = Duration::from_secs(30);
 /// One `poll` waits at most this long, so deadlines and cancellation are seen.
 const POLL: Duration = Duration::from_millis(100);
 /// Time a blocking call gets beyond its deadline to close its consumer before the request gives
-/// up on it (the call still ends on its own, holding its slot until then).
+/// up on it (the call still ends on its own, holding its slot until then); also the longest a
+/// single Kafka request may wait for its answer.
 pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// Why a browser call answered no data; the HTTP layer maps each to a status.
@@ -166,8 +167,11 @@ struct Kafka {
 
 impl Kafka {
     /// A consumer of `group` that only ever assigns: no commit, no subscription, no topic
-    /// creation; small fetch queues, so a search holds little memory.
+    /// creation; small fetch queues, so a search holds little memory. No request to Kafka waits
+    /// longer than [`CLOSE_GRACE`] (librdkafka's default is 60 s), so a consumer closed while a
+    /// broker hangs is gone within the grace and its call's slot with it.
     fn consumer(&self, group: &str) -> Result<Client, Refusal> {
+        let request_timeout = CLOSE_GRACE.as_millis().to_string();
         ClientConfig::new()
             .set("bootstrap.servers", &self.bootstrap)
             .set("client.id", &self.client_id)
@@ -181,6 +185,9 @@ impl Kafka {
             .set("queued.max.messages.kbytes", "4096")
             .set("queued.min.messages", "1000")
             .set("fetch.wait.max.ms", "100")
+            .set("socket.timeout.ms", &request_timeout)
+            .set("socket.connection.setup.timeout.ms", &request_timeout)
+            .set("api.version.request.timeout.ms", &request_timeout)
             .set_log_level(RDKafkaLogLevel::Warning)
             .create_with_context(Context {
                 warnings: Arc::clone(&self.warnings),
