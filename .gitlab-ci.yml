@@ -1,65 +1,76 @@
-# GitLab CI skeleton for kraken-hub. Pipeline shape follows kraken/docs/09-observability-and-testing.md.
-# Placeholders: the GitLab host and registry (gitlab.damoreira.ml) are not real yet.
+# Shell-executor pipeline: the runners have Rust, protoc, Docker and buildx installed.
+# Images and services are intentionally not used; Testcontainers talks to the host daemon.
 
 stages:
-  - fmt
-  - clippy
+  - check
   - test
-  - docker
-
-default:
-  image: rust:1.99 # placeholder tag; pin to the exact digest once the registry mirror exists
-  cache:
-    key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
-    paths:
-      - .cargo/registry
-      - target/
+  - image
+  - release
 
 variables:
-  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CARGO_TERM_COLOR: always
-
-before_script:
-  - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler > /dev/null
+  TESTCONTAINERS_RYUK_DISABLED: "true"
 
 fmt:
-  stage: fmt
+  stage: check
   script:
     - cargo fmt --all -- --check
 
 # proto/hub.proto must stay byte-identical to the umbrella's kraken/protocol/hub.proto.
 proto-sync:
-  stage: fmt
-  before_script: []
-  variables:
-    KRAKEN_PROTO_SYNC_REQUIRED: "true"
-    KRAKEN_PROTO_SOURCE: "$CI_PROJECT_DIR/../kraken/protocol/hub.proto"
+  stage: check
   script:
-    - git clone --depth 1 "${KRAKEN_UMBRELLA_REPO:-https://gitlab.damoreira.ml/kraken-org/kraken.git}" ../kraken
-    - bash scripts/check-proto-sync.sh
+    - |
+      export GIT_ASKPASS="$CI_PROJECT_DIR/.git-askpass"
+      cat > "$GIT_ASKPASS" <<'EOF'
+      #!/bin/sh
+      case "$1" in
+        Username*) echo "$KRAKEN_UMBRELLA_DEPLOY_USER" ;;
+        Password*) echo "$KRAKEN_UMBRELLA_DEPLOY_TOKEN" ;;
+      esac
+      EOF
+      chmod +x "$GIT_ASKPASS"
+      rm -rf "$CI_PROJECT_DIR/../kraken"
+      git clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
+      KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
-  stage: clippy
+  stage: check
   script:
     - cargo clippy --all-targets --all-features -- -D warnings
 
 test:
   stage: test
-  # The hub's integration tests run an in-process hub; the event browser's start Kafka in a
-  # Testcontainer, so the runner needs Docker on the same host (the tests reach it on 127.0.0.1).
   script:
     - cargo test --all-features
 
 docker:
-  stage: docker
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
+  stage: image
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
   script:
-    - /kaniko/executor
-      --context "$CI_PROJECT_DIR"
-      --dockerfile "$CI_PROJECT_DIR/Dockerfile"
-      --destination "registry.gitlab.damoreira.ml/kraken-org/kraken-hub:$CI_COMMIT_TAG"
-      --destination "registry.gitlab.damoreira.ml/kraken-org/kraken-hub:latest"
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME"
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
+    - docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+    - docker push "$IMAGE:$VERSION"
+    - docker push "$IMAGE:latest"
+
+release:
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  script:
+    - |
+      VERSION="${CI_COMMIT_TAG#v}"
+      PAYLOAD=$(jq -n \
+        --arg name "$CI_PROJECT_NAME $CI_COMMIT_TAG" \
+        --arg tag "$CI_COMMIT_TAG" \
+        --arg desc "Release $VERSION. Image: $HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME:$VERSION." \
+        '{name:$name,tag_name:$tag,description:$desc}')
+      curl --fail --silent --show-error \
+        --request POST \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$PAYLOAD" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"

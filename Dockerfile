@@ -2,6 +2,7 @@
 FROM rust:1.99-bookworm AS builder
 # cmake: librdkafka is built from source for the event browser (rdkafka `cmake-build`).
 RUN apt-get update && apt-get install -y --no-install-recommends cmake protobuf-compiler \
+    libcurl4-openssl-dev libssl-dev zlib1g-dev libsasl2-dev libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
