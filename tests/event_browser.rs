@@ -619,14 +619,19 @@ async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_n
     drop(broker);
 }
 
-#[tokio::test]
-async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
+/// A bootstrap address nothing listens on.
+fn closed_port() -> String {
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
     drop(closed);
+    format!("127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
     let (grpc, http) = hub(Config {
         event_search_timeout: Duration::from_secs(2),
-        ..config(&format!("127.0.0.1:{port}"), &["kraken.events"])
+        ..config(&closed_port(), &["kraken.events"])
     })
     .await;
     let searches: Vec<_> = [
@@ -694,6 +699,45 @@ async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
         assert_eq!(status, 503, "{path}: {body}");
         assert!(body["error"].as_str().unwrap().contains("Kafka"), "{body}");
     }
+}
+
+/// A tail request that is dropped while its Kafka setup still runs keeps its slot until that
+/// setup ends: opening and aborting tails never runs more setups than the tail limit.
+#[tokio::test]
+async fn an_aborted_tail_keeps_its_slot_until_its_kafka_setup_ends() {
+    use tokio::io::AsyncWriteExt;
+    let budget = Duration::from_secs(3);
+    let (_g, http) = hub(Config {
+        event_search_timeout: budget,
+        event_max_tails: 4,
+        ..config(&closed_port(), &["kraken.events"])
+    })
+    .await;
+    let opened = Instant::now();
+    for _ in 0..8 {
+        let mut client = tokio::net::TcpStream::connect(http).await.unwrap();
+        let request = format!("GET /api/v1/events/tail HTTP/1.1\r\nHost: {http}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+    }
+    // Every setup still waits for Kafka: a fifth tail is refused.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let busy = http_send(
+        http,
+        "GET",
+        "/api/v1/events/tail",
+        &[],
+        b"",
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(busy.status, 429, "{}", busy.body);
+    assert!(opened.elapsed() < budget, "{:?}", opened.elapsed());
+    // The setups end at their budget and give their slots back.
+    tokio::time::sleep_until((opened + budget + Duration::from_secs(1)).into()).await;
+    let (status, body) = get(http, "/api/v1/events/tail", None).await;
+    assert_eq!(status, 503, "{body}");
 }
 
 #[tokio::test]

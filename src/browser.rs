@@ -47,7 +47,7 @@ const WARN_EVERY: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(100);
 /// Time a blocking call gets beyond its deadline to close its consumer before the request gives
 /// up on it (the call still ends on its own, holding its slot until then).
-const CLOSE_GRACE: Duration = Duration::from_secs(5);
+pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// Why a browser call answered no data; the HTTP layer maps each to a status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,10 +696,16 @@ impl Browser {
         })?;
         let budget = self.config.event_search_timeout;
         let duration = self.config.event_tail_duration;
-        let (c, parts) = {
-            let kafka = kafka.clone();
-            let topic = topic.clone();
-            let task = tokio::task::spawn_blocking(move || {
+        let (started_tx, started) = oneshot::channel();
+        let (tx, records) = mpsc::channel(TAIL_BUFFER);
+        let (end_tx, end) = oneshot::channel();
+        let metrics = Arc::clone(&self.metrics);
+        // One blocking call holds the slot and the consumer from the setup to the end, so a
+        // request that leaves (or gives up waiting) during the setup never frees a slot while
+        // Kafka work still runs for it, and the consumer is closed on this thread.
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let setup = || {
                 let deadline = Instant::now() + budget;
                 let c = kafka.browser()?;
                 let Some(parts) = partitions(&c, &topic, deadline)? else {
@@ -713,20 +719,25 @@ impl Browser {
                 }
                 c.assign(&tpl).map_err(unavailable)?;
                 Ok((c, parts.len()))
-            });
-            match tokio::time::timeout(budget + CLOSE_GRACE, task).await {
-                Ok(Ok(started)) => started?,
-                Ok(Err(_)) => return Err(Refusal::Unavailable("the Kafka read failed".into())),
-                Err(_) => return Err(late()),
-            }
-        };
-        let (tx, records) = mpsc::channel(TAIL_BUFFER);
-        let (end_tx, end) = oneshot::channel();
-        let ends = std::time::SystemTime::now() + duration;
-        let metrics = Arc::clone(&self.metrics);
-        metrics.event_tails_add(1);
-        tokio::task::spawn_blocking(move || {
-            let _slot = slot;
+            };
+            let c = match setup() {
+                Ok((c, parts)) => {
+                    let ends = std::time::SystemTime::now() + duration;
+                    let ends_at_ms = ends
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as i64);
+                    if started_tx.send(Ok((parts, ends_at_ms))).is_err() {
+                        // The request left during the setup.
+                        return;
+                    }
+                    c
+                }
+                Err(refusal) => {
+                    let _ = started_tx.send(Err(refusal));
+                    return;
+                }
+            };
+            metrics.event_tails_add(1);
             let deadline = Instant::now() + duration;
             let reason = loop {
                 if stopping.is_cancelled() {
@@ -761,13 +772,16 @@ impl Browser {
             drop(c);
             metrics.event_tails_add(-1);
         });
+        let (parts, ends_at_ms) = match tokio::time::timeout(budget + CLOSE_GRACE, started).await {
+            Ok(Ok(started)) => started?,
+            Ok(Err(_)) => return Err(Refusal::Unavailable("the Kafka read failed".into())),
+            Err(_) => return Err(late()),
+        };
         Ok(Tail {
             partitions: parts,
             records,
             end,
-            ends_at_ms: ends
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as i64),
+            ends_at_ms,
         })
     }
 
