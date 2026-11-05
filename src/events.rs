@@ -444,7 +444,9 @@ impl Filters {
         }
         let equal = |want: &Option<String>, got: Option<&[u8]>| match want {
             None => true,
-            Some(want) => got.is_some_and(|g| g == want.as_bytes() || escaped(g) == *want),
+            Some(want) => got.is_some_and(|g| {
+                g == want.as_bytes() || (std::str::from_utf8(g).is_err() && escaped(g) == *want)
+            }),
         };
         if !equal(&self.key, r.key)
             || !equal(&self.source, r.header("source"))
@@ -807,6 +809,23 @@ pub fn merge<C: Chunks>(
             if lane.buffer.is_empty() {
                 // Nothing in the chunk: on to the next one down.
                 lane.next = start;
+            }
+            // This page emits at most `wanted` more results, so no partition needs a summary
+            // beyond its newest `wanted` hits: the older part of the chunk is let go (and read
+            // again by the next page), which bounds a page's memory by partitions x limit.
+            let wanted = budget.limit - results.len();
+            if let Some(oldest_kept) = lane
+                .buffer
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, e)| e.hit.is_some())
+                .nth(wanted.saturating_sub(1))
+                .map(|(i, _)| i)
+                && oldest_kept > 0
+            {
+                lane.loaded_from = lane.buffer[oldest_kept].offset;
+                lane.buffer.drain(..oldest_kept);
             }
         }
         if lanes.iter().any(|l| l.buffer.is_empty() && !l.done()) {
@@ -1374,6 +1393,37 @@ mod tests {
             }
             assert_eq!(got, expected, "limit {limit}, scan budget {max_scanned}");
         }
+    }
+
+    /// A chunk full of matches keeps only the summaries the page can still return (here 3 of
+    /// 400 per partition); the rest is read again by the next page, so nothing is lost.
+    #[test]
+    fn a_chunk_full_of_matches_is_trimmed_without_losing_a_record() {
+        let mut fake = Fake::new(&[
+            (0, (0..400).map(|o| (o, o * 2, true)).collect()),
+            (1, (0..400).map(|o| (o, o * 2 + 1, true)).collect()),
+        ]);
+        let page = run(&mut fake, budget(3, 10_000));
+        assert_eq!(places(&page), vec![(1, 399), (0, 399), (1, 398)]);
+        assert_eq!(page.positions, vec![(0, 399), (1, 398)]);
+        let next = merge(
+            &mut fake,
+            &[
+                Range {
+                    partition: 0,
+                    lower: 0,
+                    upper: 399,
+                },
+                Range {
+                    partition: 1,
+                    lower: 0,
+                    upper: 398,
+                },
+            ],
+            budget(3, 10_000),
+        )
+        .unwrap();
+        assert_eq!(places(&next), vec![(0, 398), (1, 397), (0, 397)]);
     }
 
     #[test]
