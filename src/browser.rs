@@ -169,13 +169,14 @@ struct Kafka {
 }
 
 impl Kafka {
-    /// A consumer of `group` that only ever assigns: no commit, no subscription, no topic
-    /// creation; small fetch queues, so a search holds little memory. No request to Kafka waits
-    /// longer than [`CLOSE_GRACE`] (librdkafka's default is 60 s), so a consumer closed while a
-    /// broker hangs is gone within the grace and its call's slot with it.
-    fn consumer(&self, group: &str) -> Result<Client, Refusal> {
+    /// The settings of a consumer of `group` that only ever assigns: no commit, no subscription,
+    /// no topic creation; fetches of about a chunk, so a search holds little memory. No request to
+    /// Kafka waits longer than [`CLOSE_GRACE`] (librdkafka's default is 60 s), so a consumer
+    /// closed while a broker hangs is gone within the grace and its call's slot with it.
+    fn settings(&self, group: &str) -> ClientConfig {
         let request_timeout = CLOSE_GRACE.as_millis().to_string();
-        ClientConfig::new()
+        let mut settings = ClientConfig::new();
+        settings
             .set("bootstrap.servers", &self.bootstrap)
             .set("client.id", &self.client_id)
             .set("group.id", group)
@@ -184,14 +185,23 @@ impl Kafka {
             .set("enable.partition.eof", "true")
             .set("allow.auto.create.topics", "false")
             .set("auto.offset.reset", "earliest")
+            // A fetch brings a partition about one chunk, and the consumer keeps about one chunk
+            // ahead per partition: a search's broker traffic follows the records it examines.
+            .set("max.partition.fetch.bytes", "262144")
+            .set("queued.max.messages.kbytes", "256")
+            .set("queued.min.messages", CHUNK.to_string())
             .set("fetch.max.bytes", "4194304")
-            .set("queued.max.messages.kbytes", "4096")
-            .set("queued.min.messages", "1000")
             .set("fetch.wait.max.ms", "100")
             .set("socket.timeout.ms", &request_timeout)
             .set("socket.connection.setup.timeout.ms", &request_timeout)
             .set("api.version.request.timeout.ms", &request_timeout)
-            .set_log_level(RDKafkaLogLevel::Warning)
+            .set_log_level(RDKafkaLogLevel::Warning);
+        settings
+    }
+
+    /// A consumer of `group` with [`Kafka::settings`].
+    fn consumer(&self, group: &str) -> Result<Client, Refusal> {
+        self.settings(group)
             .create_with_context(Context {
                 warnings: Arc::clone(&self.warnings),
             })
@@ -965,6 +975,26 @@ mod tests {
             browser.topic(Some("b")),
             Err(Refusal::BadRequest(_))
         ));
+    }
+
+    /// The broker sends a partition about one chunk per fetch, and the consumer keeps about one
+    /// chunk ahead per partition, so a search's broker traffic follows the records it examines.
+    #[test]
+    fn a_consumer_fetches_about_one_chunk_per_partition() {
+        let kafka = Kafka {
+            bootstrap: "127.0.0.1:1".into(),
+            client_id: "kraken-hub-test".into(),
+            group: format!("{BROWSER_GROUP_PREFIX}test"),
+            warnings: Arc::default(),
+        };
+        let settings = kafka.settings(&kafka.group);
+        assert_eq!(settings.get("max.partition.fetch.bytes"), Some("262144"));
+        assert_eq!(settings.get("queued.max.messages.kbytes"), Some("256"));
+        assert_eq!(
+            settings.get("queued.min.messages"),
+            Some(CHUNK.to_string().as_str())
+        );
+        assert!(kafka.browser().is_ok(), "librdkafka takes the settings");
     }
 
     #[test]
