@@ -251,6 +251,15 @@ export default {
       }
     };
 
+    /** The group, linked to its lag on the Consumer groups page where this hub reads Kafka. */
+    const groupCell = (p) => {
+      const eb = ctx.version && ctx.version.eventBrowser;
+      if (!eb || !eb.enabled) return p.groupId;
+      const q = new URLSearchParams({ open: p.groupId });
+      if (eb.topics.includes(p.topic)) q.set('topic', p.topic);
+      return h('a', { href: `#/consumer-groups?${q}`, title: 'Its lag per partition, as Kafka reports it' }, p.groupId);
+    };
+
     const actionsCell = (service, p) => h('td', { class: 'nowrap actions' },
       p.state === 'PAUSED'
         ? h('button', { type: 'button', on: { click: () => act('resume', service, p) } }, 'Resume')
@@ -299,7 +308,7 @@ export default {
             title: expanded ? 'Hide the partitions of every instance' : 'Show the partitions of every instance',
             on: { click: () => toggle(key) },
           }, p.name)),
-          h('td', { class: 'mono nowrap' }, p.groupId),
+          h('td', { class: 'mono nowrap' }, groupCell(p)),
           h('td', { class: 'mono nowrap' }, p.topic),
           h('td', { class: 'nowrap' }, stateCell(p)),
           h('td', { class: 'num' }, fmt.int(p.instancesReporting)),

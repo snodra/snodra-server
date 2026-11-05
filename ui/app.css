@@ -201,16 +201,6 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 }
 .tabs a:hover { color: var(--ink); }
 .tabs a[aria-current="page"] { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
-.tabs li.upcoming a { color: var(--muted); }
-.tabs .sep { width: 1px; margin: 10px 6px; background: var(--hairline); }
-.phase {
-  font-size: 11px;
-  font-weight: 500;
-  padding: 0 5px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--muted);
-}
 
 .banner {
   display: flex;
@@ -583,3 +573,35 @@ fieldset.reset-target > .choice { display: flex; }
 }
 table.data.letters { min-width: 1100px; }
 table.data.letters td:nth-child(8) { overflow-wrap: anywhere; min-width: 24ch; }
+
+/* Event browser (ADR 0025) ------------------------------------------------------------------- */
+
+.event-form input[type="search"] { flex: 1 1 180px; max-width: 260px; }
+.event-form input[type="datetime-local"] {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+button.linkish { border: 0; background: none; padding: 0; color: var(--link); font: inherit; }
+button.linkish:hover { background: none; text-decoration: underline; }
+table.data.events { min-width: 900px; }
+table.data.events td:nth-child(6) { overflow-wrap: anywhere; }
+table.data.headers td:last-child { overflow-wrap: anywhere; }
+pre.payload {
+  margin: 0;
+  max-height: 480px;
+  overflow: auto;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+table.data.groups tr.idle > td { background: var(--warn-wash); }

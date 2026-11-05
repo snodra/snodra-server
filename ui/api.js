@@ -6,6 +6,9 @@
 // cross-origin, without cookies, with the same token (the hubs of one deployment share it).
 // The processor controls (ADR 0023) send a second credential, the write token, kept the same way
 // under its own key, only on `control` calls and only to this hub (it reaches every instance).
+// The event browser (ADR 0025) reads this hub only, with the dashboard token, or the write token
+// when the tab holds no dashboard token (the write token reads too, and a hub that has only a
+// write token serves payloads to a request that presents it).
 
 const BASE = new URL('../api/v1/', document.baseURI);
 const TOKEN_KEY = 'kraken-hub.token';
@@ -72,11 +75,14 @@ export function onUnauthorized(fn) {
   listeners.add(fn);
 }
 
-function headers(accept) {
+function headers(accept, credential = token) {
   const h = { accept };
-  if (token) h.authorization = `Bearer ${token}`;
+  if (credential) h.authorization = `Bearer ${credential}`;
   return h;
 }
+
+/** The credential of the event browser's reads: the dashboard token, else the write token. */
+const browserCredential = () => token || writeToken;
 
 /** An Error carrying the HTTP status of the answer (`status`), so a caller can tell an answer
  * that names nothing (404) from a failure. */
@@ -161,15 +167,59 @@ export const canStream = () => typeof fetch === 'function' && typeof TextDecoder
  * an Error on another non-2xx answer or a network error, and with the abort reason when
  * `signal` aborts.
  */
-export async function readStream({ signal, onOpen, onEvent }) {
-  const response = await fetch(new URL('stream', BASE), {
-    headers: headers('text/event-stream'),
+export function readStream({ signal, onOpen, onEvent }) {
+  return readEvents('stream', token, { signal, onOpen, onEvent });
+}
+
+/**
+ * GET /api/v1/<path> of the event browser (ADR 0025), with its credential. Resolves to
+ * `{ ok, status, data }` for every answer (`data`: its JSON, null when it has none), so the page
+ * can show why the hub refused; throws AuthError on 401 and an Error on a network error.
+ */
+export async function browse(path, { signal } = {}) {
+  const response = await fetch(new URL(path, BASE), {
+    headers: headers('application/json', browserCredential()),
     cache: 'no-store',
     credentials: 'omit',
     signal,
   });
-  if (response.status === 401) throw unauthorized('stream');
-  if (!response.ok || !response.body) throw new Error(`stream: HTTP ${response.status}`);
+  if (response.status === 401) throw unauthorized(path.split('?')[0]);
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+  return { ok: response.ok, status: response.status, data };
+}
+
+/**
+ * Reads the event tail /api/v1/events/tail?<query> like `readStream`; `onRefused(status, data)`
+ * is called instead of rejecting when the hub refuses it with JSON (429, 403, 503).
+ */
+export async function readTail(query, { signal, onOpen, onEvent, onRefused }) {
+  return readEvents(`events/tail?${query}`, browserCredential(), { signal, onOpen, onEvent, onRefused });
+}
+
+async function readEvents(path, credential, { signal, onOpen, onEvent, onRefused }) {
+  const response = await fetch(new URL(path, BASE), {
+    headers: headers('text/event-stream', credential),
+    cache: 'no-store',
+    credentials: 'omit',
+    signal,
+  });
+  if (response.status === 401) throw unauthorized(path.split('?')[0]);
+  if (!response.ok && onRefused) {
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    onRefused(response.status, data);
+    return;
+  }
+  if (!response.ok || !response.body) throw new Error(`${path.split('?')[0]}: HTTP ${response.status}`);
   onOpen();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();

@@ -1,11 +1,14 @@
 // kraken-hub dashboard: hash routing, the header, live updates; the processor controls need a
-// write credential (ADR 0023). No third-party code.
+// write credential (ADR 0023); the event browser's pages (ADR 0025) show only where the hub reads
+// Kafka. No third-party code.
 
 import * as api from './api.js';
 import { badge, fill, h } from './dom.js';
 import * as fmt from './format.js';
 import { hideTip } from './graph.js';
 import deadLetters from './pages/deadletters.js';
+import events from './pages/events.js';
+import groups from './pages/groups.js';
 import * as hubs from './hubs.js';
 import { startLive } from './live.js';
 import { showLogin } from './login.js';
@@ -14,7 +17,6 @@ import processors from './pages/processors.js';
 import services from './pages/services.js';
 import settings from './pages/settings.js';
 import types from './pages/types.js';
-import { upcoming } from './pages/upcoming.js';
 
 /** This page's build (from its own module URL, /ui/v/<build>/app.js). */
 const BUILD = (import.meta.url.match(/\/v\/([^/]+)\//) || [])[1] || null;
@@ -34,12 +36,13 @@ const PAGES = [
   types,
   processors,
   deadLetters,
+  events,
+  groups,
   settings,
-  upcoming({
-    id: 'events', title: 'Events', phase: 7,
-    text: 'A read-only browser over the Kafka events topic: search by time, type, key and headers, consumer-group lag.',
-  }),
 ];
+
+/** False for an event browser page while this hub does not read Kafka (its nav entry hides). */
+const shown = (p) => !p.browser || Boolean(version?.eventBrowser?.enabled);
 
 const $ = (id) => document.getElementById(id);
 const main = $('main');
@@ -101,17 +104,8 @@ function setParams(values) {
 const ctx = () => ({ api, params: route.params, setParams, version, hubs, allHubs: allHubs(), refresh: () => refresh() });
 
 function renderNav() {
-  const items = [];
-  PAGES.forEach((p, i) => {
-    if (p.phase && !PAGES[i - 1]?.phase) items.push(h('li', { class: 'sep', 'aria-hidden': 'true' }));
-    items.push(h('li', { class: p.phase ? 'upcoming' : null },
-      h('a', {
-        href: `#/${p.id}`,
-        'aria-current': p === route.page ? 'page' : null,
-        title: p.phase ? `Available from phase ${p.phase}` : null,
-      }, p.title, p.phase ? h('span', { class: 'phase' }, `P${p.phase}`) : null)));
-  });
-  fill($('nav'), items);
+  fill($('nav'), PAGES.filter(shown).map((p) => h('li', null,
+    h('a', { href: `#/${p.id}`, 'aria-current': p === route.page ? 'page' : null }, p.title))));
 }
 
 function showError(error) {

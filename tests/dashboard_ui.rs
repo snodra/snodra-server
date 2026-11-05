@@ -1081,3 +1081,122 @@ async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
     }
     panic!("the sign-in form never appeared: {last}");
 }
+
+/// The event browser's pages (ADR 0025) against a real Kafka: the Events page lists the records
+/// newest first and opens one (its headers, the reason its payload is hidden), every value as
+/// text; the Consumer groups page highlights a group without members. A hub without Kafka has
+/// neither page in its navigation.
+#[tokio::test]
+async fn the_event_browser_pages_render_as_text_and_hide_without_kafka() {
+    use common::kafka::{self, Rec};
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("ui");
+    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
+    kafka::produce(
+        &broker.bootstrap,
+        &topic,
+        &[
+            Rec::on(0)
+                .at(1_700_000_000_000)
+                .key("order-1")
+                .header("type", "orders.<img src=x onerror=alert(1)>")
+                .header("correlationId", "corr-ui")
+                .payload("{\"total\":\"<script>alert(1)</script>\"}"),
+            Rec::on(1)
+                .at(1_700_000_001_000)
+                .key("order-2")
+                .header("type", "orders.Shipped")
+                .header("source", "service-b")
+                .payload("{}"),
+        ],
+    )
+    .await;
+    let bootstrap = broker.bootstrap.clone();
+    let commit_topic = topic.clone();
+    tokio::task::spawn_blocking(move || {
+        kafka::commit(
+            &bootstrap,
+            "service-b.audit",
+            &commit_topic,
+            &[(0, 0), (1, 0)],
+        )
+    })
+    .await
+    .unwrap();
+    let (_grpc, http) = common::start_hub_with_http(Config {
+        kafka_bootstrap: Some(broker.bootstrap.clone()),
+        event_topics: vec![topic.clone()],
+        event_payloads: true,
+        ..config()
+    })
+    .await;
+    let http: SocketAddr = http.unwrap();
+    let _slots = take_stream_slots(http).await;
+    let profiles =
+        std::env::temp_dir().join(format!("kraken-hub-ui-events-{}", std::process::id()));
+
+    let (dom, _) = rendered(
+        &browser,
+        http,
+        &format!("events?record={topic}%2F0%2F0"),
+        &profiles.join("events"),
+    )
+    .await;
+    for marker in [
+        "aria-label=\"Search results\"",
+        "Scanned 2 records; every partition searched.",
+        "orders.Shipped",
+        "orders.&lt;img src=x onerror=alert(1)&gt;",
+        "href=\"#/events?topic=",
+        "correlationId=corr-ui",
+        ">corr-ui</a>",
+        "aria-label=\"Record\"",
+        "payload hidden",
+        "no-token-configured",
+        "Payloads are not served to this page",
+        "href=\"#/consumer-groups\"",
+    ] {
+        assert!(dom.contains(marker), "events: {marker:?} missing in {dom}");
+    }
+    assert!(
+        !dom.contains("<img src=x"),
+        "markup from a header became markup"
+    );
+    // Newest first: order-2 (partition 1, a second later) above order-1.
+    let results = &dom[dom.find("aria-label=\"Search results\"").unwrap()..];
+    assert!(results.find(">order-2<").unwrap() < results.find(">order-1<").unwrap());
+
+    let (dom, _) = rendered(
+        &browser,
+        http,
+        "consumer-groups?open=service-b.audit",
+        &profiles.join("groups"),
+    )
+    .await;
+    for marker in [
+        "service-b.audit",
+        ">no members</span>",
+        "class=\"idle\"",
+        &format!("Partitions of service-b.audit on {topic}"),
+        "1 group on",
+    ] {
+        assert!(dom.contains(marker), "groups: {marker:?} missing in {dom}");
+    }
+
+    // Without Kafka the pages are not in the navigation.
+    let (_grpc, plain) = common::start_hub_with_http(config()).await;
+    let plain: SocketAddr = plain.unwrap();
+    let _plain_slots = take_stream_slots(plain).await;
+    let (dom, _) = rendered(&browser, plain, "overview", &profiles.join("plain")).await;
+    assert!(dom.contains("href=\"#/processors\""), "{dom}");
+    assert!(
+        !dom.contains("href=\"#/events\"") && !dom.contains("href=\"#/consumer-groups\""),
+        "{dom}"
+    );
+    let _ = std::fs::remove_dir_all(&profiles);
+    drop(broker);
+}
