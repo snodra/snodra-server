@@ -1202,15 +1202,18 @@ mod tests {
 
     // ---- merge ---------------------------------------------------------------------------
 
-    /// Partitions in memory: per partition, `(offset, timestamp, matches)`; offsets may have gaps.
+    /// Records of one partition: `(offset, timestamp, matches)`; offsets may have gaps.
+    type Records = Vec<(i64, i64, bool)>;
+
+    /// Partitions in memory.
     struct Fake {
-        partitions: BTreeMap<i32, Vec<(i64, i64, bool)>>,
+        partitions: BTreeMap<i32, Records>,
         reads: usize,
         slow_after: Option<usize>,
     }
 
     impl Fake {
-        fn new(partitions: &[(i32, Vec<(i64, i64, bool)>)]) -> Self {
+        fn new(partitions: &[(i32, Records)]) -> Self {
             Self {
                 partitions: partitions.iter().cloned().collect(),
                 reads: 0,

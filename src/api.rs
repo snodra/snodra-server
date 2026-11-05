@@ -95,6 +95,20 @@ pub struct Version {
     /// `KRAKEN_HUB_PEERS` as origins (ADR 0016): the hubs whose APIs the page merges. May list
     /// this hub; the page skips it by hub id. Empty: the page shows this hub only.
     pub peers: Vec<String>,
+    /// What the event browser offers here (ADR 0025); the page hides its pages when it is off.
+    pub event_browser: EventBrowser,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventBrowser {
+    /// `KRAKEN_HUB_KAFKA_BOOTSTRAP` is set.
+    pub enabled: bool,
+    /// A request that presents this hub's dashboard or write token sees payloads: the switch is
+    /// on and a token is configured.
+    pub payloads: bool,
+    /// The browsable topics, the default first (empty when off).
+    pub topics: Vec<String>,
 }
 
 pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
@@ -108,6 +122,20 @@ pub fn version(config: &Config, t: &Topology, build_id: &str) -> Version {
         grafana_url: config.grafana_url.as_deref().map(without_userinfo),
         window_ms: ms(config.edge_stats_window),
         peers: config.peers.clone(),
+        event_browser: {
+            let enabled = config.kafka_bootstrap.is_some();
+            EventBrowser {
+                enabled,
+                payloads: enabled
+                    && config.event_payloads
+                    && (config.dashboard_token.is_some() || config.dashboard_write_token.is_some()),
+                topics: if enabled {
+                    config.event_topics.clone()
+                } else {
+                    vec![]
+                },
+            }
+        },
     }
 }
 
@@ -857,6 +885,69 @@ pub fn settings(c: &Config) -> SettingsView {
             Plain,
             "how long the instance that executes a reset may take",
         ),
+        setting(
+            "KRAKEN_HUB_KAFKA_BOOTSTRAP",
+            c.kafka_bootstrap.clone().unwrap_or_default(),
+            Some(String::new()),
+            Plain,
+            "Kafka bootstrap servers the event browser reads (plaintext); unset: the event browser and the consumer groups are off",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_TOPICS",
+            c.event_topics.join(","),
+            Some(d.event_topics.join(",")),
+            Plain,
+            "the only topics the event browser and its tail read; the first is the default",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS",
+            c.event_payloads.to_string(),
+            Some(d.event_payloads.to_string()),
+            Plain,
+            "serve event payloads (record detail, payload search) to a request that presents the dashboard or write token",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED",
+            c.event_search_max_scanned.to_string(),
+            Some(d.event_search_max_scanned.to_string()),
+            Plain,
+            "records one event search reads from Kafka at most",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS",
+            c.event_search_max_results.to_string(),
+            Some(d.event_search_max_results.to_string()),
+            Plain,
+            "results one event search page returns at most",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_SEARCH_TIMEOUT",
+            fmt_duration(c.event_search_timeout),
+            Some(fmt_duration(d.event_search_timeout)),
+            Plain,
+            "time budget of one event search, record read or consumer-group listing",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_MAX_SEARCHES",
+            c.event_max_searches.to_string(),
+            Some(d.event_max_searches.to_string()),
+            Plain,
+            "event searches, record reads and consumer-group listings at once; one more is refused (429)",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_MAX_TAILS",
+            c.event_max_tails.to_string(),
+            Some(d.event_max_tails.to_string()),
+            Plain,
+            "event tails open at once; one more is refused (429)",
+        ),
+        setting(
+            "KRAKEN_HUB_EVENT_TAIL_DURATION",
+            fmt_duration(c.event_tail_duration),
+            Some(fmt_duration(d.event_tail_duration)),
+            Plain,
+            "an event tail ends after this long",
+        ),
     ];
     SettingsView { settings: s }
 }
@@ -1226,7 +1317,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 47);
+        assert_eq!(v.settings.len(), 56);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         let control = get("KRAKEN_HUB_CONTROL_TIMEOUT");
         assert_eq!(

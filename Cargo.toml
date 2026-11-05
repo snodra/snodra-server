@@ -53,6 +53,9 @@ base64 = "0.22"
 x509-parser = { version = "0.18", default-features = false }
 # Control and reset operation ids (ADR 0023).
 uuid = { version = "1", features = ["v4"] }
+# The event browser reads Kafka (ADR 0025): librdkafka built from source (cmake) as in
+# kraken-messaging-rs, with zlib linked in, so the distroless runtime needs no extra library.
+rdkafka = { version = "0.39.0", features = ["cmake-build", "libz-static"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.8"
@@ -67,3 +70,6 @@ rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pe
 rsa = "0.9"
 rand = "0.8"
 time = { version = "0.3", default-features = false, features = ["std"] }
+# A real Kafka for the event browser's tests (as kraken-messaging-rs's tests run it).
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15.0", features = ["kafka"] }

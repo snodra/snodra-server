@@ -198,6 +198,10 @@ pub struct Metrics {
     credentials_refreshes: Counter<u64>,
     control: Counter<u64>,
     control_unknown_replies: Counter<u64>,
+    event_browser_requests: Counter<u64>,
+    event_browser_scanned: Histogram<u64>,
+    event_tails: UpDownCounter<i64>,
+    event_payload_views: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -336,6 +340,25 @@ impl Metrics {
                 .u64_counter("kraken_hub_control_unknown_replies_total")
                 .with_description("ControlReply messages dropped because no request waits for them (unknown id, a reply after the timeout, or from another session than the one asked)")
                 .build(),
+            event_browser_requests: meter
+                .u64_counter("kraken_hub_event_browser_requests_total")
+                .with_description("Event browser calls (ADR 0025), per kind (search, record, tail, groups) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, disabled)")
+                .build(),
+            event_browser_scanned: meter
+                .u64_histogram("kraken_hub_event_browser_scanned_records")
+                .with_boundaries(vec![
+                    0.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 25000.0, 50000.0, 100000.0,
+                ])
+                .with_description("Records one event search read from Kafka")
+                .build(),
+            event_tails: meter
+                .i64_up_down_counter("kraken_hub_event_tails")
+                .with_description("Event tails reading Kafka now")
+                .build(),
+            event_payload_views: meter
+                .u64_counter("kraken_hub_event_payload_views_total")
+                .with_description("Event payloads served by the record detail (each also writes an audit line)")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -360,6 +383,32 @@ impl Metrics {
                 KeyValue::new("outcome", outcome),
             ],
         );
+    }
+
+    /// One event browser call (ADR 0025); `kind` and `outcome` are from fixed sets.
+    pub fn event_request(&self, kind: &'static str, outcome: &'static str) {
+        self.event_browser_requests.add(
+            1,
+            &[
+                KeyValue::new("kind", kind),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
+    /// The records one search read.
+    pub fn event_scanned(&self, records: u64) {
+        self.event_browser_scanned.record(records, &[]);
+    }
+
+    /// A tail started (`1`) or ended (`-1`).
+    pub fn event_tails_add(&self, delta: i64) {
+        self.event_tails.add(delta, &[]);
+    }
+
+    /// One payload served.
+    pub fn event_payload_view(&self) {
+        self.event_payload_views.add(1, &[]);
     }
 
     /// A `ControlReply` nobody waited for, dropped.
@@ -812,6 +861,22 @@ pub(crate) mod test_support {
                 .map(|p| p.value())
                 .collect();
             (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// The sum of the i64 up-down counter `name` over all its points.
+        pub(crate) fn up_down_total(&self, name: &str) -> Option<i64> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)?;
+            let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+                panic!("{name} is not an i64 up-down counter");
+            };
+            Some(sum.data_points().map(|p| p.value()).sum())
         }
 
         /// `(count, sum)` of the histogram `name` over all its points, as exported now.

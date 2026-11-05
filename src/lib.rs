@@ -4,6 +4,7 @@
 pub mod api;
 pub mod assets;
 pub mod auth;
+pub mod browser;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -222,6 +223,7 @@ pub async fn serve_with_shutdown(
             stopping: stopping.clone(),
             streams: Arc::default(),
             summaries: Arc::default(),
+            browser: browser::Browser::new(Arc::clone(&config), Arc::clone(&metrics)),
         });
         let stopping = stopping.clone();
         let local = listener.local_addr();

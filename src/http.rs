@@ -28,6 +28,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, Authorizer, ControlRight, Secret};
+use crate::browser::{Browser, Refusal};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::control::{
@@ -38,7 +39,7 @@ use crate::registry::Registry;
 use crate::router::Router;
 use crate::session::Sessions;
 use crate::topology::{self, ClockAnchor, Topology};
-use crate::{api, assets, processors};
+use crate::{api, assets, events, processors};
 
 /// The shared live summary is recomputed this often while a stream is open; each stream sends
 /// it when it changed...
@@ -85,6 +86,8 @@ pub struct HttpState {
     pub streams: Arc<AtomicUsize>,
     /// The summary every open stream reads (computed once per tick for all of them).
     pub summaries: Arc<SummaryFeed>,
+    /// The event browser (ADR 0025): off without `KRAKEN_HUB_KAFKA_BOOTSTRAP`.
+    pub browser: Arc<Browser>,
 }
 
 impl HttpState {
@@ -145,7 +148,14 @@ pub fn app(state: HttpState) -> axum::Router {
             .route("/api/v1/version", get(api_version))
             .route("/api/v1/processors", get(api_processors))
             .route(&format!("{PROCESSOR}/dead-letters"), get(api_dead_letters))
-            .route("/api/v1/stream", get(api_stream));
+            .route("/api/v1/stream", get(api_stream))
+            .route("/api/v1/events", get(api_events))
+            .route("/api/v1/events/tail", get(api_events_tail))
+            .route(
+                "/api/v1/events/{topic}/{partition}/{offset}",
+                get(api_event),
+            )
+            .route("/api/v1/consumer-groups", get(api_consumer_groups));
         // The token check sits inside the CORS layer: a peer's preflight carries no
         // `Authorization` header and must be answered, and a 401 must still carry the CORS
         // headers or the peer's page could not tell a wrong token from a network error.
@@ -354,6 +364,220 @@ async fn api_version(State(s): State<HttpState>) -> Response {
 /// The event processors of every service, aggregated over its instances (ADR 0022).
 async fn api_processors(State(s): State<HttpState>) -> Response {
     fresh_json(processors::view(&s.topology()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Event browser (ADR 0025)
+
+/// The answer to a browser call that has no data, counted under `kind`.
+fn refused(s: &HttpState, kind: &'static str, refusal: Refusal) -> Response {
+    s.browser.count(kind, refusal.outcome());
+    match refusal {
+        Refusal::Disabled => error_json(StatusCode::NOT_FOUND, crate::browser::DISABLED),
+        Refusal::BadRequest(why) => error_json(StatusCode::BAD_REQUEST, &why),
+        Refusal::NotFound(why) => error_json(StatusCode::NOT_FOUND, &why),
+        Refusal::Unavailable(why) => error_json(StatusCode::SERVICE_UNAVAILABLE, &why),
+        Refusal::Forbidden(hidden) => answer_json(
+            StatusCode::FORBIDDEN,
+            &serde_json::json!({ "error": hidden.reason(), "hidden": hidden.code() }),
+        ),
+        Refusal::TooMany(why) => {
+            let mut r = error_json(StatusCode::TOO_MANY_REQUESTS, &why);
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            r
+        }
+    }
+}
+
+/// The topic, the filters and, for a payload filter (`q`), the caller who may use it.
+fn browse(
+    s: &HttpState,
+    query: &events::SearchQuery,
+    headers: &HeaderMap,
+    tail: bool,
+) -> Result<(String, events::Filters), Refusal> {
+    let topic = s.browser.topic(query.topic.as_deref())?;
+    let filters = events::Filters::parse(query, tail).map_err(Refusal::BadRequest)?;
+    if filters.q.is_some() {
+        let caller =
+            events::payload_access(&s.config, presented(headers)).map_err(Refusal::Forbidden)?;
+        tracing::info!(caller, topic = %topic, tail, "event payload search");
+    }
+    Ok((topic, filters))
+}
+
+/// `GET /api/v1/events`: one page of a search, newest first (see [`crate::browser`]).
+async fn api_events(
+    State(s): State<HttpState>,
+    Query(query): Query<events::SearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    const KIND: &str = "search";
+    let page = async {
+        let (topic, filters) = browse(&s, &query, &headers, false)?;
+        let limit = events::parse_limit(query.limit.as_deref(), s.config.event_search_max_results)
+            .map_err(Refusal::BadRequest)?;
+        let cursor = query
+            .cursor
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(|c| events::Cursor::decode(c, filters.digest(&topic)))
+            .transpose()
+            .map_err(Refusal::BadRequest)?;
+        s.browser.search(topic, filters, limit, cursor).await
+    };
+    match page.await {
+        Ok(view) => {
+            s.browser.count(KIND, "ok");
+            fresh_json(view)
+        }
+        Err(refusal) => refused(&s, KIND, refusal),
+    }
+}
+
+/// `GET /api/v1/events/{topic}/{partition}/{offset}`: one record, with every header and, under
+/// the payload rules (ADR 0025), its payload, each served payload audited.
+async fn api_event(
+    State(s): State<HttpState>,
+    Path((topic, partition, offset)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    const KIND: &str = "record";
+    let access = events::payload_access(&s.config, presented(&headers));
+    let detail = async {
+        let topic = s.browser.topic(Some(&topic))?;
+        let partition = partition.parse::<i32>().ok().filter(|p| *p >= 0);
+        let offset = offset.parse::<i64>().ok().filter(|o| *o >= 0);
+        let (Some(partition), Some(offset)) = (partition, offset) else {
+            return Err(Refusal::BadRequest(
+                "the partition and the offset are non-negative numbers".to_string(),
+            ));
+        };
+        s.browser
+            .record(topic, partition, offset, access.map(|_| ()))
+            .await
+    };
+    match detail.await {
+        Ok(detail) => {
+            if let Ok(caller) = access
+                && (detail.payload_base64.is_some() || matches!(detail.payload, Some(Some(_))))
+            {
+                let r = &detail.summary;
+                s.browser
+                    .payload_served(caller, &r.topic, r.partition, r.offset, r.size);
+            }
+            s.browser.count(KIND, "ok");
+            fresh_json(detail)
+        }
+        Err(refusal) => refused(&s, KIND, refusal),
+    }
+}
+
+/// How often a tail sends `event: heartbeat`.
+pub const TAIL_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// `GET /api/v1/events/tail`: server-sent events from the end of every partition: `start`, then a
+/// `record` (a summary, never a payload) per matching record, `heartbeat` every
+/// [`TAIL_HEARTBEAT`], and `end` with the reason (`maxDuration`, `slowReader`, `shutdown`).
+async fn api_events_tail(
+    State(s): State<HttpState>,
+    Query(query): Query<events::SearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    const KIND: &str = "tail";
+    let tail = async {
+        let (topic, filters) = browse(&s, &query, &headers, true)?;
+        let tail = s
+            .browser
+            .tail(topic.clone(), filters, s.stopping.clone())
+            .await?;
+        Ok::<_, Refusal>((topic, tail))
+    };
+    let (topic, mut tail) = match tail.await {
+        Ok(started) => started,
+        Err(refusal) => return refused(&s, KIND, refusal),
+    };
+    s.browser.count(KIND, "ok");
+    let (out, events) = tokio::sync::mpsc::channel::<Event>(16);
+    let start = serde_json::json!({
+        "topic": topic,
+        "partitions": tail.partitions,
+        "endsAtMs": tail.ends_at_ms,
+    });
+    tokio::spawn(async move {
+        if out
+            .send(Event::default().event("start").data(start.to_string()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut heartbeat = tokio::time::interval(TAIL_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = out.closed() => return,
+                reason = &mut tail.end => {
+                    // Without a reason the tail stopped because this reader left.
+                    let Ok(reason) = reason else { return };
+                    let end = serde_json::json!({ "reason": reason });
+                    let _ = out.send(Event::default().event("end").data(end.to_string())).await;
+                    return;
+                }
+                record = tail.records.recv() => match record {
+                    Some(summary) => match Event::default().event("record").json_data(&summary) {
+                        Ok(event) => event,
+                        Err(_) => continue,
+                    },
+                    // The Kafka side ended; its reason follows on `end`.
+                    None => continue,
+                },
+                _ = heartbeat.tick() => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
+                    Event::default().event("heartbeat").data(format!("{{\"nowMs\":{now}}}"))
+                }
+            };
+            if out.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(events).map(Ok::<_, Infallible>);
+    let mut response = Sse::new(stream).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+}
+
+#[derive(Deserialize)]
+struct GroupsQuery {
+    topic: Option<String>,
+}
+
+/// `GET /api/v1/consumer-groups?topic=`: every consumer group with committed offsets on the
+/// topic and its lag, members or not.
+async fn api_consumer_groups(
+    State(s): State<HttpState>,
+    Query(query): Query<GroupsQuery>,
+) -> Response {
+    const KIND: &str = "groups";
+    let groups = async {
+        let topic = s.browser.topic(query.topic.as_deref())?;
+        s.browser.groups(topic).await
+    };
+    match groups.await {
+        Ok(view) => {
+            s.browser.count(KIND, "ok");
+            fresh_json(view)
+        }
+        Err(refusal) => refused(&s, KIND, refusal),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -984,6 +1208,7 @@ mod tests {
             Metrics::new(opentelemetry::global::meter("test")),
         );
         let anchor = ClockAnchor::now();
+        let browser = Browser::new(Arc::clone(&config), Metrics::noop());
         HttpState {
             registry,
             sessions,
@@ -996,6 +1221,7 @@ mod tests {
             stopping: CancellationToken::new(),
             streams: Arc::default(),
             summaries: Arc::default(),
+            browser,
         }
     }
 
@@ -1197,5 +1423,134 @@ mod tests {
         drop(slots);
         assert_eq!(open.load(Ordering::Acquire), 0);
         assert!(StreamSlot::acquire(&open).is_some());
+    }
+
+    /// The event browser's instruments: every call by kind and outcome, the records a search
+    /// read, the open tails, and one payload view (with its audit line) per payload served.
+    #[tokio::test]
+    async fn the_event_browser_counts_calls_scans_tails_and_payload_views() {
+        use rdkafka::config::ClientConfig;
+        use rdkafka::producer::{FutureProducer, FutureRecord};
+        use testcontainers::runners::AsyncRunner;
+        use tower::ServiceExt;
+        crate::telemetry::test_support::capture_logs();
+        let kafka = testcontainers_modules::kafka::apache::Kafka::default()
+            .start()
+            .await
+            .expect("kafka container");
+        let port = kafka
+            .get_host_port_ipv4(testcontainers_modules::kafka::apache::KAFKA_PORT)
+            .await
+            .unwrap();
+        let bootstrap = format!("127.0.0.1:{port}");
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .create()
+            .unwrap();
+        for i in 0..3 {
+            producer
+                .send(
+                    FutureRecord::<str, str>::to("kraken.events")
+                        .key("k")
+                        .payload(&format!("{{\"n\":{i}}}")),
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+        }
+        let metrics = crate::telemetry::test_support::test_metrics();
+        let mut s = state();
+        s.config = Arc::new(Config {
+            otlp_endpoint: None,
+            kafka_bootstrap: Some(bootstrap),
+            event_payloads: true,
+            dashboard_token: Some(Secret::new("a-dashboard-token-0123456789")),
+            ..Config::default()
+        });
+        s.browser = Browser::new(Arc::clone(&s.config), Arc::clone(&metrics.metrics));
+        let app = app(s);
+        let get = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer a-dashboard-token-0123456789")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let r = app.clone().oneshot(get("/api/v1/events")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app
+            .clone()
+            .oneshot(get("/api/v1/events?topic=other"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let r = app
+            .clone()
+            .oneshot(get("/api/v1/events/kraken.events/0/1"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("{\\\"n\\\":1}"));
+
+        let tail = app
+            .clone()
+            .oneshot(get("/api/v1/events/tail"))
+            .await
+            .unwrap();
+        assert_eq!(tail.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.up_down_total("kraken_hub_event_tails"),
+            Some(1),
+            "a tail reading Kafka"
+        );
+        drop(tail);
+        // The tail notices its reader left at its next poll.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while metrics.up_down_total("kraken_hub_event_tails") != Some(0) {
+            assert!(Instant::now() < deadline, "the tail did not end");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let count = |kind: &str, outcome: &str| {
+            let total = metrics
+                .counter("kraken_hub_event_browser_requests_total", "kind", kind)
+                .unwrap_or(0);
+            let by_outcome = metrics
+                .counter(
+                    "kraken_hub_event_browser_requests_total",
+                    "outcome",
+                    outcome,
+                )
+                .unwrap_or(0);
+            (total, by_outcome)
+        };
+        assert_eq!(count("search", "bad_request"), (2, 1));
+        assert_eq!(count("record", "ok").0, 1);
+        assert_eq!(count("tail", "ok").0, 1);
+        assert_eq!(
+            metrics.histogram_sum("kraken_hub_event_browser_scanned_records"),
+            Some((1, 3.0)),
+            "one search that read the three records"
+        );
+        assert_eq!(
+            metrics.counter_total("kraken_hub_event_payload_views_total"),
+            Some(1)
+        );
+        let audits: Vec<_> = crate::telemetry::test_support::logged()
+            .into_iter()
+            .filter(|l| l.message == "event payload served")
+            .collect();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        for (field, value) in [
+            ("caller", "dashboard-token"),
+            ("topic", "kraken.events"),
+            ("partition", "0"),
+            ("offset", "1"),
+            ("size", "7"),
+        ] {
+            assert_eq!(audits[0].field(field), Some(value), "{field}");
+        }
+        drop(kafka);
     }
 }
