@@ -633,6 +633,8 @@ async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_n
     let live = tokio::task::spawn_blocking(move || {
         kafka::commit(&bootstrap, "g-empty", &t, &[(0, 4), (1, 5)]);
         kafka::commit(&bootstrap, "g-elsewhere", &o, &[(0, 0)]);
+        // Named like the browser's group.id: listed like any other (the hub has none of its own).
+        kafka::commit(&bootstrap, "kraken-hub-browser-planted", &o, &[(0, 0)]);
         Member::join(&bootstrap, "g-live", &t, &[(0, 10), (1, 2)])
     })
     .await
@@ -681,7 +683,7 @@ async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_n
         .iter()
         .map(|g| g["groupId"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["g-elsewhere"]);
+    assert_eq!(names, ["g-elsewhere", "kraken-hub-browser-planted"]);
     let (status, _) = get(http, "/api/v1/consumer-groups?topic=nope", None).await;
     assert_eq!(status, 400);
 
@@ -705,9 +707,20 @@ async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_n
     tokio::time::sleep(Duration::from_secs(1)).await;
     let after = kafka::groups(&broker.bootstrap);
     let new: Vec<&String> = after.difference(&before).collect();
-    assert_eq!(new, ["g-elsewhere", "g-empty", "g-live"], "{after:?}");
+    assert_eq!(
+        new,
+        [
+            "g-elsewhere",
+            "g-empty",
+            "g-live",
+            "kraken-hub-browser-planted"
+        ],
+        "{after:?}"
+    );
     assert!(
-        after.iter().all(|g| !g.starts_with("kraken-hub")),
+        after
+            .iter()
+            .all(|g| !g.starts_with("kraken-hub") || g == "kraken-hub-browser-planted"),
         "{after:?}"
     );
     drop((live, grpc));

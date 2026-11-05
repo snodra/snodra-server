@@ -851,7 +851,6 @@ impl Browser {
             let mut known: Vec<(String, String, usize)> = list
                 .groups()
                 .iter()
-                .filter(|g| !g.name().starts_with(BROWSER_GROUP_PREFIX))
                 .map(|g| {
                     (
                         g.name().to_string(),
