@@ -102,9 +102,20 @@ impl Rec {
 
 /// Writes `records` in order and returns where each landed, `(partition, offset)`.
 pub async fn produce(bootstrap: &str, topic: &str, records: &[Rec]) -> Vec<(i32, i64)> {
+    produce_compressed(bootstrap, topic, records, "none").await
+}
+
+/// [`produce`] with the producer's `compression.type` (`gzip`, `snappy`, `lz4`, `zstd`).
+pub async fn produce_compressed(
+    bootstrap: &str,
+    topic: &str,
+    records: &[Rec],
+    compression: &str,
+) -> Vec<(i32, i64)> {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("message.timeout.ms", "20000")
+        .set("compression.type", compression)
         .create()
         .unwrap();
     let mut out = Vec::new();

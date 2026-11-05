@@ -54,8 +54,9 @@ x509-parser = { version = "0.18", default-features = false }
 # Control and reset operation ids (ADR 0023).
 uuid = { version = "1", features = ["v4"] }
 # The event browser reads Kafka (ADR 0025): librdkafka built from source (cmake) as in
-# kraken-messaging-rs, with zlib linked in, so the distroless runtime needs no extra library.
-rdkafka = { version = "0.39.0", features = ["cmake-build", "libz-static"] }
+# kraken-messaging-rs, with zlib and zstd linked in, so the distroless runtime needs no extra
+# library and records any producer compressed (gzip, snappy, lz4, zstd) can be read.
+rdkafka = { version = "0.39.0", features = ["cmake-build", "libz-static", "zstd"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.8"

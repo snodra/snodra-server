@@ -251,6 +251,27 @@ async fn from_and_to_find_records_with_out_of_order_timestamps() {
     drop(broker);
 }
 
+/// Records compressed by their producer (any codec a Kafka client may use) are found and read.
+#[tokio::test]
+async fn compressed_records_are_found_and_read() {
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("codecs");
+    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
+    for (i, codec) in ["gzip", "snappy", "lz4", "zstd"].into_iter().enumerate() {
+        let record = library(0, i as i64, codec, "c.Packed", &format!("e-{codec}"));
+        kafka::produce_compressed(&broker.bootstrap, &topic, &[record], codec).await;
+    }
+    let (_g, http) = hub(config(&broker.bootstrap, &[&topic])).await;
+    let (status, page) = get(http, "/api/v1/events", None).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(ids(&page), ["e-zstd", "e-lz4", "e-snappy", "e-gzip"]);
+    let (status, detail) = get(http, &format!("/api/v1/events/{topic}/0/3"), None).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["key"], "zstd");
+    assert_eq!(detail["headers"]["id"], "e-zstd");
+    drop(broker);
+}
+
 /// Many partitions read at once: every page of a search with a cursor continues the last, and
 /// together they are the whole list, newest first, nothing twice.
 #[tokio::test]
