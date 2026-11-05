@@ -1203,3 +1203,192 @@ async fn the_event_browser_pages_render_as_text_and_hide_without_kafka() {
     let _ = std::fs::remove_dir_all(&profiles);
     drop(broker);
 }
+
+/// A headless browser driven over the DevTools protocol on a pipe (`--remote-debugging-pipe`:
+/// the browser reads commands on fd 3 and writes answers on fd 4, each JSON message ended by a
+/// NUL), for a page that must be watched while it runs rather than dumped once.
+struct Devtools {
+    child: std::process::Child,
+    commands: std::fs::File,
+    answers: std::io::BufReader<std::fs::File>,
+    next: u64,
+    session: Option<String>,
+}
+
+impl Devtools {
+    /// Starts `browser` with its pipe on two FIFOs under `profile` (a shell sets fds 3 and 4).
+    fn launch(browser: &Path, profile: &Path) -> Self {
+        std::fs::create_dir_all(profile).unwrap();
+        let (to, from) = (profile.join("devtools-in"), profile.join("devtools-out"));
+        for fifo in [&to, &from] {
+            let _ = std::fs::remove_file(fifo);
+            let made = std::process::Command::new("mkfifo").arg(fifo).status();
+            assert!(made.unwrap().success(), "mkfifo {}", fifo.display());
+        }
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec \"$0\" \"$@\" 3<\"$DEVTOOLS_IN\" 4>\"$DEVTOOLS_OUT\"")
+            .arg(browser)
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--remote-debugging-pipe",
+            ])
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("about:blank")
+            .env("DEVTOOLS_IN", &to)
+            .env("DEVTOOLS_OUT", &from)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("browser did not start");
+        // The shell opens fd 3 (blocking until this side writes), then fd 4.
+        let commands = std::fs::OpenOptions::new().write(true).open(&to).unwrap();
+        let answers = std::io::BufReader::new(std::fs::File::open(&from).unwrap());
+        Self {
+            child,
+            commands,
+            answers,
+            next: 0,
+            session: None,
+        }
+    }
+
+    /// Sends `method` (to the attached page, once there is one) and returns its `result`.
+    fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::{BufRead, Write};
+        self.next += 1;
+        let mut message = serde_json::json!({"id": self.next, "method": method, "params": params});
+        if let Some(session) = &self.session {
+            message["sessionId"] = session.clone().into();
+        }
+        let mut bytes = serde_json::to_vec(&message).unwrap();
+        bytes.push(0);
+        self.commands.write_all(&bytes).unwrap();
+        loop {
+            let mut raw = Vec::new();
+            let read = self.answers.read_until(0, &mut raw).unwrap();
+            assert!(read > 0, "the browser closed its pipe");
+            raw.pop();
+            let answer: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            if answer["id"] == self.next {
+                assert!(answer.get("error").is_none(), "{method}: {answer}");
+                return answer["result"].clone();
+            }
+        }
+    }
+
+    /// Opens `url` in a new page and talks to that page from now on.
+    fn open(&mut self, url: &str) {
+        let target = self.call("Target.createTarget", serde_json::json!({ "url": url }));
+        let attached = self.call(
+            "Target.attachToTarget",
+            serde_json::json!({ "targetId": target["targetId"], "flatten": true }),
+        );
+        self.session = attached["sessionId"].as_str().map(str::to_string);
+    }
+
+    /// The value of the JavaScript `expression` in the page.
+    fn eval(&mut self, expression: &str) -> serde_json::Value {
+        let result = self.call(
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": expression, "returnByValue": true }),
+        );
+        result["result"]["value"].clone()
+    }
+
+    /// Evaluates `expression` until it is a string containing `marker`, for at most `within`.
+    fn wait_for(&mut self, expression: &str, marker: &str, within: Duration) -> String {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let value = self.eval(expression);
+            let text = value.as_str().unwrap_or_default().to_string();
+            if text.contains(marker) {
+                return text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{marker:?} never came: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Devtools {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A busy topic does not freeze the Events page's tail (`tail=on` starts it): ten thousand
+/// records arrive at 2 000 a second, and the page keeps up: it shows the tail's own end when the
+/// hub sends it, not seconds later, with the newest 500 records drawn, newest first.
+#[tokio::test]
+async fn the_events_tail_keeps_up_with_a_busy_topic() {
+    use common::kafka;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("busy");
+    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
+    let duration = Duration::from_secs(8);
+    let (_grpc, http) = common::start_hub_with_http(Config {
+        kafka_bootstrap: Some(broker.bootstrap.clone()),
+        event_topics: vec![topic.clone()],
+        event_tail_duration: duration,
+        ..config()
+    })
+    .await;
+    let http: SocketAddr = http.unwrap();
+    let profile = std::env::temp_dir().join(format!("kraken-hub-ui-tail-{}", std::process::id()));
+    let status =
+        "document.querySelector('[aria-label=\"Live tail\"] [role=status]')?.textContent ?? ''";
+    let page = format!("http://{http}/ui/#/events?tail=on");
+    let dir = profile.clone();
+    let (mut devtools, tailing) = tokio::task::spawn_blocking(move || {
+        let mut devtools = Devtools::launch(&browser, &dir);
+        devtools.open(&page);
+        let text = devtools.wait_for(status, "Tailing", Duration::from_secs(30));
+        (devtools, text)
+    })
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(tailing.contains("1 partitions"), "{tailing}");
+    let bootstrap = broker.bootstrap.clone();
+    let busy = topic.clone();
+    let flood = tokio::task::spawn_blocking(move || {
+        kafka::produce_paced(&bootstrap, &busy, 0, 10_000, Some(2_000), 1_700_000_000_000)
+    });
+    let (tail, ended, late) = tokio::task::spawn_blocking(move || {
+        let ended = devtools.wait_for(status, "The tail ended", Duration::from_secs(60));
+        let late = started.elapsed().saturating_sub(duration);
+        let tail = devtools.eval("document.querySelector('[aria-label=\"Live tail\"]').outerHTML");
+        (tail.as_str().unwrap().to_string(), ended, late)
+    })
+    .await
+    .unwrap();
+    flood.await.unwrap();
+    assert!(ended.contains("it reached its maximum duration"), "{ended}");
+    assert!(
+        late < Duration::from_secs(3),
+        "the page showed the end {late:?} late"
+    );
+    let rows = tail.matches("<tr>").count() - 1;
+    assert_eq!(rows, 500, "rows drawn");
+    let first = tail.find(">k-").unwrap();
+    assert!(
+        tail[first..].starts_with(">k-9999<"),
+        "newest first: {}",
+        &tail[first..first + 20]
+    );
+    let _ = std::fs::remove_dir_all(&profile);
+    drop(broker);
+}

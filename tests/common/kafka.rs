@@ -152,6 +152,19 @@ pub async fn produce_compressed(
 /// Writes `count` small records to `partition`, as fast as the producer batches them; record `i`
 /// has key `k-<i>` and timestamp `first_ts + i`.
 pub fn produce_many(bootstrap: &str, topic: &str, partition: i32, count: usize, first_ts: i64) {
+    produce_paced(bootstrap, topic, partition, count, None, first_ts);
+}
+
+/// [`produce_many`] at about `per_second` records a second (`None`: as fast as it can), each
+/// tenth of a second's records flushed before the next: a busy topic rather than a burst.
+pub fn produce_paced(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    count: usize,
+    per_second: Option<usize>,
+    first_ts: i64,
+) {
     let producer: BaseProducer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("linger.ms", "20")
@@ -159,7 +172,16 @@ pub fn produce_many(bootstrap: &str, topic: &str, partition: i32, count: usize, 
         .set("queue.buffering.max.messages", "1000000")
         .create()
         .unwrap();
+    let started = std::time::Instant::now();
     for i in 0..count {
+        if let Some(rate) = per_second {
+            let tick = rate.div_ceil(10).max(1);
+            if i > 0 && i % tick == 0 {
+                producer.flush(Duration::from_secs(10)).unwrap();
+                let due = started + Duration::from_millis((i / tick) as u64 * 100);
+                std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+            }
+        }
         let key = format!("k-{i}");
         let mut record = BaseRecord::<str, [u8]>::to(topic)
             .partition(partition)

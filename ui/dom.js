@@ -69,17 +69,21 @@ export function table(caption, headers, rows, kind) {
     const spec = typeof th === 'string' ? { label: th } : th;
     return h('th', { scope: 'col', class: spec.class, title: spec.title }, spec.label);
   }));
-  const body = rows.map((cells) => h('tr', null, cells.map((cell) => {
-    if (cell && typeof cell === 'object' && !(cell instanceof Node) && !Array.isArray(cell)) {
-      return h('td', { class: cell.class, title: cell.title }, cell.content);
-    }
-    return h('td', null, cell);
-  })));
   return h('div', { class: 'table-wrap', role: 'region', 'aria-label': caption, tabindex: 0 },
     h('table', { class: ['data', kind] },
       h('caption', { class: 'visually-hidden' }, caption),
       h('thead', null, head),
-      h('tbody', null, body)));
+      h('tbody', null, rows.map(row))));
+}
+
+/** One table row: cells as `table` takes them. */
+export function row(cells) {
+  return h('tr', null, cells.map((cell) => {
+    if (cell && typeof cell === 'object' && !(cell instanceof Node) && !Array.isArray(cell)) {
+      return h('td', { class: cell.class, title: cell.title }, cell.content);
+    }
+    return h('td', null, cell);
+  }));
 }
 
 /**

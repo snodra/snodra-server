@@ -228,9 +228,11 @@ async function readEvents(path, credential, { signal, onOpen, onEvent, onRefused
     const { done, value } = await reader.read();
     if (done) return;
     buffer += decoder.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
-    for (let end = buffer.indexOf('\n\n'); end !== -1; end = buffer.indexOf('\n\n')) {
-      const block = buffer.slice(0, end);
-      buffer = buffer.slice(end + 2);
+    // One pass over what came: a busy stream brings hundreds of events per read.
+    let start = 0;
+    for (let end = buffer.indexOf('\n\n'); end !== -1; end = buffer.indexOf('\n\n', start)) {
+      const block = buffer.slice(start, end);
+      start = end + 2;
       let name = 'message';
       const data = [];
       for (const line of block.split('\n')) {
@@ -243,5 +245,6 @@ async function readEvents(path, credential, { signal, onOpen, onEvent, onRefused
       }
       if (data.length) onEvent(name, data.join('\n'));
     }
+    buffer = buffer.slice(start);
   }
 }

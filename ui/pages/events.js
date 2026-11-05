@@ -4,11 +4,13 @@
 // tab holds, its payload; the tail prepends new records as they come. This hub only: every hub
 // reads the same Kafka. Everything is rendered as text (h / textContent), payloads included.
 
-import { badge, fill, h, table } from '../dom.js';
+import { badge, fill, h, row, table } from '../dom.js';
 import * as fmt from '../format.js';
 
 /** Rows the tail keeps; older ones fall off the end. */
 const MAX_TAIL_ROWS = 500;
+
+const TAIL_CAPTION = 'Records as they arrive, newest first';
 
 /** The time range presets: label and span in ms (null: any time). */
 const RANGES = [
@@ -163,8 +165,10 @@ export default {
     let last = null;
     let rows = [];
     let tail = null;
-    let tailRows = [];
-    let held = [];
+    // Tail records not drawn yet, oldest first; drawn once per animation frame, not while paused.
+    let pending = [];
+    let frame = 0;
+    let tailRows = null;
     let paused = false;
 
     const eb = browserOf(ctx);
@@ -306,15 +310,33 @@ export default {
 
     // ---- tail ----
 
+    // Prepends the records that came since the last frame (only the newest that can stay) and
+    // drops the rows beyond MAX_TAIL_ROWS: a busy topic costs one small change per frame.
     const drawTail = () => {
-      fill(tailBody, tailRows.length
-        ? table('Records as they arrive, newest first', HEADERS, tailRows.map((r) => cells(r, openRecord)), 'events')
-        : null);
+      frame = 0;
+      const fresh = pending.slice(-MAX_TAIL_ROWS).reverse();
+      pending = [];
+      if (!fresh.length) return;
+      if (!tailRows) {
+        const wrap = table(TAIL_CAPTION, HEADERS, [], 'events');
+        tailRows = wrap.querySelector('tbody');
+        fill(tailBody, wrap);
+      }
+      tailRows.prepend(...fresh.map((r) => row(cells(r, openRecord))));
+      while (tailRows.rows.length > MAX_TAIL_ROWS) tailRows.lastElementChild.remove();
+    };
+
+    const queueTail = (record) => {
+      pending.push(record);
+      // Only the newest MAX_TAIL_ROWS can be shown: let the rest go, a batch at a time.
+      if (pending.length >= 2 * MAX_TAIL_ROWS) pending = pending.slice(-MAX_TAIL_ROWS);
+      if (!paused && !frame) frame = requestAnimationFrame(drawTail);
     };
 
     const stopTail = (why) => {
       if (tail) tail.abort();
       tail = null;
+      ctx.setParams({ tail: null });
       tailButton.textContent = 'Tail';
       tailButton.setAttribute('aria-pressed', 'false');
       if (why) tailStatus.textContent = why;
@@ -324,6 +346,7 @@ export default {
       if (tail) tail.abort();
       const controller = new AbortController();
       tail = controller;
+      ctx.setParams({ tail: 'on' });
       tailButton.textContent = 'Stop tail';
       tailButton.setAttribute('aria-pressed', 'true');
       tailStatus.textContent = 'Starting the tail…';
@@ -344,14 +367,7 @@ export default {
           if (name === 'start') {
             tailStatus.textContent = `Tailing ${str(value.topic)} (${fmt.int(value.partitions)} partitions) from now until ${fmt.clock(value.endsAtMs)}.`;
           } else if (name === 'record' && isObject(value)) {
-            if (paused) {
-              held.unshift(value);
-              held.length = Math.min(held.length, MAX_TAIL_ROWS);
-              return;
-            }
-            tailRows.unshift(value);
-            tailRows.length = Math.min(tailRows.length, MAX_TAIL_ROWS);
-            drawTail();
+            queueTail(value);
           } else if (name === 'end') {
             ended(`The tail ended: ${ENDED[value.reason] || str(value.reason)}.`);
           }
@@ -369,12 +385,11 @@ export default {
     });
     pause.addEventListener('change', () => {
       paused = pause.checked;
-      if (!paused && held.length) {
-        tailRows = held.concat(tailRows).slice(0, MAX_TAIL_ROWS);
-        held = [];
-        drawTail();
-      }
+      if (!paused && pending.length && !frame) frame = requestAnimationFrame(drawTail);
     });
+
+    // A link with tail=on opens the page tailing.
+    if (ctx.params.get('tail') === 'on') startTail();
 
     return {
       update(data) {
@@ -387,6 +402,8 @@ export default {
       dispose() {
         if (tail) tail.abort();
         tail = null;
+        if (frame) cancelAnimationFrame(frame);
+        frame = 0;
       },
     };
   },
