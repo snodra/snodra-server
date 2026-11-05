@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod control;
+pub mod kafka;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
