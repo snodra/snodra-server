@@ -1,3 +1,10 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - when: never
+
 # Shell-executor pipeline: the runners have Rust, protoc, Docker and buildx installed.
 # Images and services are intentionally not used; Testcontainers talks to the host daemon.
 
@@ -6,6 +13,7 @@ stages:
   - test
   - image
   - release
+  - version
 
 variables:
   CARGO_TERM_COLOR: always
@@ -74,3 +82,61 @@ release:
         --header "Content-Type: application/json" \
         --data "$PAYLOAD" \
         "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+
+version:
+  stage: version
+  resource_group: release
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - git fetch --tags --force
+  script:
+    - |
+      set -euo pipefail
+      if git describe --tags --exact-match >/dev/null 2>&1; then
+        echo "HEAD is already tagged; nothing to do."
+        exit 0
+      fi
+      CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -1)
+      if [ -z "$CURRENT" ]; then CURRENT="v0.0.0"; fi
+      BUMP="${SEMVER_BUMP:-}"
+      if [ -z "$BUMP" ]; then
+        if [ "$CURRENT" = "v0.0.0" ]; then
+          LOG=$(git log --format='%s%n%b')
+        else
+          LOG=$(git log "$CURRENT..HEAD" --format='%s%n%b')
+        fi
+        if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
+          BUMP=major
+        elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+          BUMP=minor
+        elif echo "$LOG" | grep -qE '^(fix|perf)(\([^)]*\))?:'; then
+          BUMP=patch
+        else
+          echo "No semver-relevant commits since $CURRENT; no release."
+          exit 0
+        fi
+      fi
+      case "$BUMP" in
+        major|minor|patch) ;;
+        *) echo "SEMVER_BUMP must be major, minor or patch"; exit 1 ;;
+      esac
+      V="${CURRENT#v}"
+      IFS=. read -r MAJ MIN PAT <<< "$V"
+      case "$BUMP" in
+        major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+        minor) MIN=$((MIN+1)); PAT=0 ;;
+        patch) PAT=$((PAT+1)) ;;
+      esac
+      NEXT="v$MAJ.$MIN.$PAT"
+      echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
+      if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "DRY_RUN: not tagging"
+        exit 0
+      fi
+      git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
+      git push "$CI_REPOSITORY_URL" "$NEXT"
