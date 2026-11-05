@@ -1041,7 +1041,7 @@ services:
 `docker stop` sends SIGTERM to the hub (PID 1), which shuts down gracefully (see above).
 
 `kraken-hub:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
-releases (`vX.Y.Z`) to `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:<tag>` and `:latest`.
+releases (`vX.Y.Z`) to `harbor.damoreira.ml/kraken-org/kraken-hub:<tag>` and `:latest`.
 
 ## Layout
 
@@ -1087,7 +1087,7 @@ with `protobuf-compiler` installed.
 
 ```mermaid
 flowchart LR
-    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Kaniko → registry"]
+    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Docker → Harbor"]
 ```
 
 | Stage | Job | Runs | Produces |
@@ -1096,7 +1096,7 @@ flowchart LR
 | fmt | `proto-sync` | always | `scripts/check-proto-sync.sh` against a fresh umbrella clone: `proto/hub.proto` must match `kraken/protocol/hub.proto` byte for byte |
 | clippy | `clippy` | always | lint with warnings as errors |
 | test | `test` | always | unit and in-process integration tests |
-| docker | `docker` | only on tags `vX.Y.Z` | `registry.gitlab.damoreira.ml/kraken-org/kraken-hub:vX.Y.Z` and `:latest` |
+| docker | `docker` | only on tags `vX.Y.Z` | `harbor.damoreira.ml/kraken-org/kraken-hub:vX.Y.Z` and `:latest` |
 
 The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `kraken-hub:dev`).
 
