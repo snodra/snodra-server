@@ -25,19 +25,10 @@ fmt:
 proto-sync:
   stage: check
   script:
-    - |
-      export GIT_ASKPASS="$CI_PROJECT_DIR/.git-askpass"
-      cat > "$GIT_ASKPASS" <<'EOF'
-      #!/bin/sh
-      case "$1" in
-        Username*) echo "$KRAKEN_UMBRELLA_DEPLOY_USER" ;;
-        Password*) echo "$KRAKEN_UMBRELLA_DEPLOY_TOKEN" ;;
-      esac
-      EOF
-      chmod +x "$GIT_ASKPASS"
-      rm -rf "$CI_PROJECT_DIR/../kraken"
-      git clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
-      KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
+    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
+    - rm -rf "$CI_PROJECT_DIR/../kraken"
+    - git -c url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
+    - KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
   stage: check
