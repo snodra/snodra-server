@@ -2,7 +2,6 @@ workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
     - when: never
 
 # Shell-executor pipeline: the runners have Rust, protoc, Docker and buildx installed.
@@ -11,9 +10,7 @@ workflow:
 stages:
   - check
   - test
-  - image
   - release
-  - version
 
 variables:
   CARGO_TERM_COLOR: always
@@ -52,43 +49,10 @@ test:
   script:
     - cargo test --all-features
 
-docker:
-  stage: image
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
-  script:
-    - VERSION="${CI_COMMIT_TAG#v}"
-    - IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME"
-    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
-    - docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
-    - docker push "$IMAGE:$VERSION"
-    - docker push "$IMAGE:latest"
-
 release:
   stage: release
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
-  script:
-    - |
-      VERSION="${CI_COMMIT_TAG#v}"
-      PAYLOAD=$(jq -n \
-        --arg name "$CI_PROJECT_NAME $CI_COMMIT_TAG" \
-        --arg tag "$CI_COMMIT_TAG" \
-        --arg desc "Release $VERSION. Image: $HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME:$VERSION." \
-        '{name:$name,tag_name:$tag,description:$desc}')
-      curl --fail --silent --show-error \
-        --request POST \
-        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "$PAYLOAD" \
-        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
-
-version:
-  stage: version
   resource_group: release
   rules:
-    - if: '$CI_COMMIT_TAG'
-      when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   variables:
     GIT_DEPTH: "0"
@@ -133,6 +97,7 @@ version:
         patch) PAT=$((PAT+1)) ;;
       esac
       NEXT="v$MAJ.$MIN.$PAT"
+      VERSION="$MAJ.$MIN.$PAT"
       echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
       if [ "${DRY_RUN:-false}" = "true" ]; then
         echo "DRY_RUN: not tagging"
@@ -142,10 +107,15 @@ version:
       git config user.email "ci@damoreira.ml"
       git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
       git push "$CI_REPOSITORY_URL" "$NEXT"
+      IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME"
+      echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
+      docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+      docker push "$IMAGE:$VERSION"
+      docker push "$IMAGE:latest"
       RELEASE=$(jq -n \
         --arg name "$CI_PROJECT_NAME $NEXT" \
         --arg tag "$NEXT" \
-        --arg desc "Release $NEXT." \
+        --arg desc "Release $VERSION. Image: $HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME:$VERSION." \
         '{name:$name,tag_name:$tag,description:$desc}')
       STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
         --request POST \
