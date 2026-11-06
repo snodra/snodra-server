@@ -61,52 +61,63 @@ release:
   script:
     - |
       set -euo pipefail
-      if git describe --tags --exact-match >/dev/null 2>&1; then
-        echo "HEAD is already tagged; nothing to do."
-        exit 0
-      fi
-      CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -1)
+      CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
       if [ -z "$CURRENT" ]; then CURRENT="v0.0.0"; fi
-      BUMP="${SEMVER_BUMP:-}"
-      if [ -z "$BUMP" ]; then
-        if [ "$CURRENT" = "v0.0.0" ]; then
-          LOG=$(git log --format='%s%n%b')
-        else
-          LOG=$(git log "$CURRENT..HEAD" --format='%s%n%b')
-        fi
-        if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
-          BUMP=major
-        elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
-          BUMP=minor
-        elif echo "$LOG" | grep -qE '^(fix|perf)(\([^)]*\))?:'; then
-          BUMP=patch
-        else
-          echo "No semver-relevant commits since $CURRENT; no release."
+      if [ -n "${RELEASE_VERSION:-}" ]; then
+        VERSION="${RELEASE_VERSION#v}"
+        NEXT="v$VERSION"
+        echo "Using explicit RELEASE_VERSION: $VERSION ($NEXT)"
+      else
+        if git describe --tags --exact-match >/dev/null 2>&1; then
+          echo "HEAD is already tagged $(git describe --tags --exact-match); nothing to do."
           exit 0
         fi
+        BUMP="${SEMVER_BUMP:-}"
+        if [ -z "$BUMP" ]; then
+          if [ "$CURRENT" = "v0.0.0" ]; then
+            LOG=$(git log --format='%s%n%b')
+          else
+            LOG=$(git log "$CURRENT..HEAD" --format='%s%n%b')
+          fi
+          if [ -z "$LOG" ]; then
+            echo "No new commits since $CURRENT; no release."
+            exit 0
+          fi
+          if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
+            BUMP=major
+          elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+            BUMP=minor
+          else
+            BUMP=patch
+          fi
+        fi
+        case "$BUMP" in
+          major|minor|patch) ;;
+          *) echo "SEMVER_BUMP must be major, minor or patch"; exit 1 ;;
+        esac
+        V="${CURRENT#v}"
+        IFS=. read -r MAJ MIN PAT <<< "$V"
+        case "$BUMP" in
+          major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+          minor) MIN=$((MIN+1)); PAT=0 ;;
+          patch) PAT=$((PAT+1)) ;;
+        esac
+        NEXT="v$MAJ.$MIN.$PAT"
+        VERSION="$MAJ.$MIN.$PAT"
+        echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
       fi
-      case "$BUMP" in
-        major|minor|patch) ;;
-        *) echo "SEMVER_BUMP must be major, minor or patch"; exit 1 ;;
-      esac
-      V="${CURRENT#v}"
-      IFS=. read -r MAJ MIN PAT <<< "$V"
-      case "$BUMP" in
-        major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
-        minor) MIN=$((MIN+1)); PAT=0 ;;
-        patch) PAT=$((PAT+1)) ;;
-      esac
-      NEXT="v$MAJ.$MIN.$PAT"
-      VERSION="$MAJ.$MIN.$PAT"
-      echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
       if [ "${DRY_RUN:-false}" = "true" ]; then
-        echo "DRY_RUN: not tagging"
+        echo "DRY_RUN: not tagging or publishing"
         exit 0
       fi
-      git config user.name "kraken-org CI"
-      git config user.email "ci@damoreira.ml"
-      git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
-      git push "$CI_REPOSITORY_URL" "$NEXT"
+      if ! git rev-parse "$NEXT" >/dev/null 2>&1; then
+        git config user.name "kraken-org CI"
+        git config user.email "ci@damoreira.ml"
+        git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
+        git push "$CI_REPOSITORY_URL" "$NEXT"
+      else
+        echo "Tag $NEXT already exists, skipping tag push"
+      fi
       IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$CI_PROJECT_NAME"
       echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
       docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
