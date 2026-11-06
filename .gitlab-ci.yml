@@ -138,5 +138,22 @@ version:
         echo "DRY_RUN: not tagging"
         exit 0
       fi
+      git config user.name "kraken-org CI"
+      git config user.email "ci@damoreira.ml"
       git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
       git push "$CI_REPOSITORY_URL" "$NEXT"
+      RELEASE=$(jq -n \
+        --arg name "$CI_PROJECT_NAME $NEXT" \
+        --arg tag "$NEXT" \
+        --arg desc "Release $NEXT." \
+        '{name:$name,tag_name:$tag,description:$desc}')
+      STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+        --request POST \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$RELEASE" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases")
+      case "$STATUS" in
+        201|409) echo "Release $NEXT is available." ;;
+        *) echo "Release API returned $STATUS"; exit 1 ;;
+      esac
