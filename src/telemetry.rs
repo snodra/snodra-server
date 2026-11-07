@@ -64,7 +64,7 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
             }
         }
         Some(endpoint) => {
-            let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+            let resource = resource(config);
             let span_exporter = SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint.clone())
@@ -98,6 +98,16 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
         tracing::warn!(error = %e, directive = %config.log, "invalid log filter, using info");
     }
     Ok(guard)
+}
+
+/// The OTLP resource of every span and metric: `service.name` `kraken-hub` and
+/// `service.instance.id` the hub id, which Prometheus turns into the `job` and `instance` labels
+/// dashboards select hubs by (ADR 0026); no `service.namespace`, which would change `job`.
+pub fn resource(config: &Config) -> Resource {
+    Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attribute(KeyValue::new("service.instance.id", config.hub_id.clone()))
+        .build()
 }
 
 /// Makes `span` a child of the trace context carried in `headers` (`traceparent`, `tracestate`).
@@ -166,14 +176,14 @@ pub fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
-/// Router metrics: the six instruments of the hub spec. The `sessions` and `registered_types`
-/// gauges are set imperatively (not observable callbacks); services that disappeared are
-/// written back as 0 so the exported series does not go stale at its last value.
+/// Router metrics. The `connected_instances` and `registered_types` gauges are set imperatively
+/// (not observable callbacks); services that disappeared are written back as 0 so the exported
+/// series does not go stale at its last value.
 pub struct Metrics {
     requests: Counter<u64>,
     duration: Histogram<f64>,
     in_flight: UpDownCounter<i64>,
-    sessions: Gauge<u64>,
+    connected_instances: Gauge<u64>,
     registered_types: Gauge<u64>,
     buffer_full: Counter<u64>,
     queue_depth: Gauge<u64>,
@@ -207,7 +217,7 @@ pub struct Metrics {
 
 #[derive(Default)]
 struct Seen {
-    sessions: HashSet<String>,
+    instances: HashSet<String>,
     types: HashSet<String>,
     flows: HashSet<String>,
 }
@@ -232,9 +242,9 @@ impl Metrics {
                 .i64_up_down_counter("kraken_hub_in_flight")
                 .with_description("Requests awaiting a reply")
                 .build(),
-            sessions: meter
-                .u64_gauge("kraken_hub_sessions")
-                .with_description("Connected sessions per service")
+            connected_instances: meter
+                .u64_gauge("kraken_hub_connected_instances")
+                .with_description("Instances with a stream to this hub, per service")
                 .build(),
             registered_types: meter
                 .u64_gauge("kraken_hub_registered_types")
@@ -622,20 +632,22 @@ impl Metrics {
             .add(1, &[KeyValue::new("service", service.to_string())]);
     }
 
-    pub fn sessions_set(&self, by_service: HashMap<String, usize>) {
+    /// Instances connected per service (one session each); a service whose last instance left
+    /// is written back as 0.
+    pub fn connected_instances_set(&self, by_service: HashMap<String, usize>) {
         let mut seen = self.seen.lock().unwrap();
         for gone in seen
-            .sessions
+            .instances
             .iter()
             .filter(|s| !by_service.contains_key(*s))
         {
-            self.sessions
+            self.connected_instances
                 .record(0, &[KeyValue::new("service", gone.clone())]);
         }
-        seen.sessions = by_service.keys().cloned().collect();
+        seen.instances = by_service.keys().cloned().collect();
         drop(seen);
         for (service, n) in by_service {
-            self.sessions
+            self.connected_instances
                 .record(n as u64, &[KeyValue::new("service", service)]);
         }
     }
@@ -677,10 +689,12 @@ impl Metrics {
     }
 }
 
+/// The handler's service and instance. The instance is `instance_id`: Prometheus overwrites a
+/// data-point `instance` (and `job`) with the resource's (ADR 0026).
 fn stream_attrs(service: &str, instance: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("service", service.to_string()),
-        KeyValue::new("instance", instance.to_string()),
+        KeyValue::new("instance_id", instance.to_string()),
     ]
 }
 
@@ -983,11 +997,11 @@ mod tests {
         m.metrics.subscription_update("A", "q.Watch");
         m.metrics.subscription_update("B", "q.Watch");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
@@ -1081,6 +1095,57 @@ mod tests {
         };
         let total: i64 = sum.data_points().map(|p| p.value()).sum();
         assert_eq!(total, 0);
+    }
+
+    /// Dashboards select hubs by the resource (ADR 0026 hub ruling 1): `service.name` becomes
+    /// `job` and `service.instance.id` becomes `instance` in Prometheus.
+    #[test]
+    fn the_resource_names_the_hub_and_its_id() {
+        let config = Config {
+            hub_id: "hub-7".into(),
+            ..Config::default()
+        };
+        let resource = resource(&config);
+        let get = |key: &'static str| {
+            resource
+                .get(&opentelemetry::Key::from_static_str(key))
+                .map(|v| v.to_string())
+        };
+        assert_eq!(get("service.name").as_deref(), Some("kraken-hub"));
+        assert_eq!(get("service.instance.id").as_deref(), Some("hub-7"));
+        assert_eq!(get("service.namespace"), None, "it would change `job`");
+    }
+
+    /// One gauge per service; a service whose last instance left is written back as 0.
+    #[test]
+    fn connected_instances_are_counted_per_service() {
+        let m = test_support::test_metrics();
+        m.metrics
+            .connected_instances_set(HashMap::from([("A".to_string(), 2), ("B".to_string(), 1)]));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "A"), Some(2));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "B"), Some(1));
+        m.metrics
+            .connected_instances_set(HashMap::from([("A".to_string(), 1)]));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "A"), Some(1));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "B"), Some(0));
+    }
+
+    /// A data-point attribute named `instance` (or `job`) is overwritten by the resource's in
+    /// Prometheus, so the handler instance is `instance_id`.
+    #[test]
+    fn open_streams_and_subscriptions_name_the_handler_instance_instance_id() {
+        let m = test_support::test_metrics();
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.subscription_opened("A", "a2");
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "instance_id", "a1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a2"),
+            Some(1)
+        );
+        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", "a1"), None);
     }
 
     #[test]

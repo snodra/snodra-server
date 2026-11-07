@@ -1613,10 +1613,11 @@ impl Router {
         }
     }
 
-    /// Refreshes the `kraken_hub_sessions` and `kraken_hub_registered_types` gauges from the
-    /// current session and registry state. Call after any change to either.
+    /// Refreshes the `kraken_hub_connected_instances` and `kraken_hub_registered_types` gauges
+    /// from the current session and registry state. Call after any change to either.
     pub fn refresh_gauges(&self) {
-        self.metrics.sessions_set(self.sessions.count_by_service());
+        self.metrics
+            .connected_instances_set(self.sessions.count_by_service());
         self.metrics.registered_types_set(&self.registry.snapshot());
         self.metrics.flows_set(self.flow_gauges());
     }
@@ -6573,9 +6574,12 @@ mod stream_tests {
         f.router.route(&D, "s1", stream("st1", "q.Find", 0, 0, 0));
         let (h, _) = f.target_of("st1");
         f.router.route(&D, "s1", stream("st2", "q.Own", 0, 0, 0));
-        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", h), Some(1));
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance", "x1"),
+            m.up_down("kraken_hub_streams_open", "instance_id", h),
+            Some(1)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "instance_id", "x1"),
             Some(1)
         );
         assert_eq!(
@@ -6587,9 +6591,12 @@ mod stream_tests {
         f.end(h, "st1#1", None);
         f.cancel("s1", "st2", "bye");
         f.router.route(&D, "s1", stream("p1", "q.Nope", 0, 0, 0));
-        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", h), Some(0));
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance", "x1"),
+            m.up_down("kraken_hub_streams_open", "instance_id", h),
+            Some(0)
+        );
+        assert_eq!(
+            m.up_down("kraken_hub_streams_open", "instance_id", "x1"),
             Some(0)
         );
         assert_eq!(
@@ -8086,11 +8093,11 @@ mod subscription_tests {
         f.router.route(&D, "s1", subscribe("w2", "q.Own", 0, 0, 0));
         f.open("w2");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
@@ -8115,7 +8122,7 @@ mod subscription_tests {
         f.part("b1", "w1#2", 1, b"u2");
         f.end("a1", "w1#1", None);
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(0)
         );
         assert_eq!(
@@ -8128,7 +8135,7 @@ mod subscription_tests {
         );
         f.cancel("s1", "w1", "bye");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(0)
         );
         assert_eq!(
@@ -8139,7 +8146,7 @@ mod subscription_tests {
         // Cancelled before the initial part: counted once, as cancelled.
         f.cancel("s1", "w2", "bye");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "x1"),
+            m.up_down("kraken_hub_subscriptions_open", "instance_id", "x1"),
             Some(0)
         );
         assert_eq!(
