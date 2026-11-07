@@ -83,6 +83,28 @@ impl ProcessorStateName {
         }
     }
 
+    /// Every state, for a gauge that exports one series per state.
+    pub const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::Running,
+        Self::Failing,
+        Self::Stopped,
+        Self::Paused,
+        Self::Unspecified,
+    ];
+
+    /// The `state` label of the processor state gauge (ADR 0026): the name in lowercase.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Failing => "failing",
+            Self::Stopped => "stopped",
+            Self::Paused => "paused",
+        }
+    }
+
     /// Higher is worse: FAILING, unknown, STARTING, PAUSED, STOPPED, RUNNING.
     fn severity(self) -> u8 {
         match self {
@@ -416,41 +438,58 @@ pub fn aggregate(name: &str, mut instances: Vec<ProcessorInstance>) -> Processor
 
 /// The per-service processors view of a topology snapshot.
 pub fn view(t: &Topology) -> ProcessorsView {
-    let mut services = Vec::new();
-    for s in &t.services {
-        let mut by_name: BTreeMap<&str, Vec<ProcessorInstance>> = BTreeMap::new();
-        for i in &s.instances {
-            for p in &i.processors {
-                by_name
-                    .entry(p.name.as_str())
-                    .or_default()
-                    .push(ProcessorInstance {
+    let reports = t.services.iter().flat_map(|s| {
+        s.instances.iter().flat_map(move |i| {
+            i.processors.iter().map(move |p| {
+                (
+                    s.service_name.clone(),
+                    ProcessorInstance {
                         instance_id: i.instance_id.clone(),
                         status_age_ms: i.status_age_ms,
                         report: p.clone(),
-                    });
-            }
-        }
-        if by_name.is_empty() {
-            continue;
-        }
-        let processors: Vec<ProcessorAggregate> = by_name
-            .into_iter()
-            .map(|(name, instances)| aggregate(name, instances))
-            .collect();
-        services.push(ServiceProcessors {
-            service_name: s.service_name.clone(),
-            dead_letters: processors
-                .iter()
-                .fold(0u64, |a, p| a.saturating_add(p.dead_letters)),
-            processors,
-        });
-    }
+                    },
+                )
+            })
+        })
+    });
     ProcessorsView {
         hub_id: t.hub_id.clone(),
         now_ms: t.now_ms,
-        services,
+        services: by_service(reports),
     }
+}
+
+/// Every service's processors, each aggregated over the instances that report it
+/// ([`aggregate`]), from `(service, one instance's report of one processor)`; services sorted
+/// by name. The Processors page and the processor gauges (ADR 0026) both read this.
+pub fn by_service(
+    reports: impl IntoIterator<Item = (String, ProcessorInstance)>,
+) -> Vec<ServiceProcessors> {
+    let mut grouped: BTreeMap<String, BTreeMap<String, Vec<ProcessorInstance>>> = BTreeMap::new();
+    for (service, instance) in reports {
+        grouped
+            .entry(service)
+            .or_default()
+            .entry(instance.report.name.clone())
+            .or_default()
+            .push(instance);
+    }
+    grouped
+        .into_iter()
+        .map(|(service_name, by_name)| {
+            let processors: Vec<ProcessorAggregate> = by_name
+                .into_iter()
+                .map(|(name, instances)| aggregate(&name, instances))
+                .collect();
+            ServiceProcessors {
+                service_name,
+                dead_letters: processors
+                    .iter()
+                    .fold(0u64, |a, p| a.saturating_add(p.dead_letters)),
+                processors,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -104,7 +104,10 @@ pub async fn serve_with_shutdown(
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
-    let metrics = Metrics::new(opentelemetry::global::meter("kraken-hub"));
+    let meter = opentelemetry::global::meter("kraken-hub");
+    let metrics = Metrics::new(meter.clone());
+    // Read from the sessions when the metrics are exported; kept for the life of the hub.
+    let _processor_gauges = telemetry::ProcessorGauges::register(&meter, Arc::clone(&sessions));
     let auth = Authorizer::from_config(&config, Arc::clone(&metrics))?;
     info!(auth_mode = config.auth_mode.as_str(), "auth mode");
     let router = Router::with_auth(
