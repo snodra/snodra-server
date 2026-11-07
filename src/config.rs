@@ -204,6 +204,10 @@ pub struct Config {
     /// A tail ends (`event: end`) after this long. `KRAKEN_HUB_EVENT_TAIL_DURATION`, default
     /// 15 m, at least 1 s.
     pub event_tail_duration: Duration,
+    /// How often the consumer-group lag of the event topics is read for
+    /// `kraken_hub_consumer_group_lag` (ADR 0026), when `kafka_bootstrap` is set; zero turns it
+    /// off. `KRAKEN_HUB_GROUP_LAG_INTERVAL`, default 60 s, `0` or at least 1 s.
+    pub group_lag_interval: Duration,
     /// At most one key-set fetch per this long is made because a token names an unknown `kid`.
     /// Not an environment variable: 30 s, shortened by tests.
     pub jwks_refetch_interval: Duration,
@@ -277,6 +281,7 @@ impl Default for Config {
             event_max_searches: 4,
             event_max_tails: 4,
             event_tail_duration: Duration::from_secs(900),
+            group_lag_interval: Duration::from_secs(60),
         }
     }
 }
@@ -482,6 +487,9 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_EVENT_TAIL_DURATION") {
             c.event_tail_duration = parse_duration(&v).context("KRAKEN_HUB_EVENT_TAIL_DURATION")?;
         }
+        if let Some(v) = var("KRAKEN_HUB_GROUP_LAG_INTERVAL") {
+            c.group_lag_interval = parse_duration(&v).context("KRAKEN_HUB_GROUP_LAG_INTERVAL")?;
+        }
         c.resolve_jwt(explicit_uri)?;
         c.validate()?;
         Ok(c)
@@ -617,6 +625,13 @@ impl Config {
             }
         }
         changed
+    }
+
+    /// How often the consumer-group lag task runs; `None` when it does not (no Kafka, or
+    /// `KRAKEN_HUB_GROUP_LAG_INTERVAL=0`).
+    pub fn group_lag(&self) -> Option<Duration> {
+        (self.kafka_bootstrap.is_some() && !self.group_lag_interval.is_zero())
+            .then_some(self.group_lag_interval)
     }
 
     /// The bounds of the TLS handshakes of each listener.
@@ -768,6 +783,12 @@ impl Config {
             bail!(
                 "KRAKEN_HUB_EVENT_TAIL_DURATION ({:?}) must be at least {MIN_MAX_STREAM_DURATION:?}",
                 self.event_tail_duration
+            );
+        }
+        if !self.group_lag_interval.is_zero() && self.group_lag_interval < Duration::from_secs(1) {
+            bail!(
+                "KRAKEN_HUB_GROUP_LAG_INTERVAL ({:?}) must be 0 (off) or at least 1s",
+                self.group_lag_interval
             );
         }
         // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
@@ -2318,6 +2339,27 @@ mod tests {
         assert_eq!(c.event_max_searches, 4);
         assert_eq!(c.event_max_tails, 4);
         assert_eq!(c.event_tail_duration, Duration::from_secs(900));
+        assert_eq!(c.group_lag_interval, Duration::from_secs(60));
+        assert_eq!(c.group_lag(), None, "no lag task without Kafka");
+    }
+
+    /// The consumer-group lag task (ADR 0026): every 60 s once Kafka is set, `0` turns it off.
+    #[test]
+    fn the_group_lag_interval_is_read_from_the_environment() {
+        let kafka = ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092");
+        let c = with_env(&[kafka]).unwrap();
+        assert_eq!(c.group_lag(), Some(Duration::from_secs(60)));
+        let c = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "15s")]).unwrap();
+        assert_eq!(c.group_lag(), Some(Duration::from_secs(15)));
+        let c = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "0")]).unwrap();
+        assert_eq!(c.group_lag(), None);
+        for bad in ["500ms", "soon"] {
+            let err = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", bad)]).expect_err(bad);
+            assert!(
+                err.to_string().contains("KRAKEN_HUB_GROUP_LAG_INTERVAL"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

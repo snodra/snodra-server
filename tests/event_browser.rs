@@ -1,19 +1,24 @@
 //! The event browser (ADR 0025) against a real Kafka: search by every filter, newest first over
 //! the partitions, with a cursor; the budgets and the concurrency limits; the record detail and
-//! the payload rules; the tail; consumer groups and their lag; and what happens without Kafka.
+//! the payload rules; the tail; consumer groups and their lag, and the lag task of the metrics;
+//! and what happens without Kafka.
 //! Every test keeps its broker in a local, dropped at its end.
 
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::kafka::{self, Member, Rec};
 use common::{FakeClient, http_send};
 use kraken_hub::auth::Secret;
+use kraken_hub::browser::{self, Browser, GroupLag};
 use kraken_hub::config::Config;
 use kraken_hub::proto::{RequestKind, server_message};
+use kraken_hub::telemetry::Metrics;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 const T: i64 = 1_700_000_000_000;
 const READ: &str = "a-dashboard-token-0123456789";
@@ -748,6 +753,166 @@ async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_n
     drop(broker);
 }
 
+/// The consumer-group lag task (ADR 0026) reads every group with a committed offset on every
+/// configured topic, a group without a live member too, and the next run sees new records.
+#[tokio::test]
+async fn the_group_lag_task_reads_every_group_of_every_topic() {
+    let broker = kafka::kafka().await;
+    let topic = kafka::unique("lag");
+    let other = kafka::unique("lag-other");
+    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
+    kafka::create_topic(&broker.bootstrap, &other, 1).await;
+    let mut records: Vec<Rec> = (0..10).map(|i| library(0, i, "k", "a.B", "e")).collect();
+    records.extend((0..5).map(|i| library(1, i, "k", "a.B", "e")));
+    kafka::produce(&broker.bootstrap, &topic, &records).await;
+    let three: Vec<Rec> = (0..3).map(|i| library(0, i, "k", "a.B", "e")).collect();
+    kafka::produce(&broker.bootstrap, &other, &three).await;
+    let bootstrap = broker.bootstrap.clone();
+    let (t, o) = (topic.clone(), other.clone());
+    let live = tokio::task::spawn_blocking(move || {
+        kafka::commit(&bootstrap, "g-empty", &t, &[(0, 4), (1, 5)]);
+        kafka::commit(&bootstrap, "g-other", &o, &[(0, 1)]);
+        Member::join(&bootstrap, "g-live", &t, &[(0, 10), (1, 2)])
+    })
+    .await
+    .unwrap();
+
+    let browser = Browser::new(
+        Arc::new(config(&broker.bootstrap, &[&topic, &other])),
+        Metrics::noop(),
+    );
+    let lag = Arc::new(GroupLag::default());
+    let stopping = CancellationToken::new();
+    let task = tokio::spawn(browser::run_group_lag(
+        browser,
+        Arc::clone(&lag),
+        Duration::from_secs(1),
+        stopping.clone(),
+    ));
+    let expect = |groups: &[(&str, &str, i64)]| -> Vec<(String, String, i64)> {
+        let mut v: Vec<(String, String, i64)> = groups
+            .iter()
+            .map(|(t, g, l)| (t.to_string(), g.to_string(), *l))
+            .collect();
+        v.sort();
+        v
+    };
+    let first = expect(&[
+        (&topic, "g-empty", 6),
+        (&topic, "g-live", 3),
+        (&other, "g-other", 2),
+    ]);
+    wait_for_lag(&lag, &first).await;
+
+    kafka::produce(
+        &broker.bootstrap,
+        &topic,
+        &[
+            library(0, 50, "k", "a.B", "e"),
+            library(0, 51, "k", "a.B", "e"),
+        ],
+    )
+    .await;
+    let second = expect(&[
+        (&topic, "g-empty", 8),
+        (&topic, "g-live", 5),
+        (&other, "g-other", 2),
+    ]);
+    wait_for_lag(&lag, &second).await;
+
+    stopping.cancel();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the task stops")
+        .unwrap();
+    drop(live);
+    drop(broker);
+}
+
+/// Waits (30 s at most) until the lag task's reading is `want`.
+async fn wait_for_lag(lag: &GroupLag, want: &[(String, String, i64)]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = lag.points();
+        if got == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "want {want:?}, got {got:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The lag task against a broker that never answers runs on its own slot and the blocking
+/// pool: routing goes on as always, and the dashboard's searches keep their slots.
+#[tokio::test]
+async fn a_hanging_group_lag_task_never_blocks_routing() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bootstrap = silent.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in silent.incoming() {
+            held.push(stream);
+        }
+    });
+    let (grpc, http) = hub(Config {
+        event_search_timeout: Duration::from_secs(2),
+        event_max_searches: 1,
+        group_lag_interval: Duration::from_secs(1),
+        ..config(&bootstrap, &["kraken.events", "kraken.events.dlt"])
+    })
+    .await;
+    let mut handler = FakeClient::register(grpc, "service-b", &[], &["b.Count"]).await;
+    let mut sender = FakeClient::register(grpc, "service-a", &[], &[]).await;
+    // Several lag runs hang on the broker meanwhile; every request is routed at once.
+    for i in 0..6 {
+        let id = format!("r{i}");
+        let routed = Instant::now();
+        sender
+            .tx
+            .send(FakeClient::request(
+                &id,
+                RequestKind::Query,
+                "b.Count",
+                "",
+                0,
+            ))
+            .await
+            .unwrap();
+        loop {
+            match handler.next().await {
+                Some(Ok(m)) => match m.message {
+                    Some(server_message::Message::Request(_)) => break,
+                    _ => continue,
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        handler
+            .tx
+            .send(FakeClient::reply_ok(&id, b"1"))
+            .await
+            .unwrap();
+        loop {
+            match sender.next().await {
+                Some(Ok(m)) => match m.message {
+                    Some(server_message::Message::Reply(_)) => break,
+                    _ => continue,
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            routed.elapsed() < Duration::from_millis(500),
+            "{id}: {:?}",
+            routed.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The one search slot is the dashboard's: a listing gets it (and fails on the broker).
+    let (status, body) = get(http, "/api/v1/consumer-groups", None).await;
+    assert_eq!(status, 503, "{body}");
+}
+
 /// A bootstrap address nothing listens on.
 fn closed_port() -> String {
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -947,6 +1112,7 @@ async fn without_a_bootstrap_the_browser_is_off() {
         "KRAKEN_HUB_EVENT_MAX_SEARCHES",
         "KRAKEN_HUB_EVENT_MAX_TAILS",
         "KRAKEN_HUB_EVENT_TAIL_DURATION",
+        "KRAKEN_HUB_GROUP_LAG_INTERVAL",
     ] {
         assert!(names.contains(&name), "{name} missing");
     }

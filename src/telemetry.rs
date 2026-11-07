@@ -217,6 +217,7 @@ pub struct Metrics {
     event_browser_scanned: Histogram<u64>,
     event_tails: UpDownCounter<i64>,
     event_payload_views: Counter<u64>,
+    group_lag_refreshes: Counter<u64>,
     seen: Mutex<Seen>,
 }
 
@@ -390,6 +391,10 @@ impl Metrics {
                 .u64_counter("kraken_hub_event_payload_views_total")
                 .with_description("Event payloads served by the record detail (each also writes an audit line)")
                 .build(),
+            group_lag_refreshes: meter
+                .u64_counter("kraken_hub_consumer_group_lag_refreshes_total")
+                .with_description("Readings of one topic's consumer-group lag by the lag task, per outcome: ok, truncated (more groups than listed, or out of time), unavailable (Kafka did not answer; the last reading stays), busy (the previous reading still runs)")
+                .build(),
             seen: Mutex::new(Seen::default()),
         })
     }
@@ -440,6 +445,12 @@ impl Metrics {
     /// One payload served.
     pub fn event_payload_view(&self) {
         self.event_payload_views.add(1, &[]);
+    }
+
+    /// One reading of a topic's consumer-group lag by the lag task; `outcome` from a fixed set.
+    pub fn group_lag_refresh(&self, outcome: &'static str) {
+        self.group_lag_refreshes
+            .add(1, &[KeyValue::new("outcome", outcome)]);
     }
 
     /// A `ControlReply` nobody waited for, dropped.
@@ -892,6 +903,31 @@ impl ProcessorGauges {
                 .build(),
         }
     }
+}
+
+/// `kraken_hub_consumer_group_lag{group,topic}` (ADR 0026): the lag task's last reading,
+/// observed when the metrics are exported (from memory; the task does the Kafka reads). Every
+/// hub reads the same groups: dashboards take `max` over hubs. Keep the value for the life of
+/// the meter provider.
+pub fn observe_group_lag(
+    meter: &Meter,
+    lag: Arc<crate::browser::GroupLag>,
+) -> ObservableGauge<i64> {
+    meter
+        .i64_observable_gauge("kraken_hub_consumer_group_lag")
+        .with_description("Records behind per consumer group and event topic: the end offsets less the group's committed offsets, summed over the partitions it committed on; read by the lag task every KRAKEN_HUB_GROUP_LAG_INTERVAL, groups without a live member included")
+        .with_callback(move |observer| {
+            for (topic, group, value) in lag.points() {
+                observer.observe(
+                    value,
+                    &[
+                        KeyValue::new("group", group),
+                        KeyValue::new("topic", topic),
+                    ],
+                );
+            }
+        })
+        .build()
 }
 
 /// In-memory metrics for unit tests elsewhere in the crate.
@@ -1663,6 +1699,35 @@ mod tests {
                 .keys()
                 .all(|name| !name.starts_with("kraken_hub_processor_")),
             "{export:?}"
+        );
+    }
+
+    /// The consumer-group lag gauge exports the last reading of each topic's groups, labelled
+    /// by group and topic; a group no longer read is no longer exported.
+    #[test]
+    fn the_group_lag_gauge_exports_the_last_reading() {
+        let m = test_support::test_metrics();
+        let lag = Arc::new(crate::browser::GroupLag::default());
+        let _gauge = observe_group_lag(&m.meter(), Arc::clone(&lag));
+        assert!(m.gauge_points("kraken_hub_consumer_group_lag").is_empty());
+        lag.set("t", vec![("g-live".into(), 3), ("g-empty".into(), 6)]);
+        let point = |group: &str, value: i64| {
+            (
+                vec![
+                    ("group".to_string(), group.to_string()),
+                    ("topic".to_string(), "t".to_string()),
+                ],
+                value,
+            )
+        };
+        assert_eq!(
+            m.gauge_points("kraken_hub_consumer_group_lag"),
+            [point("g-empty", 6), point("g-live", 3)]
+        );
+        lag.set("t", vec![("g-live".into(), 0)]);
+        assert_eq!(
+            m.gauge_points("kraken_hub_consumer_group_lag"),
+            [point("g-live", 0)]
         );
     }
 
