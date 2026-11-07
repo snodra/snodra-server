@@ -220,6 +220,22 @@ struct Seen {
     instances: HashSet<String>,
     types: HashSet<String>,
     flows: HashSet<String>,
+    queued: HashSet<(String, String)>,
+}
+
+/// The flow gauges of one pass over every instance: permits left per service, requests queued
+/// per (service, type).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlowGauges {
+    pub permits: HashMap<String, u64>,
+    pub queued: HashMap<(String, String), u64>,
+}
+
+fn queue_attrs(service: &str, type_name: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("service", service.to_string()),
+        KeyValue::new("type", type_name.to_string()),
+    ]
 }
 
 impl Metrics {
@@ -256,7 +272,7 @@ impl Metrics {
                 .build(),
             queue_depth: meter
                 .u64_gauge("kraken_hub_queue_depth")
-                .with_description("Requests queued for instances, per service")
+                .with_description("Requests queued for instances, per service and type")
                 .build(),
             permits_available: meter
                 .u64_gauge("kraken_hub_permits_available")
@@ -489,21 +505,36 @@ impl Metrics {
         self.acl_reload_errors.add(1, &[]);
     }
 
-    /// Queue depth and permits left per service (its instances summed); services
-    /// that had flows before and have none now are written back as 0.
-    pub fn flows_set(&self, by_service: HashMap<String, (u64, u64)>) {
+    /// Permits left per service and requests queued per service and type (their instances
+    /// summed); a service or a (service, type) that had a value before and has none now is
+    /// written back as 0.
+    pub fn flows_set(&self, flows: FlowGauges) {
         let mut seen = self.seen.lock().unwrap();
-        for gone in seen.flows.iter().filter(|s| !by_service.contains_key(*s)) {
-            let attrs = [KeyValue::new("service", gone.clone())];
-            self.queue_depth.record(0, &attrs);
-            self.permits_available.record(0, &attrs);
+        for gone in seen
+            .flows
+            .iter()
+            .filter(|s| !flows.permits.contains_key(*s))
+        {
+            self.permits_available
+                .record(0, &[KeyValue::new("service", gone.clone())]);
         }
-        seen.flows = by_service.keys().cloned().collect();
+        for (service, type_name) in seen
+            .queued
+            .iter()
+            .filter(|k| !flows.queued.contains_key(*k))
+        {
+            self.queue_depth.record(0, &queue_attrs(service, type_name));
+        }
+        seen.flows = flows.permits.keys().cloned().collect();
+        seen.queued = flows.queued.keys().cloned().collect();
         drop(seen);
-        for (service, (depth, permits)) in by_service {
-            let attrs = [KeyValue::new("service", service)];
-            self.queue_depth.record(depth, &attrs);
-            self.permits_available.record(permits, &attrs);
+        for (service, permits) in flows.permits {
+            self.permits_available
+                .record(permits, &[KeyValue::new("service", service)]);
+        }
+        for ((service, type_name), depth) in flows.queued {
+            self.queue_depth
+                .record(depth, &queue_attrs(&service, &type_name));
         }
     }
 
@@ -541,38 +572,46 @@ impl Metrics {
             .add(delta, &[KeyValue::new("kind", kind_label(kind))]);
     }
 
-    /// A unary request ended.
+    /// A unary request ended; `service` is the handler's (`None` when it had none).
     pub fn request_finished(
         &self,
         kind: Kind,
         type_name: &str,
+        service: Option<&str>,
         outcome: Outcome,
         duration: Duration,
     ) {
-        self.request_finished_mode(kind, type_name, outcome, duration, "unary");
+        self.request_finished_mode(kind, type_name, service, outcome, duration, "unary");
     }
 
     /// A request of `mode` (`unary`, `scatter_gather`, ...) ended. A scatter-gather counts once,
-    /// whatever its number of targets.
+    /// whatever its number of targets. `service` is the service that handled it: `None` when
+    /// no handler was found, or the targets of a gather or subscription span services.
     pub fn request_finished_mode(
         &self,
         kind: Kind,
         type_name: &str,
+        service: Option<&str>,
         outcome: Outcome,
         duration: Duration,
         mode: &'static str,
     ) {
         self.in_flight_add(kind, -1);
         // The duration keeps the mode (a gather's latency is to its ReplyEnd, not comparable
-        // with a unary request of the same type) but never the outcome.
-        let attrs = [
+        // with a unary request of the same type) but never the outcome, which is last.
+        let mut attrs = Vec::with_capacity(5);
+        attrs.extend([
             KeyValue::new("kind", kind_label(kind)),
             KeyValue::new("type", type_name.to_string()),
             KeyValue::new("mode", mode),
-            KeyValue::new("outcome", outcome.as_str()),
-        ];
+        ]);
+        if let Some(service) = service {
+            attrs.push(KeyValue::new("service", service.to_string()));
+        }
+        attrs.push(KeyValue::new("outcome", outcome.as_str()));
         self.requests.add(1, &attrs);
-        self.duration.record(duration.as_secs_f64(), &attrs[..3]);
+        self.duration
+            .record(duration.as_secs_f64(), &attrs[..attrs.len() - 1]);
     }
 
     /// The number of targets one scatter-gather query went to.
@@ -916,6 +955,94 @@ pub(crate) mod test_support {
             }
         }
 
+        /// `f` of the metric `name` as exported now; `None` when it is not.
+        fn with_metric<R>(
+            &self,
+            name: &str,
+            f: impl FnOnce(&opentelemetry_sdk::metrics::data::Metric) -> R,
+        ) -> Option<R> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)
+                .map(f)
+        }
+
+        /// The sum of the u64 counter `name` over the points that have no attribute `key`.
+        pub(crate) fn counter_without(&self, name: &str, key: &str) -> Option<u64> {
+            let points: Vec<u64> = self.with_metric(name, |metric| {
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    panic!("{name} is not a u64 counter");
+                };
+                sum.data_points()
+                    .filter(|p| p.attributes().all(|kv| kv.key.as_str() != key))
+                    .map(|p| p.value())
+                    .collect()
+            })?;
+            (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// The count of the f64 histogram `name` over the points whose attribute `key` is
+        /// `value`.
+        pub(crate) fn histogram_count(&self, name: &str, key: &str, value: &str) -> Option<u64> {
+            let counts: Vec<u64> = self.with_metric(name, |metric| {
+                let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data() else {
+                    panic!("{name} is not an f64 histogram");
+                };
+                h.data_points()
+                    .filter(|p| {
+                        p.attributes()
+                            .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                    })
+                    .map(|p| p.count())
+                    .collect()
+            })?;
+            (!counts.is_empty()).then(|| counts.iter().sum())
+        }
+
+        /// The value of the u64 or i64 gauge `name` whose attributes are exactly `attrs`.
+        pub(crate) fn gauge_where(&self, name: &str, attrs: &[(&str, &str)]) -> Option<i64> {
+            let mut want: Vec<(String, String)> = attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            want.sort();
+            self.gauge_points(name)
+                .into_iter()
+                .find(|(got, _)| *got == want)
+                .map(|(_, v)| v)
+        }
+
+        /// Every point of the u64 or i64 gauge `name` as (sorted attributes, value), sorted.
+        pub(crate) fn gauge_points(&self, name: &str) -> Vec<(Vec<(String, String)>, i64)> {
+            fn attrs_of<'a>(kvs: impl Iterator<Item = &'a KeyValue>) -> Vec<(String, String)> {
+                let mut attrs: Vec<(String, String)> = kvs
+                    .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                    .collect();
+                attrs.sort();
+                attrs
+            }
+            let mut points: Vec<(Vec<(String, String)>, i64)> = self
+                .with_metric(name, |metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (attrs_of(p.attributes()), p.value() as i64))
+                        .collect(),
+                    AggregatedMetrics::I64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (attrs_of(p.attributes()), p.value()))
+                        .collect(),
+                    _ => panic!("{name} is not a u64 or i64 gauge"),
+                })
+                .unwrap_or_default();
+            points.sort();
+            points
+        }
+
         /// The last value of the u64 gauge `name` for `service`, as exported now.
         pub(crate) fn gauge(&self, name: &str, service: &str) -> Option<u64> {
             self.exporter.reset();
@@ -954,7 +1081,13 @@ mod tests {
             .build();
         let metrics = Metrics::new(provider.meter("test"));
 
-        metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        metrics.request_finished(
+            Kind::Command,
+            "a.B",
+            Some("A"),
+            Outcome::Ok,
+            Duration::from_millis(10),
+        );
         provider.force_flush().unwrap();
 
         let finished = exporter.get_finished_metrics().unwrap();
@@ -977,6 +1110,7 @@ mod tests {
             "{attrs:?}"
         );
         assert!(attrs.contains(&("type".into(), "a.B".into())), "{attrs:?}");
+        assert!(attrs.contains(&("service".into(), "A".into())), "{attrs:?}");
         assert!(
             attrs.contains(&("outcome".into(), "ok".into())),
             "{attrs:?}"
@@ -1024,14 +1158,22 @@ mod tests {
     }
 
     /// The duration histogram has the `mode` label, so a gather's latency (to its `ReplyEnd`)
-    /// does not mix with the unary latency of the same type; never the outcome.
+    /// does not mix with the unary latency of the same type, and the handling service when
+    /// there is one; never the outcome.
     #[test]
-    fn duration_histogram_has_kind_type_and_mode_labels_only() {
+    fn duration_histogram_has_kind_type_mode_and_service_labels_only() {
         let (exporter, provider, metrics) = exporter_and_metrics();
-        metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        metrics.request_finished(
+            Kind::Command,
+            "a.B",
+            Some("A"),
+            Outcome::Ok,
+            Duration::from_millis(10),
+        );
         metrics.request_finished_mode(
             Kind::Query,
             "q.F",
+            None,
             Outcome::Timeout,
             Duration::from_millis(20),
             "scatter_gather",
@@ -1059,18 +1201,22 @@ mod tests {
             })
             .collect();
         points.sort();
-        let labels = |kind: &str, type_name: &str, mode: &str| {
-            vec![
+        let labels = |kind: &str, type_name: &str, mode: &str, service: Option<&str>| {
+            let mut labels = vec![
                 ("kind".to_string(), kind.to_string()),
                 ("mode".to_string(), mode.to_string()),
                 ("type".to_string(), type_name.to_string()),
-            ]
+            ];
+            if let Some(service) = service {
+                labels.insert(2, ("service".to_string(), service.to_string()));
+            }
+            labels
         };
         assert_eq!(
             points,
             [
-                (labels("command", "a.B", "unary"), 1),
-                (labels("query", "q.F", "scatter_gather"), 1)
+                (labels("command", "a.B", "unary", Some("A")), 1),
+                (labels("query", "q.F", "scatter_gather", None), 1)
             ]
         );
         let point = h.data_points().next().expect("one data point");
@@ -1081,7 +1227,7 @@ mod tests {
     fn in_flight_returns_to_zero_after_finish() {
         let (exporter, provider, metrics) = exporter_and_metrics();
         metrics.request_started(Kind::Query);
-        metrics.request_finished(Kind::Query, "q.X", Outcome::Ok, Duration::ZERO);
+        metrics.request_finished(Kind::Query, "q.X", None, Outcome::Ok, Duration::ZERO);
         provider.force_flush().unwrap();
         let finished = exporter.get_finished_metrics().unwrap();
         let metric = finished

@@ -86,6 +86,8 @@ type Key = (Reverse<i32>, u64);
 pub struct InstanceQueue {
     entries: BTreeMap<Key, Queued>,
     keys: HashMap<String, Key>,
+    /// Entries per type, for the depth gauge (a type with none is removed).
+    types: HashMap<String, usize>,
     bytes: usize,
     next_seq: u64,
     max_len: usize,
@@ -104,6 +106,7 @@ impl InstanceQueue {
         Self {
             entries: BTreeMap::new(),
             keys: HashMap::new(),
+            types: HashMap::new(),
             bytes: 0,
             next_seq: 0,
             max_len,
@@ -124,6 +127,29 @@ impl InstanceQueue {
         self.bytes
     }
 
+    /// Entries queued per type.
+    pub fn by_type(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.types.iter().map(|(t, n)| (t.as_str(), *n))
+    }
+
+    fn count_type(&mut self, type_name: &str) {
+        match self.types.get_mut(type_name) {
+            Some(n) => *n += 1,
+            None => {
+                self.types.insert(type_name.to_string(), 1);
+            }
+        }
+    }
+
+    fn uncount_type(&mut self, type_name: &str) {
+        if let Some(n) = self.types.get_mut(type_name) {
+            *n -= 1;
+            if *n == 0 {
+                self.types.remove(type_name);
+            }
+        }
+    }
+
     /// Appends behind every entry of the same or higher priority; on a full queue returns the
     /// entry back with the cap it hit and leaves the queue unchanged.
     pub fn push(&mut self, entry: Queued) -> Result<(), (Full, Box<Queued>)> {
@@ -139,6 +165,7 @@ impl InstanceQueue {
         let key = (Reverse(entry.priority), self.next_seq);
         self.next_seq += 1;
         self.bytes += entry.bytes;
+        self.count_type(&entry.type_name);
         self.keys.insert(entry.id.clone(), key);
         self.entries.insert(key, entry);
         Ok(())
@@ -148,6 +175,7 @@ impl InstanceQueue {
     pub fn pop(&mut self) -> Option<Queued> {
         let (_, entry) = self.entries.pop_first()?;
         self.keys.remove(&entry.id);
+        self.uncount_type(&entry.type_name);
         self.bytes -= entry.bytes;
         self.total.sub(entry.bytes);
         Some(entry)
@@ -156,6 +184,7 @@ impl InstanceQueue {
     pub fn remove(&mut self, id: &str) -> Option<Queued> {
         let key = self.keys.remove(id)?;
         let entry = self.entries.remove(&key)?;
+        self.uncount_type(&entry.type_name);
         self.bytes -= entry.bytes;
         self.total.sub(entry.bytes);
         Some(entry)
@@ -261,6 +290,28 @@ mod tests {
         drop(b);
         assert_eq!(total.used(), 0, "a dropped queue releases its bytes");
         assert_eq!(Full::TotalBytes.reason(), "queue_bytes_total");
+    }
+
+    /// The queue keeps its count per type, so the depth gauge never walks the entries.
+    #[test]
+    fn counts_per_type_follow_push_pop_remove_and_rejections() {
+        let typed = |id: &str, t: &str| Queued {
+            type_name: t.to_string(),
+            ..item(id, 0, 1)
+        };
+        let mut q = InstanceQueue::new(3, 1 << 20);
+        q.push(typed("a", "t.A")).unwrap();
+        q.push(typed("b", "t.B")).unwrap();
+        q.push(typed("c", "t.A")).unwrap();
+        assert!(q.push(typed("d", "t.C")).is_err());
+        let mut counts: Vec<(&str, usize)> = q.by_type().collect();
+        counts.sort();
+        assert_eq!(counts, [("t.A", 2), ("t.B", 1)]);
+        q.pop().unwrap();
+        q.remove("b").unwrap();
+        assert_eq!(q.by_type().collect::<Vec<_>>(), [("t.A", 1)]);
+        q.drain();
+        assert_eq!(q.by_type().count(), 0, "a type with nothing queued is gone");
     }
 
     #[test]

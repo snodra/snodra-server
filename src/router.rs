@@ -63,7 +63,7 @@ use crate::proto::{
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, SenderInfo, Sessions};
-use crate::telemetry::{Metrics, Outcome, kind_label, set_parent_from_headers};
+use crate::telemetry::{FlowGauges, Metrics, Outcome, kind_label, set_parent_from_headers};
 
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,6 +103,8 @@ struct Unary {
     /// The sender's service, for the edge statistics (`None` if its session was already gone).
     sender_service: Option<String>,
     handler: InstanceId,
+    /// The handler's service, for the metrics (`None` if its session was already gone).
+    handler_service: Option<String>,
     /// The handler session the request was forwarded to. A reconnect with the same instance id
     /// is a different session: it cannot answer requests forwarded to the old stream.
     handler_token: u64,
@@ -135,6 +137,8 @@ struct Scatter {
     sender: InstanceId,
     sender_token: Option<u64>,
     sender_service: Option<String>,
+    /// The service of every target, for the metrics; `None` when they span services.
+    service: Option<String>,
     kind: Kind,
     type_name: String,
     started: Instant,
@@ -220,6 +224,8 @@ struct Subscription {
     sender: InstanceId,
     sender_token: u64,
     sender_service: String,
+    /// The service of every target, for the metrics; `None` when they span services.
+    service: Option<String>,
     kind: Kind,
     type_name: String,
     started: Instant,
@@ -435,6 +441,14 @@ struct Closed {
     /// Targets that had not answered, removed from the map with the gather.
     rest: Vec<(String, Unary)>,
     timed_out: u32,
+}
+
+/// The one service `services` name, for the `service` metric label; `None` when they name
+/// several (a shared query type over services) or none.
+fn one_service<'a>(services: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut services = services.into_iter().filter(|s| !s.is_empty());
+    let first = services.next()?;
+    services.all(|s| s == first).then(|| first.to_string())
 }
 
 /// Label of `Request.mode` for the `mode` metric attribute.
@@ -1161,7 +1175,8 @@ impl Router {
         span.record("kraken.handler", handler.as_str());
         let sender_token = sender_info.as_ref().map(|info| info.token);
         // `None`: the handler's session vanished since the pick; the send below reports it Gone.
-        let handler_token = self.sessions.token_of(ctx, &handler).unwrap_or(u64::MAX);
+        let handler_info = self.sessions.sender_info(ctx, &handler);
+        let handler_token = handler_info.as_ref().map_or(u64::MAX, |info| info.token);
         let timeout = self.config.effective_timeout(&type_name, req.timeout_ms);
 
         // Insert before forwarding so a fast reply always finds its entry. The lock is held
@@ -1206,6 +1221,7 @@ impl Router {
                 sender_token,
                 sender_service: sender_info.map(|s| s.service),
                 handler: handler.clone(),
+                handler_service: handler_info.map(|h| h.service),
                 handler_token,
                 forwarded: false,
                 kind,
@@ -1465,8 +1481,13 @@ impl Router {
             );
         }
         let elapsed = entry.started.elapsed();
-        self.metrics
-            .request_finished(entry.kind, &entry.type_name, outcome, elapsed);
+        self.metrics.request_finished(
+            entry.kind,
+            &entry.type_name,
+            entry.handler_service.as_deref(),
+            outcome,
+            elapsed,
+        );
         self.record_edge(
             entry.sender_service.as_deref(),
             &entry.type_name,
@@ -1622,18 +1643,23 @@ impl Router {
         self.metrics.flows_set(self.flow_gauges());
     }
 
-    /// Requests queued and permits left per service, over every instance: one pass
-    /// for the whole hub, run by the watchdog every tick (at most a second) instead of per
-    /// request, so the gauges are right after timeouts, departures and returned permits too.
-    fn flow_gauges(&self) -> HashMap<String, (u64, u64)> {
+    /// Permits left per service and requests queued per service and type, over every
+    /// instance: one pass for the whole hub (the queues keep their counts per type), run by the
+    /// watchdog every tick (at most a second) instead of per request, so the gauges are right
+    /// after timeouts, departures and returned permits too.
+    fn flow_gauges(&self) -> FlowGauges {
         let flows = self.flows.lock().unwrap();
-        let mut by_service: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut gauges = FlowGauges::default();
         for f in flows.values() {
-            let entry = by_service.entry(f.service.clone()).or_default();
-            entry.0 += f.queue.len() as u64;
-            entry.1 += u64::from(f.permits);
+            *gauges.permits.entry(f.service.clone()).or_default() += u64::from(f.permits);
+            for (type_name, n) in f.queue.by_type() {
+                *gauges
+                    .queued
+                    .entry((f.service.clone(), type_name.to_string()))
+                    .or_default() += n as u64;
+            }
         }
-        by_service
+        gauges
     }
 
     /// Pending requests per instance (as handler and as sender) and the total pending count,
@@ -1729,8 +1755,13 @@ impl Router {
             return;
         }
         let elapsed = entry.started.elapsed();
-        self.metrics
-            .request_finished(entry.kind, &entry.type_name, outcome, elapsed);
+        self.metrics.request_finished(
+            entry.kind,
+            &entry.type_name,
+            entry.handler_service.as_deref(),
+            outcome,
+            elapsed,
+        );
         self.record_edge(
             entry.sender_service.as_deref(),
             &entry.type_name,
@@ -1767,7 +1798,7 @@ impl Router {
     ) {
         self.metrics.request_started(kind);
         self.metrics
-            .request_finished_mode(kind, type_name, outcome, Duration::ZERO, mode);
+            .request_finished_mode(kind, type_name, None, outcome, Duration::ZERO, mode);
         self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
@@ -1896,6 +1927,7 @@ impl Router {
                     sender_token: Some(info.token),
                     sender_service: Some(info.service.clone()),
                     handler: target.id.clone(),
+                    handler_service: Some(target.service.clone()),
                     handler_token: *token,
                     forwarded: false,
                     kind,
@@ -1915,6 +1947,7 @@ impl Router {
                 sender: sender.to_string(),
                 sender_token: Some(info.token),
                 sender_service: Some(info.service.clone()),
+                service: one_service(targets.iter().map(|(_, t, _)| t.service.as_str())),
                 kind,
                 type_name: type_name.clone(),
                 started: now,
@@ -2131,6 +2164,7 @@ impl Router {
         self.metrics.request_finished_mode(
             gather.kind,
             &gather.type_name,
+            gather.service.as_deref(),
             outcome,
             elapsed,
             mode_label(RequestMode::ScatterGather as i32),
@@ -2259,6 +2293,7 @@ impl Router {
                 sender_token: Some(info.token),
                 sender_service: Some(info.service.clone()),
                 handler: handler.clone(),
+                handler_service: Some(handler_service.clone()),
                 handler_token,
                 forwarded: false,
                 kind,
@@ -2779,6 +2814,7 @@ impl Router {
         self.metrics.request_finished_mode(
             stream.kind,
             &stream.type_name,
+            Some(&stream.handler_service),
             end.outcome,
             elapsed,
             mode_label(RequestMode::Streaming as i32),
@@ -3013,6 +3049,7 @@ impl Router {
                 sender_token: Some(info.token),
                 sender_service: Some(info.service.clone()),
                 handler: initial_handler.clone(),
+                handler_service: Some(initial_service.clone()),
                 handler_token: initial_token,
                 forwarded: false,
                 kind,
@@ -3022,7 +3059,7 @@ impl Router {
                 span: tracing::Span::none(),
                 part_of: Some(PartOf {
                     parent: id.clone(),
-                    service: initial_service,
+                    service: initial_service.clone(),
                 }),
             };
             pending.insert(initial_id.clone(), Pending::Unary(initial));
@@ -3032,6 +3069,12 @@ impl Router {
                 sender: sender.to_string(),
                 sender_token: info.token,
                 sender_service: info.service.clone(),
+                service: one_service(
+                    targets
+                        .iter()
+                        .map(|(_, t)| t.service.as_str())
+                        .chain([initial_service.as_str()]),
+                ),
                 kind,
                 type_name,
                 started: now,
@@ -3192,6 +3235,7 @@ impl Router {
                     self.metrics.request_finished_mode(
                         sub.kind,
                         &sub.type_name,
+                        sub.service.as_deref(),
                         Outcome::Ok,
                         elapsed,
                         mode_label(RequestMode::Subscription as i32),
@@ -3590,6 +3634,7 @@ impl Router {
             self.metrics.request_finished_mode(
                 sub.kind,
                 &sub.type_name,
+                sub.service.as_deref(),
                 end.outcome,
                 elapsed,
                 mode_label(RequestMode::Subscription as i32),
@@ -4738,6 +4783,80 @@ mod tests {
         assert_eq!((view.permits_available, view.queued), (1, 0));
     }
 
+    /// Requests and their latency carry the service that handled them (ADR 0026), so dashboards
+    /// break them down by service; a request that found no handler has no `service`.
+    #[tokio::test]
+    async fn request_metrics_name_the_handling_service() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut c = Cluster::with_metrics(Arc::clone(&m.metrics));
+        c.join("h1", 1);
+        c.router.route(&D, "s1", unkeyed("u1", 0, 0));
+        assert_eq!(c.forwarded("h1"), ["u1"]);
+        c.router.on_reply(&D, "h1", payload_reply("u1"));
+        c.router.route(&D, "s1", request("x1", "t.Unknown", 0));
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "service", "orders"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
+            Some(1)
+        );
+        assert_eq!(
+            m.histogram_count("kraken_hub_request_duration_seconds", "service", "orders"),
+            Some(1)
+        );
+        assert_eq!(
+            m.counter_without("kraken_hub_requests_total", "service"),
+            Some(1),
+            "the no_handler request"
+        );
+    }
+
+    /// Queue depth per service and type: one queue holds requests of several types.
+    #[tokio::test]
+    async fn queue_depth_is_per_service_and_type() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut c = Cluster::with_metrics(Arc::clone(&m.metrics));
+        c.join("h1", 1);
+        c.router.route(&D, "s1", unkeyed("busy", 0, 0));
+        c.router.route(&D, "s1", unkeyed("c1", 0, 0));
+        c.router.route(&D, "s1", unkeyed("c2", 0, 0));
+        c.router.route(
+            &D,
+            "s1",
+            Request {
+                kind: RequestKind::Query as i32,
+                ..request("q1", "t.Qry", 0)
+            },
+        );
+        c.router.refresh_gauges();
+        assert_eq!(
+            m.gauge_where(
+                "kraken_hub_queue_depth",
+                &[("service", "orders"), ("type", "t.Cmd")]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            m.gauge_where(
+                "kraken_hub_queue_depth",
+                &[("service", "orders"), ("type", "t.Qry")]
+            ),
+            Some(1)
+        );
+        c.leave("h1");
+        c.router.refresh_gauges();
+        assert_eq!(
+            m.gauge_where(
+                "kraken_hub_queue_depth",
+                &[("service", "orders"), ("type", "t.Cmd")]
+            ),
+            Some(0),
+            "written back as 0"
+        );
+    }
+
     /// The flow gauges follow the queues even when no further request comes: they are
     /// refreshed by the watchdog's sweep (`refresh_gauges`), not per request.
     #[tokio::test(start_paused = true)]
@@ -5576,6 +5695,11 @@ mod tests {
         assert_eq!(
             m.histogram_sum("kraken_hub_scatter_targets"),
             Some((1, 3.0))
+        );
+        assert_eq!(
+            m.counter_without("kraken_hub_requests_total", "service"),
+            Some(2),
+            "targets over A and B name no one service; the refused one had none"
         );
     }
 }
@@ -6622,6 +6746,11 @@ mod stream_tests {
         assert_eq!(
             m.counter("kraken_hub_requests_total", "mode", "unary"),
             None
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "service", "X"),
+            Some(1),
+            "the stream x1 served"
         );
     }
 
