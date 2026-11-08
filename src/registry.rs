@@ -781,6 +781,13 @@ impl Registry {
         before - inner.types.len()
     }
 
+    /// Whether `type_name` has an owner: a service registered it and has a live instance, or
+    /// lost its last one less than `owner_grace` ago (the types a metric label may name).
+    pub fn has_owner(&self, ctx: &ContextId, type_name: &str) -> bool {
+        check_context(ctx);
+        self.inner.lock().unwrap().types.contains_key(type_name)
+    }
+
     pub fn service_of(&self, ctx: &ContextId, instance_id: &str) -> Option<String> {
         check_context(ctx);
         let inner = self.inner.lock().unwrap();

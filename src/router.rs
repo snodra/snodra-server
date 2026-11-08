@@ -63,7 +63,9 @@ use crate::proto::{
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
 use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, SenderInfo, Sessions};
-use crate::telemetry::{FlowGauges, Metrics, Outcome, kind_label, set_parent_from_headers};
+use crate::telemetry::{
+    FlowGauges, Metrics, OTHER_TYPE, Outcome, kind_label, set_parent_from_headers,
+};
 
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1079,7 +1081,13 @@ impl Router {
             };
             // Without a kind there is no metrics label, so only kind-bearing requests are counted.
             if let Some(kind) = req_kind {
-                self.record_rejected(sender_service, kind, &type_name, Outcome::InvalidRequest);
+                self.record_rejected(
+                    ctx,
+                    sender_service,
+                    kind,
+                    &type_name,
+                    Outcome::InvalidRequest,
+                );
             }
             record_outcome(&span, Outcome::InvalidRequest);
             log_outcome(
@@ -1106,7 +1114,7 @@ impl Router {
         // A sender without a session has no principal to judge and nobody to answer, so with
         // access control on it is refused too (it used to fall through to routing).
         if sender_info.is_none() && self.auth.mode() != AuthMode::Off {
-            self.record_rejected(None, req_kind, &type_name, Outcome::Denied);
+            self.record_rejected(ctx, None, req_kind, &type_name, Outcome::Denied);
             record_outcome(&span, Outcome::Denied);
             log_outcome(
                 &id,
@@ -1125,7 +1133,14 @@ impl Router {
                     .check_send(info.principal.as_deref(), &info.service, &type_name)
         {
             let mode = mode_label(req.mode);
-            self.record_rejected_mode(sender_service, req_kind, &type_name, Outcome::Denied, mode);
+            self.record_rejected_mode(
+                ctx,
+                sender_service,
+                req_kind,
+                &type_name,
+                Outcome::Denied,
+                mode,
+            );
             record_outcome(&span, Outcome::Denied);
             log_outcome(
                 &id,
@@ -1152,7 +1167,13 @@ impl Router {
             Ok(picked) => picked,
             Err(e) => {
                 let message = no_handler_message(&type_name, e);
-                self.record_rejected(sender_service, req_kind, &type_name, Outcome::NoHandler);
+                self.record_rejected(
+                    ctx,
+                    sender_service,
+                    req_kind,
+                    &type_name,
+                    Outcome::NoHandler,
+                );
                 record_outcome(&span, Outcome::NoHandler);
                 log_outcome(
                     &id,
@@ -1185,7 +1206,13 @@ impl Router {
             let mut pending = self.pending.lock().unwrap();
             if pending.contains_key(&id) {
                 drop(pending);
-                self.record_rejected(sender_service, kind, &type_name, Outcome::InvalidRequest);
+                self.record_rejected(
+                    ctx,
+                    sender_service,
+                    kind,
+                    &type_name,
+                    Outcome::InvalidRequest,
+                );
                 record_outcome(&span, Outcome::InvalidRequest);
                 log_outcome(
                     &id,
@@ -1780,25 +1807,35 @@ impl Router {
     /// on its edge, without a latency.
     fn record_rejected(
         &self,
+        ctx: &ContextId,
         sender_service: Option<&str>,
         kind: Kind,
         type_name: &str,
         outcome: Outcome,
     ) {
-        self.record_rejected_mode(sender_service, kind, type_name, outcome, "unary");
+        self.record_rejected_mode(ctx, sender_service, kind, type_name, outcome, "unary");
     }
 
+    /// As [`Router::record_rejected`] for a request of `mode`. The type is the sender's choice,
+    /// so the metrics name it only when it has an owner, else [`OTHER_TYPE`] (ADR 0026): the
+    /// series stay bounded by the registered types whatever the senders send.
     fn record_rejected_mode(
         &self,
+        ctx: &ContextId,
         sender_service: Option<&str>,
         kind: Kind,
         type_name: &str,
         outcome: Outcome,
         mode: &'static str,
     ) {
+        let label = if self.registry.has_owner(ctx, type_name) {
+            type_name
+        } else {
+            OTHER_TYPE
+        };
         self.metrics.request_started(kind);
         self.metrics
-            .request_finished_mode(kind, type_name, None, outcome, Duration::ZERO, mode);
+            .request_finished_mode(kind, label, None, outcome, Duration::ZERO, mode);
         self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
@@ -2181,7 +2218,7 @@ impl Router {
     /// Answers a non-unary request before it was routed.
     fn reject_mode(&self, m: &ModeContext<'_>, kind: Kind, code: ErrorCode, message: String) {
         let outcome = outcome_of(code);
-        self.record_rejected_mode(m.sender_service, kind, m.type_name, outcome, m.mode);
+        self.record_rejected_mode(m.ctx, m.sender_service, kind, m.type_name, outcome, m.mode);
         record_outcome(m.span, outcome);
         log_outcome(
             m.id,
@@ -4810,6 +4847,43 @@ mod tests {
             m.counter_without("kraken_hub_requests_total", "service"),
             Some(1),
             "the no_handler request"
+        );
+    }
+
+    /// The `type` of a request answered before routing is the sender's choice: a type nobody
+    /// registered is counted as `other`, so the series stay bounded by the registered types
+    /// (ADR 0026); a registered type keeps its name.
+    #[tokio::test]
+    async fn a_type_nobody_registered_is_counted_as_other() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let mut c = Cluster::with_metrics(Arc::clone(&m.metrics));
+        c.join("h1", 1);
+        c.router.route(&D, "s1", request("x1", "t.Unknown", 0));
+        c.router
+            .route(&D, "s1", request("x2", "t.Other.Unknown", 0));
+        c.router.route(&D, "s1", unkeyed("u1", 0, 0));
+        c.router.on_reply(&D, "h1", payload_reply("u1"));
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "type", "other"),
+            Some(2)
+        );
+        assert_eq!(
+            m.histogram_count("kraken_hub_request_duration_seconds", "type", "other"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "type", "t.Unknown"),
+            None
+        );
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "type", "t.Cmd"),
+            Some(1)
+        );
+        // A registered type keeps its name when it is refused.
+        c.router.route(&D, "s1", request("", "t.Cmd", 0));
+        assert_eq!(
+            m.counter("kraken_hub_requests_total", "type", "t.Cmd"),
+            Some(2)
         );
     }
 

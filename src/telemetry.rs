@@ -174,6 +174,10 @@ impl Outcome {
     }
 }
 
+/// The `type` of a request metric whose type has no owner (ADR 0026): what a sender names is
+/// not bounded, the registered types are.
+pub const OTHER_TYPE: &str = "other";
+
 pub fn kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::Command => "command",
