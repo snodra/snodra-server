@@ -1002,8 +1002,9 @@ any client change.
     `kraken_hub_queue_wait_seconds{service,type}`, `kraken_hub_rejected_total{service,reason}` (`queue_full`,
     `queue_bytes`, `queue_bytes_total`, `buffer_full`), refreshed by the watchdog every tick (at most a second);
   - query modes: `kraken_hub_scatter_targets{type}`, `kraken_hub_streams_open{service,instance_id}` and
-    `kraken_hub_subscriptions_open{service,instance_id}` (per handler instance: the only metrics with an instance
-    label, named `instance_id` because Prometheus overwrites `instance`), `kraken_hub_stream_parts_total{service,type}`,
+    `kraken_hub_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
+    with an instance label, named `instance_id` because Prometheus overwrites `instance`; an instance whose last one
+    closed reads 0 once, then is not exported), `kraken_hub_stream_parts_total{service,type}`,
     `kraken_hub_subscription_updates_total{service,type}`;
   - event processors, from the instances' status (no Kafka read): `kraken_hub_processor_lag{service,processor}`,
     `kraken_hub_processor_dead_letters{service,processor}`, `kraken_hub_processor_state{service,processor,state}`

@@ -6773,15 +6773,15 @@ mod stream_tests {
         let (h, _) = f.target_of("st1");
         f.router.route(&D, "s1", stream("st2", "q.Own", 0, 0, 0));
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance_id", h),
+            m.gauge_sum("kraken_hub_streams_open", "instance_id", h),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance_id", "x1"),
+            m.gauge_sum("kraken_hub_streams_open", "instance_id", "x1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "service", "X"),
+            m.gauge_sum("kraken_hub_streams_open", "service", "X"),
             Some(1)
         );
         f.part(h, "st1#1", 0, b"a");
@@ -6789,14 +6789,11 @@ mod stream_tests {
         f.end(h, "st1#1", None);
         f.cancel("s1", "st2", "bye");
         f.router.route(&D, "s1", stream("p1", "q.Nope", 0, 0, 0));
-        assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance_id", h),
-            Some(0)
-        );
-        assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance_id", "x1"),
-            Some(0)
-        );
+        // Both instances' last stream closed: each reads 0 once (one export), then is gone.
+        let open = m.gauge_points("kraken_hub_streams_open");
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(open.iter().all(|(_, n)| *n == 0), "{open:?}");
+        assert_eq!(m.gauge_points("kraken_hub_streams_open"), []);
         assert_eq!(
             m.counter("kraken_hub_stream_parts_total", "type", "q.Find"),
             Some(2)
@@ -8296,15 +8293,15 @@ mod subscription_tests {
         f.router.route(&D, "s1", subscribe("w2", "q.Own", 0, 0, 0));
         f.open("w2");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "service", "X"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "service", "X"),
             Some(1)
         );
         assert_eq!(
@@ -8325,7 +8322,7 @@ mod subscription_tests {
         f.part("b1", "w1#2", 1, b"u2");
         f.end("a1", "w1#1", None);
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(0)
         );
         assert_eq!(
@@ -8338,7 +8335,7 @@ mod subscription_tests {
         );
         f.cancel("s1", "w1", "bye");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(0)
         );
         assert_eq!(
@@ -8349,7 +8346,7 @@ mod subscription_tests {
         // Cancelled before the initial part: counted once, as cancelled.
         f.cancel("s1", "w2", "bye");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "x1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "x1"),
             Some(0)
         );
         assert_eq!(

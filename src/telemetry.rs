@@ -200,9 +200,9 @@ pub struct Metrics {
     queue_wait: Histogram<f64>,
     rejected: Counter<u64>,
     scatter_targets: Histogram<u64>,
-    streams_open: UpDownCounter<i64>,
+    streams_open: Arc<OpenCounts>,
     stream_parts: Counter<u64>,
-    subscriptions_open: UpDownCounter<i64>,
+    subscriptions_open: Arc<OpenCounts>,
     subscription_updates: Counter<u64>,
     auth_violations: Counter<u64>,
     acl_generation: Gauge<u64>,
@@ -223,6 +223,7 @@ pub struct Metrics {
     event_payload_views: Counter<u64>,
     group_lag_refreshes: Counter<u64>,
     seen: Mutex<Seen>,
+    _open_gauges: [ObservableGauge<i64>; 2],
 }
 
 #[derive(Default)]
@@ -250,6 +251,22 @@ fn queue_attrs(service: &str, type_name: &str) -> [KeyValue; 2] {
 
 impl Metrics {
     pub fn new(meter: Meter) -> Arc<Self> {
+        let streams_open = Arc::new(OpenCounts::default());
+        let subscriptions_open = Arc::new(OpenCounts::default());
+        let open_gauges = [
+            OpenCounts::observe(
+                &meter,
+                "kraken_hub_streams_open",
+                "Streaming queries open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
+                Arc::clone(&streams_open),
+            ),
+            OpenCounts::observe(
+                &meter,
+                "kraken_hub_subscriptions_open",
+                "Subscription query targets open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
+                Arc::clone(&subscriptions_open),
+            ),
+        ];
         Arc::new(Self {
             requests: meter
                 .u64_counter("kraken_hub_requests_total")
@@ -308,18 +325,12 @@ impl Metrics {
                 ])
                 .with_description("Targets of one scatter-gather query")
                 .build(),
-            streams_open: meter
-                .i64_up_down_counter("kraken_hub_streams_open")
-                .with_description("Streaming queries open, per handler service and instance")
-                .build(),
+            streams_open,
             stream_parts: meter
                 .u64_counter("kraken_hub_stream_parts_total")
                 .with_description("Parts of streaming queries relayed, per handler service and type")
                 .build(),
-            subscriptions_open: meter
-                .i64_up_down_counter("kraken_hub_subscriptions_open")
-                .with_description("Subscription query targets open, per handler service and instance")
-                .build(),
+            subscriptions_open,
             subscription_updates: meter
                 .u64_counter("kraken_hub_subscription_updates_total")
                 .with_description("Updates of subscription queries relayed, per handler service and type")
@@ -400,6 +411,7 @@ impl Metrics {
                 .with_description("Readings of one topic's consumer-group lag by the lag task, per outcome: ok, truncated (more groups than listed, or out of time), unavailable (Kafka did not answer; the last reading stays), busy (the previous reading still runs)")
                 .build(),
             seen: Mutex::new(Seen::default()),
+            _open_gauges: open_gauges,
         })
     }
 
@@ -644,12 +656,12 @@ impl Metrics {
 
     /// A streaming query was routed to `instance` of `service`.
     pub fn stream_opened(&self, service: &str, instance: &str) {
-        self.streams_open.add(1, &stream_attrs(service, instance));
+        self.streams_open.add(service, instance, 1);
     }
 
     /// A streaming query served by `instance` of `service` ended, however.
     pub fn stream_closed(&self, service: &str, instance: &str) {
-        self.streams_open.add(-1, &stream_attrs(service, instance));
+        self.streams_open.add(service, instance, -1);
     }
 
     /// A part of a streaming query of `type_name`, served by `service`, was relayed.
@@ -665,14 +677,12 @@ impl Metrics {
 
     /// A subscription query (ADR 0017, P4c) got `instance` of `service` as a target.
     pub fn subscription_opened(&self, service: &str, instance: &str) {
-        self.subscriptions_open
-            .add(1, &stream_attrs(service, instance));
+        self.subscriptions_open.add(service, instance, 1);
     }
 
     /// A subscription target served by `instance` of `service` ended, however.
     pub fn subscription_closed(&self, service: &str, instance: &str) {
-        self.subscriptions_open
-            .add(-1, &stream_attrs(service, instance));
+        self.subscriptions_open.add(service, instance, -1);
     }
 
     /// An update of a subscription query of `type_name`, pushed by `service`, was relayed.
@@ -755,6 +765,58 @@ fn stream_attrs(service: &str, instance: &str) -> [KeyValue; 2] {
         KeyValue::new("service", service.to_string()),
         KeyValue::new("instance_id", instance.to_string()),
     ]
+}
+
+/// Streams or subscription targets open per (handler service, handler instance id), kept by the
+/// router's open and close calls and observed when the metrics are exported: only instances with
+/// one open are held, so the label set is the live handler instances, not every instance id
+/// seen since the hub started (an up-down counter would keep each one at 0 forever).
+#[derive(Default)]
+struct OpenCounts(Mutex<HashMap<(String, String), i64>>);
+
+impl OpenCounts {
+    fn add(&self, service: &str, instance: &str, delta: i64) {
+        let mut open = self.0.lock().unwrap();
+        let key = (service.to_string(), instance.to_string());
+        let n = open.get(&key).copied().unwrap_or(0) + delta;
+        if n > 0 {
+            open.insert(key, n);
+        } else {
+            open.remove(&key);
+        }
+    }
+
+    /// The gauge `name` of `counts`; an instance whose last one closed is exported once more as
+    /// 0, then not at all ([`Departed`]).
+    fn observe(
+        meter: &Meter,
+        name: &'static str,
+        description: &'static str,
+        counts: Arc<OpenCounts>,
+    ) -> ObservableGauge<i64> {
+        let departed = Departed::new();
+        meter
+            .i64_observable_gauge(name)
+            .with_description(description)
+            .with_callback(move |observer| {
+                let open: Vec<((String, String), i64)> = counts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, n)| (k.clone(), *n))
+                    .collect();
+                for (service, instance) in
+                    departed.gone(open.iter().map(|(k, _)| k.clone()).collect())
+                {
+                    observer.observe(0, &stream_attrs(&service, &instance));
+                }
+                for ((service, instance), n) in &open {
+                    observer.observe(*n, &stream_attrs(service, instance));
+                }
+            })
+            .build()
+    }
 }
 
 /// The keys an observed gauge exported last time. Such a gauge exports only what its callback
@@ -1104,27 +1166,14 @@ pub(crate) mod test_support {
             g.data_points().next().map(|p| p.value())
         }
 
-        /// The sum of the i64 up-down counter `name` over the points whose attribute `key` is
-        /// `value`.
-        pub(crate) fn up_down(&self, name: &str, key: &str, value: &str) -> Option<i64> {
-            self.exporter.reset();
-            self.provider.force_flush().unwrap();
-            let finished = self.exporter.get_finished_metrics().unwrap();
-            let metric = finished
-                .iter()
-                .flat_map(|rm| rm.scope_metrics())
-                .flat_map(|sm| sm.metrics())
-                .find(|m| m.name() == name)?;
-            let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
-                panic!("{name} is not an i64 up-down counter");
-            };
-            let points: Vec<i64> = sum
-                .data_points()
-                .filter(|p| {
-                    p.attributes()
-                        .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
-                })
-                .map(|p| p.value())
+        /// The sum of the i64 or u64 gauge `name` over the points whose attribute `key` is
+        /// `value`, from one export.
+        pub(crate) fn gauge_sum(&self, name: &str, key: &str, value: &str) -> Option<i64> {
+            let points: Vec<i64> = self
+                .gauge_points(name)
+                .into_iter()
+                .filter(|(attrs, _)| attrs.iter().any(|(k, v)| k == key && v == value))
+                .map(|(_, v)| v)
                 .collect();
             (!points.is_empty()).then(|| points.iter().sum())
         }
@@ -1368,11 +1417,11 @@ mod tests {
         m.metrics.subscription_update("A", "q.Watch");
         m.metrics.subscription_update("B", "q.Watch");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
@@ -1513,6 +1562,45 @@ mod tests {
         assert_eq!(m.gauge("kraken_hub_connected_instances", "B"), Some(0));
     }
 
+    /// The open streams and subscription targets are gauges of the live counts per handler
+    /// instance: an instance whose last one closed reads 0 once, then is no longer exported, so
+    /// the series of past instance ids (a fresh id per start) do not pile up (ADR 0026).
+    #[test]
+    fn an_instance_whose_last_stream_closed_reads_0_once_then_is_gone() {
+        let m = test_support::test_metrics();
+        let open = |m: &test_support::TestMetrics| {
+            let export = m.all_gauge_points();
+            ["kraken_hub_streams_open", "kraken_hub_subscriptions_open"].map(|name| {
+                export
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(attrs, v)| {
+                        let id = attrs.iter().find(|(k, _)| k == "instance_id").unwrap();
+                        (id.1.clone(), v)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.subscription_opened("A", "a1");
+        assert_eq!(open(&m), [vec![("a1".into(), 2)], vec![("a1".into(), 1)]]);
+        m.metrics.stream_closed("A", "a1");
+        m.metrics.stream_closed("A", "a1");
+        m.metrics.subscription_closed("A", "a1");
+        m.metrics.stream_opened("A", "a2");
+        assert_eq!(
+            open(&m),
+            [
+                vec![("a1".into(), 0), ("a2".into(), 1)],
+                vec![("a1".into(), 0)]
+            ]
+        );
+        assert_eq!(open(&m), [vec![("a2".into(), 1)], vec![]]);
+    }
+
     /// A data-point attribute named `instance` (or `job`) is overwritten by the resource's in
     /// Prometheus, so the handler instance is `instance_id`.
     #[test]
@@ -1521,14 +1609,17 @@ mod tests {
         m.metrics.stream_opened("A", "a1");
         m.metrics.subscription_opened("A", "a2");
         assert_eq!(
-            m.up_down("kraken_hub_streams_open", "instance_id", "a1"),
+            m.gauge_sum("kraken_hub_streams_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance_id", "a2"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a2"),
             Some(1)
         );
-        assert_eq!(m.up_down("kraken_hub_streams_open", "instance", "a1"), None);
+        assert_eq!(
+            m.gauge_sum("kraken_hub_streams_open", "instance", "a1"),
+            None
+        );
     }
 
     fn processor(
