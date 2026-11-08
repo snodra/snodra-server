@@ -995,7 +995,8 @@ any client change.
   `../kraken/docs/05-services/hub.md` (Observability); in short:
   - routing: `kraken_hub_requests_total{kind,type,mode,service,outcome}` and
     `kraken_hub_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
-    there was none or a gather's targets span services; outcome `denied` for a refused request),
+    there was none or a gather's targets span services; outcome `denied` for a refused request; a request answered
+    before routing whose type has no owner is counted as type `other`, so senders cannot grow the series),
     `kraken_hub_in_flight{kind}` (queued requests included), `kraken_hub_connected_instances{service}`,
     `kraken_hub_registered_types{service,kind}`, `kraken_hub_session_buffer_full_total{service}`;
   - flow control: `kraken_hub_queue_depth{service,type}`, `kraken_hub_permits_available{service}`,
