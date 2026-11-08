@@ -1797,6 +1797,37 @@ mod tests {
         );
     }
 
+    /// A processor whose lag becomes unknown is still reported: its lag is absent, not 0 (0
+    /// means caught up), and the departure rule (0 once) is not applied to it (ADR 0026 hub
+    /// ruling 9).
+    #[test]
+    fn a_lag_that_becomes_unknown_is_absent_not_0() {
+        use crate::proto::ProcessorState::ProcessorRunning;
+        let m = test_support::test_metrics();
+        let sessions = Arc::new(Sessions::new());
+        let _gauges = ProcessorGauges::register(&m.meter(), Arc::clone(&sessions));
+        let p = |lag| {
+            vec![processor(
+                "default",
+                ProcessorRunning,
+                &[(0, lag)],
+                0,
+                (1, 0),
+            )]
+        };
+        report(&sessions, "a1", "svc", p(9), std::time::Instant::now());
+        assert_eq!(m.gauge_points("kraken_hub_processor_lag").len(), 1);
+        report(&sessions, "a1", "svc", p(-1), std::time::Instant::now());
+        for _ in 0..2 {
+            let export = m.all_gauge_points();
+            assert!(
+                !export.contains_key("kraken_hub_processor_lag"),
+                "{export:?}"
+            );
+            assert_eq!(export["kraken_hub_processor_state"].len(), 6);
+        }
+    }
+
     /// The consumer-group lag gauge exports the last reading of each topic's groups, labelled
     /// by group and topic; a group no longer read is no longer exported.
     #[test]
