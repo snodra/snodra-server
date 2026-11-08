@@ -130,6 +130,7 @@ cargo run
 | `KRAKEN_HUB_EVENT_MAX_SEARCHES` | `4` | searches, record reads and group listings at once; one more is 429 |
 | `KRAKEN_HUB_EVENT_MAX_TAILS` | `4` | event tails at once; one more is 429 |
 | `KRAKEN_HUB_EVENT_TAIL_DURATION` | `15m` | a tail ends (`maxDuration`) after this long; at least `1s` |
+| `KRAKEN_HUB_GROUP_LAG_INTERVAL` | `60s` | with `KRAKEN_HUB_KAFKA_BOOTSTRAP`: how often a background task reads the lag of every consumer group on the event topics for `kraken_hub_consumer_group_lag` (its own Kafka slot, never a search slot; never on the router); `0` turns it off, otherwise at least `1s` |
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
@@ -857,7 +858,7 @@ umbrella `docs/05-services/hub.md` (Query modes).
   handler's `inFlightAsHandler`, one handler permit from the forward to the end, released on
   every ending path); one count on its edge with the latency to the end (an error when the end
   carries one); `kraken_hub_requests_total{mode="streaming"}` and the duration histogram;
-  `kraken_hub_streams_open{service,instance}` (the handler's) and
+  `kraken_hub_streams_open{service,instance_id}` (the handler's) and
   `kraken_hub_stream_parts_total{service,type}`.
 - `tests/streaming.rs` drives it over gRPC with raw clients. The client APIs are in the
   libraries' READMEs: [kraken-messaging, Streaming queries](../kraken-messaging/README.md#streaming-queries)
@@ -922,7 +923,7 @@ umbrella `docs/05-services/hub.md` (Query modes).
 - **Subscription accounting:** one request in flight (`inFlight`, the sender's
   `inFlightAsSender`; the initial request in its handler's `inFlightAsHandler`) until the initial
   part is delivered, then the subscription counts nowhere but in
-  `kraken_hub_subscriptions_open{service,instance}` (targets per handler instance); one count on
+  `kraken_hub_subscriptions_open{service,instance_id}` (targets per handler instance); one count on
   its edge at the initial reply (an error when the initial failed, or when the subscription ended
   before it other than by the sender's cancel), `kraken_hub_requests_total{mode="subscription"}`
   and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
@@ -987,25 +988,42 @@ any client change.
   is taken from the request's trace headers. Exported over OTLP.
 - Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
   [Dashboard](#dashboard)); Grafana for history.
-- Metrics (OTLP): `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
-  `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
-  `kraken_hub_jwks_fetches_total{result}` (`ok`, `network`, `tls`, `timeout`, `status`, `too_large`, `invalid`), `kraken_hub_jwks_keys`,
-  `kraken_hub_credentials_refreshes_total{result}`, `kraken_hub_client_certificates_total{result}`,
-  `kraken_hub_tls_handshake_failures_total{listener,reason}`, `kraken_hub_tls_client_ca_reload_errors_total`, `kraken_hub_requests_total` (outcome `denied` for a refused request), `kraken_hub_request_duration_seconds`,
-  `kraken_hub_in_flight` (queued requests included), `kraken_hub_sessions`, `kraken_hub_registered_types`,
-  `kraken_hub_session_buffer_full_total`, and for flow control `kraken_hub_queue_depth{service}`,
-  `kraken_hub_permits_available{service}`, `kraken_hub_queue_wait_seconds{service,type}`,
-  `kraken_hub_rejected_total{service,reason}` (`queue_full`, `queue_bytes`, `queue_bytes_total`,
-  `buffer_full`), `kraken_hub_scatter_targets{type}` (targets per scatter-gather),
-  `kraken_hub_streams_open{service,instance}` (streaming queries open per handler instance) and
-  `kraken_hub_stream_parts_total{service,type}` (parts relayed),
-  `kraken_hub_subscriptions_open{service,instance}` (subscription targets open per handler
-  instance; with `streams_open` the only metrics with an instance label) and
-  `kraken_hub_subscription_updates_total{service,type}` (updates relayed), `kraken_hub_control_total{action,outcome}`
-  (processor control calls), `kraken_hub_control_unknown_replies_total` (control replies nobody waited for), and for
-  the [event browser](#event-browser) `kraken_hub_event_browser_requests_total{kind,outcome}`,
-  `kraken_hub_event_browser_scanned_records`, `kraken_hub_event_tails` and `kraken_hub_event_payload_views_total`. Queue depth and
-  permits are refreshed by the watchdog every tick (at most a second), not per request.
+- Metrics (OTLP, ADR 0026, `../kraken/docs/adr/0026-metrics-and-dashboards.md`): the resource is
+  `service.name=kraken-hub`, `service.instance.id=<KRAKEN_HUB_ID>`, so in Prometheus every series carries
+  `job="kraken-hub"` and `instance="<hub id>"`; no data point carries a hub id. Exported every 60 s
+  (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it). Every metric with its labels and meaning is in
+  `../kraken/docs/05-services/hub.md` (Observability); in short:
+  - routing: `kraken_hub_requests_total{kind,type,mode,service,outcome}` and
+    `kraken_hub_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
+    there was none or a gather's targets span services; outcome `denied` for a refused request; a request answered
+    before routing whose type has no owner is counted as type `other`, so senders cannot grow the series),
+    `kraken_hub_in_flight{kind}` (queued requests included), `kraken_hub_connected_instances{service}`,
+    `kraken_hub_registered_types{service,kind}`, `kraken_hub_session_buffer_full_total{service}`;
+  - flow control: `kraken_hub_queue_depth{service,type}`, `kraken_hub_permits_available{service}`,
+    `kraken_hub_queue_wait_seconds{service,type}`, `kraken_hub_rejected_total{service,reason}` (`queue_full`,
+    `queue_bytes`, `queue_bytes_total`, `buffer_full`), refreshed by the watchdog every tick (at most a second);
+  - query modes: `kraken_hub_scatter_targets{type}`, `kraken_hub_streams_open{service,instance_id}` and
+    `kraken_hub_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
+    with an instance label, named `instance_id` because Prometheus overwrites `instance`; an instance whose last one
+    closed reads 0 once, then is not exported), `kraken_hub_stream_parts_total{service,type}`,
+    `kraken_hub_subscription_updates_total{service,type}`;
+  - event processors, from the instances' status (no Kafka read): `kraken_hub_processor_lag{service,processor}`,
+    `kraken_hub_processor_dead_letters{service,processor}`, `kraken_hub_processor_state{service,processor,state}`
+    (1 for the current state, 0 for the others), `kraken_hub_processor_processed{service,processor}` and
+    `kraken_hub_processor_failed{service,processor}` (since-start totals summed over the live instances: gauges, not
+    counters); `kraken_hub_control_total{action,outcome}`, `kraken_hub_control_unknown_replies_total`;
+  - Kafka: `kraken_hub_consumer_group_lag{group,topic}` (every group on the event topics, idle ones included, read
+    every `KRAKEN_HUB_GROUP_LAG_INTERVAL`), `kraken_hub_consumer_group_lag_refreshes_total{outcome}`,
+    `kraken_hub_event_browser_requests_total{kind,outcome}`, `kraken_hub_event_browser_scanned_records`,
+    `kraken_hub_event_tails`, `kraken_hub_event_payload_views_total`;
+  - security: `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
+    `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
+    `kraken_hub_jwks_fetches_total{result}`, `kraken_hub_jwks_keys`, `kraken_hub_credentials_refreshes_total{result}`,
+    `kraken_hub_client_certificates_total{result}`, `kraken_hub_tls_handshake_failures_total{listener,reason}`,
+    `kraken_hub_tls_handshakes_shed_total{listener,reason}`, `kraken_hub_tls_client_ca_reload_errors_total`.
+
+  Over several hubs, counters, histograms and the hub-local gauges add up (`sum`); connected instances, registered
+  types, the processor gauges and the consumer-group lag are the same on every hub (`max`).
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
   `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
   `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when

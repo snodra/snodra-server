@@ -948,6 +948,13 @@ pub fn settings(c: &Config) -> SettingsView {
             Plain,
             "an event tail ends after this long",
         ),
+        setting(
+            "KRAKEN_HUB_GROUP_LAG_INTERVAL",
+            fmt_duration(c.group_lag_interval),
+            Some(fmt_duration(d.group_lag_interval)),
+            Plain,
+            "how often the consumer-group lag of the event topics is read for kraken_hub_consumer_group_lag (with Kafka); 0 turns it off",
+        ),
     ];
     SettingsView { settings: s }
 }
@@ -1317,7 +1324,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(v.settings.len(), 56);
+        assert_eq!(v.settings.len(), 57);
         assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
         let control = get("KRAKEN_HUB_CONTROL_TIMEOUT");
         assert_eq!(

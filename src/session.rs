@@ -583,6 +583,29 @@ impl Sessions {
         known.then_some(holders)
     }
 
+    /// Every session's latest processor reports as `(service, report)`, for the processor
+    /// gauges: only the processors are cloned, under one brief lock.
+    pub fn processor_reports(&self, now: Instant) -> Vec<(String, processors::ProcessorInstance)> {
+        let inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, s) in inner.iter() {
+            let Some(status) = &s.status else { continue };
+            let age = now.saturating_duration_since(status.at);
+            let status_age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+            for p in &status.processors {
+                out.push((
+                    s.service.clone(),
+                    processors::ProcessorInstance {
+                        instance_id: id.clone(),
+                        status_age_ms,
+                        report: p.clone(),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
     pub fn count_by_service(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
         for s in self.inner.lock().unwrap().values() {

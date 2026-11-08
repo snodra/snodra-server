@@ -462,6 +462,63 @@ pub struct Tail {
     pub ends_at_ms: i64,
 }
 
+/// The consumer-group lag of the event topics as the lag task last read it, for the
+/// `kraken_hub_consumer_group_lag` gauge (ADR 0026): per topic, every group with a committed
+/// offset on it and its lag (the sum of its partitions' known lags). At most [`MAX_GROUPS`]
+/// groups per configured topic.
+#[derive(Default)]
+pub struct GroupLag {
+    by_topic: Mutex<std::collections::BTreeMap<String, Vec<(String, i64)>>>,
+}
+
+impl GroupLag {
+    /// Replaces the groups of `topic` with `groups` (group id, lag).
+    pub fn set(&self, topic: &str, groups: Vec<(String, i64)>) {
+        self.by_topic
+            .lock()
+            .unwrap()
+            .insert(topic.to_string(), groups);
+    }
+
+    /// Every `(topic, group, lag)`, sorted by topic, then group.
+    pub fn points(&self) -> Vec<(String, String, i64)> {
+        let by_topic = self.by_topic.lock().unwrap();
+        let mut points: Vec<(String, String, i64)> = by_topic
+            .iter()
+            .flat_map(|(topic, groups)| {
+                groups
+                    .iter()
+                    .map(move |(group, lag)| (topic.clone(), group.clone(), *lag))
+            })
+            .collect();
+        points.sort();
+        points
+    }
+}
+
+/// Reads the consumer-group lag of every configured topic into `lag` every `interval`, the
+/// first time at once, until `stopping` (ADR 0026). Runs are never concurrent: one that
+/// outlives the interval delays the next.
+pub async fn run_group_lag(
+    browser: Arc<Browser>,
+    lag: Arc<GroupLag>,
+    interval: Duration,
+    stopping: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stopping.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        tokio::select! {
+            _ = stopping.cancelled() => return,
+            _ = browser.refresh_group_lag(&lag) => {}
+        }
+    }
+}
+
 /// The event browser of one hub.
 pub struct Browser {
     config: Arc<Config>,
@@ -469,6 +526,9 @@ pub struct Browser {
     kafka: Option<Kafka>,
     reads: Arc<Semaphore>,
     tails: Arc<Semaphore>,
+    /// The lag task's one slot ([`Browser::refresh_group_lag`]): its own, so it never takes a
+    /// search slot from the dashboard, held by its blocking call until that ends.
+    lag_slot: Arc<Semaphore>,
 }
 
 impl Browser {
@@ -482,6 +542,7 @@ impl Browser {
         Arc::new(Self {
             reads: Arc::new(Semaphore::new(config.event_max_searches)),
             tails: Arc::new(Semaphore::new(config.event_max_tails)),
+            lag_slot: Arc::new(Semaphore::new(1)),
             config,
             metrics,
             kafka,
@@ -829,6 +890,43 @@ impl Browser {
     pub async fn groups(&self, topic: String) -> Result<GroupsView, Refusal> {
         let kafka = self.kafka()?.clone();
         let slot = self.read_slot()?;
+        self.list_groups(kafka, slot, topic).await
+    }
+
+    /// One reading of the consumer-group lag of every configured topic into `lag`, one topic
+    /// after the other, on the lag task's own slot, each under the search budget and the
+    /// [`MAX_GROUPS`] bound. Counted per topic in `kraken_hub_consumer_group_lag_refreshes_total`
+    /// (`ok`, `truncated`, `unavailable`, `busy` while the previous call still holds the slot).
+    /// A topic that does not exist has no groups; one that could not be read keeps its last
+    /// reading (Kafka being down is not "no lag").
+    pub async fn refresh_group_lag(&self, lag: &GroupLag) {
+        let Ok(kafka) = self.kafka() else { return };
+        for topic in &self.config.event_topics {
+            let Ok(slot) = Arc::clone(&self.lag_slot).try_acquire_owned() else {
+                self.metrics.group_lag_refresh("busy");
+                continue;
+            };
+            match self.list_groups(kafka.clone(), slot, topic.clone()).await {
+                Ok(view) => {
+                    self.metrics
+                        .group_lag_refresh(if view.truncated { "truncated" } else { "ok" });
+                    let groups = view.groups.into_iter().map(|g| (g.group_id, g.lag));
+                    lag.set(topic, groups.collect());
+                }
+                Err(refusal) => {
+                    self.metrics.group_lag_refresh("unavailable");
+                    tracing::debug!(topic, error = ?refusal, "consumer-group lag not read");
+                }
+            }
+        }
+    }
+
+    async fn list_groups(
+        &self,
+        kafka: Kafka,
+        slot: OwnedSemaphorePermit,
+        topic: String,
+    ) -> Result<GroupsView, Refusal> {
         let budget = self.config.event_search_timeout;
         Self::blocking(slot, budget, move || {
             let deadline = Instant::now() + budget;
@@ -994,6 +1092,103 @@ mod tests {
             Some(CHUNK.to_string().as_str())
         );
         assert!(kafka.browser().is_ok(), "librdkafka takes the settings");
+    }
+
+    fn closed_port() -> String {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        format!("127.0.0.1:{port}")
+    }
+
+    /// The lag task reads on a slot of its own (ADR 0026): it never takes a search slot from
+    /// the dashboard, and while its previous Kafka call still runs (past its budget) the next
+    /// refresh is skipped, so it never piles blocking calls up.
+    #[tokio::test]
+    async fn the_lag_refresh_has_a_slot_of_its_own_and_skips_while_it_is_busy() {
+        let m = crate::telemetry::test_support::test_metrics();
+        let config = Config {
+            kafka_bootstrap: Some(closed_port()),
+            event_topics: vec!["a".into(), "b".into()],
+            event_max_searches: 1,
+            event_search_timeout: Duration::from_millis(500),
+            ..Config::default()
+        };
+        let browser = Browser::new(Arc::new(config), Arc::clone(&m.metrics));
+        let lag = GroupLag::default();
+        let _search = browser.read_slot().unwrap();
+        browser.refresh_group_lag(&lag).await;
+        assert_eq!(
+            m.counter(
+                "kraken_hub_consumer_group_lag_refreshes_total",
+                "outcome",
+                "unavailable"
+            ),
+            Some(2),
+            "one per topic, with every search slot taken"
+        );
+        let _running = Arc::clone(&browser.lag_slot).try_acquire_owned().unwrap();
+        let started = Instant::now();
+        browser.refresh_group_lag(&lag).await;
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            m.counter(
+                "kraken_hub_consumer_group_lag_refreshes_total",
+                "outcome",
+                "busy"
+            ),
+            Some(2)
+        );
+    }
+
+    /// A failed refresh keeps the topic's last reading (Kafka down is not "no lag"); a topic
+    /// read again replaces its groups.
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_reading() {
+        let config = Config {
+            kafka_bootstrap: Some(closed_port()),
+            event_topics: vec!["a".into()],
+            event_search_timeout: Duration::from_millis(500),
+            ..Config::default()
+        };
+        let browser = Browser::new(Arc::new(config), Metrics::noop());
+        let lag = GroupLag::default();
+        lag.set("a", vec![("g1".into(), 7)]);
+        lag.set("gone", vec![("g2".into(), 1)]);
+        browser.refresh_group_lag(&lag).await;
+        assert_eq!(
+            lag.points(),
+            [
+                ("a".to_string(), "g1".to_string(), 7),
+                ("gone".to_string(), "g2".to_string(), 1)
+            ]
+        );
+        lag.set("a", vec![("g3".into(), 2)]);
+        assert_eq!(lag.points()[0], ("a".to_string(), "g3".to_string(), 2));
+    }
+
+    /// The task stops at once on `stopping`, even mid-wait.
+    #[tokio::test]
+    async fn the_lag_task_stops_on_shutdown() {
+        let config = Config {
+            kafka_bootstrap: Some(closed_port()),
+            event_search_timeout: Duration::from_millis(500),
+            ..Config::default()
+        };
+        let browser = Browser::new(Arc::new(config), Metrics::noop());
+        let stopping = CancellationToken::new();
+        let task = tokio::spawn(run_group_lag(
+            browser,
+            Arc::new(GroupLag::default()),
+            Duration::from_secs(3600),
+            stopping.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stopping.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("stopped")
+            .unwrap();
     }
 
     #[test]

@@ -104,7 +104,10 @@ pub async fn serve_with_shutdown(
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
-    let metrics = Metrics::new(opentelemetry::global::meter("kraken-hub"));
+    let meter = opentelemetry::global::meter("kraken-hub");
+    let metrics = Metrics::new(meter.clone());
+    // Read from the sessions when the metrics are exported; kept for the life of the hub.
+    let _processor_gauges = telemetry::ProcessorGauges::register(&meter, Arc::clone(&sessions));
     let auth = Authorizer::from_config(&config, Arc::clone(&metrics))?;
     info!(auth_mode = config.auth_mode.as_str(), "auth mode");
     let router = Router::with_auth(
@@ -206,6 +209,19 @@ pub async fn serve_with_shutdown(
             },
         ));
     }
+    // The event browser (ADR 0025) and, with Kafka, the consumer-group lag task of the metrics
+    // (ADR 0026): off the router, on the blocking pool, bounded like the browser's reads.
+    let browser = browser::Browser::new(Arc::clone(&config), Arc::clone(&metrics));
+    let group_lag = Arc::new(browser::GroupLag::default());
+    let _group_lag_gauge = telemetry::observe_group_lag(&meter, Arc::clone(&group_lag));
+    if let Some(interval) = config.group_lag() {
+        tokio::spawn(browser::run_group_lag(
+            Arc::clone(&browser),
+            group_lag,
+            interval,
+            stopping.clone(),
+        ));
+    }
     // Set once, when shutdown begins; the gRPC drain and the HTTP join share one deadline from it.
     let stop_began: Arc<std::sync::OnceLock<Instant>> = Arc::default();
     let handshake_limits = config.handshake_limits();
@@ -223,7 +239,7 @@ pub async fn serve_with_shutdown(
             stopping: stopping.clone(),
             streams: Arc::default(),
             summaries: Arc::default(),
-            browser: browser::Browser::new(Arc::clone(&config), Arc::clone(&metrics)),
+            browser: Arc::clone(&browser),
         });
         let stopping = stopping.clone();
         let local = listener.local_addr();

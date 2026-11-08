@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider, UpDownCounter};
+use opentelemetry::metrics::{
+    AsyncInstrument, Counter, Gauge, Histogram, Meter, MeterProvider, ObservableGauge,
+    UpDownCounter,
+};
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
@@ -18,7 +21,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::config::Config;
+use crate::processors::{self, ProcessorStateName};
 use crate::registry::{Kind, RegistrySnapshot};
+use crate::session::Sessions;
 
 const SERVICE_NAME: &str = "kraken-hub";
 
@@ -64,7 +69,7 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
             }
         }
         Some(endpoint) => {
-            let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+            let resource = resource(config);
             let span_exporter = SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint.clone())
@@ -98,6 +103,16 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
         tracing::warn!(error = %e, directive = %config.log, "invalid log filter, using info");
     }
     Ok(guard)
+}
+
+/// The OTLP resource of every span and metric: `service.name` `kraken-hub` and
+/// `service.instance.id` the hub id, which Prometheus turns into the `job` and `instance` labels
+/// dashboards select hubs by (ADR 0026); no `service.namespace`, which would change `job`.
+pub fn resource(config: &Config) -> Resource {
+    Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attribute(KeyValue::new("service.instance.id", config.hub_id.clone()))
+        .build()
 }
 
 /// Makes `span` a child of the trace context carried in `headers` (`traceparent`, `tracestate`).
@@ -159,6 +174,10 @@ impl Outcome {
     }
 }
 
+/// The `type` of a request metric whose type has no owner (ADR 0026): what a sender names is
+/// not bounded, the registered types are.
+pub const OTHER_TYPE: &str = "other";
+
 pub fn kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::Command => "command",
@@ -166,14 +185,14 @@ pub fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
-/// Router metrics: the six instruments of the hub spec. The `sessions` and `registered_types`
-/// gauges are set imperatively (not observable callbacks); services that disappeared are
-/// written back as 0 so the exported series does not go stale at its last value.
+/// Router metrics. The `connected_instances` and `registered_types` gauges are set imperatively
+/// (not observable callbacks); services that disappeared are written back as 0 so the exported
+/// series does not go stale at its last value.
 pub struct Metrics {
     requests: Counter<u64>,
     duration: Histogram<f64>,
     in_flight: UpDownCounter<i64>,
-    sessions: Gauge<u64>,
+    connected_instances: Gauge<u64>,
     registered_types: Gauge<u64>,
     buffer_full: Counter<u64>,
     queue_depth: Gauge<u64>,
@@ -181,9 +200,9 @@ pub struct Metrics {
     queue_wait: Histogram<f64>,
     rejected: Counter<u64>,
     scatter_targets: Histogram<u64>,
-    streams_open: UpDownCounter<i64>,
+    streams_open: Arc<OpenCounts>,
     stream_parts: Counter<u64>,
-    subscriptions_open: UpDownCounter<i64>,
+    subscriptions_open: Arc<OpenCounts>,
     subscription_updates: Counter<u64>,
     auth_violations: Counter<u64>,
     acl_generation: Gauge<u64>,
@@ -202,18 +221,52 @@ pub struct Metrics {
     event_browser_scanned: Histogram<u64>,
     event_tails: UpDownCounter<i64>,
     event_payload_views: Counter<u64>,
+    group_lag_refreshes: Counter<u64>,
     seen: Mutex<Seen>,
+    _open_gauges: [ObservableGauge<i64>; 2],
 }
 
 #[derive(Default)]
 struct Seen {
-    sessions: HashSet<String>,
+    instances: HashSet<String>,
     types: HashSet<String>,
     flows: HashSet<String>,
+    queued: HashSet<(String, String)>,
+}
+
+/// The flow gauges of one pass over every instance: permits left per service, requests queued
+/// per (service, type).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlowGauges {
+    pub permits: HashMap<String, u64>,
+    pub queued: HashMap<(String, String), u64>,
+}
+
+fn queue_attrs(service: &str, type_name: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("service", service.to_string()),
+        KeyValue::new("type", type_name.to_string()),
+    ]
 }
 
 impl Metrics {
     pub fn new(meter: Meter) -> Arc<Self> {
+        let streams_open = Arc::new(OpenCounts::default());
+        let subscriptions_open = Arc::new(OpenCounts::default());
+        let open_gauges = [
+            OpenCounts::observe(
+                &meter,
+                "kraken_hub_streams_open",
+                "Streaming queries open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
+                Arc::clone(&streams_open),
+            ),
+            OpenCounts::observe(
+                &meter,
+                "kraken_hub_subscriptions_open",
+                "Subscription query targets open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
+                Arc::clone(&subscriptions_open),
+            ),
+        ];
         Arc::new(Self {
             requests: meter
                 .u64_counter("kraken_hub_requests_total")
@@ -232,9 +285,9 @@ impl Metrics {
                 .i64_up_down_counter("kraken_hub_in_flight")
                 .with_description("Requests awaiting a reply")
                 .build(),
-            sessions: meter
-                .u64_gauge("kraken_hub_sessions")
-                .with_description("Connected sessions per service")
+            connected_instances: meter
+                .u64_gauge("kraken_hub_connected_instances")
+                .with_description("Instances with a stream to this hub, per service")
                 .build(),
             registered_types: meter
                 .u64_gauge("kraken_hub_registered_types")
@@ -246,7 +299,7 @@ impl Metrics {
                 .build(),
             queue_depth: meter
                 .u64_gauge("kraken_hub_queue_depth")
-                .with_description("Requests queued for instances, per service")
+                .with_description("Requests queued for instances, per service and type")
                 .build(),
             permits_available: meter
                 .u64_gauge("kraken_hub_permits_available")
@@ -272,18 +325,12 @@ impl Metrics {
                 ])
                 .with_description("Targets of one scatter-gather query")
                 .build(),
-            streams_open: meter
-                .i64_up_down_counter("kraken_hub_streams_open")
-                .with_description("Streaming queries open, per handler service and instance")
-                .build(),
+            streams_open,
             stream_parts: meter
                 .u64_counter("kraken_hub_stream_parts_total")
                 .with_description("Parts of streaming queries relayed, per handler service and type")
                 .build(),
-            subscriptions_open: meter
-                .i64_up_down_counter("kraken_hub_subscriptions_open")
-                .with_description("Subscription query targets open, per handler service and instance")
-                .build(),
+            subscriptions_open,
             subscription_updates: meter
                 .u64_counter("kraken_hub_subscription_updates_total")
                 .with_description("Updates of subscription queries relayed, per handler service and type")
@@ -359,7 +406,12 @@ impl Metrics {
                 .u64_counter("kraken_hub_event_payload_views_total")
                 .with_description("Event payloads served by the record detail (each also writes an audit line)")
                 .build(),
+            group_lag_refreshes: meter
+                .u64_counter("kraken_hub_consumer_group_lag_refreshes_total")
+                .with_description("Readings of one topic's consumer-group lag by the lag task, per outcome: ok, truncated (more groups than listed, or out of time), unavailable (Kafka did not answer; the last reading stays), busy (the previous reading still runs)")
+                .build(),
             seen: Mutex::new(Seen::default()),
+            _open_gauges: open_gauges,
         })
     }
 
@@ -409,6 +461,12 @@ impl Metrics {
     /// One payload served.
     pub fn event_payload_view(&self) {
         self.event_payload_views.add(1, &[]);
+    }
+
+    /// One reading of a topic's consumer-group lag by the lag task; `outcome` from a fixed set.
+    pub fn group_lag_refresh(&self, outcome: &'static str) {
+        self.group_lag_refreshes
+            .add(1, &[KeyValue::new("outcome", outcome)]);
     }
 
     /// A `ControlReply` nobody waited for, dropped.
@@ -479,21 +537,36 @@ impl Metrics {
         self.acl_reload_errors.add(1, &[]);
     }
 
-    /// Queue depth and permits left per service (its instances summed); services
-    /// that had flows before and have none now are written back as 0.
-    pub fn flows_set(&self, by_service: HashMap<String, (u64, u64)>) {
+    /// Permits left per service and requests queued per service and type (their instances
+    /// summed); a service or a (service, type) that had a value before and has none now is
+    /// written back as 0.
+    pub fn flows_set(&self, flows: FlowGauges) {
         let mut seen = self.seen.lock().unwrap();
-        for gone in seen.flows.iter().filter(|s| !by_service.contains_key(*s)) {
-            let attrs = [KeyValue::new("service", gone.clone())];
-            self.queue_depth.record(0, &attrs);
-            self.permits_available.record(0, &attrs);
+        for gone in seen
+            .flows
+            .iter()
+            .filter(|s| !flows.permits.contains_key(*s))
+        {
+            self.permits_available
+                .record(0, &[KeyValue::new("service", gone.clone())]);
         }
-        seen.flows = by_service.keys().cloned().collect();
+        for (service, type_name) in seen
+            .queued
+            .iter()
+            .filter(|k| !flows.queued.contains_key(*k))
+        {
+            self.queue_depth.record(0, &queue_attrs(service, type_name));
+        }
+        seen.flows = flows.permits.keys().cloned().collect();
+        seen.queued = flows.queued.keys().cloned().collect();
         drop(seen);
-        for (service, (depth, permits)) in by_service {
-            let attrs = [KeyValue::new("service", service)];
-            self.queue_depth.record(depth, &attrs);
-            self.permits_available.record(permits, &attrs);
+        for (service, permits) in flows.permits {
+            self.permits_available
+                .record(permits, &[KeyValue::new("service", service)]);
+        }
+        for ((service, type_name), depth) in flows.queued {
+            self.queue_depth
+                .record(depth, &queue_attrs(&service, &type_name));
         }
     }
 
@@ -531,38 +604,46 @@ impl Metrics {
             .add(delta, &[KeyValue::new("kind", kind_label(kind))]);
     }
 
-    /// A unary request ended.
+    /// A unary request ended; `service` is the handler's (`None` when it had none).
     pub fn request_finished(
         &self,
         kind: Kind,
         type_name: &str,
+        service: Option<&str>,
         outcome: Outcome,
         duration: Duration,
     ) {
-        self.request_finished_mode(kind, type_name, outcome, duration, "unary");
+        self.request_finished_mode(kind, type_name, service, outcome, duration, "unary");
     }
 
     /// A request of `mode` (`unary`, `scatter_gather`, ...) ended. A scatter-gather counts once,
-    /// whatever its number of targets.
+    /// whatever its number of targets. `service` is the service that handled it: `None` when
+    /// no handler was found, or the targets of a gather or subscription span services.
     pub fn request_finished_mode(
         &self,
         kind: Kind,
         type_name: &str,
+        service: Option<&str>,
         outcome: Outcome,
         duration: Duration,
         mode: &'static str,
     ) {
         self.in_flight_add(kind, -1);
         // The duration keeps the mode (a gather's latency is to its ReplyEnd, not comparable
-        // with a unary request of the same type) but never the outcome.
-        let attrs = [
+        // with a unary request of the same type) but never the outcome, which is last.
+        let mut attrs = Vec::with_capacity(5);
+        attrs.extend([
             KeyValue::new("kind", kind_label(kind)),
             KeyValue::new("type", type_name.to_string()),
             KeyValue::new("mode", mode),
-            KeyValue::new("outcome", outcome.as_str()),
-        ];
+        ]);
+        if let Some(service) = service {
+            attrs.push(KeyValue::new("service", service.to_string()));
+        }
+        attrs.push(KeyValue::new("outcome", outcome.as_str()));
         self.requests.add(1, &attrs);
-        self.duration.record(duration.as_secs_f64(), &attrs[..3]);
+        self.duration
+            .record(duration.as_secs_f64(), &attrs[..attrs.len() - 1]);
     }
 
     /// The number of targets one scatter-gather query went to.
@@ -575,12 +656,12 @@ impl Metrics {
 
     /// A streaming query was routed to `instance` of `service`.
     pub fn stream_opened(&self, service: &str, instance: &str) {
-        self.streams_open.add(1, &stream_attrs(service, instance));
+        self.streams_open.add(service, instance, 1);
     }
 
     /// A streaming query served by `instance` of `service` ended, however.
     pub fn stream_closed(&self, service: &str, instance: &str) {
-        self.streams_open.add(-1, &stream_attrs(service, instance));
+        self.streams_open.add(service, instance, -1);
     }
 
     /// A part of a streaming query of `type_name`, served by `service`, was relayed.
@@ -596,14 +677,12 @@ impl Metrics {
 
     /// A subscription query (ADR 0017, P4c) got `instance` of `service` as a target.
     pub fn subscription_opened(&self, service: &str, instance: &str) {
-        self.subscriptions_open
-            .add(1, &stream_attrs(service, instance));
+        self.subscriptions_open.add(service, instance, 1);
     }
 
     /// A subscription target served by `instance` of `service` ended, however.
     pub fn subscription_closed(&self, service: &str, instance: &str) {
-        self.subscriptions_open
-            .add(-1, &stream_attrs(service, instance));
+        self.subscriptions_open.add(service, instance, -1);
     }
 
     /// An update of a subscription query of `type_name`, pushed by `service`, was relayed.
@@ -622,20 +701,22 @@ impl Metrics {
             .add(1, &[KeyValue::new("service", service.to_string())]);
     }
 
-    pub fn sessions_set(&self, by_service: HashMap<String, usize>) {
+    /// Instances connected per service (one session each); a service whose last instance left
+    /// is written back as 0.
+    pub fn connected_instances_set(&self, by_service: HashMap<String, usize>) {
         let mut seen = self.seen.lock().unwrap();
         for gone in seen
-            .sessions
+            .instances
             .iter()
             .filter(|s| !by_service.contains_key(*s))
         {
-            self.sessions
+            self.connected_instances
                 .record(0, &[KeyValue::new("service", gone.clone())]);
         }
-        seen.sessions = by_service.keys().cloned().collect();
+        seen.instances = by_service.keys().cloned().collect();
         drop(seen);
         for (service, n) in by_service {
-            self.sessions
+            self.connected_instances
                 .record(n as u64, &[KeyValue::new("service", service)]);
         }
     }
@@ -677,11 +758,242 @@ impl Metrics {
     }
 }
 
+/// The handler's service and instance. The instance is `instance_id`: Prometheus overwrites a
+/// data-point `instance` (and `job`) with the resource's (ADR 0026).
 fn stream_attrs(service: &str, instance: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("service", service.to_string()),
-        KeyValue::new("instance", instance.to_string()),
+        KeyValue::new("instance_id", instance.to_string()),
     ]
+}
+
+/// Streams or subscription targets open per (handler service, handler instance id), kept by the
+/// router's open and close calls and observed when the metrics are exported: only instances with
+/// one open are held, so the label set is the live handler instances, not every instance id
+/// seen since the hub started (an up-down counter would keep each one at 0 forever).
+#[derive(Default)]
+struct OpenCounts(Mutex<HashMap<(String, String), i64>>);
+
+impl OpenCounts {
+    fn add(&self, service: &str, instance: &str, delta: i64) {
+        let mut open = self.0.lock().unwrap();
+        let key = (service.to_string(), instance.to_string());
+        let n = open.get(&key).copied().unwrap_or(0) + delta;
+        if n > 0 {
+            open.insert(key, n);
+        } else {
+            open.remove(&key);
+        }
+    }
+
+    /// The gauge `name` of `counts`; an instance whose last one closed is exported once more as
+    /// 0, then not at all ([`Departed`]).
+    fn observe(
+        meter: &Meter,
+        name: &'static str,
+        description: &'static str,
+        counts: Arc<OpenCounts>,
+    ) -> ObservableGauge<i64> {
+        let departed = Departed::new();
+        meter
+            .i64_observable_gauge(name)
+            .with_description(description)
+            .with_callback(move |observer| {
+                let open: Vec<((String, String), i64)> = counts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, n)| (k.clone(), *n))
+                    .collect();
+                for (service, instance) in
+                    departed.gone(open.iter().map(|(k, _)| k.clone()).collect())
+                {
+                    observer.observe(0, &stream_attrs(&service, &instance));
+                }
+                for ((service, instance), n) in &open {
+                    observer.observe(*n, &stream_attrs(service, instance));
+                }
+            })
+            .build()
+    }
+}
+
+/// The keys an observed gauge exported last time. Such a gauge exports only what its callback
+/// observes, and Prometheus keeps a series that stops at its last value until it goes stale
+/// (minutes): a key that went away is exported once more as 0 instead.
+struct Departed<K>(Mutex<HashSet<K>>);
+
+impl<K: Eq + std::hash::Hash + Clone> Departed<K> {
+    fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+
+    /// Keeps `present` as the keys of this export and returns the keys of the last one that
+    /// are not in it.
+    fn gone(&self, present: HashSet<K>) -> Vec<K> {
+        let mut last = self.0.lock().unwrap();
+        let gone = last.difference(&present).cloned().collect();
+        *last = present;
+        gone
+    }
+}
+
+/// One processor of one service, aggregated over its instances ([`processors::by_service`]).
+struct ProcessorRow {
+    service: String,
+    processor: String,
+    lag: Option<i64>,
+    dead_letters: u64,
+    state: ProcessorStateName,
+    processed: u64,
+    failed: u64,
+}
+
+impl ProcessorRow {
+    fn key(&self) -> (String, String) {
+        (self.service.clone(), self.processor.clone())
+    }
+}
+
+fn processor_attrs(service: &str, processor: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("service", service.to_string()),
+        KeyValue::new("processor", processor.to_string()),
+    ]
+}
+
+/// The processor gauges (ADR 0022, 0026), per service and processor, aggregated over the
+/// instances as the Processors page does, from the latest `InstanceStatus` each session holds:
+/// observed when the metrics are exported (by the exporter's thread), from memory, no I/O and
+/// no new Kafka read. Every instance reports to every hub (ADR 0016), so hubs export the same
+/// values: dashboards take `max` over hubs. Dropping the value unregisters nothing; keep it for
+/// the life of the meter provider.
+pub struct ProcessorGauges {
+    _lag: ObservableGauge<i64>,
+    _dead_letters: ObservableGauge<u64>,
+    _state: ObservableGauge<u64>,
+    _processed: ObservableGauge<u64>,
+    _failed: ObservableGauge<u64>,
+}
+
+impl ProcessorGauges {
+    pub fn register(meter: &Meter, sessions: Arc<Sessions>) -> Self {
+        let rows = move || -> Vec<ProcessorRow> {
+            let reports = sessions.processor_reports(std::time::Instant::now());
+            processors::by_service(reports)
+                .into_iter()
+                .flat_map(|s| {
+                    let service = s.service_name;
+                    s.processors.into_iter().map(move |p| ProcessorRow {
+                        service: service.clone(),
+                        processor: p.name,
+                        lag: p.lag,
+                        dead_letters: p.dead_letters,
+                        state: p.state,
+                        processed: p.processed_total,
+                        failed: p.failed_total,
+                    })
+                })
+                .collect()
+        };
+        let rows = Arc::new(rows);
+        // A gauge of one value per (service, processor); `None` exports nothing for that key
+        // (an unknown lag) without counting it as gone.
+        fn per_processor<T: Copy + Default + Send + Sync + 'static>(
+            rows: &Arc<impl Fn() -> Vec<ProcessorRow> + Send + Sync + 'static>,
+            value: fn(&ProcessorRow) -> Option<T>,
+        ) -> impl Fn(&dyn AsyncInstrument<T>) + Send + Sync + 'static {
+            let rows = Arc::clone(rows);
+            let departed = Departed::new();
+            move |observer| {
+                let rows = rows();
+                for (service, processor) in
+                    departed.gone(rows.iter().map(ProcessorRow::key).collect())
+                {
+                    observer.observe(T::default(), &processor_attrs(&service, &processor));
+                }
+                for row in &rows {
+                    if let Some(v) = value(row) {
+                        observer.observe(v, &processor_attrs(&row.service, &row.processor));
+                    }
+                }
+            }
+        }
+        let state = {
+            let rows = Arc::clone(&rows);
+            let departed = Departed::new();
+            move |observer: &dyn AsyncInstrument<u64>| {
+                let rows = rows();
+                let gone = departed.gone(rows.iter().map(ProcessorRow::key).collect());
+                let current = rows
+                    .iter()
+                    .map(|r| (r.service.clone(), r.processor.clone(), Some(r.state)));
+                let gone = gone.into_iter().map(|(s, p)| (s, p, None));
+                for (service, processor, current) in current.chain(gone) {
+                    for state in ProcessorStateName::ALL {
+                        let [s, p] = processor_attrs(&service, &processor);
+                        observer.observe(
+                            u64::from(current == Some(state)),
+                            &[s, p, KeyValue::new("state", state.label())],
+                        );
+                    }
+                }
+            }
+        };
+        Self {
+            _lag: meter
+                .i64_observable_gauge("kraken_hub_processor_lag")
+                .with_description("Records behind per service and processor: the sum over its distinct partitions as the freshest report has them; absent while no lag is known")
+                .with_callback(per_processor(&rows, |r| r.lag))
+                .build(),
+            _dead_letters: meter
+                .u64_observable_gauge("kraken_hub_processor_dead_letters")
+                .with_description("Dead letters per service and processor: the highest count its instances report")
+                .with_callback(per_processor(&rows, |r| Some(r.dead_letters)))
+                .build(),
+            _state: meter
+                .u64_observable_gauge("kraken_hub_processor_state")
+                .with_description("1 for the state of the processor (the worst over its instances), 0 for the other states")
+                .with_callback(state)
+                .build(),
+            _processed: meter
+                .u64_observable_gauge("kraken_hub_processor_processed")
+                .with_description("Records processed, summed over the instances reporting the processor, each since its own start (a gauge: it drops when an instance restarts; rates come from kraken_events_consumed_total)")
+                .with_callback(per_processor(&rows, |r| Some(r.processed)))
+                .build(),
+            _failed: meter
+                .u64_observable_gauge("kraken_hub_processor_failed")
+                .with_description("Records whose handling failed, summed over the instances reporting the processor, each since its own start (a gauge, as kraken_hub_processor_processed)")
+                .with_callback(per_processor(&rows, |r| Some(r.failed)))
+                .build(),
+        }
+    }
+}
+
+/// `kraken_hub_consumer_group_lag{group,topic}` (ADR 0026): the lag task's last reading,
+/// observed when the metrics are exported (from memory; the task does the Kafka reads). Every
+/// hub reads the same groups: dashboards take `max` over hubs. Keep the value for the life of
+/// the meter provider.
+pub fn observe_group_lag(
+    meter: &Meter,
+    lag: Arc<crate::browser::GroupLag>,
+) -> ObservableGauge<i64> {
+    meter
+        .i64_observable_gauge("kraken_hub_consumer_group_lag")
+        .with_description("Records behind per consumer group and event topic: the end offsets less the group's committed offsets, summed over the partitions it committed on; read by the lag task every KRAKEN_HUB_GROUP_LAG_INTERVAL, groups without a live member included")
+        .with_callback(move |observer| {
+            for (topic, group, value) in lag.points() {
+                observer.observe(
+                    value,
+                    &[
+                        KeyValue::new("group", group),
+                        KeyValue::new("topic", topic),
+                    ],
+                );
+            }
+        })
+        .build()
 }
 
 /// In-memory metrics for unit tests elsewhere in the crate.
@@ -763,6 +1075,17 @@ pub(crate) mod test_support {
         LINES.with_borrow(Vec::clone)
     }
 
+    fn sorted_attrs<'a>(kvs: impl Iterator<Item = &'a KeyValue>) -> Vec<(String, String)> {
+        let mut attrs: Vec<(String, String)> = kvs
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        attrs.sort();
+        attrs
+    }
+
+    /// One gauge point: its attributes, sorted, and its value.
+    pub(crate) type Point = (Vec<(String, String)>, i64);
+
     pub(crate) struct TestMetrics {
         pub metrics: Arc<Metrics>,
         exporter: InMemoryMetricExporter,
@@ -782,6 +1105,11 @@ pub(crate) mod test_support {
     }
 
     impl TestMetrics {
+        /// A meter of the same provider, for the observed gauges.
+        pub(crate) fn meter(&self) -> Meter {
+            self.provider.meter("test")
+        }
+
         /// The sum of the u64 counter `name` over the points whose attribute `key` is `value`.
         pub(crate) fn counter(&self, name: &str, key: &str, value: &str) -> Option<u64> {
             self.exporter.reset();
@@ -838,27 +1166,14 @@ pub(crate) mod test_support {
             g.data_points().next().map(|p| p.value())
         }
 
-        /// The sum of the i64 up-down counter `name` over the points whose attribute `key` is
-        /// `value`.
-        pub(crate) fn up_down(&self, name: &str, key: &str, value: &str) -> Option<i64> {
-            self.exporter.reset();
-            self.provider.force_flush().unwrap();
-            let finished = self.exporter.get_finished_metrics().unwrap();
-            let metric = finished
-                .iter()
-                .flat_map(|rm| rm.scope_metrics())
-                .flat_map(|sm| sm.metrics())
-                .find(|m| m.name() == name)?;
-            let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
-                panic!("{name} is not an i64 up-down counter");
-            };
-            let points: Vec<i64> = sum
-                .data_points()
-                .filter(|p| {
-                    p.attributes()
-                        .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
-                })
-                .map(|p| p.value())
+        /// The sum of the i64 or u64 gauge `name` over the points whose attribute `key` is
+        /// `value`, from one export.
+        pub(crate) fn gauge_sum(&self, name: &str, key: &str, value: &str) -> Option<i64> {
+            let points: Vec<i64> = self
+                .gauge_points(name)
+                .into_iter()
+                .filter(|(attrs, _)| attrs.iter().any(|(k, v)| k == key && v == value))
+                .map(|(_, v)| v)
                 .collect();
             (!points.is_empty()).then(|| points.iter().sum())
         }
@@ -902,6 +1217,118 @@ pub(crate) mod test_support {
             }
         }
 
+        /// `f` of the metric `name` as exported now; `None` when it is not.
+        fn with_metric<R>(
+            &self,
+            name: &str,
+            f: impl FnOnce(&opentelemetry_sdk::metrics::data::Metric) -> R,
+        ) -> Option<R> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)
+                .map(f)
+        }
+
+        /// The sum of the u64 counter `name` over the points that have no attribute `key`.
+        pub(crate) fn counter_without(&self, name: &str, key: &str) -> Option<u64> {
+            let points: Vec<u64> = self.with_metric(name, |metric| {
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    panic!("{name} is not a u64 counter");
+                };
+                sum.data_points()
+                    .filter(|p| p.attributes().all(|kv| kv.key.as_str() != key))
+                    .map(|p| p.value())
+                    .collect()
+            })?;
+            (!points.is_empty()).then(|| points.iter().sum())
+        }
+
+        /// The count of the f64 histogram `name` over the points whose attribute `key` is
+        /// `value`.
+        pub(crate) fn histogram_count(&self, name: &str, key: &str, value: &str) -> Option<u64> {
+            let counts: Vec<u64> = self.with_metric(name, |metric| {
+                let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data() else {
+                    panic!("{name} is not an f64 histogram");
+                };
+                h.data_points()
+                    .filter(|p| {
+                        p.attributes()
+                            .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                    })
+                    .map(|p| p.count())
+                    .collect()
+            })?;
+            (!counts.is_empty()).then(|| counts.iter().sum())
+        }
+
+        /// The value of the u64 or i64 gauge `name` whose attributes are exactly `attrs`.
+        pub(crate) fn gauge_where(&self, name: &str, attrs: &[(&str, &str)]) -> Option<i64> {
+            let mut want: Vec<(String, String)> = attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            want.sort();
+            self.gauge_points(name)
+                .into_iter()
+                .find(|(got, _)| *got == want)
+                .map(|(_, v)| v)
+        }
+
+        /// Every point of every u64 or i64 gauge with at least one point, from one export.
+        pub(crate) fn all_gauge_points(&self) -> std::collections::BTreeMap<String, Vec<Point>> {
+            self.exporter.reset();
+            self.provider.force_flush().unwrap();
+            let finished = self.exporter.get_finished_metrics().unwrap();
+            let mut out = std::collections::BTreeMap::new();
+            for metric in finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+            {
+                let mut points: Vec<Point> = match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (sorted_attrs(p.attributes()), p.value() as i64))
+                        .collect(),
+                    AggregatedMetrics::I64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (sorted_attrs(p.attributes()), p.value()))
+                        .collect(),
+                    _ => continue,
+                };
+                if points.is_empty() {
+                    continue;
+                }
+                points.sort();
+                out.insert(metric.name().to_string(), points);
+            }
+            out
+        }
+
+        /// Every point of the u64 or i64 gauge `name` as (sorted attributes, value), sorted.
+        pub(crate) fn gauge_points(&self, name: &str) -> Vec<Point> {
+            let mut points: Vec<Point> = self
+                .with_metric(name, |metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (sorted_attrs(p.attributes()), p.value() as i64))
+                        .collect(),
+                    AggregatedMetrics::I64(MetricData::Gauge(g)) => g
+                        .data_points()
+                        .map(|p| (sorted_attrs(p.attributes()), p.value()))
+                        .collect(),
+                    _ => panic!("{name} is not a u64 or i64 gauge"),
+                })
+                .unwrap_or_default();
+            points.sort();
+            points
+        }
+
         /// The last value of the u64 gauge `name` for `service`, as exported now.
         pub(crate) fn gauge(&self, name: &str, service: &str) -> Option<u64> {
             self.exporter.reset();
@@ -940,7 +1367,13 @@ mod tests {
             .build();
         let metrics = Metrics::new(provider.meter("test"));
 
-        metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        metrics.request_finished(
+            Kind::Command,
+            "a.B",
+            Some("A"),
+            Outcome::Ok,
+            Duration::from_millis(10),
+        );
         provider.force_flush().unwrap();
 
         let finished = exporter.get_finished_metrics().unwrap();
@@ -963,6 +1396,7 @@ mod tests {
             "{attrs:?}"
         );
         assert!(attrs.contains(&("type".into(), "a.B".into())), "{attrs:?}");
+        assert!(attrs.contains(&("service".into(), "A".into())), "{attrs:?}");
         assert!(
             attrs.contains(&("outcome".into(), "ok".into())),
             "{attrs:?}"
@@ -983,11 +1417,11 @@ mod tests {
         m.metrics.subscription_update("A", "q.Watch");
         m.metrics.subscription_update("B", "q.Watch");
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "a1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.up_down("kraken_hub_subscriptions_open", "instance", "b1"),
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
@@ -1010,14 +1444,22 @@ mod tests {
     }
 
     /// The duration histogram has the `mode` label, so a gather's latency (to its `ReplyEnd`)
-    /// does not mix with the unary latency of the same type; never the outcome.
+    /// does not mix with the unary latency of the same type, and the handling service when
+    /// there is one; never the outcome.
     #[test]
-    fn duration_histogram_has_kind_type_and_mode_labels_only() {
+    fn duration_histogram_has_kind_type_mode_and_service_labels_only() {
         let (exporter, provider, metrics) = exporter_and_metrics();
-        metrics.request_finished(Kind::Command, "a.B", Outcome::Ok, Duration::from_millis(10));
+        metrics.request_finished(
+            Kind::Command,
+            "a.B",
+            Some("A"),
+            Outcome::Ok,
+            Duration::from_millis(10),
+        );
         metrics.request_finished_mode(
             Kind::Query,
             "q.F",
+            None,
             Outcome::Timeout,
             Duration::from_millis(20),
             "scatter_gather",
@@ -1045,18 +1487,22 @@ mod tests {
             })
             .collect();
         points.sort();
-        let labels = |kind: &str, type_name: &str, mode: &str| {
-            vec![
+        let labels = |kind: &str, type_name: &str, mode: &str, service: Option<&str>| {
+            let mut labels = vec![
                 ("kind".to_string(), kind.to_string()),
                 ("mode".to_string(), mode.to_string()),
                 ("type".to_string(), type_name.to_string()),
-            ]
+            ];
+            if let Some(service) = service {
+                labels.insert(2, ("service".to_string(), service.to_string()));
+            }
+            labels
         };
         assert_eq!(
             points,
             [
-                (labels("command", "a.B", "unary"), 1),
-                (labels("query", "q.F", "scatter_gather"), 1)
+                (labels("command", "a.B", "unary", Some("A")), 1),
+                (labels("query", "q.F", "scatter_gather", None), 1)
             ]
         );
         let point = h.data_points().next().expect("one data point");
@@ -1067,7 +1513,7 @@ mod tests {
     fn in_flight_returns_to_zero_after_finish() {
         let (exporter, provider, metrics) = exporter_and_metrics();
         metrics.request_started(Kind::Query);
-        metrics.request_finished(Kind::Query, "q.X", Outcome::Ok, Duration::ZERO);
+        metrics.request_finished(Kind::Query, "q.X", None, Outcome::Ok, Duration::ZERO);
         provider.force_flush().unwrap();
         let finished = exporter.get_finished_metrics().unwrap();
         let metric = finished
@@ -1081,6 +1527,334 @@ mod tests {
         };
         let total: i64 = sum.data_points().map(|p| p.value()).sum();
         assert_eq!(total, 0);
+    }
+
+    /// Dashboards select hubs by the resource (ADR 0026 hub ruling 1): `service.name` becomes
+    /// `job` and `service.instance.id` becomes `instance` in Prometheus.
+    #[test]
+    fn the_resource_names_the_hub_and_its_id() {
+        let config = Config {
+            hub_id: "hub-7".into(),
+            ..Config::default()
+        };
+        let resource = resource(&config);
+        let get = |key: &'static str| {
+            resource
+                .get(&opentelemetry::Key::from_static_str(key))
+                .map(|v| v.to_string())
+        };
+        assert_eq!(get("service.name").as_deref(), Some("kraken-hub"));
+        assert_eq!(get("service.instance.id").as_deref(), Some("hub-7"));
+        assert_eq!(get("service.namespace"), None, "it would change `job`");
+    }
+
+    /// One gauge per service; a service whose last instance left is written back as 0.
+    #[test]
+    fn connected_instances_are_counted_per_service() {
+        let m = test_support::test_metrics();
+        m.metrics
+            .connected_instances_set(HashMap::from([("A".to_string(), 2), ("B".to_string(), 1)]));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "A"), Some(2));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "B"), Some(1));
+        m.metrics
+            .connected_instances_set(HashMap::from([("A".to_string(), 1)]));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "A"), Some(1));
+        assert_eq!(m.gauge("kraken_hub_connected_instances", "B"), Some(0));
+    }
+
+    /// The open streams and subscription targets are gauges of the live counts per handler
+    /// instance: an instance whose last one closed reads 0 once, then is no longer exported, so
+    /// the series of past instance ids (a fresh id per start) do not pile up (ADR 0026).
+    #[test]
+    fn an_instance_whose_last_stream_closed_reads_0_once_then_is_gone() {
+        let m = test_support::test_metrics();
+        let open = |m: &test_support::TestMetrics| {
+            let export = m.all_gauge_points();
+            ["kraken_hub_streams_open", "kraken_hub_subscriptions_open"].map(|name| {
+                export
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(attrs, v)| {
+                        let id = attrs.iter().find(|(k, _)| k == "instance_id").unwrap();
+                        (id.1.clone(), v)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.subscription_opened("A", "a1");
+        assert_eq!(open(&m), [vec![("a1".into(), 2)], vec![("a1".into(), 1)]]);
+        m.metrics.stream_closed("A", "a1");
+        m.metrics.stream_closed("A", "a1");
+        m.metrics.subscription_closed("A", "a1");
+        m.metrics.stream_opened("A", "a2");
+        assert_eq!(
+            open(&m),
+            [
+                vec![("a1".into(), 0), ("a2".into(), 1)],
+                vec![("a1".into(), 0)]
+            ]
+        );
+        assert_eq!(open(&m), [vec![("a2".into(), 1)], vec![]]);
+    }
+
+    /// A data-point attribute named `instance` (or `job`) is overwritten by the resource's in
+    /// Prometheus, so the handler instance is `instance_id`.
+    #[test]
+    fn open_streams_and_subscriptions_name_the_handler_instance_instance_id() {
+        let m = test_support::test_metrics();
+        m.metrics.stream_opened("A", "a1");
+        m.metrics.subscription_opened("A", "a2");
+        assert_eq!(
+            m.gauge_sum("kraken_hub_streams_open", "instance_id", "a1"),
+            Some(1)
+        );
+        assert_eq!(
+            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a2"),
+            Some(1)
+        );
+        assert_eq!(
+            m.gauge_sum("kraken_hub_streams_open", "instance", "a1"),
+            None
+        );
+    }
+
+    fn processor(
+        name: &str,
+        state: crate::proto::ProcessorState,
+        lags: &[(i32, i64)],
+        dead_letters: u64,
+        totals: (u64, u64),
+    ) -> crate::proto::ProcessorStatus {
+        crate::proto::ProcessorStatus {
+            name: name.to_string(),
+            group_id: "g".to_string(),
+            topic: "kraken.events".to_string(),
+            state: state as i32,
+            partitions: lags
+                .iter()
+                .map(|(partition, lag)| crate::proto::PartitionStatus {
+                    partition: *partition,
+                    lag: *lag,
+                    ..Default::default()
+                })
+                .collect(),
+            dead_letters,
+            processed_total: totals.0,
+            failed_total: totals.1,
+            ..Default::default()
+        }
+    }
+
+    /// One reporting instance of `service`; returns its token.
+    fn report(
+        sessions: &Sessions,
+        id: &str,
+        service: &str,
+        processors: Vec<crate::proto::ProcessorStatus>,
+        at: std::time::Instant,
+    ) -> u64 {
+        let ctx = crate::context::ContextId::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let token = sessions.insert(
+            &ctx,
+            id,
+            service,
+            crate::session::SessionMeta::default(),
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let status = crate::proto::InstanceStatus {
+            processors,
+            ..Default::default()
+        };
+        assert!(sessions.set_status(&ctx, id, token, &status, at));
+        token
+    }
+
+    /// The processor gauges aggregate each (service, processor) over its instances as the
+    /// Processors page does: lag over distinct partitions as the freshest report has them, the
+    /// worst state, the highest dead-letter count, the summed totals (ADR 0026).
+    #[test]
+    fn processor_gauges_aggregate_the_latest_reports_per_service_and_processor() {
+        use crate::proto::ProcessorState::{ProcessorFailing, ProcessorRunning};
+        let m = test_support::test_metrics();
+        let sessions = Arc::new(Sessions::new());
+        let _gauges = ProcessorGauges::register(&m.meter(), Arc::clone(&sessions));
+        let now = std::time::Instant::now();
+        let earlier = now - Duration::from_secs(3);
+        report(
+            &sessions,
+            "a1",
+            "svc",
+            vec![processor(
+                "default",
+                ProcessorRunning,
+                &[(0, 5), (1, 7)],
+                2,
+                (100, 1),
+            )],
+            earlier,
+        );
+        report(
+            &sessions,
+            "a2",
+            "svc",
+            vec![
+                processor("default", ProcessorFailing, &[(1, 3), (2, 4)], 3, (50, 2)),
+                processor("audit", ProcessorRunning, &[(0, -1)], 0, (0, 0)),
+            ],
+            now,
+        );
+        let labels = |processor: &str| {
+            vec![
+                ("processor".to_string(), processor.to_string()),
+                ("service".to_string(), "svc".to_string()),
+            ]
+        };
+        // Partition 1 as a2 (the freshest) has it: 5 + 3 + 4; audit's lag is unknown.
+        assert_eq!(
+            m.gauge_points("kraken_hub_processor_lag"),
+            [(labels("default"), 12)]
+        );
+        assert_eq!(
+            m.gauge_points("kraken_hub_processor_dead_letters"),
+            [(labels("audit"), 0), (labels("default"), 3)]
+        );
+        assert_eq!(
+            m.gauge_points("kraken_hub_processor_processed"),
+            [(labels("audit"), 0), (labels("default"), 150)]
+        );
+        assert_eq!(
+            m.gauge_points("kraken_hub_processor_failed"),
+            [(labels("audit"), 0), (labels("default"), 3)]
+        );
+        let states: Vec<(String, i64)> = m
+            .gauge_points("kraken_hub_processor_state")
+            .into_iter()
+            .filter(|(attrs, _)| attrs.contains(&("processor".into(), "default".into())))
+            .map(|(attrs, v)| {
+                let state = attrs.iter().find(|(k, _)| k == "state").unwrap().1.clone();
+                (state, v)
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("failing".to_string(), 1),
+                ("paused".to_string(), 0),
+                ("running".to_string(), 0),
+                ("starting".to_string(), 0),
+                ("stopped".to_string(), 0),
+                ("unspecified".to_string(), 0),
+            ]
+        );
+    }
+
+    /// A processor nobody reports any more is exported once more as 0 (an observed gauge
+    /// otherwise keeps its last value in Prometheus until the series goes stale), then not at
+    /// all.
+    #[test]
+    fn a_processor_that_went_away_reads_0_once_then_is_gone() {
+        use crate::proto::ProcessorState::ProcessorRunning;
+        let m = test_support::test_metrics();
+        let sessions = Arc::new(Sessions::new());
+        let _gauges = ProcessorGauges::register(&m.meter(), Arc::clone(&sessions));
+        let token = report(
+            &sessions,
+            "a1",
+            "svc",
+            vec![processor("default", ProcessorRunning, &[(0, 9)], 1, (5, 0))],
+            std::time::Instant::now(),
+        );
+        assert_eq!(m.gauge_points("kraken_hub_processor_lag").len(), 1);
+        assert_eq!(m.gauge_points("kraken_hub_processor_state").len(), 6);
+        sessions.remove_if(&crate::context::ContextId::default(), "a1", token);
+        // One export: every gauge of the processor once more, at 0.
+        let export = m.all_gauge_points();
+        for name in [
+            "kraken_hub_processor_lag",
+            "kraken_hub_processor_dead_letters",
+            "kraken_hub_processor_processed",
+            "kraken_hub_processor_failed",
+        ] {
+            assert_eq!(export[name].len(), 1, "{name}");
+            assert_eq!(export[name][0].1, 0, "{name}");
+        }
+        let state = &export["kraken_hub_processor_state"];
+        assert_eq!(state.len(), 6);
+        assert!(state.iter().all(|(_, v)| *v == 0), "{state:?}");
+        // The next export has none of them.
+        let export = m.all_gauge_points();
+        assert!(
+            export
+                .keys()
+                .all(|name| !name.starts_with("kraken_hub_processor_")),
+            "{export:?}"
+        );
+    }
+
+    /// A processor whose lag becomes unknown is still reported: its lag is absent, not 0 (0
+    /// means caught up), and the departure rule (0 once) is not applied to it (ADR 0026 hub
+    /// ruling 9).
+    #[test]
+    fn a_lag_that_becomes_unknown_is_absent_not_0() {
+        use crate::proto::ProcessorState::ProcessorRunning;
+        let m = test_support::test_metrics();
+        let sessions = Arc::new(Sessions::new());
+        let _gauges = ProcessorGauges::register(&m.meter(), Arc::clone(&sessions));
+        let p = |lag| {
+            vec![processor(
+                "default",
+                ProcessorRunning,
+                &[(0, lag)],
+                0,
+                (1, 0),
+            )]
+        };
+        report(&sessions, "a1", "svc", p(9), std::time::Instant::now());
+        assert_eq!(m.gauge_points("kraken_hub_processor_lag").len(), 1);
+        report(&sessions, "a1", "svc", p(-1), std::time::Instant::now());
+        for _ in 0..2 {
+            let export = m.all_gauge_points();
+            assert!(
+                !export.contains_key("kraken_hub_processor_lag"),
+                "{export:?}"
+            );
+            assert_eq!(export["kraken_hub_processor_state"].len(), 6);
+        }
+    }
+
+    /// The consumer-group lag gauge exports the last reading of each topic's groups, labelled
+    /// by group and topic; a group no longer read is no longer exported.
+    #[test]
+    fn the_group_lag_gauge_exports_the_last_reading() {
+        let m = test_support::test_metrics();
+        let lag = Arc::new(crate::browser::GroupLag::default());
+        let _gauge = observe_group_lag(&m.meter(), Arc::clone(&lag));
+        assert!(m.gauge_points("kraken_hub_consumer_group_lag").is_empty());
+        lag.set("t", vec![("g-live".into(), 3), ("g-empty".into(), 6)]);
+        let point = |group: &str, value: i64| {
+            (
+                vec![
+                    ("group".to_string(), group.to_string()),
+                    ("topic".to_string(), "t".to_string()),
+                ],
+                value,
+            )
+        };
+        assert_eq!(
+            m.gauge_points("kraken_hub_consumer_group_lag"),
+            [point("g-empty", 6), point("g-live", 3)]
+        );
+        lag.set("t", vec![("g-live".into(), 0)]);
+        assert_eq!(
+            m.gauge_points("kraken_hub_consumer_group_lag"),
+            [point("g-live", 0)]
+        );
     }
 
     #[test]
