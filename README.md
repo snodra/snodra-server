@@ -604,7 +604,9 @@ types are judged again against the new entry; one refresh per second per session
 rest are counted as `throttled` and dropped silently, so send at most one per renewal; a refresh whose
 `kid` is not known yet is waited for at most 1.5 s and then, if still not judgeable, counted as
 `unavailable` and dropped while the session keeps its old credentials; no reply on success; `off`
-ignores it). A reload that removes the
+ignores it). The wall clock decides the expiry: the session's timer wakes at `exp` plus the grace or
+after 60 s, whichever is first, so a clock step or a suspend never closes it early and delays the close
+by at most 60 s. A reload that removes the
 service's table closes its session in `enforce`. The topology and the dashboard show each
 instance's `authKind` (`token`, `jwt`, `certificate`, `none`), a JWT's or certificate's `expiresAt` and a
 certificate's `certFingerprint`. In Keycloak, give each

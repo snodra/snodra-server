@@ -706,6 +706,9 @@ pub enum Expiry {
     Close(Denied),
     /// Permissive mode: counted and logged, the session stays; ask once.
     Keep,
+    /// Not expired by the wall clock yet (the clock stepped back, or the timer only woke to look
+    /// again): nothing counted; arm the timer again.
+    NotYet,
 }
 
 /// At most one refresh in [`REFRESH_MIN_INTERVAL`] is looked at per session, so a client cannot
@@ -718,6 +721,9 @@ pub struct RefreshGate {
 /// A JWT whose expiry is further away than this is never timed (nothing runs that long, and
 /// the timer's arithmetic stays far from overflow).
 const MAX_EXPIRY_WAIT: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// The longest the expiry timer waits before comparing `exp` with the wall clock again.
+const EXPIRY_RECHECK: Duration = Duration::from_secs(60);
 
 /// The shortest time between two refreshes of one session that are both looked at.
 pub const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -1408,11 +1414,19 @@ impl Authorizer {
         self.report(denials, service, principal, disposition);
     }
 
-    /// What to do with a session whose JWT passed `exp` plus the grace without a refresh. Counted
-    /// and logged here; the caller asks once per session.
+    /// What to do with a session whose expiry timer fired: [`Expiry::NotYet`] when the wall clock
+    /// has not reached `exp` plus the grace, else the session expired without a refresh (counted
+    /// and logged here; the caller asks once per session).
     pub fn expired(&self, principal: &Principal, service: &str) -> Expiry {
         if self.mode == AuthMode::Off {
             return Expiry::Keep;
+        }
+        // The timer is monotonic; the wall clock decides (amended in H1).
+        if self
+            .expires_at(principal)
+            .is_none_or(|at| at > SystemTime::now())
+        {
+            return Expiry::NotYet;
         }
         let certificate = principal.kind() == CredentialKind::Certificate;
         if certificate {
@@ -1446,13 +1460,9 @@ impl Authorizer {
         }
     }
 
-    /// When a session holding `principal` is to be judged expired: `exp` plus the grace. `None`
-    /// when it never is (mode `off`, a token, an expiry beyond any process's life).
-    pub fn expiry_deadline(&self, principal: Option<&Principal>) -> Option<tokio::time::Instant> {
-        if self.mode == AuthMode::Off {
-            return None;
-        }
-        let principal = principal?;
+    /// When, by the wall clock, a session holding `principal` is expired: `exp` plus the grace.
+    /// `None` when it never is (a token).
+    fn expires_at(&self, principal: &Principal) -> Option<SystemTime> {
         let exp = principal.expires_at?;
         // A TLS session cannot be refreshed on a live stream: a certificate ends at `notAfter`.
         let grace = match principal.kind() {
@@ -1462,11 +1472,24 @@ impl Authorizer {
                 .as_ref()
                 .map_or(Duration::ZERO, |j| j.expiry_grace()),
         };
-        let remaining = exp
-            .checked_add(grace)?
+        exp.checked_add(grace)
+    }
+
+    /// When the expiry timer of a session holding `principal` is to fire: at `exp` plus the
+    /// grace, or after [`EXPIRY_RECHECK`] when that is further away, so a wall-clock step
+    /// forward or a suspend is noticed within it; [`Authorizer::expired`] compares with the wall
+    /// clock when it fires. `None` when it never fires (mode `off`, a token, an expiry beyond any
+    /// process's life).
+    pub fn expiry_deadline(&self, principal: Option<&Principal>) -> Option<tokio::time::Instant> {
+        if self.mode == AuthMode::Off {
+            return None;
+        }
+        let remaining = self
+            .expires_at(principal?)?
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        (remaining <= MAX_EXPIRY_WAIT).then(|| tokio::time::Instant::now() + remaining)
+        (remaining <= MAX_EXPIRY_WAIT)
+            .then(|| tokio::time::Instant::now() + remaining.min(EXPIRY_RECHECK))
     }
 
     /// True when `token` is a valid JWT of a service that has a `[[service]]` table: a service
@@ -3255,11 +3278,7 @@ handle = ["*"]
     #[tokio::test]
     async fn an_expired_session_is_closed_in_enforce_and_counted_once_in_permissive() {
         let fx = jwt_fx(AuthMode::Enforce).await;
-        let p = fx
-            .auth
-            .admit(Some(&fx.token("billing", 60)), "billing", &[])
-            .principal
-            .unwrap();
+        let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(31));
         let Expiry::Close(d) = fx.auth.expired(&p, "billing") else {
             panic!("enforce closes")
         };
@@ -3276,11 +3295,7 @@ handle = ["*"]
             Some(1)
         );
         let fx = jwt_fx(AuthMode::Permissive).await;
-        let p = fx
-            .auth
-            .admit(Some(&fx.token("billing", 60)), "billing", &[])
-            .principal
-            .unwrap();
+        let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(31));
         assert_eq!(fx.auth.expired(&p, "billing"), Expiry::Keep);
         assert_eq!(
             fx.m.counter("kraken_hub_auth_violations_total", "reason", "expired"),
@@ -3289,6 +3304,43 @@ handle = ["*"]
         assert_eq!(
             fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
             Some(1)
+        );
+    }
+
+    /// The timer is monotonic, armed from the wall clock once: a wall-clock step back (or a
+    /// look-again wake-up) makes it fire before `exp` plus the grace by the wall clock. That is
+    /// not an expiry: nothing is counted and the caller arms the timer again (amended in H1).
+    #[tokio::test]
+    async fn a_timer_that_fires_before_exp_plus_the_grace_by_the_wall_clock_expires_nothing() {
+        for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+            let fx = jwt_fx(mode).await;
+            let p = Principal::jwt("billing", SystemTime::now() + Duration::from_secs(100));
+            assert_eq!(fx.auth.expired(&p, "billing"), Expiry::NotYet, "{mode:?}");
+            // Within the grace is not expired either.
+            let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(10));
+            assert_eq!(fx.auth.expired(&p, "billing"), Expiry::NotYet, "{mode:?}");
+            assert_eq!(
+                fx.m.counter_total("kraken_hub_auth_violations_total"),
+                None,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A wall-clock step forward or a suspend leaves a monotonic timer late; it never waits more
+    /// than [`EXPIRY_RECHECK`] before comparing `exp` with the wall clock again (amended in H1).
+    #[tokio::test]
+    async fn a_distant_expiry_is_looked_at_again_within_the_recheck() {
+        let fx = jwt_fx(AuthMode::Enforce).await;
+        let p = Principal::jwt("billing", SystemTime::now() + Duration::from_secs(2 * 3600));
+        let left = fx
+            .auth
+            .expiry_deadline(Some(&p))
+            .expect("a deadline")
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            left > EXPIRY_RECHECK - Duration::from_secs(1) && left <= EXPIRY_RECHECK,
+            "{left:?}"
         );
     }
 
@@ -3305,10 +3357,10 @@ handle = ["*"]
             fx.auth.expiry_deadline(Some(&p))
         };
         // The default grace is 30 s.
-        let d = in_secs(100).expect("a deadline");
+        let d = in_secs(20).expect("a deadline");
         let left = d.saturating_duration_since(tokio::time::Instant::now());
         assert!(
-            left > Duration::from_secs(125) && left <= Duration::from_secs(130),
+            left > Duration::from_secs(45) && left <= Duration::from_secs(50),
             "{left:?}"
         );
         // Already past: due now.
@@ -3605,14 +3657,14 @@ handle = ["billing.*"]
     #[test]
     fn a_certificate_expires_at_not_after_with_no_grace() {
         let (a, _m) = authorizer(AuthMode::Enforce);
-        let bytes = der(&ClientSpec::service("orders").valid_for(Duration::from_secs(100)));
+        let bytes = der(&ClientSpec::service("orders").valid_for(Duration::from_secs(40)));
         let p = Principal::certificate(&crate::mtls::identify(&bytes).unwrap());
         let left = a
             .expiry_deadline(Some(&p))
             .unwrap()
             .saturating_duration_since(tokio::time::Instant::now());
         assert!(
-            left > Duration::from_secs(95) && left <= Duration::from_secs(100),
+            left > Duration::from_secs(35) && left <= Duration::from_secs(40),
             "{left:?}"
         );
         let off = authorizer(AuthMode::Off).0;
@@ -3634,7 +3686,9 @@ handle = ["billing.*"]
 
     #[test]
     fn the_expiry_of_a_certificate_session_closes_in_enforce_and_counts_once_in_permissive() {
-        let p = Principal::certificate(&crate::mtls::identify(&svc("orders")).unwrap());
+        let mut cert = crate::mtls::identify(&svc("orders")).unwrap();
+        cert.not_after = SystemTime::now() - Duration::from_secs(1);
+        let p = Principal::certificate(&cert);
         let (a, m) = authorizer(AuthMode::Enforce);
         let Expiry::Close(denied) = a.expired(&p, "orders") else {
             panic!("enforce closes")
