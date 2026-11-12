@@ -133,14 +133,19 @@ fn join_or_dash(items: &[String]) -> String {
     }
 }
 
-/// Fixed-width rows (first row is the header), indented, trailing spaces trimmed.
+/// Fixed-width rows (first row is the header), indented, trailing spaces trimmed. Every cell
+/// goes through [`one_line`]: its text comes from clients (names, ids, types, errors).
 fn table(rows: &[Vec<String>]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|cell| one_line(cell)).collect())
+        .collect();
     let cols = rows[0].len();
     let widths: Vec<usize> = (0..cols)
         .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
         .collect();
     let mut out = String::new();
-    for row in rows {
+    for row in &rows {
         let cells: Vec<String> = row
             .iter()
             .zip(&widths)
@@ -291,7 +296,7 @@ pub fn render_table(t: &Topology) -> String {
     for service in &t.services {
         out.push_str(&format!(
             "service {} ({} instances)\n",
-            service.service_name,
+            one_line(&service.service_name),
             service.instances.len()
         ));
         let mut rows = vec![
@@ -343,10 +348,10 @@ pub fn render_table(t: &Topology) -> String {
             };
             out.push_str(&format!(
                 "  {} {} owner={} for {}\n",
-                ty.type_name,
+                one_line(&ty.type_name),
                 kind,
                 // Every owner of a shared query type (ADR 0017), comma-separated.
-                ty.owner_services.join(","),
+                one_line(&ty.owner_services.join(",")),
                 fmt_duration_ms(ty.orphaned_for_ms)
             ));
         }
@@ -777,6 +782,57 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
             table.lines().count(),
             render_table(&fixture()).lines().count() + 2,
             "a header and one row: {table}"
+        );
+    }
+
+    /// Every name in the table comes from a client (a service name, an instance id, a type, a
+    /// processor's name, group and topic, an operation id): none of them can break a line or send
+    /// an escape to the terminal.
+    #[test]
+    fn client_text_in_any_cell_or_header_stays_on_its_line() {
+        use crate::processors::{ProcessorReport, ProcessorStateName};
+        let bad = |s: &str| format!("{s}\u{1b}[2J\r\nx");
+        let mut t = fixture();
+        t.services[0].service_name = bad("billing");
+        let i = &mut t.services[0].instances[0];
+        i.instance_id = bad("b-1");
+        i.command_types = vec![bad("Pay")];
+        i.query_types = vec![bad("GetInvoice")];
+        i.processors = vec![ProcessorReport {
+            name: bad("audit"),
+            group_id: bad("billing.audit"),
+            topic: bad("kraken.events"),
+            operation_id: bad("op"),
+            state: ProcessorStateName::Running,
+            dead_letter_mode: bad("topic"),
+            ..Default::default()
+        }];
+        t.types[1].type_name = bad("Archive");
+        t.types[1].owner_services = vec![bad("archive")];
+        let table = render_table(&t);
+        assert!(
+            !table.contains('\u{1b}') && !table.contains('\r'),
+            "{table:?}"
+        );
+        assert_eq!(
+            table.lines().count(),
+            render_table(&fixture()).lines().count() + 2,
+            "a processor header and one row: {table}"
+        );
+        assert!(
+            table.starts_with("service billing [2J x (2 instances)\n"),
+            "{table}"
+        );
+        assert!(table.contains("\n  b-1 [2J x "), "{table}");
+        assert!(table.contains("| Pay [2J x "), "{table}");
+        assert!(
+            table.contains("\n  audit [2J x | b-1 [2J x | RUNNING op op [2J | billing.audit [2J x | kraken.events [2J x |"),
+            "{table}"
+        );
+        assert!(table.contains("| (topic [2J x) |"), "{table}");
+        assert!(
+            table.contains("\n  Archive [2J x COMMAND owner=archive [2J x for 2m05s\n"),
+            "{table}"
         );
     }
 
