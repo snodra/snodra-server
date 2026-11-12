@@ -191,6 +191,17 @@ fn partition_ranges(partitions: &[i32]) -> String {
 /// Longest last error the table shows, in characters; longer ones end with `...`.
 const LAST_ERROR_CHARS: usize = 60;
 
+/// `text` on one line: control characters (a newline, a tab, an ANSI escape) become spaces and
+/// every run of whitespace one space, so free text from a library never breaks a table row.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The state of a processor as the table shows it: the state, then `replaying` while a replay
 /// range is open and `op <first 8>` of the reset holding its lock (ADR 0023).
 fn state_cell(p: &crate::processors::ProcessorReport) -> String {
@@ -231,11 +242,12 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
                 } else {
                     format!("({})", p.dead_letter_mode)
                 };
-            let last_error = if p.last_error.is_empty() {
+            let error = one_line(&p.last_error);
+            let last_error = if error.is_empty() {
                 "-".to_string()
             } else {
-                let mut text: String = p.last_error.chars().take(LAST_ERROR_CHARS).collect();
-                if p.last_error.chars().count() > LAST_ERROR_CHARS {
+                let mut text: String = error.chars().take(LAST_ERROR_CHARS).collect();
+                if error.chars().count() > LAST_ERROR_CHARS {
                     text.push_str("...");
                 }
                 if p.last_error_at_ms > 0 {
@@ -731,6 +743,41 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         assert!(row("audit").contains("| PAUSED "), "{table}");
         assert!(row("orders").contains("| STOPPED op 0f3c9a1e "), "{table}");
         assert!(row("default").contains("| RUNNING replaying "), "{table}");
+    }
+
+    /// A last error is free text from a library (a stack trace, an ANSI-coloured message): the
+    /// table shows it on one line, control characters as spaces, runs of them as one, cut after
+    /// [`LAST_ERROR_CHARS`] (H-3).
+    #[test]
+    fn a_multi_line_last_error_stays_on_its_row() {
+        use crate::processors::{ProcessorReport, ProcessorStateName};
+        let mut t = fixture();
+        t.services[0].instances[0].processors = vec![ProcessorReport {
+            name: "audit".into(),
+            state: ProcessorStateName::Failing,
+            last_error: format!(
+                "boom:\r\n\tat Handler.on(Handler.kt:12)\n\u{1b}[31mred\u{7f}{}",
+                "y".repeat(80)
+            ),
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        }];
+        let table = render_table(&t);
+        let row = table
+            .lines()
+            .find(|l| l.trim_start().starts_with("audit "))
+            .unwrap_or_else(|| panic!("no row in {table}"));
+        let cell = row.rsplit(" | ").next().unwrap();
+        assert_eq!(
+            cell,
+            "boom: at Handler.on(Handler.kt:12) [31mred yyyyyyyyyyyyyyyyy..."
+        );
+        assert!(!table.contains('\u{1b}') && !table.contains('\t') && !table.contains('\r'));
+        assert_eq!(
+            table.lines().count(),
+            render_table(&fixture()).lines().count() + 2,
+            "a header and one row: {table}"
+        );
     }
 
     #[test]

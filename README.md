@@ -430,7 +430,8 @@ and shows it.
 - **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /api/v1/topology`, and
   under each service in `kraken-hub --topology` a table with one row per (processor,
   instance): state, group, topic, partitions as ranges (`0-2,5`), the known lag, processed, failed, dead letters (or
-  `(topic)` / `(log)`), the last error (60 characters) with its age.
+  `(topic)` / `(log)`), the last error with its age, on one line (control characters such as newlines become
+  spaces, runs of them one) and cut at 60 characters.
 - **`GET /api/v1/processors`** (dashboard token, CORS for the peers, off with the dashboard):
 
   ```json
