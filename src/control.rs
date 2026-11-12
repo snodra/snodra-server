@@ -670,6 +670,29 @@ struct Renewals {
     replies: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// The lease renewals of a running reset, stopped when it is dropped: a reset that ends without
+/// reaching its finish (its caller went away, a panic) never renews the lease again.
+struct Renewing(Arc<Mutex<Renewals>>);
+
+impl Renewing {
+    /// Stops the renewals: none is sent after this returns. The waits of those in flight are
+    /// returned.
+    fn stop(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut renewals = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        renewals.stopped = true;
+        std::mem::take(&mut renewals.replies)
+    }
+}
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Removes the reset of its (service, processor) from [`Control::resets`] when the operation
 /// ends, however it ends.
 struct Running {
@@ -1100,11 +1123,7 @@ impl Control {
             .await;
         // No renewal may be sent after a finish, nor be in flight while it is sent: a renewal
         // that reached an instance after its finish would find the lock free.
-        let in_flight = {
-            let mut renewing = renewing.lock().unwrap();
-            renewing.stopped = true;
-            std::mem::take(&mut renewing.replies)
-        };
+        let in_flight = renewing.stop();
         let _ = tokio::time::timeout(self.timeouts.request, async {
             for reply in in_flight {
                 let _ = reply.await;
@@ -1174,16 +1193,16 @@ impl Control {
     }
 
     /// Renews the lease of `prepared` every [`Timeouts::renew`] from `since` until the returned
-    /// [`Renewals::stopped`] is set. The flag is checked under its lock while the renewals are
-    /// sent and their reply waits recorded, so once it is set no renewal follows and the waits of
-    /// those in flight are known (a renewal after the finish would take the lock again).
+    /// [`Renewing`] is stopped or dropped. The flag is checked under its lock while the renewals
+    /// are sent and their reply waits recorded, so once it is set no renewal follows and the
+    /// waits of those in flight are known (a renewal after the finish would take the lock again).
     fn renew(
         self: &Arc<Self>,
         prepared: Vec<ProcessorHolder>,
         processor: &str,
         prepare: control_request::Action,
         since: tokio::time::Instant,
-    ) -> Arc<Mutex<Renewals>> {
+    ) -> Renewing {
         let stopped = Arc::new(Mutex::new(Renewals::default()));
         let (this, flag, processor) = (
             Arc::clone(self),
@@ -1219,7 +1238,7 @@ impl Control {
                 }
             }
         });
-        stopped
+        Renewing(stopped)
     }
 
     /// The audit line of one control call (ADR 0023) and its count in
@@ -1716,6 +1735,51 @@ mod tests {
             control.begin("svc", "audit", "op-3").is_ok(),
             "released when it ends"
         );
+    }
+
+    /// A reset that ends without reaching its finish (its caller went away, a panic) stops
+    /// renewing the lease: the instances are released when it runs out (H-4).
+    #[tokio::test]
+    async fn a_reset_dropped_mid_way_renews_the_lease_no_more() {
+        let m = test_metrics();
+        let sessions = Arc::new(Sessions::new());
+        let control = Control::new(
+            Arc::clone(&sessions),
+            m.metrics.clone(),
+            Timeouts {
+                request: Duration::from_millis(300),
+                reset: Duration::from_secs(5),
+                lease: Duration::from_millis(500),
+                renew: Duration::from_millis(50),
+            },
+        );
+        let (token, mut rx) = session(&sessions, "i1");
+        let reset = {
+            let control = Arc::clone(&control);
+            tokio::spawn(async move { control.reset(&D, "svc", "audit", Target::Latest).await })
+        };
+        let prepare = request(&mut rx).await;
+        assert!(matches!(
+            prepare.action,
+            Some(control_request::Action::ResetPrepare(_))
+        ));
+        control.on_reply(&D, "i1", token, ok(&prepare.control_id));
+        let execute = request(&mut rx).await;
+        assert!(matches!(
+            execute.action,
+            Some(control_request::Action::ResetExecute(_))
+        ));
+        // A renewal goes out while the execute runs.
+        let renewal = request(&mut rx).await;
+        assert!(matches!(
+            renewal.action,
+            Some(control_request::Action::ResetPrepare(_))
+        ));
+        reset.abort();
+        assert!(reset.await.unwrap_err().is_cancelled());
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(rx.try_recv().is_err(), "a renewal after the reset ended");
     }
 
     #[tokio::test]

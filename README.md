@@ -119,7 +119,7 @@ cargo run
 | `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
 | `KRAKEN_HUB_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `KRAKEN_HUB_DASHBOARD_TOKEN` when both are set (as `KRAKEN_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
 | `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | at least 16 characters; the [processor controls](#processor-control)' token (`Authorization: Bearer <token>` on the mutating calls), which also reads what the dashboard token reads; the file variant is read and reloaded like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`. Equal to the dashboard token (whatever the source) is a config error at start, and a reload that would make them equal keeps both previous tokens. Unset and no ACL entry with `control = true`: the controls answer 403 `controls are disabled` |
-| `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters) |
+| `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters); at most `20s`, the 30 s reset lease minus its 10 s renewal period |
 | `KRAKEN_HUB_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
 | `KRAKEN_HUB_KAFKA_BOOTSTRAP` | none | Kafka bootstrap servers the [event browser](#event-browser) reads (plaintext); unset: the event browser and the consumer groups are off (404) and their pages hidden |
 | `KRAKEN_HUB_EVENT_TOPICS` | `kraken.events` | the only topics the event browser and its tail read, comma-separated, the first the default; a `<topic>.dlt` is browsable when listed |
@@ -430,7 +430,9 @@ and shows it.
 - **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /api/v1/topology`, and
   under each service in `kraken-hub --topology` a table with one row per (processor,
   instance): state, group, topic, partitions as ranges (`0-2,5`), the known lag, processed, failed, dead letters (or
-  `(topic)` / `(log)`), the last error (60 characters) with its age.
+  `(topic)` / `(log)`), the last error with its age, cut at 60 characters. Every cell and service header of the
+  `--topology` table is shown on one line (control characters such as newlines and escapes become spaces, runs of
+  them one): names, ids, types and errors all come from clients.
 - **`GET /api/v1/processors`** (dashboard token, CORS for the peers, off with the dashboard):
 
   ```json
@@ -604,7 +606,9 @@ types are judged again against the new entry; one refresh per second per session
 rest are counted as `throttled` and dropped silently, so send at most one per renewal; a refresh whose
 `kid` is not known yet is waited for at most 1.5 s and then, if still not judgeable, counted as
 `unavailable` and dropped while the session keeps its old credentials; no reply on success; `off`
-ignores it). A reload that removes the
+ignores it). The wall clock decides the expiry: the session's timer wakes at `exp` plus the grace or
+after 60 s, whichever is first, so a clock step or a suspend never closes it early and delays the close
+by at most 60 s. A reload that removes the
 service's table closes its session in `enforce`. The topology and the dashboard show each
 instance's `authKind` (`token`, `jwt`, `certificate`, `none`), a JWT's or certificate's `expiresAt` and a
 certificate's `certFingerprint`. In Keycloak, give each
@@ -631,7 +635,9 @@ reloads its certificate and reconnects before `notAfter`; `permissive` counts th
 never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
 handshakes only. Logs and the topology show a certificate only by the first 8 hex characters of its
 SHA-256 fingerprint. Metrics: `kraken_hub_client_certificates_total{result}` (`ok`, `no_service`,
-`multiple_services`, `mismatch`, `expired`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
+`multiple_services`, `mismatch`, `expired`; one per `Register` that carries a certificate, plus one
+`expired` per session that reaches `notAfter`, none in `off`; `ok` is a usable certificate, the ACL
+may still refuse the `Register`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
 (`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
 `kraken_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
 certificates and remove the service's table to cut it off. `--health-check` and `--topology` take

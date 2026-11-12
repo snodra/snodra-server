@@ -161,7 +161,7 @@ pub struct Config {
     pub jwt_jwks_ca: Option<PathBuf>,
     /// How long a control call waits for an instance's answer (pause, resume, the prepare and
     /// finish of a reset, dead letters; ADR 0023). `KRAKEN_HUB_CONTROL_TIMEOUT`, default 10 s,
-    /// positive.
+    /// positive, at most [`Config::control_lease`] minus [`Config::control_lease_renew`].
     pub control_timeout: Duration,
     /// How long the instance that executes a reset may take (its reset handlers, the marker
     /// deletion and the offset commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
@@ -700,6 +700,17 @@ impl Config {
                 "the reset lease renewal ({:?}) must be positive and shorter than the lease ({:?})",
                 self.control_lease_renew,
                 self.control_lease
+            );
+        }
+        // The renewals start once every prepare is answered: an instance that prepared at once
+        // must still be renewed with a renewal period of its lease to spare.
+        let longest = self.control_lease.saturating_sub(self.control_lease_renew);
+        if self.control_timeout > longest {
+            bail!(
+                "KRAKEN_HUB_CONTROL_TIMEOUT ({:?}) must be at most {longest:?}, the reset lease ({:?}) minus its renewal period ({:?}): a reset renews the lease only once every prepare is answered",
+                self.control_timeout,
+                self.control_lease,
+                self.control_lease_renew
             );
         }
         if self.auth_mode != AuthMode::Off && self.acl_file.is_none() {
@@ -2118,6 +2129,27 @@ mod tests {
             renew_too_slow.validate().is_err(),
             "renewing no faster than the lease"
         );
+    }
+
+    /// The renewals of a reset start once every prepare is answered, so an instance that
+    /// prepared at once waits up to `KRAKEN_HUB_CONTROL_TIMEOUT` for its first one: the timeout
+    /// may not eat more of the lease than a renewal period does (H-5).
+    #[test]
+    fn the_control_timeout_leaves_a_renewal_period_of_the_lease() {
+        let c = with_env(&[("KRAKEN_HUB_CONTROL_TIMEOUT", "20s")]).unwrap();
+        assert_eq!(
+            c.control_timeout,
+            Duration::from_secs(20),
+            "lease 30 s - renewal 10 s"
+        );
+        for long in ["21s", "30s", "1m"] {
+            let err = with_env(&[("KRAKEN_HUB_CONTROL_TIMEOUT", long)]).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("KRAKEN_HUB_CONTROL_TIMEOUT") && text.contains("at most 20s"),
+                "{long}: {text}"
+            );
+        }
     }
 
     #[test]

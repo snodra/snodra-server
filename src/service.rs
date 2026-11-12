@@ -572,15 +572,21 @@ async fn run_stream(
             biased;
             _ = cancel.cancelled() => break,
             _ = &mut expiry, if expiry_armed => {
-                // Asked once: permissive counts and keeps the session, enforce closes it.
+                // Asked once: permissive counts and keeps the session, enforce closes it. Not
+                // expired by the wall clock yet: the timer is armed again.
                 expiry_armed = false;
-                if let Some(p) = principal.as_deref()
-                    && let Expiry::Close(denied) = ctx.auth.expired(p, &service)
-                {
-                    if let Some(tx) = out.upgrade() {
-                        let _ = tx.try_send(Err(denied.to_status()));
+                match principal.as_deref().map(|p| ctx.auth.expired(p, &service)) {
+                    Some(Expiry::Close(denied)) => {
+                        if let Some(tx) = out.upgrade() {
+                            let _ = tx.try_send(Err(denied.to_status()));
+                        }
+                        break;
                     }
-                    break;
+                    Some(Expiry::NotYet) => {
+                        expiry_armed =
+                            arm_expiry(&ctx.auth, principal.as_deref(), expiry.as_mut());
+                    }
+                    Some(Expiry::Keep) | None => {}
                 }
                 continue;
             }

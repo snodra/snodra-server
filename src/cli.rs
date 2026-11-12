@@ -133,14 +133,19 @@ fn join_or_dash(items: &[String]) -> String {
     }
 }
 
-/// Fixed-width rows (first row is the header), indented, trailing spaces trimmed.
+/// Fixed-width rows (first row is the header), indented, trailing spaces trimmed. Every cell
+/// goes through [`one_line`]: its text comes from clients (names, ids, types, errors).
 fn table(rows: &[Vec<String>]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|cell| one_line(cell)).collect())
+        .collect();
     let cols = rows[0].len();
     let widths: Vec<usize> = (0..cols)
         .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
         .collect();
     let mut out = String::new();
-    for row in rows {
+    for row in &rows {
         let cells: Vec<String> = row
             .iter()
             .zip(&widths)
@@ -191,6 +196,17 @@ fn partition_ranges(partitions: &[i32]) -> String {
 /// Longest last error the table shows, in characters; longer ones end with `...`.
 const LAST_ERROR_CHARS: usize = 60;
 
+/// `text` on one line: control characters (a newline, a tab, an ANSI escape) become spaces and
+/// every run of whitespace one space, so free text from a library never breaks a table row.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The state of a processor as the table shows it: the state, then `replaying` while a replay
 /// range is open and `op <first 8>` of the reset holding its lock (ADR 0023).
 fn state_cell(p: &crate::processors::ProcessorReport) -> String {
@@ -231,11 +247,12 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
                 } else {
                     format!("({})", p.dead_letter_mode)
                 };
-            let last_error = if p.last_error.is_empty() {
+            let error = one_line(&p.last_error);
+            let last_error = if error.is_empty() {
                 "-".to_string()
             } else {
-                let mut text: String = p.last_error.chars().take(LAST_ERROR_CHARS).collect();
-                if p.last_error.chars().count() > LAST_ERROR_CHARS {
+                let mut text: String = error.chars().take(LAST_ERROR_CHARS).collect();
+                if error.chars().count() > LAST_ERROR_CHARS {
                     text.push_str("...");
                 }
                 if p.last_error_at_ms > 0 {
@@ -279,7 +296,7 @@ pub fn render_table(t: &Topology) -> String {
     for service in &t.services {
         out.push_str(&format!(
             "service {} ({} instances)\n",
-            service.service_name,
+            one_line(&service.service_name),
             service.instances.len()
         ));
         let mut rows = vec![
@@ -331,10 +348,10 @@ pub fn render_table(t: &Topology) -> String {
             };
             out.push_str(&format!(
                 "  {} {} owner={} for {}\n",
-                ty.type_name,
+                one_line(&ty.type_name),
                 kind,
                 // Every owner of a shared query type (ADR 0017), comma-separated.
-                ty.owner_services.join(","),
+                one_line(&ty.owner_services.join(",")),
                 fmt_duration_ms(ty.orphaned_for_ms)
             ));
         }
@@ -731,6 +748,92 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         assert!(row("audit").contains("| PAUSED "), "{table}");
         assert!(row("orders").contains("| STOPPED op 0f3c9a1e "), "{table}");
         assert!(row("default").contains("| RUNNING replaying "), "{table}");
+    }
+
+    /// A last error is free text from a library (a stack trace, an ANSI-coloured message): the
+    /// table shows it on one line, control characters as spaces, runs of them as one, cut after
+    /// [`LAST_ERROR_CHARS`] (H-3).
+    #[test]
+    fn a_multi_line_last_error_stays_on_its_row() {
+        use crate::processors::{ProcessorReport, ProcessorStateName};
+        let mut t = fixture();
+        t.services[0].instances[0].processors = vec![ProcessorReport {
+            name: "audit".into(),
+            state: ProcessorStateName::Failing,
+            last_error: format!(
+                "boom:\r\n\tat Handler.on(Handler.kt:12)\n\u{1b}[31mred\u{7f}{}",
+                "y".repeat(80)
+            ),
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        }];
+        let table = render_table(&t);
+        let row = table
+            .lines()
+            .find(|l| l.trim_start().starts_with("audit "))
+            .unwrap_or_else(|| panic!("no row in {table}"));
+        let cell = row.rsplit(" | ").next().unwrap();
+        assert_eq!(
+            cell,
+            "boom: at Handler.on(Handler.kt:12) [31mred yyyyyyyyyyyyyyyyy..."
+        );
+        assert!(!table.contains('\u{1b}') && !table.contains('\t') && !table.contains('\r'));
+        assert_eq!(
+            table.lines().count(),
+            render_table(&fixture()).lines().count() + 2,
+            "a header and one row: {table}"
+        );
+    }
+
+    /// Every name in the table comes from a client (a service name, an instance id, a type, a
+    /// processor's name, group and topic, an operation id): none of them can break a line or send
+    /// an escape to the terminal.
+    #[test]
+    fn client_text_in_any_cell_or_header_stays_on_its_line() {
+        use crate::processors::{ProcessorReport, ProcessorStateName};
+        let bad = |s: &str| format!("{s}\u{1b}[2J\r\nx");
+        let mut t = fixture();
+        t.services[0].service_name = bad("billing");
+        let i = &mut t.services[0].instances[0];
+        i.instance_id = bad("b-1");
+        i.command_types = vec![bad("Pay")];
+        i.query_types = vec![bad("GetInvoice")];
+        i.processors = vec![ProcessorReport {
+            name: bad("audit"),
+            group_id: bad("billing.audit"),
+            topic: bad("kraken.events"),
+            operation_id: bad("op"),
+            state: ProcessorStateName::Running,
+            dead_letter_mode: bad("topic"),
+            ..Default::default()
+        }];
+        t.types[1].type_name = bad("Archive");
+        t.types[1].owner_services = vec![bad("archive")];
+        let table = render_table(&t);
+        assert!(
+            !table.contains('\u{1b}') && !table.contains('\r'),
+            "{table:?}"
+        );
+        assert_eq!(
+            table.lines().count(),
+            render_table(&fixture()).lines().count() + 2,
+            "a processor header and one row: {table}"
+        );
+        assert!(
+            table.starts_with("service billing [2J x (2 instances)\n"),
+            "{table}"
+        );
+        assert!(table.contains("\n  b-1 [2J x "), "{table}");
+        assert!(table.contains("| Pay [2J x "), "{table}");
+        assert!(
+            table.contains("\n  audit [2J x | b-1 [2J x | RUNNING op op [2J | billing.audit [2J x | kraken.events [2J x |"),
+            "{table}"
+        );
+        assert!(table.contains("| (topic [2J x) |"), "{table}");
+        assert!(
+            table.contains("\n  Archive [2J x COMMAND owner=archive [2J x for 2m05s\n"),
+            "{table}"
+        );
     }
 
     #[test]
