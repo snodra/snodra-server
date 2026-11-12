@@ -633,7 +633,9 @@ reloads its certificate and reconnects before `notAfter`; `permissive` counts th
 never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
 handshakes only. Logs and the topology show a certificate only by the first 8 hex characters of its
 SHA-256 fingerprint. Metrics: `kraken_hub_client_certificates_total{result}` (`ok`, `no_service`,
-`multiple_services`, `mismatch`, `expired`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
+`multiple_services`, `mismatch`, `expired`; one per `Register` that carries a certificate, plus one
+`expired` per session that reaches `notAfter`, none in `off`; `ok` is a usable certificate, the ACL
+may still refuse the `Register`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
 (`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
 `kraken_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
 certificates and remove the service's table to cut it off. `--health-check` and `--topology` take

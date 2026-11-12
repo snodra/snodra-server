@@ -361,7 +361,7 @@ impl Metrics {
                 .build(),
             client_certificates: meter
                 .u64_counter("kraken_hub_client_certificates_total")
-                .with_description("Client certificates judged at Register (ADR 0020), per result: ok, no_service, multiple_services, mismatch (credentials name another service), expired (the session was closed or, in permissive, counted at notAfter)")
+                .with_description("Client certificates judged (ADR 0020; not in off): one per Register that carries one, per result: ok (it names one service and has not ended; the Register may still be refused by the ACL), no_service, multiple_services, mismatch (credentials name another service), expired (it had ended at Register); plus one expired when a session reaches notAfter (closed, or in permissive kept)")
                 .build(),
             jwt_validations: meter
                 .u64_counter("kraken_hub_jwt_validations_total")
@@ -377,7 +377,7 @@ impl Metrics {
                 .build(),
             credentials_refreshes: meter
                 .u64_counter("kraken_hub_credentials_refreshes_total")
-                .with_description("ClientMessage.credentials refreshes, per result: ok, refused, wrong_service, throttled, unavailable")
+                .with_description("ClientMessage.credentials refreshes (not in off), per result: ok, refused (in permissive a refresh refused only for a handled type is still adopted), wrong_service, throttled, unavailable (not judgeable yet; the session keeps its credentials), ignored_certificate_session")
                 .build(),
             control: meter
                 .u64_counter("kraken_hub_control_total")
@@ -1881,5 +1881,55 @@ mod tests {
                 "invalid_request"
             ]
         );
+    }
+
+    /// The descriptions of the credential counters name every result the code counts, and when
+    /// it counts them (H-2): a certificate is counted once per `Register` that carries one
+    /// (`expired` included, when it ended before), and once more when a session reaches
+    /// `notAfter`; never in `off`.
+    #[test]
+    fn the_credential_counters_describe_every_result_they_count() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = Metrics::new(provider.meter("test"));
+        metrics.client_certificate("ok");
+        metrics.credentials_refresh("ok");
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let description = |name: &str| {
+            finished
+                .iter()
+                .flat_map(|rm| rm.scope_metrics())
+                .flat_map(|sm| sm.metrics())
+                .find(|m| m.name() == name)
+                .map(|m| m.description().to_string())
+                .expect(name)
+        };
+        let certificates = description("kraken_hub_client_certificates_total");
+        for words in [
+            "ok",
+            "no_service",
+            "multiple_services",
+            "mismatch",
+            "expired",
+            "at Register",
+            "notAfter",
+            "not in off",
+        ] {
+            assert!(certificates.contains(words), "{words}: {certificates}");
+        }
+        let refreshes = description("kraken_hub_credentials_refreshes_total");
+        for result in [
+            "ok",
+            "refused",
+            "wrong_service",
+            "throttled",
+            "unavailable",
+            "ignored_certificate_session",
+        ] {
+            assert!(refreshes.contains(result), "{result}: {refreshes}");
+        }
     }
 }
