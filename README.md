@@ -5,7 +5,7 @@
 <h1 align="center">kraken-hub</h1>
 
 <p align="center">
-  A stateless gRPC router for commands and queries between kraken services, in the spirit of Axon Server.
+  A stateless gRPC router for commands and queries between kraken services.
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ---
 
-Axon-Server-like gRPC router for kraken. Services open one bidirectional stream (`Hub.Connect`),
+gRPC router for kraken. Services open one bidirectional stream (`Hub.Connect`),
 register the command and query types they handle, and the hub forwards each request to a live
 instance of the owning service and relays the reply. Events never pass through here; they go
 straight to Kafka.
@@ -957,7 +957,7 @@ any client change.
 ## Routing and limitations
 
 - **Builder call:** routing is per service. The hub routes to any live instance of the owning
-  service and assumes all instances of a service handle the same types (Axon-style). During a
+  service and assumes all instances of a service handle the same types. During a
   rolling deploy of a service a request may reach an instance that dropped the type; that instance's
   library answers `NO_HANDLER` and the sender sees a transient error.
 - Single hub instance; no clustering or failover.
