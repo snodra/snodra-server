@@ -1,19 +1,20 @@
 // Event processors (ADR 0022, P6a): one row per (service, processor), merged over every reachable
-// hub like the other pages; a row opens to every instance's partitions. With a write credential
+// hub like the other pages; a row opens to every instance's segments. With a write credential
 // the page pauses, resumes and resets a processor (ADR 0023, P6b); the call goes to the hub that
-// served the page, which reaches every instance.
+// served the page, which reaches every instance. A reset is offered only when the processor's
+// event store declares the `replay` capability (ADR 0027).
 
 import * as controls from '../controls.js';
 import { MAX_ROWS, badge, capNote, fill, h, keepScroll, selectionIn, table } from '../dom.js';
 import * as fmt from '../format.js';
-import { merge } from '../processors.js';
+import { REPLAY, can, merge } from '../processors.js';
 
 const STATE_BADGES = {
-  RUNNING: ['good', 'Partitions assigned and records flowing'],
-  FAILING: ['crit', 'A record exhausted its attempts in the last 60 s, or the consumer reports an error'],
-  STARTING: ['warn', 'Started; no partition assigned yet, or a rebalance is in progress'],
-  PAUSED: ['warn', 'Paused from the control plane: in its consumer group, consuming nothing'],
-  STOPPED: ['plain', 'Stopping or stopped, or out of its consumer group while a reset runs'],
+  RUNNING: ['good', 'Segments assigned and records flowing'],
+  FAILING: ['crit', 'A record exhausted its attempts in the last 60 s, or the reader reports an error'],
+  STARTING: ['warn', 'Started; no segment assigned yet, or a reassignment is in progress'],
+  PAUSED: ['warn', 'Paused from the control plane: in its subscription, consuming nothing'],
+  STOPPED: ['plain', 'Stopping or stopped, or out of its subscription while a reset runs'],
   UNSPECIFIED: ['plain', 'A state this dashboard does not know'],
 };
 
@@ -27,7 +28,7 @@ function stateCell(p, prefix = '') {
   return [
     stateBadge(p.state, prefix),
     p.replaying
-      ? [' ', badge('warn', 'replaying', 'A reset moved the offsets back: records below each partition\'s replay end are handled again')]
+      ? [' ', badge('warn', 'replaying', 'A reset moved the positions back: records before each segment\'s replay end are handled again')]
       : null,
     p.operationId
       ? [' ', h('span', { class: 'mono dim nowrap', title: `Reset operation ${p.operationId} holds the processor's lock` }, `op ${p.operationId.slice(0, 8)}`)]
@@ -43,16 +44,23 @@ const keyOf = (service, name) => `${encodeURIComponent(service)}/${encodeURIComp
 
 const plural = (n, word) => `${fmt.int(n)} ${word}${n === 1 ? '' : 's'}`;
 
-/** A Kafka offset or lag; -1 (or null) is unknown. */
-function offsetCell(v, unknown = 'unknown') {
+/** A lag; -1 (or null) is unknown. */
+function lagCell(v, unknown = 'unknown') {
   return v === null || v < 0
     ? { class: 'num dim', content: '—', title: unknown }
     : { class: 'num', content: fmt.int(v) };
 }
 
+/** A position: an opaque string only the event store reads, shown as text; empty is unknown. */
+function positionCell(v, unknown = 'unknown') {
+  return v === ''
+    ? { class: 'num dim', content: '—', title: unknown }
+    : { class: 'num mono', content: v };
+}
+
 function deadLettersCell(service, p) {
-  if (p.deadLetterMode === 'topic') {
-    return { class: 'dim', content: 'to topic', title: `Failed records go to ${p.topic}.dlt (dead-letter mode "topic"); count them with the topic's tooling` };
+  if (p.deadLetterMode === 'event-store') {
+    return { class: 'dim', content: 'to the event store', title: `Failed records go to the dead-letter destination of the event store${p.eventStore ? ` (${p.eventStore})` : ''} (dead-letter mode "event-store"); count them with its tooling` };
   }
   if (p.deadLetterMode === 'log') {
     return { class: 'dim', content: 'logged only', title: 'Failed records are logged and skipped (dead-letter mode "log")' };
@@ -81,46 +89,52 @@ function problem(p) {
 
 function matches(service, p, q) {
   if (!q) return true;
-  const hay = [service, p.name, p.groupId, p.topic, ...p.eventTypes, ...p.instances.map((i) => i.instanceId),
+  const hay = [service, p.name, p.subscription, p.source, p.eventStore, ...p.eventTypes, ...p.instances.map((i) => i.instanceId),
     p.lastError ? p.lastError.message : ''];
   return hay.some((s) => s.toLowerCase().includes(q));
 }
 
 const HEADERS = [
-  'Service', 'Processor', 'Group', 'Topic', 'State',
+  'Service', 'Processor',
+  { label: 'Subscription', title: 'The event store\'s name for the processor\'s subscription' },
+  { label: 'Source', title: 'What the processor reads (a topic, a stream)' },
+  { label: 'Event store', title: 'The event store the processor reads, with the capabilities it declares' },
+  'State',
   { label: 'Instances', class: 'num', title: 'Instances reporting this processor' },
-  { label: 'Partitions', class: 'num', title: 'Partitions assigned over its instances' },
-  { label: 'Lag', class: 'num', title: 'Sum of the known lags (high watermark minus committed offset)' },
+  { label: 'Segments', class: 'num', title: 'Segments assigned over its instances' },
+  { label: 'Lag', class: 'num', title: 'Sum of the known lags (records between the committed position and the head)' },
   { label: 'Dead letters', class: 'num' },
   'Last error',
 ];
 
 const ACTIONS = { label: 'Actions', title: 'Pause, resume or reset the processor on every instance (sent to the hub that served this page)' };
 
-const PARTITION_HEADERS = [
-  { label: 'Partition', class: 'num' },
-  { label: 'Position', class: 'num', title: 'The next offset this instance will process' },
-  { label: 'Committed', class: 'num', title: 'The consumer group\'s committed offset' },
-  { label: 'High watermark', class: 'num', title: 'The offset of the next record written to the partition' },
+const SEGMENT_HEADERS = [
+  { label: 'Segment', class: 'num' },
+  { label: 'Position', class: 'num', title: 'The next position this instance will process' },
+  { label: 'Committed', class: 'num', title: 'The subscription\'s committed position' },
+  { label: 'Head', class: 'num', title: 'The position of the next record written to the segment' },
   { label: 'Lag', class: 'num' },
 ];
 
-const REPLAY_HEADER = { label: 'Replay until', class: 'num', title: 'Records below this offset are a replay (handled again)' };
+const REPLAY_HEADER = { label: 'Replay until', class: 'num', title: 'Records before this position are a replay (handled again)' };
 
 /** The body of a reset to what the dialog chose, or an error message. */
-function resetBody(choice, time, offsets) {
+function resetBody(choice, time, positions) {
   if (choice === 'earliest' || choice === 'latest') return { to: choice };
   if (choice === 'time') {
     const ms = Date.parse(time.value);
     return Number.isFinite(ms) ? { to: { timestampMs: ms } } : 'Choose the time to reset to.';
   }
   const list = [];
-  for (const part of offsets.value.split(',').map((x) => x.trim()).filter(Boolean)) {
-    const m = part.match(/^(\d+)\s*:\s*(\d+)$/);
-    if (!m) return `"${part}" is not partition:offset.`;
-    list.push({ partition: Number(m[1]), offset: Number(m[2]) });
+  for (const part of positions.value.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const at = part.indexOf('=');
+    const segment = at > 0 ? part.slice(0, at).trim() : '';
+    const position = at > 0 ? part.slice(at + 1).trim() : '';
+    if (!segment || !position) return `"${part}" is not segment=position.`;
+    list.push({ segment, position });
   }
-  return list.length ? { to: { offsets: list } } : 'List the offsets as partition:offset, separated by commas.';
+  return list.length ? { to: { positions: list } } : 'List the positions as segment=position, separated by commas.';
 }
 
 /** The reset dialog: the target and what a reset does; resolves to the request body or null. */
@@ -130,22 +144,22 @@ async function askReset(service, p) {
     h('input', { type: 'radio', name: 'reset-to', value, checked: value === choice, on: { change: () => { choice = value; } } }),
     label);
   const time = h('input', { type: 'datetime-local', step: '1', 'aria-label': 'Reset to this time' });
-  const offsets = h('input', { type: 'text', placeholder: '0:120, 1:98', 'aria-label': 'Offsets as partition:offset', spellcheck: 'false' });
+  const positions = h('input', { type: 'text', placeholder: '0=120, 1=98', 'aria-label': 'Positions as segment=position', spellcheck: 'false' });
   const confirmed = await controls.confirmDialog({
     title: `Reset ${p.name} of ${service}?`,
     lines: [
-      `Every instance of ${service} that runs the processor ${p.name} leaves its consumer group until the reset ends; one of them moves the group's offsets.`,
+      `Every instance of ${service} that runs the processor ${p.name} leaves its subscription until the reset ends; one of them moves the subscription's committed positions.`,
       'A reset to anything but "latest" is a replay: the processor\'s event handlers run again for every record from the target up to where it was (sagas and @DisallowReplay handlers excepted), after its @ResetHandler methods.',
     ],
     extra: h('fieldset', { class: 'reset-target' },
       h('legend', null, 'Reset to'),
-      radio('earliest', 'the earliest offsets (replay everything kept)'),
-      radio('latest', 'the latest offsets (skip what is waiting, no replay)'),
+      radio('earliest', 'the earliest positions (replay everything kept)'),
+      radio('latest', 'the latest positions (skip what is waiting, no replay)'),
       h('div', { class: 'choice-row' }, radio('time', 'the first record at or after'), time),
-      h('div', { class: 'choice-row' }, radio('offsets', 'these offsets'), offsets)),
+      h('div', { class: 'choice-row' }, radio('positions', 'these positions'), positions)),
     confirm: 'Reset',
   });
-  return confirmed ? resetBody(choice, time, offsets) : null;
+  return confirmed ? resetBody(choice, time, positions) : null;
 }
 
 /** A line about the answer of a pause, resume or reset. */
@@ -153,14 +167,14 @@ function outcomeText(action, service, name, data) {
   if (action === 'reset') {
     const ranges = data.ranges || [];
     return `Reset ${name} of ${service} (operation ${data.operationId}) on ${data.executedBy}: `
-      + (data.replay ? `replaying ${plural(ranges.length, 'partition')}, ${fmt.int(data.markersDeleted)} markers deleted, ${plural(data.resetHandlers, 'reset handler')} run.` : 'no replay.');
+      + (data.replay ? `replaying ${plural(ranges.length, 'segment')}, ${fmt.int(data.markersDeleted)} markers deleted, ${plural(data.resetHandlers, 'reset handler')} run.` : 'no replay.');
   }
   const done = action === 'pause' ? 'Paused' : 'Resumed';
   return `${done} ${name} of ${service} on ${plural(data.acknowledged, 'instance')}`
     + (data.failed ? `; ${data.failed} did not confirm` : '') + '.';
 }
 
-/** Every instance of an open row: a line about it and its partitions. */
+/** Every instance of an open row: a line about it and its segments. */
 function details(p, data) {
   return p.instances.map((i) => h('div', { class: 'proc-instance' },
     h('p', { class: 'proc-instance-head' },
@@ -170,23 +184,31 @@ function details(p, data) {
       data.scope === 'all'
         ? h('span', { title: 'Reachable hubs that hold a report of this instance; the freshest is shown' }, `seen by ${i.seenBy.join(', ')}`)
         : null,
-      i.groupId !== p.groupId ? badge('warn', `group ${i.groupId}`, 'This instance reports another consumer group than the freshest report') : null),
-    i.partitions.length
-      ? partitionTable(p, i)
-      : h('p', { class: 'note' }, 'No partition assigned to this instance.')));
+      i.subscription !== p.subscription ? badge('warn', `subscription ${i.subscription}`, 'This instance reports another subscription than the freshest report') : null,
+      i.eventStore !== p.eventStore ? badge('warn', `event store ${i.eventStore || 'unknown'}`, 'This instance reports another event store than the freshest report') : null),
+    i.segments.length
+      ? segmentTable(p, i)
+      : h('p', { class: 'note' }, 'No segment assigned to this instance.')));
 }
 
-function partitionTable(p, i) {
-  const replay = i.partitions.some((x) => x.replayUntil > 0);
-  return table(`Partitions of ${p.name} on ${i.instanceId}`, replay ? [...PARTITION_HEADERS, REPLAY_HEADER] : PARTITION_HEADERS,
-    i.partitions.map((x) => [
-      { class: 'num', content: String(x.partition) },
-      offsetCell(x.position),
-      offsetCell(x.committed, 'none committed'),
-      offsetCell(x.highWatermark),
-      offsetCell(x.lag),
-      replay ? (x.replayUntil > 0 ? { class: 'num', content: fmt.int(x.replayUntil) } : { class: 'num dim', content: '—', title: 'Not replaying' }) : null,
-    ].filter((c) => c !== null)), 'partitions');
+function segmentTable(p, i) {
+  const replay = i.segments.some((x) => x.replayUntil !== '');
+  return table(`Segments of ${p.name} on ${i.instanceId}`, replay ? [...SEGMENT_HEADERS, REPLAY_HEADER] : SEGMENT_HEADERS,
+    i.segments.map((x) => [
+      { class: 'num mono', content: x.segment },
+      positionCell(x.position),
+      positionCell(x.committed, 'none committed'),
+      positionCell(x.head),
+      lagCell(x.lag),
+      replay ? positionCell(x.replayUntil, 'Not replaying') : null,
+    ].filter((c) => c !== null)), 'segments');
+}
+
+/** The event store and, in its title, the capabilities it declares. */
+function eventStoreCell(p) {
+  if (!p.eventStore) return { class: 'dim', content: '—', title: 'The instances do not say' };
+  const caps = p.capabilities.length ? p.capabilities.join(', ') : 'none';
+  return { class: 'mono nowrap', content: p.eventStore, title: `Capabilities: ${caps}` };
 }
 
 export default {
@@ -212,7 +234,7 @@ export default {
     let last = null;
 
     const search = h('input', {
-      type: 'search', value: query, placeholder: 'Filter by service, processor, group, topic, event type or instance',
+      type: 'search', value: query, placeholder: 'Filter by service, processor, subscription, source, event store, event type or instance',
       'aria-label': 'Filter processors',
     });
     const problems = h('input', { type: 'checkbox', checked: problemsOnly });
@@ -251,21 +273,25 @@ export default {
       }
     };
 
-    /** The group, linked to its lag on the Consumer groups page where this hub reads Kafka. */
-    const groupCell = (p) => {
+    /** The subscription, linked to its lag on the Consumer groups page where this hub has an
+     * event browser. */
+    const subscriptionCell = (p) => {
       const eb = ctx.version && ctx.version.eventBrowser;
-      if (!eb || !eb.enabled) return p.groupId;
-      const q = new URLSearchParams({ open: p.groupId });
-      if (eb.topics.includes(p.topic)) q.set('topic', p.topic);
-      return h('a', { href: `#/consumer-groups?${q}`, title: 'Its lag per partition, as Kafka reports it' }, p.groupId);
+      if (!eb || !eb.enabled) return p.subscription;
+      const q = new URLSearchParams({ open: p.subscription });
+      if (eb.topics.includes(p.source)) q.set('topic', p.source);
+      return h('a', { href: `#/consumer-groups?${q}`, title: 'Its lag per segment, as the event browser reads it' }, p.subscription);
     };
 
+    /** Pause or resume; a reset only when the event store declares `replay`. */
     const actionsCell = (service, p) => h('td', { class: 'nowrap actions' },
       p.state === 'PAUSED'
         ? h('button', { type: 'button', on: { click: () => act('resume', service, p) } }, 'Resume')
         : h('button', { type: 'button', on: { click: () => act('pause', service, p) } }, 'Pause'),
       ' ',
-      h('button', { type: 'button', on: { click: () => act('reset', service, p) } }, 'Reset…'));
+      can(p, REPLAY)
+        ? h('button', { type: 'button', on: { click: () => act('reset', service, p) } }, 'Reset…')
+        : h('span', { class: 'dim', title: `The event store${p.eventStore ? ` (${p.eventStore})` : ''} does not declare the replay capability` }, 'no reset'));
 
     const toggle = (key) => {
       if (open.has(key)) open.delete(key);
@@ -305,16 +331,19 @@ export default {
           h('td', { class: 'nowrap' }, service),
           h('td', { class: 'nowrap' }, h('button', {
             type: 'button', class: 'disclose', 'aria-expanded': expanded ? 'true' : 'false', 'aria-controls': id,
-            title: expanded ? 'Hide the partitions of every instance' : 'Show the partitions of every instance',
+            title: expanded ? 'Hide the segments of every instance' : 'Show the segments of every instance',
             on: { click: () => toggle(key) },
           }, p.name)),
-          h('td', { class: 'mono nowrap' }, groupCell(p)),
-          h('td', { class: 'mono nowrap' }, p.topic),
+          h('td', { class: 'mono nowrap' }, subscriptionCell(p)),
+          h('td', { class: 'mono nowrap' }, p.source),
+        ];
+        const store = eventStoreCell(p);
+        cells.push(h('td', { class: store.class, title: store.title }, store.content));
+        cells.push(
           h('td', { class: 'nowrap' }, stateCell(p)),
           h('td', { class: 'num' }, fmt.int(p.instancesReporting)),
-          h('td', { class: 'num' }, fmt.int(p.assignedPartitions)),
-        ];
-        for (const cell of [offsetCell(p.lag, 'No instance knows its lag yet'), deadLettersCell(service, p), lastErrorCell(p, last.nowMs)]) {
+          h('td', { class: 'num' }, fmt.int(p.assignedSegments)));
+        for (const cell of [lagCell(p.lag, 'No instance knows its lag yet'), deadLettersCell(service, p), lastErrorCell(p, last.nowMs)]) {
           cells.push(h('td', { class: cell.class, title: cell.title }, cell.content));
         }
         if (writable) cells.push(actionsCell(service, p));

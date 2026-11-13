@@ -1,5 +1,5 @@
-//! Processor control (roadmap P6b, ADR 0023): the hub as a stateless control plane for the Kafka
-//! event processors of the libraries (ADR 0022).
+//! Processor control (roadmap P6b, ADR 0023): the hub as a stateless control plane for the event
+//! processors of the libraries (ADR 0022), whatever their event store (ADR 0027).
 //!
 //! The hub asks instances to act (`ServerMessage.control`) and
 //! matches their answers (`ClientMessage.control_reply`) to the requests by `control_id`. It keeps
@@ -9,7 +9,7 @@
 //! fails at once (`instance left`); a reply nobody waits for is dropped and counted.
 //!
 //! A reset is a leased operation: prepare every instance that runs the processor (each leaves the
-//! consumer group and holds the operation lock for the lease), renew the lease while it runs,
+//! subscription and holds the operation lock for the lease), renew the lease while it runs,
 //! execute on one, finish on all. A hub that dies mid-way stops renewing: the leases expire and
 //! the instances resume by themselves.
 
@@ -24,7 +24,10 @@ use tracing::{debug, info, warn};
 use crate::auth::clip;
 use crate::config::Config;
 use crate::context::ContextId;
-use crate::processors::{MAX_GROUP_TOPIC_BYTES, MAX_NAME_BYTES, MAX_PARTITIONS, truncate_utf8};
+use crate::processors::{
+    MAX_NAME_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENTS, MAX_SUBSCRIPTION_SOURCE_BYTES,
+    bounded_position, segment_order, truncate_utf8,
+};
 use crate::proto::{
     self, ControlRefusal, ControlReply, ServerMessage, control_reply, control_request,
 };
@@ -35,8 +38,8 @@ use crate::telemetry::Metrics;
 pub const MAX_LETTERS: u32 = 100;
 /// Letters a list asks for when the caller names no limit.
 pub const DEFAULT_LETTERS: u32 = 50;
-/// Partition offsets one reset may name.
-pub const MAX_OFFSETS: usize = 1024;
+/// Segment positions one reset may name.
+pub const MAX_POSITIONS: usize = MAX_SEGMENTS;
 /// Longest message, detail or error text kept from a reply, in bytes.
 pub const MAX_TEXT_BYTES: usize = 512;
 /// Longest letter id, key, event id or operation id kept or accepted, in bytes.
@@ -183,19 +186,20 @@ pub enum Answer {
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetResult {
-    /// Sorted by partition, at most [`MAX_PARTITIONS`].
+    /// Sorted by segment ([`segment_order`]), at most [`MAX_SEGMENTS`].
     pub ranges: Vec<RangeView>,
     pub markers_deleted: u64,
     pub reset_handlers: u32,
 }
 
-/// The records of `partition` with `from <= offset < until` are handled again.
+/// The records of `segment` at a position `from <= position < until` are handled again.
+/// Positions are opaque strings; empty means none.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RangeView {
-    pub partition: i32,
-    pub from: i64,
-    pub until: i64,
+    pub segment: String,
+    pub from: String,
+    pub until: String,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -213,9 +217,11 @@ pub struct LetterPage {
 pub struct LetterView {
     pub id: String,
     pub processor: String,
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
+    /// The source the letter's record came from.
+    pub source: String,
+    pub segment: String,
+    /// The record's position in its segment; empty when unknown.
+    pub position: String,
     pub key: String,
     pub event_id: String,
     pub event_type: String,
@@ -233,9 +239,9 @@ impl LetterView {
         Self {
             id: truncate_utf8(&l.id, MAX_ID_BYTES),
             processor: truncate_utf8(&l.processor, MAX_NAME_BYTES),
-            topic: truncate_utf8(&l.topic, MAX_GROUP_TOPIC_BYTES),
-            partition: l.partition,
-            offset: l.offset,
+            source: truncate_utf8(&l.source, MAX_SUBSCRIPTION_SOURCE_BYTES),
+            segment: truncate_utf8(&l.segment, MAX_SEGMENT_BYTES),
+            position: bounded_position(&l.position),
             key: truncate_utf8(&l.key, MAX_ID_BYTES),
             event_id: truncate_utf8(&l.event_id, MAX_ID_BYTES),
             event_type: truncate_utf8(&l.event_type, MAX_TYPE_BYTES),
@@ -274,18 +280,19 @@ fn refusal_name(code: i32) -> &'static str {
         Ok(ControlRefusal::UnknownProcessor) => "UNKNOWN_PROCESSOR",
         Ok(ControlRefusal::Locked) => "LOCKED",
         Ok(ControlRefusal::NotPrepared) => "NOT_PREPARED",
-        Ok(ControlRefusal::GroupNotEmpty) => "GROUP_NOT_EMPTY",
+        Ok(ControlRefusal::SubscribersActive) => "SUBSCRIBERS_ACTIVE",
         Ok(ControlRefusal::ResetHandlerFailed) => "RESET_HANDLER_FAILED",
         Ok(ControlRefusal::Invalid) => "INVALID",
         Ok(ControlRefusal::Failed) => "FAILED",
         Ok(ControlRefusal::NotFound) => "NOT_FOUND",
+        Ok(ControlRefusal::Unsupported) => "UNSUPPORTED",
         Ok(ControlRefusal::Unspecified) | Err(_) => "UNSPECIFIED",
     }
 }
 
 impl Answer {
     /// The reply's result, bounded: texts cut at a UTF-8 boundary, at most [`MAX_LETTERS`]
-    /// letters and [`MAX_PARTITIONS`] ranges.
+    /// letters and [`MAX_SEGMENTS`] ranges.
     fn from_reply(result: Option<control_reply::Result>) -> Self {
         use control_reply::Result as R;
         match result {
@@ -299,14 +306,14 @@ impl Answer {
                 let mut ranges: Vec<RangeView> = r
                     .ranges
                     .iter()
-                    .take(MAX_PARTITIONS)
+                    .take(MAX_SEGMENTS)
                     .map(|x| RangeView {
-                        partition: x.partition,
-                        from: x.from,
-                        until: x.until,
+                        segment: truncate_utf8(&x.segment, MAX_SEGMENT_BYTES),
+                        from: bounded_position(&x.from),
+                        until: bounded_position(&x.until),
                     })
                     .collect();
-                ranges.sort_by_key(|x| x.partition);
+                ranges.sort_by(|a, b| segment_order(&a.segment, &b.segment));
                 Self::Reset(ResetResult {
                     ranges,
                     markers_deleted: r.markers_deleted,
@@ -382,9 +389,12 @@ impl Answer {
             },
             Self::Refused { code, .. } => match *code {
                 "UNKNOWN_PROCESSOR" | "NOT_FOUND" => Verdict::NotFound,
-                "LOCKED" | "NOT_PREPARED" | "GROUP_NOT_EMPTY" | "RESET_HANDLER_FAILED" => {
-                    Verdict::Conflict
-                }
+                // UNSUPPORTED: the event store lacks the capability; asking again will not help.
+                "LOCKED"
+                | "NOT_PREPARED"
+                | "SUBSCRIBERS_ACTIVE"
+                | "RESET_HANDLER_FAILED"
+                | "UNSUPPORTED" => Verdict::Conflict,
                 "INVALID" => Verdict::BadRequest,
                 _ => Verdict::Failed,
             },
@@ -450,20 +460,27 @@ pub struct FanOutReport {
     pub verdict: Verdict,
 }
 
-/// Where a reset moves the consumer group's offsets.
+/// Where a reset moves the subscription's committed positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Earliest,
     Latest,
     Timestamp(i64),
-    /// `(partition, offset)`, distinct partitions, at most [`MAX_OFFSETS`].
-    Offsets(Vec<(i32, i64)>),
+    /// `(segment, position)`, distinct segments sorted in [`segment_order`], at most
+    /// [`MAX_POSITIONS`]; both opaque strings the event-store add-on reads.
+    Positions(Vec<(String, String)>),
+}
+
+/// A segment name or position a reset may name: 1 to [`MAX_SEGMENT_BYTES`] bytes, no control
+/// characters.
+fn valid_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_SEGMENT_BYTES && !s.chars().any(char::is_control)
 }
 
 impl Target {
     /// Parses the body of `POST .../reset`: `{"to":"earliest"}`, `{"to":"latest"}`,
-    /// `{"to":{"timestampMs":n}}` or `{"to":{"offsets":[{"partition":0,"offset":12}]}}`. The
-    /// error is safe to show the caller.
+    /// `{"to":{"timestampMs":n}}` or `{"to":{"positions":[{"segment":"0","position":"12"}]}}`.
+    /// The error is safe to show the caller.
     pub fn parse(body: &[u8]) -> Result<Self, String> {
         use serde_json::Value;
         let value: Value =
@@ -486,43 +503,42 @@ impl Target {
                     _ => Err("timestampMs must be a non-negative integer (epoch ms)".into()),
                 }
             }
-            Value::Object(o) if o.len() == 1 && o.contains_key("offsets") => {
-                let Some(list) = o["offsets"].as_array() else {
-                    return Err("offsets must be an array".into());
+            Value::Object(o) if o.len() == 1 && o.contains_key("positions") => {
+                let Some(list) = o["positions"].as_array() else {
+                    return Err("positions must be an array".into());
                 };
-                if list.is_empty() || list.len() > MAX_OFFSETS {
-                    return Err(format!("offsets must list 1 to {MAX_OFFSETS} partitions"));
+                if list.is_empty() || list.len() > MAX_POSITIONS {
+                    return Err(format!("positions must list 1 to {MAX_POSITIONS} segments"));
                 }
-                let mut offsets: Vec<(i32, i64)> = Vec::with_capacity(list.len());
+                let mut positions: Vec<(String, String)> = Vec::with_capacity(list.len());
                 for entry in list {
-                    let partition = entry
-                        .get("partition")
-                        .and_then(Value::as_i64)
-                        .and_then(|p| i32::try_from(p).ok())
-                        .filter(|p| *p >= 0);
-                    let offset = entry
-                        .get("offset")
-                        .and_then(Value::as_i64)
-                        .filter(|o| *o >= 0);
-                    let (Some(partition), Some(offset)) = (partition, offset) else {
-                        return Err(
-                            "each offset must be {\"partition\": n >= 0, \"offset\": n >= 0}"
-                                .into(),
-                        );
+                    let segment = entry
+                        .get("segment")
+                        .and_then(Value::as_str)
+                        .filter(|s| valid_name(s));
+                    let position = entry
+                        .get("position")
+                        .and_then(Value::as_str)
+                        .filter(|p| valid_name(p));
+                    let (Some(segment), Some(position)) = (segment, position) else {
+                        return Err(format!(
+                            "each position must be {{\"segment\": \"...\", \"position\": \"...\"}}, \
+                             both strings of 1 to {MAX_SEGMENT_BYTES} bytes"
+                        ));
                     };
                     if entry.as_object().is_some_and(|e| e.len() != 2) {
-                        return Err("an offset has only partition and offset".into());
+                        return Err("a position has only segment and position".into());
                     }
-                    if offsets.iter().any(|(p, _)| *p == partition) {
-                        return Err(format!("partition {partition} is listed twice"));
+                    if positions.iter().any(|(s, _)| s == segment) {
+                        return Err(format!("segment {:?} is listed twice", clip(segment)));
                     }
-                    offsets.push((partition, offset));
+                    positions.push((segment.to_string(), position.to_string()));
                 }
-                offsets.sort_unstable();
-                Ok(Self::Offsets(offsets))
+                positions.sort_by(|a, b| segment_order(&a.0, &b.0));
+                Ok(Self::Positions(positions))
             }
             _ => Err(
-                "to must be \"earliest\", \"latest\", {\"timestampMs\": n} or {\"offsets\": [...]}"
+                "to must be \"earliest\", \"latest\", {\"timestampMs\": n} or {\"positions\": [...]}"
                     .into(),
             ),
         }
@@ -535,9 +551,9 @@ impl Target {
             Self::Earliest => json!({ "to": "earliest" }),
             Self::Latest => json!({ "to": "latest" }),
             Self::Timestamp(ms) => json!({ "to": { "timestampMs": ms } }),
-            Self::Offsets(list) => json!({ "to": { "offsets": list
+            Self::Positions(list) => json!({ "to": { "positions": list
                 .iter()
-                .map(|(p, o)| json!({ "partition": p, "offset": o }))
+                .map(|(s, p)| json!({ "segment": s, "position": p }))
                 .collect::<Vec<_>>() } }),
         }
     }
@@ -548,12 +564,12 @@ impl Target {
             Self::Earliest => To::Earliest(true),
             Self::Latest => To::Latest(true),
             Self::Timestamp(ms) => To::TimestampMs(*ms),
-            Self::Offsets(list) => To::Offsets(proto::PartitionOffsets {
-                offsets: list
+            Self::Positions(list) => To::Positions(proto::SegmentPositions {
+                positions: list
                     .iter()
-                    .map(|(partition, offset)| proto::PartitionOffset {
-                        partition: *partition,
-                        offset: *offset,
+                    .map(|(segment, position)| proto::SegmentPosition {
+                        segment: segment.clone(),
+                        position: position.clone(),
                     })
                     .collect(),
             }),
@@ -586,7 +602,7 @@ pub struct ResetReport {
     pub outcome: &'static str,
     /// The instance that executed (or was asked to), `None` when the prepare failed.
     pub executed_by: Option<String>,
-    /// Some partition replays (the target was below its committed offset).
+    /// Some segment replays (the target was before its committed position).
     pub replay: bool,
     pub ranges: Vec<RangeView>,
     pub markers_deleted: u64,
@@ -1501,6 +1517,16 @@ mod tests {
             panic!()
         };
         assert_eq!(code, "UNSPECIFIED", "an unknown code");
+        for (code, name) in [
+            (ControlRefusal::SubscribersActive, "SUBSCRIBERS_ACTIVE"),
+            (ControlRefusal::Unsupported, "UNSUPPORTED"),
+        ] {
+            let answer = Answer::from_reply(Some(R::Refused(proto::ControlRefused {
+                code: code as i32,
+                message: String::new(),
+            })));
+            assert!(answer.refused_with(name), "{answer:?}");
+        }
         assert_eq!(message, "x".repeat(MAX_TEXT_BYTES - 1), "cut before the é");
 
         let letter = proto::DeadLetterSummary {
@@ -1528,9 +1554,13 @@ mod tests {
         let ranges: Vec<proto::ReplayRange> = (0..2000)
             .rev()
             .map(|p| proto::ReplayRange {
-                partition: p,
-                from: 0,
-                until: 1,
+                segment: p.to_string(),
+                from: "0".into(),
+                until: if p == 1999 {
+                    "9".repeat(MAX_SEGMENT_BYTES + 1)
+                } else {
+                    "1".into()
+                },
             })
             .collect();
         let Answer::Reset(r) = Answer::from_reply(Some(R::Reset(proto::ResetOutcome {
@@ -1540,10 +1570,23 @@ mod tests {
         }))) else {
             panic!()
         };
-        assert_eq!(r.ranges.len(), MAX_PARTITIONS);
+        assert_eq!(r.ranges.len(), MAX_SEGMENTS);
         assert!(
-            r.ranges.windows(2).all(|w| w[0].partition < w[1].partition),
-            "sorted"
+            r.ranges
+                .windows(2)
+                .all(|w| segment_order(&w[0].segment, &w[1].segment).is_lt()),
+            "sorted by value"
+        );
+        assert_eq!(
+            (
+                r.ranges[0].segment.as_str(),
+                r.ranges[1023].segment.as_str()
+            ),
+            ("976", "1999")
+        );
+        assert_eq!(
+            r.ranges[1023].until, "",
+            "a too long position reads as none"
         );
 
         let Answer::Retry(retry) =
@@ -1572,7 +1615,8 @@ mod tests {
             (refused("NOT_FOUND"), Verdict::NotFound),
             (refused("LOCKED"), Verdict::Conflict),
             (refused("NOT_PREPARED"), Verdict::Conflict),
-            (refused("GROUP_NOT_EMPTY"), Verdict::Conflict),
+            (refused("SUBSCRIBERS_ACTIVE"), Verdict::Conflict),
+            (refused("UNSUPPORTED"), Verdict::Conflict),
             (refused("RESET_HANDLER_FAILED"), Verdict::Conflict),
             (refused("INVALID"), Verdict::BadRequest),
             (refused("FAILED"), Verdict::Failed),
@@ -1612,9 +1656,12 @@ mod tests {
         );
         assert_eq!(
             Target::parse(
-                br#"{"to":{"offsets":[{"partition":2,"offset":9},{"partition":0,"offset":12}]}}"#
+                br#"{"to":{"positions":[{"segment":"10","position":"9"},{"segment":"2","position":"12"}]}}"#
             ),
-            Ok(Target::Offsets(vec![(0, 12), (2, 9)]))
+            Ok(Target::Positions(vec![
+                ("2".into(), "12".into()),
+                ("10".into(), "9".into())
+            ]))
         );
         for bad in [
             &b"not json"[..],
@@ -1624,14 +1671,17 @@ mod tests {
             br#"{"to":"earliest","extra":1}"#,
             br#"{"to":{"timestampMs":-1}}"#,
             br#"{"to":{"timestampMs":"soon"}}"#,
-            br#"{"to":{"timestampMs":1,"offsets":[]}}"#,
-            br#"{"to":{"offsets":[]}}"#,
-            br#"{"to":{"offsets":[{"partition":-1,"offset":0}]}}"#,
-            br#"{"to":{"offsets":[{"partition":0,"offset":-5}]}}"#,
-            br#"{"to":{"offsets":[{"partition":0}]}}"#,
-            br#"{"to":{"offsets":[{"partition":0,"offset":1,"x":2}]}}"#,
-            br#"{"to":{"offsets":[{"partition":0,"offset":1},{"partition":0,"offset":2}]}}"#,
-            br#"{"to":{"offsets":[{"partition":4294967296,"offset":1}]}}"#,
+            br#"{"to":{"timestampMs":1,"positions":[]}}"#,
+            br#"{"to":{"positions":[]}}"#,
+            br#"{"to":{"positions":[{"segment":"","position":"0"}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0","position":""}]}}"#,
+            br#"{"to":{"positions":[{"segment":0,"position":"1"}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0","position":12}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0"}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0","position":"1","x":2}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0","position":"1"},{"segment":"0","position":"2"}]}}"#,
+            br#"{"to":{"positions":[{"segment":"0\n","position":"1"}]}}"#,
+            br#"{"to":{"offsets":[{"partition":0,"offset":1}]}}"#,
         ] {
             assert!(
                 Target::parse(bad).is_err(),
@@ -1639,25 +1689,33 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
-        let many: Vec<String> = (0..=MAX_OFFSETS)
-            .map(|p| format!("{{\"partition\":{p},\"offset\":0}}"))
+        let long = "9".repeat(MAX_SEGMENT_BYTES + 1);
+        for (segment, position) in [(long.as_str(), "1"), ("0", long.as_str())] {
+            let body = serde_json::json!({"to": {"positions": [{"segment": segment, "position": position}]}});
+            assert!(
+                Target::parse(body.to_string().as_bytes()).is_err(),
+                "{body}"
+            );
+        }
+        let many: Vec<String> = (0..=MAX_POSITIONS)
+            .map(|p| format!("{{\"segment\":\"{p}\",\"position\":\"0\"}}"))
             .collect();
-        let body = format!("{{\"to\":{{\"offsets\":[{}]}}}}", many.join(","));
+        let body = format!("{{\"to\":{{\"positions\":[{}]}}}}", many.join(","));
         assert!(
             Target::parse(body.as_bytes())
                 .unwrap_err()
                 .contains("1 to 1024")
         );
         let body = format!(
-            "{{\"to\":{{\"offsets\":[{}]}}}}",
-            many[..MAX_OFFSETS].join(",")
+            "{{\"to\":{{\"positions\":[{}]}}}}",
+            many[..MAX_POSITIONS].join(",")
         );
         assert!(Target::parse(body.as_bytes()).is_ok());
         // The body echoes back as it was given.
         for body in [
             r#"{"to":"earliest"}"#,
             r#"{"to":{"timestampMs":5}}"#,
-            r#"{"to":{"offsets":[{"partition":0,"offset":12}]}}"#,
+            r#"{"to":{"positions":[{"segment":"0","position":"12"}]}}"#,
         ] {
             let target = Target::parse(body.as_bytes()).unwrap();
             assert_eq!(

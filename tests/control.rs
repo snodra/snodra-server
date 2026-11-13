@@ -264,7 +264,7 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
     assert_eq!(body["replay"], true);
     assert_eq!(
         body["ranges"],
-        json!([{ "partition": 0, "from": 0, "until": 42 }])
+        json!([{ "segment": "0", "from": "0", "until": "42" }])
     );
     assert_eq!(
         (
@@ -320,16 +320,16 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
             kraken_hub::proto::reset_target::To::TimestampMs(1_762_250_000_000),
         ),
         (
-            r#"{"to":{"offsets":[{"partition":1,"offset":7},{"partition":0,"offset":12}]}}"#,
-            kraken_hub::proto::reset_target::To::Offsets(kraken_hub::proto::PartitionOffsets {
-                offsets: vec![
-                    kraken_hub::proto::PartitionOffset {
-                        partition: 0,
-                        offset: 12,
+            r#"{"to":{"positions":[{"segment":"1","position":"7"},{"segment":"0","position":"12"}]}}"#,
+            kraken_hub::proto::reset_target::To::Positions(kraken_hub::proto::SegmentPositions {
+                positions: vec![
+                    kraken_hub::proto::SegmentPosition {
+                        segment: "0".into(),
+                        position: "12".into(),
                     },
-                    kraken_hub::proto::PartitionOffset {
-                        partition: 1,
-                        offset: 7,
+                    kraken_hub::proto::SegmentPosition {
+                        segment: "1".into(),
+                        position: "7".into(),
                     },
                 ],
             }),
@@ -416,8 +416,8 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
         answering(|req| {
             is(req, "execute").then(|| {
                 Reaction::Reply(refused(
-                    ControlRefusal::GroupNotEmpty,
-                    "members: consumer-7",
+                    ControlRefusal::SubscribersActive,
+                    "subscribers: consumer-7",
                 ))
             })
         })
@@ -429,7 +429,7 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
     let body = json_of(&r);
     assert_eq!(body["outcome"], "failed");
     assert_eq!(body["error"]["stage"], "execute");
-    assert_eq!(body["error"]["code"], "GROUP_NOT_EMPTY");
+    assert_eq!(body["error"]["code"], "SUBSCRIBERS_ACTIVE");
     assert_eq!(body["replay"], false);
     let executor = body["executedBy"].as_str().unwrap();
     for b in [&b1, &b2] {
@@ -661,9 +661,9 @@ fn letter(n: usize, long: bool) -> kraken_hub::proto::DeadLetterSummary {
             format!("letter-{n}")
         },
         processor: "audit".into(),
-        topic: "kraken.events".into(),
-        partition: 1,
-        offset: 100 + n as i64,
+        source: "kraken.events".into(),
+        segment: "1".into(),
+        position: (100 + n).to_string(),
         key: "order-7".into(),
         event_id: format!("evt-{n}"),
         event_type: "examples.OrderPlaced".into(),
@@ -744,8 +744,8 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
     assert_eq!(
         body["letters"][0],
         json!({
-            "id": "letter-0", "processor": "audit", "topic": "kraken.events", "partition": 1,
-            "offset": 100, "key": "order-7", "eventId": "evt-0", "eventType": "examples.OrderPlaced",
+            "id": "letter-0", "processor": "audit", "source": "kraken.events", "segment": "1",
+            "position": "100", "key": "order-7", "eventId": "evt-0", "eventType": "examples.OrderPlaced",
             "reason": "HANDLER_FAILED", "errorType": "IllegalStateException", "errorMessage": "boom ",
             "blockedBy": "", "attempts": 3, "parkedAtMs": 1762250000000i64, "lastAttemptAtMs": 1762250001000i64,
         })
@@ -833,7 +833,7 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
     let (grpc, http) = hub(config()).await;
     let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
     let many: Vec<String> = (0..1025)
-        .map(|p| format!("{{\"partition\":{p},\"offset\":0}}"))
+        .map(|p| format!("{{\"segment\":\"{p}\",\"position\":\"0\"}}"))
         .collect();
     for (body, why) in [
         ("".to_string(), "no target"),
@@ -844,8 +844,8 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
         ),
         ("not json".to_string(), "not JSON"),
         (
-            format!("{{\"to\":{{\"offsets\":[{}]}}}}", many.join(",")),
-            "1025 offsets",
+            format!("{{\"to\":{{\"positions\":[{}]}}}}", many.join(",")),
+            "1025 positions",
         ),
         (
             format!("{{\"to\":\"earliest\",\"pad\":\"{}\"}}", "x".repeat(5000)),

@@ -865,8 +865,8 @@ fn processor_attrs(service: &str, processor: &str) -> [KeyValue; 2] {
 
 /// The processor gauges (ADR 0022, 0026), per service and processor, aggregated over the
 /// instances as the Processors page does, from the latest `InstanceStatus` each session holds:
-/// observed when the metrics are exported (by the exporter's thread), from memory, no I/O and
-/// no new Kafka read. Every instance reports to every hub (ADR 0016), so hubs export the same
+/// observed when the metrics are exported (by the exporter's thread), from memory: no I/O, no
+/// event-store read. Every instance reports to every hub (ADR 0016), so hubs export the same
 /// values: dashboards take `max` over hubs. Dropping the value unregisters nothing; keep it for
 /// the life of the meter provider.
 pub struct ProcessorGauges {
@@ -944,7 +944,7 @@ impl ProcessorGauges {
         Self {
             _lag: meter
                 .i64_observable_gauge("kraken_hub_processor_lag")
-                .with_description("Records behind per service and processor: the sum over its distinct partitions as the freshest report has them; absent while no lag is known")
+                .with_description("Records behind per service and processor: the sum over its distinct segments as the freshest report has them; absent while no lag is known")
                 .with_callback(per_processor(&rows, |r| r.lag))
                 .build(),
             _dead_letters: meter
@@ -1625,19 +1625,19 @@ mod tests {
     fn processor(
         name: &str,
         state: crate::proto::ProcessorState,
-        lags: &[(i32, i64)],
+        lags: &[(&str, i64)],
         dead_letters: u64,
         totals: (u64, u64),
     ) -> crate::proto::ProcessorStatus {
         crate::proto::ProcessorStatus {
             name: name.to_string(),
-            group_id: "g".to_string(),
-            topic: "kraken.events".to_string(),
+            subscription: "g".to_string(),
+            source: "kraken.events".to_string(),
             state: state as i32,
-            partitions: lags
+            segments: lags
                 .iter()
-                .map(|(partition, lag)| crate::proto::PartitionStatus {
-                    partition: *partition,
+                .map(|(segment, lag)| crate::proto::SegmentStatus {
+                    segment: segment.to_string(),
                     lag: *lag,
                     ..Default::default()
                 })
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     /// The processor gauges aggregate each (service, processor) over its instances as the
-    /// Processors page does: lag over distinct partitions as the freshest report has them, the
+    /// Processors page does: lag over distinct segments as the freshest report has them, the
     /// worst state, the highest dead-letter count, the summed totals (ADR 0026).
     #[test]
     fn processor_gauges_aggregate_the_latest_reports_per_service_and_processor() {
@@ -1693,7 +1693,7 @@ mod tests {
             vec![processor(
                 "default",
                 ProcessorRunning,
-                &[(0, 5), (1, 7)],
+                &[("0", 5), ("1", 7)],
                 2,
                 (100, 1),
             )],
@@ -1704,8 +1704,14 @@ mod tests {
             "a2",
             "svc",
             vec![
-                processor("default", ProcessorFailing, &[(1, 3), (2, 4)], 3, (50, 2)),
-                processor("audit", ProcessorRunning, &[(0, -1)], 0, (0, 0)),
+                processor(
+                    "default",
+                    ProcessorFailing,
+                    &[("1", 3), ("2", 4)],
+                    3,
+                    (50, 2),
+                ),
+                processor("audit", ProcessorRunning, &[("0", -1)], 0, (0, 0)),
             ],
             now,
         );
@@ -1715,7 +1721,7 @@ mod tests {
                 ("service".to_string(), "svc".to_string()),
             ]
         };
-        // Partition 1 as a2 (the freshest) has it: 5 + 3 + 4; audit's lag is unknown.
+        // Segment 1 as a2 (the freshest) has it: 5 + 3 + 4; audit's lag is unknown.
         assert_eq!(
             m.gauge_points("kraken_hub_processor_lag"),
             [(labels("default"), 12)]
@@ -1767,7 +1773,13 @@ mod tests {
             &sessions,
             "a1",
             "svc",
-            vec![processor("default", ProcessorRunning, &[(0, 9)], 1, (5, 0))],
+            vec![processor(
+                "default",
+                ProcessorRunning,
+                &[("0", 9)],
+                1,
+                (5, 0),
+            )],
             std::time::Instant::now(),
         );
         assert_eq!(m.gauge_points("kraken_hub_processor_lag").len(), 1);
@@ -1810,7 +1822,7 @@ mod tests {
             vec![processor(
                 "default",
                 ProcessorRunning,
-                &[(0, lag)],
+                &[("0", lag)],
                 0,
                 (1, 0),
             )]

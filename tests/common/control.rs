@@ -27,8 +27,8 @@ pub enum Reaction {
 
 pub type Behaviour = Arc<dyn Fn(&ControlRequest) -> Reaction + Send + Sync>;
 
-/// Answers `ok` to everything but a reset execute, which it answers with a replay of partition 0
-/// from 0 to 42 (3 markers deleted, 1 reset handler), and the dead-letter calls, which it answers
+/// Answers `ok` to everything but a reset execute, which it answers with a replay of segment "0"
+/// from "0" to "42" (3 markers deleted, 1 reset handler), and the dead-letter calls, which it answers
 /// with an empty page, `Retried` and zero counts.
 pub fn ok_to_everything() -> Behaviour {
     Arc::new(|req: &ControlRequest| Reaction::Reply(default_result(req)))
@@ -41,9 +41,9 @@ pub fn default_result(req: &ControlRequest) -> control_reply::Result {
     match &req.action {
         Some(A::ResetExecute(_)) => R::Reset(kraken_hub::proto::ResetOutcome {
             ranges: vec![kraken_hub::proto::ReplayRange {
-                partition: 0,
-                from: 0,
-                until: 42,
+                segment: "0".into(),
+                from: "0".into(),
+                until: "42".into(),
             }],
             markers_deleted: 3,
             reset_handlers: 1,
@@ -76,12 +76,16 @@ pub fn refused(code: ControlRefusal, message: &str) -> control_reply::Result {
     })
 }
 
-/// A processor as a P6b instance reports it.
+/// A processor as an instance reports it, on an event store with every first-wave capability.
 pub fn processor(name: &str) -> ProcessorStatus {
     ProcessorStatus {
         name: name.to_string(),
-        group_id: format!("svc.{name}"),
-        topic: "kraken.events".to_string(),
+        subscription: format!("svc.{name}"),
+        source: "kraken.events".to_string(),
+        event_store: "kafka".to_string(),
+        capabilities: ["replay", "browse", "lag", "native-dead-letter"]
+            .map(String::from)
+            .to_vec(),
         state: ProcessorState::ProcessorRunning as i32,
         dead_letter_mode: "collection".to_string(),
         ..Default::default()

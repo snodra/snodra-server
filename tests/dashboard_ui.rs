@@ -618,37 +618,42 @@ async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
 
 // ---- processors (ADR 0022) ---------------------------------------------------------------
 
-fn partition(
-    partition: i32,
+/// A segment with decimal positions, as the first-wave event stores report them.
+fn segment(
+    segment: i32,
     position: i64,
     committed: i64,
-    hw: i64,
-) -> kraken_hub::proto::PartitionStatus {
-    kraken_hub::proto::PartitionStatus {
-        partition,
-        position,
-        committed,
-        high_watermark: hw,
-        lag: hw - committed,
-        replay_until: 0,
+    head: i64,
+) -> kraken_hub::proto::SegmentStatus {
+    kraken_hub::proto::SegmentStatus {
+        segment: segment.to_string(),
+        position: position.to_string(),
+        committed: committed.to_string(),
+        head: head.to_string(),
+        lag: head - committed,
+        replay_until: String::new(),
     }
 }
 
 fn processor(
     name: &str,
     state: kraken_hub::proto::ProcessorState,
-    partitions: Vec<kraken_hub::proto::PartitionStatus>,
+    segments: Vec<kraken_hub::proto::SegmentStatus>,
 ) -> kraken_hub::proto::ProcessorStatus {
     kraken_hub::proto::ProcessorStatus {
         name: name.to_string(),
-        group_id: if name == "default" {
+        subscription: if name == "default" {
             "service-b".to_string()
         } else {
             format!("service-b.{name}")
         },
-        topic: "kraken.events".to_string(),
+        source: "kraken.events".to_string(),
+        event_store: "kafka".to_string(),
+        capabilities: ["replay", "browse", "lag", "native-dead-letter"]
+            .map(String::from)
+            .to_vec(),
         state: state as i32,
-        partitions,
+        segments,
         dead_letter_mode: "collection".to_string(),
         ..Default::default()
     }
@@ -664,10 +669,10 @@ async fn register_as(grpc: SocketAddr, service: &str, instance_id: &str) -> Fake
 }
 
 /// The Processors page: one row per (service, processor) with its aggregate, a row opened from
-/// the URL shows every instance's partitions; the Services page counts the processors and shows
+/// the URL shows every instance's segments; the Services page counts the processors and shows
 /// the dead letters.
 #[tokio::test]
-async fn the_processors_page_aggregates_and_expands_to_partitions() {
+async fn the_processors_page_aggregates_and_expands_to_segments() {
     use kraken_hub::proto::ProcessorState;
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
@@ -681,7 +686,7 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
     let mut orders = processor(
         "orders",
         ProcessorState::ProcessorFailing,
-        vec![partition(1, 10, 8, 20)],
+        vec![segment(1, 10, 8, 20)],
     );
     orders.dead_letters = 2;
     orders.failed_total = 1;
@@ -697,7 +702,7 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
             processor(
                 "default",
                 ProcessorState::ProcessorRunning,
-                vec![partition(0, 5, 5, 5)],
+                vec![segment(0, 5, 5, 5)],
             ),
             orders,
         ],
@@ -706,7 +711,7 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
     let mut other = processor(
         "orders",
         ProcessorState::ProcessorRunning,
-        vec![partition(0, 3, 3, 4)],
+        vec![segment(0, 3, 3, 4)],
     );
     other.dead_letters = 2;
     b2.status_with_processors(&["hub"], vec![other]).await;
@@ -728,9 +733,10 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
         ">FAILING</span>",
         ">RUNNING</span>",
         "handler failed: boom",
-        "Partitions of orders on b-1",
-        "Partitions of orders on b-2",
-        "High watermark",
+        "Segments of orders on b-1",
+        "Segments of orders on b-2",
+        ">Head</th>",
+        ">kafka</td>",
         "aria-expanded=\"true\"",
         "2 processors in 1 service",
     ] {
@@ -740,8 +746,8 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
         );
     }
     assert!(
-        !dom.contains("Partitions of default on"),
-        "a closed row shows no partitions"
+        !dom.contains("Segments of default on"),
+        "a closed row shows no segments"
     );
     // The error's age: 65 s before the report, plus however long the page took to load.
     let error = &dom[dom.find("handler failed: boom").unwrap()..];
@@ -750,7 +756,7 @@ async fn the_processors_page_aggregates_and_expands_to_partitions() {
         error.contains(">1 m ") && error.contains(" s ago<"),
         "{error}"
     );
-    // The orders row: 2 instances, 2 partitions, lag 12 + 1, 2 dead letters (the max).
+    // The orders row: 2 instances, 2 segments, lag 12 + 1, 2 dead letters (the max).
     let row = &dom[dom.find("service-b.orders").unwrap()..];
     let row = &row[..row.find("</tr>").unwrap()];
     for cell in [">2</td>", ">13</td>", ">2 dead letters</span>"] {
@@ -820,7 +826,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
     let mut fresh = processor(
         "orders",
         ProcessorState::ProcessorFailing,
-        vec![partition(0, 1, 1, 8)],
+        vec![segment(0, 1, 1, 8)],
     );
     fresh.last_error = "fresh failure".to_string();
     on_b.status_with_processors(&["hub-a", "hub-b"], vec![fresh])
@@ -831,7 +837,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
             vec![processor(
                 "orders",
                 ProcessorState::ProcessorRunning,
-                vec![partition(1, 4, 4, 6)],
+                vec![segment(1, 4, 4, 6)],
             )],
         )
         .await;
@@ -851,8 +857,8 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
         "on 2 reachable hubs",
         ">FAILING</span>",
         "fresh failure",
-        "Partitions of orders on b-both",
-        "Partitions of orders on b-only-on-b",
+        "Segments of orders on b-both",
+        "Segments of orders on b-only-on-b",
     ] {
         assert!(dom.contains(marker), "{marker:?} missing in {dom}");
     }
@@ -862,7 +868,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
     );
     let row = &dom[dom.find("service-b.orders").unwrap()..];
     let row = &row[..row.find("</tr>").unwrap()];
-    // 2 instances (b-both once), 2 partitions, lag 7 + 2.
+    // 2 instances (b-both once), 2 segments, lag 7 + 2.
     for cell in [">2</td>", ">9</td>"] {
         assert!(row.contains(cell), "{cell:?} missing in {row}");
     }
@@ -873,7 +879,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
 // ---- processor control (ADR 0023) -------------------------------------------------------
 
 /// The Processors page shows a paused processor, one stopped for a reset with its operation id
-/// and one that replays (with the end of each partition's replay range); without a write
+/// and one that replays (with the end of each segment's replay range); without a write
 /// credential it offers the write-token field and no control buttons.
 #[tokio::test]
 async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the_write_token() {
@@ -888,10 +894,10 @@ async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the
     let mut replaying = processor(
         "default",
         ProcessorState::ProcessorRunning,
-        vec![partition(0, 30, 30, 90), partition(1, 5, 5, 5)],
+        vec![segment(0, 30, 30, 90), segment(1, 5, 5, 5)],
     );
     replaying.replaying = true;
-    replaying.partitions[0].replay_until = 77;
+    replaying.segments[0].replay_until = "77".to_string();
     let mut stopped = processor("orders", ProcessorState::ProcessorStopped, vec![]);
     stopped.operation_id = "0f3c9a1e-7d2b-4c1a-9e8f-5a6b7c8d9e0f".to_string();
     b1.status_with_processors(
@@ -943,6 +949,197 @@ async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the
     drop(b1);
 }
 
+/// Enters `token` in the Processors page's write-token field (as an operator does), once the page
+/// rendered, and waits for the control buttons.
+fn enable_controls(devtools: &mut Devtools, token: &str) {
+    devtools.wait_for(
+        "document.getElementById('write-token') ? 'field' : ''",
+        "field",
+        Duration::from_secs(30),
+    );
+    devtools.eval(&format!(
+        "(() => {{ const i = document.getElementById('write-token'); i.value = {}; i.form.requestSubmit(); return 'ok'; }})()",
+        serde_json::Value::from(token)
+    ));
+    devtools.wait_for(
+        "document.querySelector('table.processors')?.outerHTML ?? ''",
+        ">Pause</button>",
+        Duration::from_secs(30),
+    );
+}
+
+/// The text of each Processors row (one per processor), with its HTML.
+fn processor_rows(devtools: &mut Devtools) -> Vec<(String, String)> {
+    let rows = devtools.eval(
+        "[...document.querySelectorAll('table.processors > tbody > tr:not(.detail)')].map((r) => [r.textContent, r.outerHTML])",
+    );
+    serde_json::from_value(rows).unwrap()
+}
+
+/// With a write credential the page offers a reset only for a processor whose event store
+/// declares the `replay` capability (ADR 0027); pause and resume stay for every processor. The
+/// event store shows in its column, with its capabilities in the title.
+#[tokio::test]
+async fn reset_offered_only_with_replay_capability() {
+    use kraken_hub::proto::ProcessorState;
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(config()).await;
+    let http: SocketAddr = http.unwrap();
+    let b1 = register_as(grpc, "service-b", "b-1").await;
+    let mut queue = processor("audit", ProcessorState::ProcessorRunning, vec![]);
+    queue.event_store = "queue-x".to_string();
+    queue.capabilities = vec!["lag".to_string()];
+    let mut silent = processor("billing", ProcessorState::ProcessorPaused, vec![]);
+    silent.event_store = String::new();
+    silent.capabilities = vec![];
+    b1.status_with_processors(
+        &["hub"],
+        vec![
+            processor("orders", ProcessorState::ProcessorRunning, vec![]),
+            queue,
+            silent,
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _slots = take_stream_slots(http).await;
+    let profile =
+        std::env::temp_dir().join(format!("kraken-hub-ui-replay-cap-{}", std::process::id()));
+    let page = format!("http://{http}/ui/#/processors");
+    let dir = profile.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let mut devtools = Devtools::launch(&browser, &dir);
+        devtools.open(&page);
+        enable_controls(&mut devtools, "any-write-token");
+        processor_rows(&mut devtools)
+    })
+    .await
+    .unwrap();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|(text, _)| text.contains(name))
+            .unwrap_or_else(|| panic!("no {name} row in {rows:?}"))
+            .1
+            .clone()
+    };
+    let orders = row("orders");
+    assert!(orders.contains(">Reset…</button>"), "{orders}");
+    assert!(orders.contains(">Pause</button>"), "{orders}");
+    assert!(
+        orders.contains("title=\"Capabilities: browse, lag, native-dead-letter, replay\""),
+        "{orders}"
+    );
+    let audit = row("audit");
+    assert!(!audit.contains(">Reset…</button>"), "{audit}");
+    assert!(audit.contains(">no reset</span>"), "{audit}");
+    assert!(audit.contains(">Pause</button>"), "{audit}");
+    assert!(
+        audit.contains("title=\"Capabilities: lag\">queue-x</td>"),
+        "{audit}"
+    );
+    let billing = row("billing");
+    assert!(!billing.contains(">Reset…</button>"), "{billing}");
+    assert!(billing.contains(">Resume</button>"), "{billing}");
+    let _ = std::fs::remove_dir_all(&profile);
+    drop(b1);
+}
+
+/// An instance answers a reset its event store cannot do with `CONTROL_REFUSAL_UNSUPPORTED`
+/// (ADR 0027): the API answers 409 with the code and the instance's reason, and the Processors
+/// page shows both on its status line.
+#[tokio::test]
+async fn unsupported_refusal_reaches_the_dashboard() {
+    use common::control::{ControlClient, Reaction, default_result, refused};
+    use kraken_hub::proto::{ControlRefusal, control_request};
+    const WRITE: &str = "write-token-0123456789abcdef";
+    const WHY: &str = "this event store cannot seek by time";
+    let (grpc, http) = common::start_hub_with_http(Config {
+        dashboard_write_token: Some(kraken_hub::auth::Secret::new(WRITE)),
+        ..config()
+    })
+    .await;
+    let http: SocketAddr = http.unwrap();
+    let b1 = ControlClient::new(
+        grpc,
+        "service-b",
+        "b-1",
+        &["audit"],
+        std::sync::Arc::new(
+            |req: &kraken_hub::proto::ControlRequest| match &req.action {
+                Some(control_request::Action::ResetExecute(_)) => {
+                    Reaction::Reply(refused(ControlRefusal::Unsupported, WHY))
+                }
+                _ => Reaction::Reply(default_result(req)),
+            },
+        ),
+    )
+    .await;
+
+    let auth = format!("Bearer {WRITE}");
+    let r = common::http_send(
+        http,
+        "POST",
+        "/api/v1/services/service-b/processors/audit/reset",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &auth),
+        ],
+        br#"{"to":{"timestampMs":1762250000000}}"#,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(body["outcome"], "failed");
+    assert_eq!(
+        body["error"],
+        serde_json::json!({
+            "stage": "execute", "instanceId": "b-1", "result": "refused",
+            "code": "UNSUPPORTED", "message": WHY,
+        })
+    );
+
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let _slots = take_stream_slots(http).await;
+    let profile =
+        std::env::temp_dir().join(format!("kraken-hub-ui-unsupported-{}", std::process::id()));
+    let page = format!("http://{http}/ui/#/processors");
+    let dir = profile.clone();
+    let line = tokio::task::spawn_blocking(move || {
+        let mut devtools = Devtools::launch(&browser, &dir);
+        devtools.open(&page);
+        enable_controls(&mut devtools, WRITE);
+        devtools.eval(
+            "[...document.querySelectorAll('table.processors button')].find((b) => b.textContent === 'Reset…').click()",
+        );
+        devtools.wait_for(
+            "document.querySelector('dialog.confirm') ? 'open' : ''",
+            "open",
+            Duration::from_secs(10),
+        );
+        devtools.eval("document.querySelector('dialog.confirm button.danger').click()");
+        devtools.wait_for(
+            "document.querySelector('.control-status')?.textContent ?? ''",
+            "UNSUPPORTED",
+            Duration::from_secs(30),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        line,
+        format!("HTTP 409: refused UNSUPPORTED: {WHY} (instance b-1)")
+    );
+    let _ = std::fs::remove_dir_all(&profile);
+    drop(b1);
+}
+
 /// The Dead letters page: the processors that keep letters, and one processor's letters as an
 /// instance lists them through the hub, without retry or discard buttons until a write
 /// credential is held.
@@ -959,9 +1156,9 @@ async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
     let letter = |id: &str, reason: &str, blocked_by: &str| DeadLetterSummary {
         id: id.to_string(),
         processor: "audit".to_string(),
-        topic: "kraken.events".to_string(),
-        partition: 2,
-        offset: 41,
+        source: "kraken.events".to_string(),
+        segment: "2".to_string(),
+        position: "41".to_string(),
         key: "order-7".to_string(),
         event_id: "evt-1".to_string(),
         event_type: "examples.OrderPlaced".to_string(),

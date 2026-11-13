@@ -169,25 +169,31 @@ fn instance_row(i: &InstanceTopology, now_ms: i64) -> Vec<String> {
     ]
 }
 
-/// Partition numbers (sorted) with runs collapsed: `0-2,5,7-8`; `-` when none.
-fn partition_ranges(partitions: &[i32]) -> String {
-    let mut runs: Vec<(i32, i32)> = Vec::new();
-    for &p in partitions {
-        match runs.last_mut() {
-            Some((_, end)) if p == end.saturating_add(1) => *end = p,
-            _ => runs.push((p, p)),
+/// Segment names (sorted) with runs of consecutive decimal names collapsed: `0-2,5,7-8`; other
+/// names as they are; `-` when none.
+fn segment_ranges(segments: &[&str]) -> String {
+    enum Run<'a> {
+        Numbers(u64, u64),
+        Name(&'a str),
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for &s in segments {
+        // Only a canonical decimal name joins a run: `01` stays as it is.
+        let number = s.parse::<u64>().ok().filter(|n| n.to_string() == s);
+        match (runs.last_mut(), number) {
+            (Some(Run::Numbers(_, end)), Some(n)) if n == end.saturating_add(1) => *end = n,
+            (_, Some(n)) => runs.push(Run::Numbers(n, n)),
+            (_, None) => runs.push(Run::Name(s)),
         }
     }
     if runs.is_empty() {
         return "-".into();
     }
     runs.iter()
-        .map(|(a, b)| {
-            if a == b {
-                a.to_string()
-            } else {
-                format!("{a}-{b}")
-            }
+        .map(|run| match run {
+            Run::Numbers(a, b) if a == b => a.to_string(),
+            Run::Numbers(a, b) => format!("{a}-{b}"),
+            Run::Name(s) => s.to_string(),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -228,7 +234,7 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
     for i in instances {
         for p in &i.processors {
             let known: Vec<i64> = p
-                .partitions
+                .segments
                 .iter()
                 .map(|x| x.lag)
                 .filter(|l| *l >= 0)
@@ -263,7 +269,7 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
                 }
                 text
             };
-            let partitions: Vec<i32> = p.partitions.iter().map(|x| x.partition).collect();
+            let segments: Vec<&str> = p.segments.iter().map(|x| x.segment.as_str()).collect();
             rows.push((
                 p.name.clone(),
                 i.instance_id.clone(),
@@ -271,9 +277,9 @@ fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String
                     p.name.clone(),
                     i.instance_id.clone(),
                     state_cell(p),
-                    p.group_id.clone(),
-                    p.topic.clone(),
-                    partition_ranges(&partitions),
+                    p.subscription.clone(),
+                    p.source.clone(),
+                    segment_ranges(&segments),
                     lag,
                     p.processed_total.to_string(),
                     p.failed_total.to_string(),
@@ -321,9 +327,9 @@ pub fn render_table(t: &Topology) -> String {
                     "processor",
                     "instance",
                     "state",
-                    "group",
-                    "topic",
-                    "partitions",
+                    "subscription",
+                    "source",
+                    "segments",
                     "lag",
                     "processed",
                     "failed",
@@ -645,16 +651,13 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
 
     #[test]
     fn render_table_lists_the_processors_of_a_service_that_reports_them() {
-        use crate::processors::{PartitionReport, ProcessorReport, ProcessorStateName};
-        let parts = |list: &[(i32, i64)]| {
+        use crate::processors::{ProcessorReport, ProcessorStateName, SegmentReport};
+        let parts = |list: &[(&str, i64)]| {
             list.iter()
-                .map(|(p, lag)| PartitionReport {
-                    partition: *p,
-                    position: 0,
-                    committed: 0,
-                    high_watermark: 0,
+                .map(|(s, lag)| SegmentReport {
+                    segment: s.to_string(),
                     lag: *lag,
-                    replay_until: 0,
+                    ..Default::default()
                 })
                 .collect::<Vec<_>>()
         };
@@ -662,10 +665,10 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         t.services[0].instances[0].processors = vec![
             ProcessorReport {
                 name: "default".into(),
-                group_id: "billing".into(),
-                topic: "kraken.events".into(),
+                subscription: "billing".into(),
+                source: "kraken.events".into(),
                 state: ProcessorStateName::Running,
-                partitions: parts(&[(0, 2), (1, -1), (2, 10), (5, 0)]),
+                segments: parts(&[("0", 2), ("1", -1), ("2", 10), ("5", 0)]),
                 processed_total: 120,
                 dead_letters: 3,
                 dead_letter_mode: "collection".into(),
@@ -673,22 +676,22 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
             },
             ProcessorReport {
                 name: "invoices".into(),
-                group_id: "billing.invoices".into(),
-                topic: "kraken.events".into(),
+                subscription: "billing.invoices".into(),
+                source: "kraken.events".into(),
                 state: ProcessorStateName::Failing,
-                partitions: parts(&[(3, -1)]),
+                segments: parts(&[("3", -1)]),
                 processed_total: 7,
                 failed_total: 2,
                 last_error: format!("handler failed: {}", "x".repeat(80)),
                 last_error_at_ms: 200_000_000 - 125_000,
-                dead_letter_mode: "topic".into(),
+                dead_letter_mode: "event-store".into(),
                 ..Default::default()
             },
         ];
         t.services[0].instances[1].processors = vec![ProcessorReport {
             name: "default".into(),
-            group_id: "billing".into(),
-            topic: "kraken.events".into(),
+            subscription: "billing".into(),
+            source: "kraken.events".into(),
             state: ProcessorStateName::Starting,
             dead_letter_mode: "collection".into(),
             ..Default::default()
@@ -698,10 +701,10 @@ service billing (2 instances)
   instance | connected for | heartbeat age | stale | in-flight h/s | commands   | queries
   b-1      | 1h05m         | 800ms         | false | 0/1           | Pay,Refund | GetInvoice
   b-2      | 3m05s         | 45s           | true  | 2/0           | -          | -
-  processor | instance | state    | group            | topic         | partitions | lag | processed | failed | dead letters | last error
-  default   | b-1      | RUNNING  | billing          | kraken.events | 0-2,5      | 12  | 120       | 0      | 3            | -
-  default   | b-2      | STARTING | billing          | kraken.events | -          | -   | 0         | 0      | 0            | -
-  invoices  | b-1      | FAILING  | billing.invoices | kraken.events | 3          | -   | 7         | 2      | (topic)      | handler failed: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (2m05s ago)
+  processor | instance | state    | subscription     | source        | segments | lag | processed | failed | dead letters  | last error
+  default   | b-1      | RUNNING  | billing          | kraken.events | 0-2,5    | 12  | 120       | 0      | 3             | -
+  default   | b-2      | STARTING | billing          | kraken.events | -        | -   | 0         | 0      | 0             | -
+  invoices  | b-1      | FAILING  | billing.invoices | kraken.events | 3        | -   | 7         | 2      | (event-store) | handler failed: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (2m05s ago)
 
 service catalog (1 instances)
   instance | connected for | heartbeat age | stale | in-flight h/s | commands | queries
@@ -786,7 +789,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
     }
 
     /// Every name in the table comes from a client (a service name, an instance id, a type, a
-    /// processor's name, group and topic, an operation id): none of them can break a line or send
+    /// processor's name, subscription and source, an operation id): none of them can break a line or send
     /// an escape to the terminal.
     #[test]
     fn client_text_in_any_cell_or_header_stays_on_its_line() {
@@ -800,11 +803,11 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         i.query_types = vec![bad("GetInvoice")];
         i.processors = vec![ProcessorReport {
             name: bad("audit"),
-            group_id: bad("billing.audit"),
-            topic: bad("kraken.events"),
+            subscription: bad("billing.audit"),
+            source: bad("kraken.events"),
             operation_id: bad("op"),
             state: ProcessorStateName::Running,
-            dead_letter_mode: bad("topic"),
+            dead_letter_mode: bad("log"),
             ..Default::default()
         }];
         t.types[1].type_name = bad("Archive");
@@ -829,7 +832,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
             table.contains("\n  audit [2J x | b-1 [2J x | RUNNING op op [2J | billing.audit [2J x | kraken.events [2J x |"),
             "{table}"
         );
-        assert!(table.contains("| (topic [2J x) |"), "{table}");
+        assert!(table.contains("| (log [2J x)  |"), "{table}");
         assert!(
             table.contains("\n  Archive [2J x COMMAND owner=archive [2J x for 2m05s\n"),
             "{table}"
@@ -837,10 +840,14 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
     }
 
     #[test]
-    fn partition_lists_collapse_runs() {
-        assert_eq!(partition_ranges(&[]), "-");
-        assert_eq!(partition_ranges(&[4]), "4");
-        assert_eq!(partition_ranges(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
+    fn segment_lists_collapse_decimal_runs() {
+        assert_eq!(segment_ranges(&[]), "-");
+        assert_eq!(segment_ranges(&["4"]), "4");
+        assert_eq!(segment_ranges(&["0", "1", "2", "5", "7", "8"]), "0-2,5,7-8");
+        assert_eq!(
+            segment_ranges(&["0", "1", "01", "2", "events-a", "events-b"]),
+            "0-1,01,2,events-a,events-b"
+        );
     }
 
     #[test]

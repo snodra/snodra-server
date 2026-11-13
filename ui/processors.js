@@ -1,6 +1,7 @@
 // Event processors (ADR 0022): the merge of /api/v1/processors over the reachable hubs and the
 // per-processor aggregate, with the rules of the hub's processors.rs (since P6b, ADR 0023, also
-// whether a processor replays and the reset operation holding its lock). The page always
+// whether a processor replays and the reset operation holding its lock; since ADR 0027, its event
+// store and that store's capabilities). Segments and positions are opaque strings: shown as text. The page always
 // re-aggregates from the per-instance reports, so one hub and many hubs take the same path. An
 // instance seen by several hubs counts once: its freshest report (lowest statusAgeMs) wins.
 // Everything a hub sends is data: it is checked for shape and rendered as text by the page.
@@ -8,7 +9,24 @@
 const arr = (x) => (Array.isArray(x) ? x : []);
 const str = (x) => (typeof x === 'string' ? x : '');
 const count = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
-const offset = (x) => (Number.isFinite(x) && x >= -1 ? x : -1);
+const lagOf = (x) => (Number.isFinite(x) && x >= -1 ? x : -1);
+
+/** The order of segment names, as processors.rs `segment_order`: decimal names by value, before
+ * any other name; other names, and equal values, by their characters. */
+export function segmentOrder(a, b) {
+  const decimal = (s) => (/^\d+$/.test(s) ? BigInt(s) : null);
+  const [x, y] = [decimal(a), decimal(b)];
+  if (x !== null && y !== null && x !== y) return x < y ? -1 : 1;
+  if (x !== null && y === null) return -1;
+  if (x === null && y !== null) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The capability that offers a reset (and so a replay) of a processor (ADR 0027). */
+export const REPLAY = 'replay';
+
+/** The processor's event store declares `capability`. */
+export const can = (p, capability) => p.capabilities.includes(capability);
 
 /** Worse states rank higher; a name this page does not know is UNSPECIFIED. */
 const SEVERITY = { FAILING: 5, UNSPECIFIED: 4, STARTING: 3, PAUSED: 2, STOPPED: 1, RUNNING: 0 };
@@ -30,8 +48,10 @@ function instanceOf(i) {
     instanceId: i.instanceId,
     statusAgeMs: Number.isFinite(i.statusAgeMs) && i.statusAgeMs >= 0 ? i.statusAgeMs : Number.MAX_SAFE_INTEGER,
     state: stateOf(i.state),
-    groupId: str(i.groupId),
-    topic: str(i.topic),
+    subscription: str(i.subscription),
+    source: str(i.source),
+    eventStore: str(i.eventStore),
+    capabilities: [...new Set(arr(i.capabilities).filter((c) => typeof c === 'string' && c))].sort(),
     deadLetterMode: str(i.deadLetterMode),
     processedTotal: count(i.processedTotal),
     failedTotal: count(i.failedTotal),
@@ -39,17 +59,17 @@ function instanceOf(i) {
     lastError: str(i.lastError),
     lastErrorAtMs: count(i.lastErrorAtMs),
     eventTypes: arr(i.eventTypes).filter((t) => typeof t === 'string'),
-    partitions: arr(i.partitions)
-      .filter((p) => p && Number.isInteger(p.partition) && p.partition >= 0)
-      .map((p) => ({
-        partition: p.partition,
-        position: offset(p.position),
-        committed: offset(p.committed),
-        highWatermark: offset(p.highWatermark),
-        lag: offset(p.lag),
-        replayUntil: count(p.replayUntil),
+    segments: arr(i.segments)
+      .filter((s) => s && typeof s.segment === 'string' && s.segment !== '')
+      .map((s) => ({
+        segment: s.segment,
+        position: str(s.position),
+        committed: str(s.committed),
+        head: str(s.head),
+        lag: lagOf(s.lag),
+        replayUntil: str(s.replayUntil),
       }))
-      .sort((a, b) => a.partition - b.partition),
+      .sort((a, b) => segmentOrder(a.segment, b.segment)),
     replaying: i.replaying === true,
     operationId: str(i.operationId),
     seenBy: arr(i.seenBy),
@@ -63,10 +83,10 @@ export function aggregate(name, instances) {
   const freshest = byFreshness[0];
   let state = 'RUNNING';
   for (const i of list) if (SEVERITY[i.state] > SEVERITY[state]) state = i.state;
-  // Each partition as the freshest instance that reports it has it.
-  const partitions = new Map();
-  for (const i of byFreshness) for (const p of i.partitions) if (!partitions.has(p.partition)) partitions.set(p.partition, p);
-  const known = [...partitions.values()].map((p) => p.lag).filter((l) => l >= 0);
+  // Each segment as the freshest instance that reports it has it.
+  const segments = new Map();
+  for (const i of byFreshness) for (const s of i.segments) if (!segments.has(s.segment)) segments.set(s.segment, s);
+  const known = [...segments.values()].map((s) => s.lag).filter((l) => l >= 0);
   let lastError = null;
   for (const i of list) {
     if (!i.lastError) continue;
@@ -76,12 +96,14 @@ export function aggregate(name, instances) {
   }
   return {
     name,
-    groupId: freshest.groupId,
-    topic: freshest.topic,
+    subscription: freshest.subscription,
+    source: freshest.source,
+    eventStore: freshest.eventStore,
+    capabilities: freshest.capabilities,
     deadLetterMode: freshest.deadLetterMode,
     state,
     instancesReporting: list.length,
-    assignedPartitions: partitions.size,
+    assignedSegments: segments.size,
     lag: known.length ? known.reduce((a, l) => a + l, 0) : null,
     deadLetters: Math.max(0, ...list.map((i) => i.deadLetters)),
     processedTotal: list.reduce((a, i) => a + i.processedTotal, 0),

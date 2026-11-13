@@ -1,4 +1,4 @@
-//! Event processors, hub side (ADR 0022): a client reports its Kafka event processors in
+//! Event processors, hub side (ADR 0022, 0027): a client reports its event processors in
 //! `InstanceStatus.processors`; the hub keeps the latest report per session (bounded, never an
 //! error), shows it in the topology (gRPC, `/api/v1/topology`) and aggregates it per service in
 //! `/api/v1/processors`.
@@ -12,7 +12,7 @@ use common::{FakeClient, http_get, start_hub_with_http};
 use kraken_hub::config::Config;
 use kraken_hub::proto::hub_client::HubClient;
 use kraken_hub::proto::{
-    PartitionStatus, ProcessorState, ProcessorStatus, RegisterAck, TopologyRequest, server_message,
+    ProcessorState, ProcessorStatus, RegisterAck, SegmentStatus, TopologyRequest, server_message,
 };
 use kraken_hub::topology::Topology;
 use serde_json::{Value, json};
@@ -77,38 +77,41 @@ async fn http_json(http: SocketAddr, path: &str) -> Value {
     serde_json::from_str(&body).unwrap()
 }
 
-fn part(partition: i32, position: i64, committed: i64, high_watermark: i64) -> PartitionStatus {
-    PartitionStatus {
-        partition,
-        position,
-        committed,
-        high_watermark,
-        lag: if high_watermark < 0 {
+/// A segment with decimal positions (as the first-wave event stores report them); -1 is unknown
+/// (an empty position on the wire).
+fn part(segment: i32, position: i64, committed: i64, head: i64) -> SegmentStatus {
+    let text = |v: i64| if v < 0 { String::new() } else { v.to_string() };
+    SegmentStatus {
+        segment: segment.to_string(),
+        position: text(position),
+        committed: text(committed),
+        head: text(head),
+        lag: if head < 0 {
             -1
         } else if committed >= 0 {
-            high_watermark - committed
+            head - committed
         } else {
-            high_watermark - position
+            head - position
         },
-        replay_until: 0,
+        replay_until: String::new(),
     }
 }
 
-fn processor(
-    name: &str,
-    state: ProcessorState,
-    partitions: Vec<PartitionStatus>,
-) -> ProcessorStatus {
+fn processor(name: &str, state: ProcessorState, segments: Vec<SegmentStatus>) -> ProcessorStatus {
     ProcessorStatus {
         name: name.to_string(),
-        group_id: if name == "default" {
+        subscription: if name == "default" {
             "service-b".to_string()
         } else {
             format!("service-b.{name}")
         },
-        topic: "kraken.events".to_string(),
+        source: "kraken.events".to_string(),
+        event_store: "kafka".to_string(),
+        capabilities: ["replay", "browse", "lag", "native-dead-letter"]
+            .map(String::from)
+            .to_vec(),
         state: state as i32,
-        partitions,
+        segments,
         dead_letter_mode: "collection".to_string(),
         ..Default::default()
     }
@@ -177,8 +180,8 @@ async fn a_client_reports_processors_and_every_view_shows_them() {
     assert_eq!(i1["processors"][1]["name"], "orders");
     assert_eq!(i1["processors"][1]["state"], "FAILING");
     assert_eq!(
-        i1["processors"][0]["partitions"][1],
-        json!({"partition": 2, "position": -1, "committed": -1, "highWatermark": -1, "lag": -1, "replayUntil": 0})
+        i1["processors"][0]["segments"][1],
+        json!({"segment": "2", "position": "", "committed": "", "head": "", "lag": -1, "replayUntil": ""})
     );
 
     // `/api/v1/processors`: per service and processor, aggregated over the instances.
@@ -192,25 +195,25 @@ async fn a_client_reports_processors_and_every_view_shows_them() {
     let processors = services[0]["processors"].as_array().unwrap();
     let default = &processors[0];
     assert_eq!(default["name"], "default");
-    assert_eq!(default["groupId"], "service-b");
+    assert_eq!(default["subscription"], "service-b");
     assert_eq!(default["state"], "RUNNING");
     assert_eq!(default["instancesReporting"], 1);
-    assert_eq!(default["assignedPartitions"], 2);
-    assert_eq!(default["lag"], 0, "partition 2's unknown lag is left out");
+    assert_eq!(default["assignedSegments"], 2);
+    assert_eq!(default["lag"], 0, "segment 2's unknown lag is left out");
     assert_eq!(default["processedTotal"], 5);
     assert_eq!(default["lastError"], Value::Null);
     let orders = &processors[1];
     assert_eq!(orders["name"], "orders");
-    assert_eq!(orders["groupId"], "service-b.orders");
-    assert_eq!(orders["topic"], "kraken.events");
+    assert_eq!(orders["subscription"], "service-b.orders");
+    assert_eq!(orders["source"], "kraken.events");
     assert_eq!(orders["deadLetterMode"], "collection");
     assert_eq!(
         orders["state"], "FAILING",
         "the worst of FAILING and RUNNING"
     );
     assert_eq!(orders["instancesReporting"], 2);
-    assert_eq!(orders["assignedPartitions"], 2);
-    assert_eq!(orders["lag"], 13, "12 on partition 1 plus 1 on partition 0");
+    assert_eq!(orders["assignedSegments"], 2);
+    assert_eq!(orders["lag"], 13, "12 on segment 1 plus 1 on segment 0");
     assert_eq!(orders["deadLetters"], 2, "the max, not the sum");
     assert_eq!(orders["failedTotal"], 1);
     assert_eq!(orders["eventTypes"], json!(["examples.OrderPlaced"]));
@@ -222,7 +225,7 @@ async fn a_client_reports_processors_and_every_view_shows_them() {
     assert_eq!(members.len(), 2);
     for m in members {
         assert!(m["statusAgeMs"].as_i64().unwrap() >= 0, "{m}");
-        assert!(m["partitions"].is_array(), "{m}");
+        assert!(m["segments"].is_array(), "{m}");
         assert!(m["state"].is_string(), "{m}");
     }
 }
@@ -241,7 +244,7 @@ async fn an_oversized_report_is_cut_and_the_stream_stays_open() {
             )
         })
         .collect();
-    many[0].partitions = (0..1100).map(|p| part(p, 1, 1, 1)).collect();
+    many[0].segments = (0..1100).map(|p| part(p, 1, 1, 1)).collect();
     many[0].event_types = (0..300).map(|i| format!("t.E{i:03}")).collect();
     many[0].last_error = "é".repeat(400);
     many[0].name = "n".repeat(80);
@@ -251,7 +254,7 @@ async fn an_oversized_report_is_cut_and_the_stream_stays_open() {
     let kept = &t.services[0].instances[0].processors;
     assert_eq!(kept.len(), 32);
     assert_eq!(kept[0].name, "n".repeat(64));
-    assert_eq!(kept[0].partitions.len(), 1024);
+    assert_eq!(kept[0].segments.len(), 1024);
     assert_eq!(kept[0].event_types.len(), 256);
     assert_eq!(
         kept[0].last_error,
@@ -301,4 +304,106 @@ async fn a_new_report_replaces_the_list_and_a_reconnect_starts_without_one() {
     sync(&mut again, 3).await;
     let v = http_json(http, "/api/v1/processors").await;
     assert_eq!(v["services"], json!([]), "{v}");
+}
+
+/// The neutral status (ADR 0027): segments named and positioned by opaque strings (sorted with
+/// decimal names by value), the subscription, the source, the event store and its capabilities,
+/// bounded as the proto says (event_store 64 bytes, at most 16 capabilities of 64 bytes, cut at a
+/// UTF-8 boundary), in the topology and in the per-service aggregate.
+#[tokio::test]
+async fn processor_status_reports_segments_and_capabilities() {
+    let (grpc, http) = start_hub_with_http(config()).await;
+    let http = http.unwrap();
+    let mut c = FakeClient::register(grpc, "service-b", &[], &[]).await;
+    let segment =
+        |name: &str, position: &str, head: &str, lag: i64, replay_until: &str| SegmentStatus {
+            segment: name.to_string(),
+            position: position.to_string(),
+            committed: position.to_string(),
+            head: head.to_string(),
+            lag,
+            replay_until: replay_until.to_string(),
+        };
+    let streams = ProcessorStatus {
+        name: "orders".to_string(),
+        subscription: "service-b.orders".to_string(),
+        source: "kraken.events".to_string(),
+        event_store: "rabbitmq-streams".to_string(),
+        capabilities: vec!["replay".to_string(), "lag".to_string()],
+        state: ProcessorState::ProcessorRunning as i32,
+        segments: vec![
+            segment("kraken.events-10", "5", "9", 4, ""),
+            segment("kraken.events-2", "3:abc", "", -1, "7"),
+        ],
+        replaying: true,
+        dead_letter_mode: "event-store".to_string(),
+        ..Default::default()
+    };
+    let mut numbered = processor(
+        "default",
+        ProcessorState::ProcessorRunning,
+        vec![part(10, 1, 1, 2), part(2, 1, 1, 3)],
+    );
+    numbered.event_store = format!("{}é", "k".repeat(63));
+    numbered.capabilities = (0..20).map(|i| format!("cap-{i:02}")).collect();
+    numbered.capabilities.push(format!("{}x", "c".repeat(64)));
+    c.status_with_processors(&["hub-a"], vec![streams, numbered])
+        .await;
+    sync(&mut c, 1).await;
+
+    let t = rpc_topology(grpc).await;
+    let kept = &t.services[0].instances[0].processors;
+    let default = kept.iter().find(|p| p.name == "default").unwrap();
+    assert_eq!(default.event_store, "k".repeat(63), "cut before the é");
+    assert_eq!(default.capabilities.len(), 16, "the first 16 reported");
+    assert_eq!(default.capabilities[0], "cap-00");
+    assert_eq!(
+        default
+            .segments
+            .iter()
+            .map(|s| s.segment.as_str())
+            .collect::<Vec<_>>(),
+        ["2", "10"],
+        "decimal segments by value"
+    );
+
+    let v = http_json(http, "/api/v1/processors").await;
+    let processors = v["services"][0]["processors"].as_array().unwrap();
+    let orders = processors.iter().find(|p| p["name"] == "orders").unwrap();
+    assert_eq!(orders["eventStore"], "rabbitmq-streams");
+    assert_eq!(orders["capabilities"], json!(["lag", "replay"]));
+    assert_eq!(orders["subscription"], "service-b.orders");
+    assert_eq!(orders["source"], "kraken.events");
+    assert_eq!(orders["deadLetterMode"], "event-store");
+    assert_eq!(orders["assignedSegments"], 2);
+    assert_eq!(orders["lag"], 4, "the unknown lag is left out");
+    assert_eq!(orders["replaying"], true);
+    assert_eq!(
+        orders["instances"][0]["segments"],
+        json!([
+            {"segment": "kraken.events-10", "position": "5", "committed": "5", "head": "9", "lag": 4, "replayUntil": ""},
+            {"segment": "kraken.events-2", "position": "3:abc", "committed": "3:abc", "head": "", "lag": -1, "replayUntil": "7"},
+        ]),
+        "positions are opaque text; names that are not decimal sort by their bytes"
+    );
+    let default = processors.iter().find(|p| p["name"] == "default").unwrap();
+    assert_eq!(default["eventStore"], "k".repeat(63));
+    assert_eq!(default["capabilities"].as_array().unwrap().len(), 16);
+
+    // A report without an event store (a library that does not say) is kept as it came.
+    c.status_with_processors(
+        &["hub-a"],
+        vec![ProcessorStatus {
+            name: "bare".to_string(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    sync(&mut c, 2).await;
+    let v = http_json(http, "/api/v1/processors").await;
+    let bare = &v["services"][0]["processors"][0];
+    assert_eq!(
+        (bare["eventStore"].clone(), bare["capabilities"].clone()),
+        (json!(""), json!([]))
+    );
 }

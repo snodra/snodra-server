@@ -851,8 +851,8 @@ mod tests {
     fn processor(name: &str) -> crate::proto::ProcessorStatus {
         crate::proto::ProcessorStatus {
             name: name.to_string(),
-            group_id: "svc".into(),
-            topic: "kraken.events".into(),
+            subscription: "svc".into(),
+            source: "kraken.events".into(),
             state: crate::proto::ProcessorState::ProcessorRunning as i32,
             dead_letter_mode: "collection".into(),
             ..Default::default()

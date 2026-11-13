@@ -223,7 +223,7 @@ Top level:
 | `tags` | map | `Register.tags` |
 | `connectedHubIds` | list of string | `InstanceStatus.connected_hub_ids` as last reported: the hubs the instance holds a stream to; empty when never reported |
 | `statusAgeMs` | int64 | time since that report, ms; `-1` when never reported |
-| `processors` | list | `InstanceStatus.processors` of that report, as kept (see [Event processors](#event-processors)): `name`, `groupId`, `topic`, `state`, `partitions[]` (`partition`, `position`, `committed`, `highWatermark`, `lag`), `processedTotal`, `failedTotal`, `deadLetters`, `lastError`, `lastErrorAtMs`, `eventTypes`, `deadLetterMode`; `[]` when never reported |
+| `processors` | list | `InstanceStatus.processors` of that report, as kept (see [Event processors](#event-processors)): `name`, `subscription`, `source`, `eventStore`, `capabilities`, `state`, `segments[]` (`segment`, `position`, `committed`, `head`, `lag`, `replayUntil`), `processedTotal`, `failedTotal`, `deadLetters`, `lastError`, `lastErrorAtMs`, `eventTypes`, `deadLetterMode`, `replaying`, `operationId`; `[]` when never reported |
 
 `types[]`:
 
@@ -296,7 +296,7 @@ umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 | Services | every service with its event processors (a count linking to the Processors page and a dead-letter badge) and its live instances: instance id, client version, permits, queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
 | Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
 | Settings | hub id, version, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
-| Processors | every (service, processor): group, topic, worst state over its instances, instances, partitions, lag (sum of the known lags), dead letters (or the mode `topic` / `log`), the latest error with its age; a row opens to every instance's report and partitions (position, committed, high watermark, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
+| Processors | every (service, processor): subscription, source, event store (its capabilities in the title), worst state over its instances, instances, segments, lag (sum of the known lags), dead letters (or the mode `event-store` / `log`), the latest error with its age; a row opens to every instance's report and segments (position, committed, head and replay end as text, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)) |
 | Dead letters | the processors that keep letters, and per processor (`#/dead-letters?service=…&processor=…`) its letters as one instance lists them through the hub (no payloads); with a write credential Retry, Retry all and Discard (confirmed). Read on demand, not live |
 | Events | only where the hub reads Kafka: a search form (topic, time presets or from/to, type with `*` prefixes, key, source, correlation id, user id, event id, payload text where payloads are served), results newest first with "Load more" and the scan statistics, a record's headers and payload (pretty-printed JSON) or the reason it is hidden, a tail (new rows drawn once per animation frame, at most 500 kept, pause; `tail=on` in the page's URL opens it tailing); type and correlation id link to a search. This hub only. See [Event browser](#event-browser) |
 | Consumer groups | only where the hub reads Kafka: every group with committed offsets on a topic, by lag, opening to its partitions; a group without members highlighted. The Processors page links each group here |
@@ -414,23 +414,29 @@ picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Event processors
 
-Decision record: umbrella `docs/adr/0022-named-event-processors-status-and-dead-letters.md`. Each
-service instance runs its Kafka event handlers in event processors (`default`, plus one per named processing group,
-each its own consumer group) and reports them every 5 s in `InstanceStatus.processors`. The hub reads no Kafka and stores nothing else: it keeps the latest report per session
-and shows it.
+Decision records: umbrella `docs/adr/0022-named-event-processors-status-and-dead-letters.md` and
+`docs/adr/0027-modular-event-store.md`. Each service instance runs its event handlers in event processors (`default`,
+plus one per named processing group, each its own subscription to the event store) and reports them every 5 s in
+`InstanceStatus.processors`. The hub reads no event store for them and stores nothing else: it keeps the latest report
+per session and shows it.
 
-- **The report.** A client fills `InstanceStatus.processors` (`ProcessorStatus{name, group_id, topic, state,
-  partitions[], processed_total, failed_total, dead_letters, last_error, last_error_at_ms, event_types,
-  dead_letter_mode, replaying, operation_id}`, `PartitionStatus{partition, position, committed, high_watermark, lag,
-  replay_until}`, `-1` for unknown offsets). Each report replaces the list; it is dropped with the session.
-- **Builder call: bounds.** At most 32 processors per report, 1024 partitions and 256 event types each; names are cut
-  at 64 bytes, group id and topic at 256, the last error at 512, an event type at 256, the mode at 32, always at a
-  UTF-8 boundary; an empty or repeated name, a negative or repeated partition and empty event types are dropped;
-  offsets below -1 read as -1; an unknown state number reads as `UNSPECIFIED`. Never an error to the client.
+- **The report.** A client fills `InstanceStatus.processors` (`ProcessorStatus{name, subscription, source,
+  event_store, capabilities, state, segments[], processed_total, failed_total, dead_letters, last_error,
+  last_error_at_ms, event_types, dead_letter_mode, replaying, operation_id}`, `SegmentStatus{segment, position,
+  committed, head, lag, replay_until}`). Segments and positions are opaque strings only the event-store add-on reads
+  (a decimal offset for the first-wave stores), empty when unknown; `lag` is a number, `-1` when unknown. Each report
+  replaces the list; it is dropped with the session.
+- **Builder call: bounds.** At most 32 processors per report, 1024 segments, 16 capabilities and 256 event types each;
+  names are cut at 64 bytes, subscription and source at 256, the event store and a capability at 64, the last error at
+  512, an event type at 256, the mode at 32, always at a UTF-8 boundary. A segment name or a position is never cut (a
+  cut position would be a wrong one): a segment named in more than 128 bytes is dropped and a longer position reads as
+  unknown. An empty or repeated name, an empty or repeated segment, empty capabilities and event types are dropped;
+  lags below -1 read as -1; an unknown state number reads as `UNSPECIFIED`. Never an error to the client. Segments
+  are sorted with decimal names by value (`2` before `10`), then other names.
 - **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /api/v1/topology`, and
   under each service in `kraken-hub --topology` a table with one row per (processor,
-  instance): state, group, topic, partitions as ranges (`0-2,5`), the known lag, processed, failed, dead letters (or
-  `(topic)` / `(log)`), the last error with its age, cut at 60 characters. Every cell and service header of the
+  instance): state, subscription, source, segments (runs of decimal names as ranges, `0-2,5`), the known lag,
+  processed, failed, dead letters (or `(event-store)` / `(log)`), the last error with its age, cut at 60 characters. Every cell and service header of the
   `--topology` table is shown on one line (control characters such as newlines and escapes become spaces, runs of
   them one): names, ids, types and errors all come from clients.
 - **`GET /api/v1/processors`** (dashboard token, CORS for the peers, off with the dashboard):
@@ -438,24 +444,26 @@ and shows it.
   ```json
   { "hubId": "hub-a", "nowMs": 1762250000000,
     "services": [ { "serviceName": "service-b", "deadLetters": 2,
-      "processors": [ { "name": "orders", "groupId": "service-b.orders", "topic": "kraken.events",
+      "processors": [ { "name": "orders", "subscription": "service-b.orders", "source": "kraken.events",
+        "eventStore": "kafka", "capabilities": ["browse", "lag", "native-dead-letter", "replay"],
         "deadLetterMode": "collection", "state": "FAILING", "instancesReporting": 2,
-        "assignedPartitions": 2, "lag": 13, "deadLetters": 2, "processedTotal": 6, "failedTotal": 1,
+        "assignedSegments": 2, "lag": 13, "deadLetters": 2, "processedTotal": 6, "failedTotal": 1,
         "eventTypes": ["examples.OrderPlaced"],
         "lastError": { "message": "handler failed: boom", "atMs": 1762249990000, "instanceId": "b-1" },
-        "instances": [ { "instanceId": "b-1", "statusAgeMs": 1200, "state": "FAILING", "partitions": [ … ], … } ] } ] } ] }
+        "instances": [ { "instanceId": "b-1", "statusAgeMs": 1200, "state": "FAILING", "segments": [ … ], … } ] } ] } ] }
   ```
 
   Per processor: the worst state of its instances (`FAILING`, `UNSPECIFIED`, `STARTING`, `PAUSED`, `STOPPED`,
-  `RUNNING`); `assignedPartitions` counts distinct partitions (one two instances report during a rebalance counts once,
+  `RUNNING`); `assignedSegments` counts distinct segments (one two instances report during a reassignment counts once,
   as the freshest report has it); `lag` sums their known lags (`null` when none is known); `deadLetters` is the
   highest count an instance reported (they all sample the same collection); totals are sums; `lastError` is the most
-  recent; group, topic and mode come from the freshest report. Services without a processor are not listed.
+  recent; subscription, source, event store, capabilities and mode come from the freshest report. Services without a processor are not listed.
 - **Dashboard.** The Processors page re-aggregates `instances[]` in the browser with the same rules
   (`ui/processors.js`), over every reachable peer under "All hubs": an instance two hubs hold counts once, with its
   freshest report (lowest `statusAgeMs`); a peer that does not answer is unreachable. A report also carries
-  `replaying`, `operationId` and per partition `replayUntil`; the page shows PAUSED and STOPPED (with the reset's operation id) and a replaying badge, and with a write credential Pause,
-  Resume and Reset (see [Processor control](#processor-control)).
+  `replaying`, `operationId` and per segment `replayUntil`; the page shows PAUSED and STOPPED (with the reset's
+  operation id) and a replaying badge, and with a write credential Pause, Resume and, only when the processor's event
+  store declares the `replay` capability, Reset (see [Processor control](#processor-control)).
 
 ## Processor control
 
@@ -465,12 +473,12 @@ JSON body is the umbrella's `docs/05-services/hub.md`, "Processor control"). The
 processor, matches each `ClientMessage.control_reply`
 to its request by `control_id` and session, times requests out (`KRAKEN_HUB_CONTROL_TIMEOUT`, 10 s; a reset's execute
 `KRAKEN_HUB_RESET_TIMEOUT`, 120 s), fails them at once when the session leaves, and drops (and counts) replies nobody
-waits for. The state lives in each service's MongoDB (`processor_control`), not in the hub.
+waits for. The state lives in each service's store (`processor_control`), not in the hub.
 
 | Route under `/api/v1/services/{service}/processors/{processor}/` | Credential | Does |
 |---|---|---|
 | `POST pause`, `POST resume` | write | on every instance that reports the processor; 200 with the counts when at least one persisted it |
-| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"offsets":[{"partition":0,"offset":12}]}}` (at most 4 KiB, 1024 offsets) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while this hub runs a reset of the processor |
+| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"positions":[{"segment":"0","position":"12"}]}}` (segments and positions strings of 1 to 128 bytes; at most 4 KiB, 1024 positions) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while this hub runs a reset of the processor |
 | `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the instance with the freshest status |
 | `POST dead-letters/{id}/retry`, `POST dead-letters/retry-all`, `DELETE dead-letters/{id}` | write | the library's retry, retry all and discard |
 
@@ -478,8 +486,9 @@ waits for. The state lives in each service's MongoDB (`processor_control`), not 
   digest) or a static ACL token or JWT whose ACL entry has `control = true`. Neither configured: every write is 403
   `controls are disabled`. The dashboard token never writes; the write token also reads.
 - **Status codes:** 400 bad body, 401 no or an unknown credential, 403 no right or disabled, 404 unknown service or
-  processor (no instance reports it), 409 locked, refused or a reset already running, 502 an instance failed, 504
-  timeout. A refused execute is not always "nothing changed": after the reset handlers ran the
+  processor (no instance reports it), 409 locked, refused (`SUBSCRIBERS_ACTIVE`, `UNSUPPORTED` when the event store
+  lacks the capability, ...) or a reset already running, 502 an instance failed, 504 timeout. The dashboard's status
+  line shows the refusal code and the instance's message. A refused execute is not always "nothing changed": after the reset handlers ran the
   instance's message says what changed, and an execute that timed out (504) or whose instance left (502) may still
   finish or may already have run reset handlers or deleted markers (its `error.message` says so). The finish goes out
   once the lease renewals in flight are answered, so a late renewal never re-takes the lock.

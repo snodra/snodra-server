@@ -164,7 +164,7 @@ pub struct Config {
     /// positive, at most [`Config::control_lease`] minus [`Config::control_lease_renew`].
     pub control_timeout: Duration,
     /// How long the instance that executes a reset may take (its reset handlers, the marker
-    /// deletion and the offset commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
+    /// deletion and the position commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
     pub reset_timeout: Duration,
     /// The lease a reset's prepare asks for: an instance that hears nothing more for this long
     /// releases the operation lock and consumes again. Not an environment variable: 30 s,
