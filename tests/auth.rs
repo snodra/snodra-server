@@ -187,6 +187,40 @@ async fn enforce_refuses_a_handled_type_outside_handle_and_names_it() {
 }
 
 #[tokio::test]
+async fn enforce_refuses_kraken_events_types_without_the_event_browser_right() {
+    let dir = TempDir::new();
+    let browser = format!(
+        "{}event-browser = true\n\n",
+        acl_entry("tok-browser", "kraken-event-browser", &[], &[])
+    );
+    let file = dir.write("acl.toml", &[acl(), browser].concat());
+    let addr = start_hub(auth_config(AuthMode::Enforce, &file)).await;
+    // `ops` handles `*`, which does not reach the reserved namespace: the whole Register is
+    // refused, naming the type and the right.
+    let s = Spec {
+        commands: vec!["ops.Run"],
+        queries: vec!["kraken.events.Search"],
+        ..spec("ops", Some("tok-ops"))
+    };
+    let mut c = FakeClient::register_spec(addr, &s).await;
+    let status = c.expect_closed().await;
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status.message().contains("kraken.events.Search")
+            && status.message().contains("event-browser right"),
+        "{}",
+        status.message()
+    );
+    // The entry with the right registers the browser's queries.
+    let s = Spec {
+        queries: vec!["kraken.events.Search", "kraken.events.Tail"],
+        ..spec("kraken-event-browser", Some("tok-browser"))
+    };
+    let mut c = FakeClient::register_spec(addr, &s).await;
+    c.expect_ack().await;
+}
+
+#[tokio::test]
 async fn a_refused_registration_leaves_nothing_behind() {
     let dir = TempDir::new();
     let file = dir.write("acl.toml", &acl());

@@ -559,7 +559,9 @@ send    = ["orders.*"]               # types it may send, in every request mode
 ```
 
 Patterns are an exact type, `prefix.*` or `*`. `control = true` lets the entry's credentials call the
-[processor controls](#processor-control); `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
+[processor controls](#processor-control); `event-browser = true` lets them register the event browser's
+reserved `kraken.events.*` query types (`kraken-event-browser`), which no `handle` pattern grants, not even
+`*`; `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
 `printf %s "$TOKEN" | kraken-hub acl hash -` (or `kraken-hub acl hash <token>`).
 
 | Violation | `enforce` | `permissive` |
@@ -572,6 +574,7 @@ Patterns are an exact type, `prefix.*` or `*`. `control = true` lets the entry's
 | a JWT whose `kid` is not in the key set and no fetch made for it has looked yet (a rotation) | `UNAVAILABLE` "signing key not known yet" (clients retry at the normal backoff); `UNAUTHENTICATED` "unknown signing key" once a fetch made for it found it missing | the same, counted (`jwks_unavailable` / `jwt_invalid`) |
 | a JWT session past `exp` + `KRAKEN_HUB_JWT_EXPIRY_GRACE` without a refresh | stream closed with `UNAUTHENTICATED` "credentials expired" | counted once (`expired`), logged once, session kept |
 | a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
+| a handled `kraken.events.*` type without `event-browser = true` | stream closed with `PERMISSION_DENIED` "service `<s>` may not handle type `<t>`: kraken.events.* types need the event-browser right" | logged, counted (`event_browser_denied`), allowed |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription) | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
 | the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
@@ -605,7 +608,7 @@ the service, never from a `[[token]]` entry (and `[[service]]` tables never appl
 ```toml
 [[service]]
 name   = "billing-service"   # the token's azp, unique among [[service]]
-handle = ["billing.*"]       # the same patterns, `control` and `contexts` as [[token]]
+handle = ["billing.*"]       # the same patterns, `control`, `event-browser` and `contexts` as [[token]]
 send   = ["orders.*"]
 ```
 
