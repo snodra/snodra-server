@@ -478,7 +478,7 @@ waits for. The state lives in each service's store (`processor_control`), not in
 | Route under `/api/v1/services/{service}/processors/{processor}/` | Credential | Does |
 |---|---|---|
 | `POST pause`, `POST resume` | write | on every instance that reports the processor; 200 with the counts when at least one persisted it |
-| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"positions":[{"segment":"0","position":"12"}]}}` (segments and positions strings of 1 to 128 bytes; at most 4 KiB, 1024 positions) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front (409) while this hub runs a reset of the processor |
+| `POST reset` with `{"to":"earliest"}`, `{"to":"latest"}`, `{"to":{"timestampMs":n}}` or `{"to":{"positions":[{"segment":"0","position":"12"}]}}` (segments and positions strings of 1 to 128 bytes; at most 1024 positions and a 64 KiB body, room for 1024 decimal segments with 20-digit positions; every other control body at most 4 KiB) | write | prepare every instance (lease 30 s, renewed every 10 s), execute on the freshest, finish all; refused up front, no instance asked: 409 while this hub runs a reset of the processor, and 409 `UNSUPPORTED` when the freshest report's event store does not declare the `replay` capability (ADR 0027) |
 | `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the instance with the freshest status |
 | `POST dead-letters/{id}/retry`, `POST dead-letters/retry-all`, `DELETE dead-letters/{id}` | write | the library's retry, retry all and discard |
 

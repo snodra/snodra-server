@@ -133,14 +133,26 @@ impl ProcessorStateName {
     }
 }
 
-/// The order of segment names: decimal names by value (`2` before `10`), before any other name;
-/// other names, and equal values, by their bytes.
+/// The digits of a decimal segment name without its leading zeros (`""` for zero); `None` when
+/// the name is not decimal (empty, or anything but ASCII digits: a sign included).
+fn decimal_digits(name: &str) -> Option<&str> {
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| name.trim_start_matches('0'))
+}
+
+/// The order of segment names: decimal names (only ASCII digits) by value, of any length
+/// (`2` before `10`), before any other name; other names, and equal values (`007` and `7`), by
+/// their bytes. `ui/processors.js` `segmentOrder` is the same rule.
 pub fn segment_order(a: &str, b: &str) -> Ordering {
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(x), Ok(y)) => x.cmp(&y).then_with(|| a.cmp(b)),
-        (Ok(_), Err(_)) => Ordering::Less,
-        (Err(_), Ok(_)) => Ordering::Greater,
-        (Err(_), Err(_)) => a.cmp(b),
+    match (decimal_digits(a), decimal_digits(b)) {
+        (Some(x), Some(y)) => x
+            .len()
+            .cmp(&y.len())
+            .then_with(|| x.cmp(y))
+            .then_with(|| a.cmp(b)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
     }
 }
 
@@ -209,8 +221,9 @@ fn lag(v: i64) -> i64 {
     v.max(-1)
 }
 
-/// A position as kept: one longer than [`MAX_SEGMENT_BYTES`] reads as unknown (empty).
-pub fn bounded_position(p: &str) -> String {
+/// A position (or a segment name where it is only shown) as kept: never cut, one longer than
+/// [`MAX_SEGMENT_BYTES`] reads as unknown (empty).
+pub fn kept_whole(p: &str) -> String {
     if p.len() > MAX_SEGMENT_BYTES {
         String::new()
     } else {
@@ -252,11 +265,11 @@ impl ProcessorReport {
             }
             segments.push(SegmentReport {
                 segment: seg.segment.clone(),
-                position: bounded_position(&seg.position),
-                committed: bounded_position(&seg.committed),
-                head: bounded_position(&seg.head),
+                position: kept_whole(&seg.position),
+                committed: kept_whole(&seg.committed),
+                head: kept_whole(&seg.head),
                 lag: lag(seg.lag),
-                replay_until: bounded_position(&seg.replay_until),
+                replay_until: kept_whole(&seg.replay_until),
             });
         }
         segments.sort_by(|a, b| segment_order(&a.segment, &b.segment));
@@ -608,6 +621,40 @@ mod tests {
         let mut names = vec!["b", "10", "a", "2", "02", "0", "kraken.events-1"];
         names.sort_by(|a, b| segment_order(a, b));
         assert_eq!(names, ["0", "02", "2", "10", "a", "b", "kraken.events-1"]);
+        // Only ASCII digits are decimal (no sign); any length compares by value, no overflow;
+        // equal values by their bytes. ui/processors.js sorts this list the same way.
+        let mut names = vec![
+            "b",
+            "+5",
+            "7",
+            "99999999999999999999999",
+            "007",
+            "18446744073709551616",
+            "10",
+            "a",
+            "0",
+            "",
+            "00",
+            "5",
+        ];
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(
+            names,
+            [
+                "0",
+                "00",
+                "5",
+                "007",
+                "7",
+                "10",
+                "18446744073709551616",
+                "99999999999999999999999",
+                "",
+                "+5",
+                "a",
+                "b",
+            ]
+        );
     }
 
     #[test]

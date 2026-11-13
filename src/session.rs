@@ -153,6 +153,10 @@ pub struct ProcessorHolder {
     pub token: u64,
     /// When the hub received the status that lists the processor.
     pub reported_at: Instant,
+    /// The event store that status names for the processor (ADR 0027); empty when it names none.
+    pub event_store: String,
+    /// That event store declares the `replay` capability (a reset is offered only then).
+    pub replay: bool,
 }
 
 /// What the ACL check of a reload needs to know about a session.
@@ -571,12 +575,14 @@ impl Sessions {
             }
             known = true;
             let Some(status) = &s.status else { continue };
-            if status.processors.iter().any(|p| p.name == processor) {
+            if let Some(p) = status.processors.iter().find(|p| p.name == processor) {
                 holders.push(ProcessorHolder {
                     context: s.context.clone(),
                     instance_id: id.clone(),
                     token: s.token,
                     reported_at: status.at,
+                    event_store: p.event_store.clone(),
+                    replay: p.can(crate::processors::CAPABILITY_REPLAY),
                 });
             }
         }

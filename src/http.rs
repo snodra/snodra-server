@@ -585,8 +585,11 @@ async fn api_consumer_groups(
 
 /// Every control route starts here.
 const PROCESSOR: &str = "/api/v1/services/{service}/processors/{processor}";
-/// The largest body a control call takes (a reset with its offsets).
+/// The largest body a control call but a reset takes.
 pub const MAX_CONTROL_BODY: usize = 4096;
+/// The largest body a reset takes: room for [`crate::control::MAX_POSITIONS`] positions with
+/// decimal segments and positions (a 1024-segment source with 20-digit positions is about 54 KiB).
+pub const MAX_RESET_BODY: usize = 64 * 1024;
 
 /// The status code of a verdict.
 fn status_of(verdict: Verdict) -> StatusCode {
@@ -631,6 +634,24 @@ fn error_json(status: StatusCode, error: &str) -> Response {
     )
 }
 
+/// The answer to a call the hub refused before asking any instance: why, and the refusal code
+/// when it has one (`UNSUPPORTED`), shaped like an instance's refusal.
+fn refusal_json(refusal: &crate::control::Refusal, service: &str, processor: &str) -> Response {
+    let message = refusal.message(service, processor);
+    answer_json(
+        status_of(refusal.verdict()),
+        &ErrorBody {
+            error: &message,
+            instance_id: None,
+            answer: refusal.code().map(|code| AnswerView {
+                result: "refused",
+                code: Some(code),
+                message: message.clone(),
+            }),
+        },
+    )
+}
+
 /// Runs a control call to the end even when the caller hangs up (a reset half done would hold
 /// every instance until the lease ran out), then answers.
 async fn detached(call: impl Future<Output = Response> + Send + 'static) -> Response {
@@ -640,7 +661,7 @@ async fn detached(call: impl Future<Output = Response> + Send + 'static) -> Resp
 }
 
 /// Judges the write credential of a mutating control call and reads its body (at most
-/// [`MAX_CONTROL_BODY`] bytes). `Ok` carries the caller as the audit line names it: `write-token`
+/// [`MAX_RESET_BODY`] bytes for a reset, else [`MAX_CONTROL_BODY`]). `Ok` carries the caller as the audit line names it: `write-token`
 /// or the service of the ACL entry. A refusal is counted, never logged.
 async fn admit_control(
     s: &HttpState,
@@ -691,13 +712,18 @@ async fn admit_control(
             }
         }
     };
-    match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
+    let limit = if action == Action::Reset {
+        MAX_RESET_BODY
+    } else {
+        MAX_CONTROL_BODY
+    };
+    match axum::body::to_bytes(body, limit).await {
         Ok(bytes) => Ok((caller, bytes)),
         Err(_) => {
             control.refused(action, Verdict::BadRequest.as_str());
             Err(Box::new(error_json(
                 StatusCode::BAD_REQUEST,
-                &format!("the body is larger than {MAX_CONTROL_BODY} bytes, or unreadable"),
+                &format!("the body is larger than {limit} bytes, or unreadable"),
             )))
         }
     }
@@ -749,10 +775,7 @@ async fn fan_out(
             ),
             Err(refusal) => (
                 refusal.verdict(),
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
         };
         control.audit(
@@ -811,10 +834,7 @@ async fn api_reset(
             Err(refusal) => (
                 refusal.verdict(),
                 None,
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
         };
         let outcome = verdict.as_str();
@@ -888,10 +908,7 @@ async fn letters(
         {
             Err(refusal) => (
                 refusal.verdict(),
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
             Ok(outcome) => {
                 let verdict = outcome.answer.verdict();

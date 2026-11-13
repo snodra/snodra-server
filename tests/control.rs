@@ -409,6 +409,42 @@ async fn a_prepare_that_times_out_aborts_the_reset() {
     assert_eq!(actions(&b2.seen()), ["prepare", "finish-aborted"]);
 }
 
+/// The hub offers only what the event store declares (ADR 0027): a processor whose freshest
+/// report lacks the `replay` capability gets 409 UNSUPPORTED, and no instance is asked.
+#[tokio::test]
+async fn a_reset_without_the_replay_capability_is_refused_before_anyone_is_asked() {
+    let (grpc, http) = hub(config()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["audit"], ok_to_everything()).await;
+    // b-2 reports again, the freshest: its event store declares lag only.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut lag_only = common::control::processor("audit");
+    lag_only.event_store = "queue-x".to_string();
+    lag_only.capabilities = vec!["lag".to_string()];
+    b2.report_statuses(vec![lag_only]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    let body = json_of(&r);
+    assert_eq!(body["result"], "refused");
+    assert_eq!(body["code"], "UNSUPPORTED");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("queue-x") && error.contains("replay"),
+        "{error}"
+    );
+    assert!(b1.seen().is_empty(), "b-1 was asked: {:?}", b1.seen());
+    assert!(b2.seen().is_empty(), "b-2 was asked: {:?}", b2.seen());
+
+    // Once the freshest report declares replay again, the reset runs.
+    b2.report(&["audit"]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(actions(&b2.seen())[0], "prepare");
+}
+
 #[tokio::test]
 async fn an_execute_failure_finishes_every_instance_as_aborted() {
     let (grpc, http) = hub(config()).await;
@@ -848,8 +884,11 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
             "1025 positions",
         ),
         (
-            format!("{{\"to\":\"earliest\",\"pad\":\"{}\"}}", "x".repeat(5000)),
-            "over 4 KiB",
+            format!(
+                "{{\"to\":\"earliest\",\"pad\":\"{}\"}}",
+                "x".repeat(65 * 1024)
+            ),
+            "over 64 KiB",
         ),
     ] {
         let r = post(http, RESET, &body).await;
@@ -858,7 +897,24 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
     }
     let r = post(http, PAUSE, &"x".repeat(5000)).await;
     assert_eq!(r.status, 400, "every control call bounds its body");
+    assert!(
+        json_of(&r)["error"]
+            .as_str()
+            .unwrap()
+            .contains("larger than 4096 bytes"),
+        "{}",
+        r.body
+    );
     assert!(b1.seen().is_empty(), "nobody was asked");
+
+    // A reset may name every one of 1024 segments with the longest decimal positions.
+    let all: Vec<String> = (0..1024)
+        .map(|p| format!("{{\"segment\":\"{p}\",\"position\":\"{}\"}}", u64::MAX))
+        .collect();
+    let body = format!("{{\"to\":{{\"positions\":[{}]}}}}", all.join(","));
+    assert!(body.len() > 50 * 1024, "{}", body.len());
+    let r = post(http, RESET, &body).await;
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 // ---- access control ----

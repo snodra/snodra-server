@@ -217,11 +217,17 @@ impl ControlClient {
 
     /// Reports `processors` again (a fresher status).
     pub async fn report(&self, processors: &[&str]) {
+        self.report_statuses(processors.iter().map(|n| processor(n)).collect())
+            .await;
+    }
+
+    /// Reports these processor statuses (a fresher status).
+    pub async fn report_statuses(&self, processors: Vec<ProcessorStatus>) {
         let msg = ClientMessage {
             message: Some(client_message::Message::Status(InstanceStatus {
                 connected_hub_ids: vec![],
                 handlers_in_flight: 0,
-                processors: processors.iter().map(|n| processor(n)).collect(),
+                processors,
             })),
         };
         self.tx.send(msg).await.unwrap();

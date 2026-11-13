@@ -25,8 +25,8 @@ use crate::auth::clip;
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::processors::{
-    MAX_NAME_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENTS, MAX_SUBSCRIPTION_SOURCE_BYTES,
-    bounded_position, segment_order, truncate_utf8,
+    MAX_NAME_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENTS, MAX_SUBSCRIPTION_SOURCE_BYTES, kept_whole,
+    segment_order, truncate_utf8,
 };
 use crate::proto::{
     self, ControlRefusal, ControlReply, ServerMessage, control_reply, control_request,
@@ -134,13 +134,24 @@ pub enum Refusal {
     UnknownProcessor,
     /// A reset of the processor already runs on this hub (its operation id).
     Running(String),
+    /// A reset of a processor whose event store does not declare the `replay` capability, as the
+    /// freshest report has it (ADR 0027); the event store's name, empty when unnamed.
+    Unsupported(String),
 }
 
 impl Refusal {
     pub fn verdict(&self) -> Verdict {
         match self {
             Self::UnknownService | Self::UnknownProcessor => Verdict::NotFound,
-            Self::Running(_) => Verdict::Conflict,
+            Self::Running(_) | Self::Unsupported(_) => Verdict::Conflict,
+        }
+    }
+
+    /// The refusal code the API shows next to the message, as an instance's refusal would.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Unsupported(_) => Some("UNSUPPORTED"),
+            _ => None,
         }
     }
 
@@ -153,6 +164,16 @@ impl Refusal {
             }
             Self::Running(op) => {
                 format!("a reset of {service}/{processor} is running on this hub (operation {op})")
+            }
+            Self::Unsupported(store) => {
+                let store = if store.is_empty() {
+                    "an unnamed event store".to_string()
+                } else {
+                    format!("event store {}", clip(store))
+                };
+                format!(
+                    "{service}/{processor} reads {store}, which does not declare the replay capability: it cannot be reset"
+                )
             }
         }
     }
@@ -219,6 +240,7 @@ pub struct LetterView {
     pub processor: String,
     /// The source the letter's record came from.
     pub source: String,
+    /// Its segment; empty when unknown (or longer than the hub keeps).
     pub segment: String,
     /// The record's position in its segment; empty when unknown.
     pub position: String,
@@ -240,8 +262,9 @@ impl LetterView {
             id: truncate_utf8(&l.id, MAX_ID_BYTES),
             processor: truncate_utf8(&l.processor, MAX_NAME_BYTES),
             source: truncate_utf8(&l.source, MAX_SUBSCRIPTION_SOURCE_BYTES),
-            segment: truncate_utf8(&l.segment, MAX_SEGMENT_BYTES),
-            position: bounded_position(&l.position),
+            // Never cut: a cut name would be another segment's.
+            segment: kept_whole(&l.segment),
+            position: kept_whole(&l.position),
             key: truncate_utf8(&l.key, MAX_ID_BYTES),
             event_id: truncate_utf8(&l.event_id, MAX_ID_BYTES),
             event_type: truncate_utf8(&l.event_type, MAX_TYPE_BYTES),
@@ -306,11 +329,13 @@ impl Answer {
                 let mut ranges: Vec<RangeView> = r
                     .ranges
                     .iter()
+                    // A segment name is never cut: a range of a longer one is dropped.
+                    .filter(|x| x.segment.len() <= MAX_SEGMENT_BYTES)
                     .take(MAX_SEGMENTS)
                     .map(|x| RangeView {
-                        segment: truncate_utf8(&x.segment, MAX_SEGMENT_BYTES),
-                        from: bounded_position(&x.from),
-                        until: bounded_position(&x.until),
+                        segment: x.segment.clone(),
+                        from: kept_whole(&x.from),
+                        until: kept_whole(&x.until),
                     })
                     .collect();
                 ranges.sort_by(|a, b| segment_order(&a.segment, &b.segment));
@@ -1035,6 +1060,12 @@ impl Control {
         target: Target,
     ) -> Result<ResetReport, Refusal> {
         let holders = self.holders(ctx, service, processor)?;
+        // The hub offers only what the event store declares (ADR 0027), as the freshest report
+        // has it (the rule of the dashboard's aggregate): no instance is asked otherwise.
+        let newest = freshest(&holders).ok_or(Refusal::UnknownProcessor)?;
+        if !newest.replay {
+            return Err(Refusal::Unsupported(newest.event_store.clone()));
+        }
         let operation_id = new_id();
         let _running = self.begin(service, processor, &operation_id)?;
         info!(
@@ -1322,7 +1353,7 @@ mod tests {
 
     type Rx = mpsc::Receiver<Result<ServerMessage, tonic::Status>>;
 
-    /// A session of `svc` that reports `audit`.
+    /// A session of `svc` that reports `audit`, on an event store that declares `replay`.
     fn session(sessions: &Sessions, id: &str) -> (u64, Rx) {
         let (tx, rx) = mpsc::channel(16);
         let meta = SessionMeta::default();
@@ -1333,6 +1364,8 @@ mod tests {
             processors: vec![ProcessorStatus {
                 name: "audit".into(),
                 state: ProcessorState::ProcessorRunning as i32,
+                event_store: "kafka".into(),
+                capabilities: vec!["replay".into()],
                 ..Default::default()
             }],
         };
@@ -1534,6 +1567,8 @@ mod tests {
             error_message: "e".repeat(2000),
             event_type: "t".repeat(1000),
             reason: "HANDLER_FAILED".into(),
+            segment: "s".repeat(MAX_SEGMENT_BYTES + 1),
+            position: "9".repeat(MAX_SEGMENT_BYTES + 1),
             ..Default::default()
         };
         let page = Answer::from_reply(Some(R::DeadLetters(proto::DeadLetterPage {
@@ -1550,8 +1585,13 @@ mod tests {
         assert_eq!(l.error_message.len(), MAX_TEXT_BYTES);
         assert_eq!(l.event_type.len(), MAX_TYPE_BYTES);
         assert_eq!(l.reason, "HANDLER_FAILED");
+        assert_eq!(
+            (l.segment.as_str(), l.position.as_str()),
+            ("", ""),
+            "a too long segment or position is never cut: it reads as unknown"
+        );
 
-        let ranges: Vec<proto::ReplayRange> = (0..2000)
+        let mut ranges: Vec<proto::ReplayRange> = (0..2000)
             .rev()
             .map(|p| proto::ReplayRange {
                 segment: p.to_string(),
@@ -1563,6 +1603,16 @@ mod tests {
                 },
             })
             .collect();
+        // A range of a segment named longer than the hub keeps is dropped, never cut, and does
+        // not count towards the cap.
+        ranges.insert(
+            0,
+            proto::ReplayRange {
+                segment: "1".repeat(MAX_SEGMENT_BYTES + 1),
+                from: "0".into(),
+                until: "1".into(),
+            },
+        );
         let Answer::Reset(r) = Answer::from_reply(Some(R::Reset(proto::ResetOutcome {
             ranges,
             markers_deleted: 7,

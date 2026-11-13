@@ -11,15 +11,33 @@ const str = (x) => (typeof x === 'string' ? x : '');
 const count = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
 const lagOf = (x) => (Number.isFinite(x) && x >= -1 ? x : -1);
 
-/** The order of segment names, as processors.rs `segment_order`: decimal names by value, before
- * any other name; other names, and equal values, by their characters. */
+/** `a` against `b` by code points (the byte order of their UTF-8, as Rust compares strings). */
+function byCodePoints(a, b) {
+  const [x, y] = [[...a], [...b]];
+  for (let i = 0; i < Math.min(x.length, y.length); i += 1) {
+    const d = x[i].codePointAt(0) - y[i].codePointAt(0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return x.length < y.length ? -1 : x.length > y.length ? 1 : 0;
+}
+
+/** The digits of a decimal name without leading zeros ('' for zero); null when not decimal. */
+const decimalDigits = (s) => (/^[0-9]+$/.test(s) ? s.replace(/^0+/, '') : null);
+
+/** The order of segment names, exactly processors.rs `segment_order`: decimal names (only ASCII
+ * digits) by value, of any length, before any other name; other names, and equal values, by
+ * their code points. */
 export function segmentOrder(a, b) {
-  const decimal = (s) => (/^\d+$/.test(s) ? BigInt(s) : null);
-  const [x, y] = [decimal(a), decimal(b)];
-  if (x !== null && y !== null && x !== y) return x < y ? -1 : 1;
-  if (x !== null && y === null) return -1;
-  if (x === null && y !== null) return 1;
-  return a < b ? -1 : a > b ? 1 : 0;
+  const [x, y] = [decimalDigits(a), decimalDigits(b)];
+  if (x !== null && y !== null) {
+    if (x.length !== y.length) return x.length < y.length ? -1 : 1;
+    if (x !== y) return x < y ? -1 : 1;
+  } else if (x !== null) {
+    return -1;
+  } else if (y !== null) {
+    return 1;
+  }
+  return byCodePoints(a, b);
 }
 
 /** The capability that offers a reset (and so a replay) of a processor (ADR 0027). */
