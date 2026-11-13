@@ -98,7 +98,8 @@ message ServerMessage {
 // are read from the first Register of a stream only; later Registers cannot change them. Field 11
 // is allocated to a later roadmap phase (contexts).
 message Register {
-  // Logical service name, for example "gym-notes-service". The logical service name: each event-store add-on derives its own names from it.
+  // Logical service name, for example "gym-notes-service"; each event-store add-on derives its
+  // own names from it.
   string service_name = 1;
   // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
   string instance_id = 2;
@@ -151,11 +152,13 @@ message InstanceStatus {
   repeated string connected_hub_ids = 1;
   // Handlers of this instance running now, over all its hubs.
   uint32 handlers_in_flight = 2;
-  // Event processors (ADR 0022): one entry per event processor this instance started, as
-  // of this report. The hub keeps the latest list per session, bounded: at most 32 processors,
-  // 1024 segments and 256 event types each; longer strings are cut at a UTF-8 boundary (name 64
-  // bytes, subscription and source 256, event_store 64, a capability 64 (at most 16), last_error 512, an event type 256, operation_id 64); the excess
-  // is dropped, never an error to the client.
+  // Event processors (ADR 0022): one entry per event processor this instance started, as of this
+  // report. The hub keeps the latest list per session, bounded: at most 32 processors, 1024
+  // segments, 16 capabilities and 256 event types each; longer strings are cut at a UTF-8
+  // boundary (name 64 bytes, subscription and source 256, event_store 64, a capability 64,
+  // last_error 512, an event type 256, operation_id 64). A segment name or a position is never
+  // cut: a segment named in more than 128 bytes is dropped, a longer position reads as unknown.
+  // The excess is dropped, never an error to the client.
   repeated ProcessorStatus processors = 3;
 }
 
@@ -171,8 +174,8 @@ enum ProcessorState {
   PROCESSOR_RUNNING = 2;
   // A record exhausted its attempts in the last 60 s, or the reader reports an error.
   PROCESSOR_FAILING = 3;
-  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of its
-  // subscription while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
+  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of its subscription
+  // while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
   PROCESSOR_STOPPED = 4;
   // Paused from the hub's control plane (ADR 0023): still in its subscription,
   // consuming nothing.
@@ -281,9 +284,9 @@ message ProcessorResume {}
 
 // Stop consuming (leave the subscription) and hold the operation lock until lease_ms from now.
 // Re-sent with the same operation_id to renew the lease. Answered with ok once the instance has
-// left the subscription; LOCKED when another operation holds the lock; NOT_PREPARED for an operation
-// that already ended on the instance, or a renewal whose lock is gone (a late renewal never takes
-// the lock again).
+// left the subscription; LOCKED when another operation holds the lock; NOT_PREPARED for an
+// operation that already ended on the instance, or a renewal whose lock is gone (a late renewal
+// never takes the lock again).
 message ResetPrepare {
   string operation_id = 1;
   int64 lease_ms = 2;
@@ -398,8 +401,8 @@ enum ControlRefusal {
   // A bad target, a bad letter id, a dead-letter mode other than "collection", a limit out of
   // range.
   CONTROL_REFUSAL_INVALID = 6;
-  // Anything else (a message-store or event-store error, or "lease lost: ..." when the executor's lease was
-  // lost mid-execute); the message says what.
+  // Anything else (a message-store or event-store error, or "lease lost: ..." when the
+  // executor's lease was lost mid-execute); the message says what.
   CONTROL_REFUSAL_FAILED = 7;
   // A retry or discard of a letter that does not exist.
   CONTROL_REFUSAL_NOT_FOUND = 8;
