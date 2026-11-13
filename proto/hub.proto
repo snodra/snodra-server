@@ -408,18 +408,19 @@ enum ControlRefusal {
 }
 
 message ResetOutcome {
-  // One per partition that replays; empty for "latest".
+  // One per segment that replays; empty for "latest".
   repeated ReplayRange ranges = 1;
   uint64 markers_deleted = 2;
   // How many @ResetHandler ran.
   uint32 reset_handlers = 3;
 }
 
-// Records of `partition` with from <= offset < until are a replay.
+// Records of `segment` at a position from <= position < until are a replay. Positions are the
+// opaque strings of SegmentStatus; empty means none.
 message ReplayRange {
-  int32 partition = 1;
-  int64 from = 2;
-  int64 until = 3;
+  string segment = 1;
+  string from = 2;
+  string until = 3;
 }
 
 message DeadLetterPage {
@@ -433,9 +434,12 @@ message DeadLetterPage {
 message DeadLetterSummary {
   string id = 1;
   string processor = 2;
-  string topic = 3;
-  int32 partition = 4;
-  int64 offset = 5;
+  // The source the letter's record came from.
+  string source = 3;
+  // The segment of the source the record came from.
+  string segment = 4;
+  // The record's position in its segment; empty when unknown.
+  string position = 5;
   string key = 6;
   string event_id = 7;
   string event_type = 8;
