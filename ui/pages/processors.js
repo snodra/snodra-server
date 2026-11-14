@@ -2,7 +2,9 @@
 // hub like the other pages; a row opens to every instance's segments. With a write credential
 // the page pauses, resumes and resets a processor (ADR 0023, P6b); the call goes to the hub that
 // served the page, which reaches every instance. A reset is offered only when the processor's
-// event store declares the `replay` capability (ADR 0027).
+// event store declares the `replay` capability (ADR 0027). While an event browser add-on is
+// connected (ADR 0027), the page also lists the subscriptions no live instance reports, with the
+// lag the browser reads (kraken.events.Lag), so a stopped service's backlog stays visible.
 
 import * as controls from '../controls.js';
 import { MAX_ROWS, badge, capNote, fill, h, keepScroll, selectionIn, table } from '../dom.js';
@@ -33,6 +35,57 @@ function stateCell(p, prefix = '') {
     p.operationId
       ? [' ', h('span', { class: 'mono dim nowrap', title: `Reset operation ${p.operationId} holds the processor's lock` }, `op ${p.operationId.slice(0, 8)}`)]
       : null,
+  ];
+}
+
+/** How long the lag of subscriptions without a live instance is reused before it is read again:
+ * the page refreshes every second or two, a lag listing is a heavier read of the event store. */
+const LAG_EVERY_MS = 15000;
+
+/** The last lag answer of this hub's event browser and when it was read. */
+let lagCache = { at: 0, answer: null };
+
+/** The lag listing (`/api/v1/events/lag`, the browser's default source), at most every
+ * LAG_EVERY_MS; null when no event browser is installed or the read failed. */
+async function lagOf(ctx) {
+  if (!(ctx.version && ctx.version.eventBrowser && ctx.version.eventBrowser.installed)) return null;
+  if (Date.now() - lagCache.at < LAG_EVERY_MS) return lagCache.answer;
+  let answer = null;
+  try {
+    const r = await ctx.api.browse('events/lag');
+    answer = r.ok && r.data && Array.isArray(r.data.subscriptions) ? r.data : null;
+  } catch (error) {
+    // A 401 already showed the sign-in form; anything else only leaves the card out.
+    if (error instanceof ctx.api.AuthError) throw error;
+  }
+  lagCache = { at: Date.now(), answer };
+  return answer;
+}
+
+const IDLE_HEADERS = [
+  { label: 'Subscription', title: 'The event store\'s name for a processor\'s subscription' },
+  { label: 'Source', title: 'What it reads' },
+  { label: 'State', title: 'As the event store reports it' },
+  { label: 'Segments', class: 'num', title: 'Segments of the source' },
+  { label: 'Lag', class: 'num', title: 'Sum of the known lags (records between the committed position and the head)' },
+];
+
+/** The subscriptions with a committed position that no live instance reports, by lag. */
+function idleCard(lag, live) {
+  if (!lag) return null;
+  const idle = lag.subscriptions.filter((x) => typeof x.subscription === 'string' && !live.has(x.subscription));
+  if (!idle.length) return null;
+  return [
+    h('h2', null, 'Subscriptions without a live instance'),
+    table('Subscriptions without a live instance, by lag', IDLE_HEADERS, idle.slice(0, MAX_ROWS).map((x) => [
+      { class: 'mono nowrap', content: x.subscription },
+      { class: 'mono nowrap', content: String(lag.source || '') },
+      { class: 'nowrap', content: [String(x.state || ''), ' ', badge('warn', 'no live instance', 'No connected instance reports this subscription: nothing consumes, its lag only grows')] },
+      { class: 'num', content: fmt.int(Array.isArray(x.segments) ? x.segments.length : 0) },
+      lagCell(Number.isFinite(x.lag) ? x.lag : null),
+    ]), 'subscriptions'),
+    lag.truncated ? h('p', { class: 'note' }, 'Not every subscription is listed: the event browser stopped at its bound.') : null,
+    h('p', { class: 'note' }, `Read by the event browser from ${String(lag.source || 'the default source')}, at most every ${LAG_EVERY_MS / 1000} s.`),
   ];
 }
 
@@ -216,7 +269,7 @@ export default {
   title: 'Processors',
   live: true,
   load: async (ctx) => {
-    const own = await ctx.api.get('processors');
+    const [own, lag] = await Promise.all([ctx.api.get('processors'), lagOf(ctx)]);
     const views = [{ hubId: own.hubId, data: own }];
     if (ctx.allHubs) views.push(...(await ctx.hubs.collect('processors', looksLikeProcessors)).views);
     return {
@@ -224,6 +277,7 @@ export default {
       scope: ctx.allHubs ? 'all' : 'this',
       nowMs: own.nowMs,
       hubs: views.map((v) => v.hubId),
+      lag,
     };
   },
 
@@ -240,6 +294,7 @@ export default {
     const problems = h('input', { type: 'checkbox', checked: problemsOnly });
     const meta = h('span', { class: 'meta' });
     const body = h('div');
+    const idle = h('section', { class: 'card', 'aria-label': 'Subscriptions without a live instance', hidden: true });
     const status = controls.statusLine();
     let busy = false;
     root.append(
@@ -248,6 +303,7 @@ export default {
         h('label', null, problems, 'Only problems (not running, failures or dead letters)')),
       status.el,
       h('section', { class: 'card', 'aria-label': 'Event processors' }, body),
+      idle,
       controls.writeTokenCard(() => draw()));
 
     /** Pause, resume or reset `p` of `service`, then refreshes the page. */
@@ -271,16 +327,6 @@ export default {
         busy = false;
         ctx.refresh();
       }
-    };
-
-    /** The subscription, linked to its lag on the Consumer groups page where this hub has an
-     * event browser. */
-    const subscriptionCell = (p) => {
-      const eb = ctx.version && ctx.version.eventBrowser;
-      if (!eb || !eb.enabled) return p.subscription;
-      const q = new URLSearchParams({ open: p.subscription });
-      if (eb.topics.includes(p.source)) q.set('topic', p.source);
-      return h('a', { href: `#/consumer-groups?${q}`, title: 'Its lag per segment, as the event browser reads it' }, p.subscription);
     };
 
     /** Pause or resume; a reset only when the event store declares `replay`. */
@@ -308,6 +354,9 @@ export default {
     const render = () => {
       const q = query.trim().toLowerCase();
       const all = last.services.flatMap((s) => s.processors.map((p) => ({ service: s.serviceName, p })));
+      const card = idleCard(last.lag, new Set(all.map(({ p }) => p.subscription)));
+      fill(idle, card);
+      idle.hidden = !card;
       const merged = last.scope === 'all';
       meta.textContent = `${plural(all.length, 'processor')} in ${plural(last.services.length, 'service')}`
         + (merged ? ` on ${plural(last.hubs.length, 'reachable hub')}` : '');
@@ -334,7 +383,7 @@ export default {
             title: expanded ? 'Hide the segments of every instance' : 'Show the segments of every instance',
             on: { click: () => toggle(key) },
           }, p.name)),
-          h('td', { class: 'mono nowrap' }, subscriptionCell(p)),
+          h('td', { class: 'mono nowrap' }, p.subscription),
           h('td', { class: 'mono nowrap' }, p.source),
         ];
         const store = eventStoreCell(p);

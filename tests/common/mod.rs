@@ -1,8 +1,8 @@
 //! Shared helpers for the integration tests: an in-process hub and a fake service instance.
 #![allow(dead_code)]
 
+pub mod browser;
 pub mod control;
-pub mod kafka;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

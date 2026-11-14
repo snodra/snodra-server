@@ -221,7 +221,6 @@ pub struct Metrics {
     event_browser_scanned: Histogram<u64>,
     event_tails: UpDownCounter<i64>,
     event_payload_views: Counter<u64>,
-    group_lag_refreshes: Counter<u64>,
     seen: Mutex<Seen>,
     _open_gauges: [ObservableGauge<i64>; 2],
 }
@@ -389,26 +388,22 @@ impl Metrics {
                 .build(),
             event_browser_requests: meter
                 .u64_counter("kraken_hub_event_browser_requests_total")
-                .with_description("Event browser calls (ADR 0025), per kind (search, record, tail, groups) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, disabled)")
+                .with_description("Calls of the events API (ADR 0027), per kind (search, record, sources, lag, tail) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, not_installed, timeout, failed)")
                 .build(),
             event_browser_scanned: meter
                 .u64_histogram("kraken_hub_event_browser_scanned_records")
                 .with_boundaries(vec![
                     0.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 25000.0, 50000.0, 100000.0,
                 ])
-                .with_description("Records one event search read from Kafka")
+                .with_description("Records one event search read, as the event browser reports it")
                 .build(),
             event_tails: meter
                 .i64_up_down_counter("kraken_hub_event_tails")
-                .with_description("Event tails reading Kafka now")
+                .with_description("Event tails open on this hub now")
                 .build(),
             event_payload_views: meter
                 .u64_counter("kraken_hub_event_payload_views_total")
                 .with_description("Event payloads served by the record detail (each also writes an audit line)")
-                .build(),
-            group_lag_refreshes: meter
-                .u64_counter("kraken_hub_consumer_group_lag_refreshes_total")
-                .with_description("Readings of one topic's consumer-group lag by the lag task, per outcome: ok, truncated (more groups than listed, or out of time), unavailable (Kafka did not answer; the last reading stays), busy (the previous reading still runs)")
                 .build(),
             seen: Mutex::new(Seen::default()),
             _open_gauges: open_gauges,
@@ -437,7 +432,7 @@ impl Metrics {
         );
     }
 
-    /// One event browser call (ADR 0025); `kind` and `outcome` are from fixed sets.
+    /// One call of the events API (ADR 0027); `kind` and `outcome` are from fixed sets.
     pub fn event_request(&self, kind: &'static str, outcome: &'static str) {
         self.event_browser_requests.add(
             1,
@@ -448,7 +443,7 @@ impl Metrics {
         );
     }
 
-    /// The records one search read.
+    /// The records one search read, as the event browser reports it.
     pub fn event_scanned(&self, records: u64) {
         self.event_browser_scanned.record(records, &[]);
     }
@@ -461,12 +456,6 @@ impl Metrics {
     /// One payload served.
     pub fn event_payload_view(&self) {
         self.event_payload_views.add(1, &[]);
-    }
-
-    /// One reading of a topic's consumer-group lag by the lag task; `outcome` from a fixed set.
-    pub fn group_lag_refresh(&self, outcome: &'static str) {
-        self.group_lag_refreshes
-            .add(1, &[KeyValue::new("outcome", outcome)]);
     }
 
     /// A `ControlReply` nobody waited for, dropped.
@@ -969,31 +958,6 @@ impl ProcessorGauges {
                 .build(),
         }
     }
-}
-
-/// `kraken_hub_consumer_group_lag{group,topic}` (ADR 0026): the lag task's last reading,
-/// observed when the metrics are exported (from memory; the task does the Kafka reads). Every
-/// hub reads the same groups: dashboards take `max` over hubs. Keep the value for the life of
-/// the meter provider.
-pub fn observe_group_lag(
-    meter: &Meter,
-    lag: Arc<crate::browser::GroupLag>,
-) -> ObservableGauge<i64> {
-    meter
-        .i64_observable_gauge("kraken_hub_consumer_group_lag")
-        .with_description("Records behind per consumer group and event topic: the end offsets less the group's committed offsets, summed over the partitions it committed on; read by the lag task every KRAKEN_HUB_GROUP_LAG_INTERVAL, groups without a live member included")
-        .with_callback(move |observer| {
-            for (topic, group, value) in lag.points() {
-                observer.observe(
-                    value,
-                    &[
-                        KeyValue::new("group", group),
-                        KeyValue::new("topic", topic),
-                    ],
-                );
-            }
-        })
-        .build()
 }
 
 /// In-memory metrics for unit tests elsewhere in the crate.
@@ -1838,35 +1802,6 @@ mod tests {
             );
             assert_eq!(export["kraken_hub_processor_state"].len(), 6);
         }
-    }
-
-    /// The consumer-group lag gauge exports the last reading of each topic's groups, labelled
-    /// by group and topic; a group no longer read is no longer exported.
-    #[test]
-    fn the_group_lag_gauge_exports_the_last_reading() {
-        let m = test_support::test_metrics();
-        let lag = Arc::new(crate::browser::GroupLag::default());
-        let _gauge = observe_group_lag(&m.meter(), Arc::clone(&lag));
-        assert!(m.gauge_points("kraken_hub_consumer_group_lag").is_empty());
-        lag.set("t", vec![("g-live".into(), 3), ("g-empty".into(), 6)]);
-        let point = |group: &str, value: i64| {
-            (
-                vec![
-                    ("group".to_string(), group.to_string()),
-                    ("topic".to_string(), "t".to_string()),
-                ],
-                value,
-            )
-        };
-        assert_eq!(
-            m.gauge_points("kraken_hub_consumer_group_lag"),
-            [point("g-empty", 6), point("g-live", 3)]
-        );
-        lag.set("t", vec![("g-live".into(), 0)]);
-        assert_eq!(
-            m.gauge_points("kraken_hub_consumer_group_lag"),
-            [point("g-live", 0)]
-        );
     }
 
     #[test]

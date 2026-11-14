@@ -1282,83 +1282,87 @@ async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
     panic!("the sign-in form never appeared: {last}");
 }
 
-/// The event browser's pages (ADR 0025) against a real Kafka: the Events page lists the records
-/// newest first and opens one (its headers, the reason its payload is hidden), every value as
-/// text; the Consumer groups page highlights a group without members. A hub without Kafka has
-/// neither page in its navigation.
+/// The Events page (ADR 0025, ADR 0027) over a fake event browser: it lists the browser's
+/// records newest first and opens one (its headers, the reason its payload is hidden), every
+/// value as text. The Processors page lists a subscription no live instance reports with the
+/// browser's lag. A hub without a browser has no Events page in its navigation.
 #[tokio::test]
-async fn the_event_browser_pages_render_as_text_and_hide_without_kafka() {
-    use common::kafka::{self, Rec};
-    let Some(browser) = browser() else {
+async fn the_events_page_renders_the_browsers_answers_as_text_and_hides_without_a_browser() {
+    use common::browser::{self, Answer, FakeBrowser};
+    use serde_json::json;
+    let Some(chrome) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
     };
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("ui");
-    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            Rec::on(0)
-                .at(1_700_000_000_000)
-                .key("order-1")
-                .header("type", "orders.<img src=x onerror=alert(1)>")
-                .header("correlationId", "corr-ui")
-                .payload("{\"total\":\"<script>alert(1)</script>\"}"),
-            Rec::on(1)
-                .at(1_700_000_001_000)
-                .key("order-2")
-                .header("type", "orders.Shipped")
-                .header("source", "service-b")
-                .payload("{}"),
-        ],
-    )
-    .await;
-    let bootstrap = broker.bootstrap.clone();
-    let commit_topic = topic.clone();
-    tokio::task::spawn_blocking(move || {
-        kafka::commit(
-            &bootstrap,
-            "service-b.audit",
-            &commit_topic,
-            &[(0, 0), (1, 0)],
-        )
-    })
-    .await
-    .unwrap();
-    let (_grpc, http) = common::start_hub_with_http(Config {
-        kafka_bootstrap: Some(broker.bootstrap.clone()),
-        event_topics: vec![topic.clone()],
+    let (grpc, http) = common::start_hub_with_http(Config {
         event_payloads: true,
         ..config()
     })
     .await;
     let http: SocketAddr = http.unwrap();
+    let _fake = FakeBrowser::start(grpc, |type_name, request| match type_name {
+        browser::SEARCH => Answer::Json(browser::page(vec![
+            browser::summary(
+                "1",
+                "0",
+                1_700_000_001_000,
+                "order-2",
+                json!({"type": "orders.Shipped", "source": "service-b"}),
+            ),
+            browser::summary(
+                "0",
+                "0",
+                1_700_000_000_000,
+                "order-1",
+                json!({"type": "orders.<img src=x onerror=alert(1)>", "correlationId": "corr-ui"}),
+            ),
+        ])),
+        browser::GET => {
+            let mut r = browser::summary(
+                "0",
+                "0",
+                1_700_000_000_000,
+                "order-1",
+                json!({"type": "orders.<img src=x onerror=alert(1)>"}),
+            );
+            r["allHeaders"] =
+                json!([{"name": "type", "value": "orders.<img src=x onerror=alert(1)>"}]);
+            Answer::Json(r)
+        }
+        browser::LAG => Answer::Json(json!({"source": "kraken.events", "subscriptions": [
+            {"subscription": "service-b.audit", "state": "Empty", "members": 0,
+             "segments": [{"segment": "0", "committed": "0", "head": "7", "lag": 7}], "lag": 7}],
+            "truncated": false})),
+        _ => browser::defaults(type_name, request),
+    })
+    .await;
     let _slots = take_stream_slots(http).await;
     let profiles =
         std::env::temp_dir().join(format!("kraken-hub-ui-events-{}", std::process::id()));
 
     let (dom, _) = rendered(
-        &browser,
+        &chrome,
         http,
-        &format!("events?record={topic}%2F0%2F0"),
+        "events?record=kraken.events%2F0%2F0",
         &profiles.join("events"),
     )
     .await;
     for marker in [
         "aria-label=\"Search results\"",
-        "Scanned 2 records; every partition searched.",
+        "Scanned 2 records; every segment searched.",
         "orders.Shipped",
         "orders.&lt;img src=x onerror=alert(1)&gt;",
-        "href=\"#/events?topic=",
+        "href=\"#/events?source=kraken.events&amp;type=",
         "correlationId=corr-ui",
         ">corr-ui</a>",
+        ">0 / 0</button>",
         "aria-label=\"Record\"",
+        "kraken.events 0 / 0",
         "payload hidden",
         "no-token-configured",
         "Payloads are not served to this page",
-        "href=\"#/consumer-groups\"",
+        "<select aria-label=\"Source\"><option value=\"kraken.events\">kraken.events</option>",
+        "href=\"#/events\"",
     ] {
         assert!(dom.contains(marker), "events: {marker:?} missing in {dom}");
     }
@@ -1366,39 +1370,35 @@ async fn the_event_browser_pages_render_as_text_and_hide_without_kafka() {
         !dom.contains("<img src=x"),
         "markup from a header became markup"
     );
-    // Newest first: order-2 (partition 1, a second later) above order-1.
+    assert!(!dom.contains("consumer-groups"), "{dom}");
+    // Newest first, as the browser answered.
     let results = &dom[dom.find("aria-label=\"Search results\"").unwrap()..];
     assert!(results.find(">order-2<").unwrap() < results.find(">order-1<").unwrap());
 
-    let (dom, _) = rendered(
-        &browser,
-        http,
-        "consumer-groups?open=service-b.audit",
-        &profiles.join("groups"),
-    )
-    .await;
+    let (dom, _) = rendered(&chrome, http, "processors", &profiles.join("processors")).await;
     for marker in [
+        "Subscriptions without a live instance",
         "service-b.audit",
-        ">no members</span>",
-        "class=\"idle\"",
-        &format!("Partitions of service-b.audit on {topic}"),
-        "1 group on",
+        ">no live instance</span>",
     ] {
-        assert!(dom.contains(marker), "groups: {marker:?} missing in {dom}");
+        assert!(
+            dom.contains(marker),
+            "processors: {marker:?} missing in {dom}"
+        );
     }
 
-    // Without Kafka the pages are not in the navigation.
+    // Without a browser the Events page is not in the navigation, and says why when opened.
     let (_grpc, plain) = common::start_hub_with_http(config()).await;
     let plain: SocketAddr = plain.unwrap();
     let _plain_slots = take_stream_slots(plain).await;
-    let (dom, _) = rendered(&browser, plain, "overview", &profiles.join("plain")).await;
+    let (dom, _) = rendered(&chrome, plain, "events", &profiles.join("plain")).await;
     assert!(dom.contains("href=\"#/processors\""), "{dom}");
+    assert!(!dom.contains("href=\"#/events\""), "{dom}");
     assert!(
-        !dom.contains("href=\"#/events\"") && !dom.contains("href=\"#/consumer-groups\""),
+        dom.contains("No event browser is connected to this hub"),
         "{dom}"
     );
     let _ = std::fs::remove_dir_all(&profiles);
-    drop(broker);
 }
 
 /// A headless browser driven over the DevTools protocol on a pipe (`--remote-debugging-pipe`:
@@ -1520,72 +1520,4 @@ impl Drop for Devtools {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// A busy topic does not freeze the Events page's tail (`tail=on` starts it): ten thousand
-/// records arrive at 2 000 a second, and the page keeps up: it shows the tail's own end when the
-/// hub sends it, not seconds later, with the newest 500 records drawn, newest first.
-#[tokio::test]
-async fn the_events_tail_keeps_up_with_a_busy_topic() {
-    use common::kafka;
-    let Some(browser) = browser() else {
-        eprintln!("no Chrome or Chromium found: headless check skipped");
-        return;
-    };
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("busy");
-    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
-    let duration = Duration::from_secs(8);
-    let (_grpc, http) = common::start_hub_with_http(Config {
-        kafka_bootstrap: Some(broker.bootstrap.clone()),
-        event_topics: vec![topic.clone()],
-        event_tail_duration: duration,
-        ..config()
-    })
-    .await;
-    let http: SocketAddr = http.unwrap();
-    let profile = std::env::temp_dir().join(format!("kraken-hub-ui-tail-{}", std::process::id()));
-    let status =
-        "document.querySelector('[aria-label=\"Live tail\"] [role=status]')?.textContent ?? ''";
-    let page = format!("http://{http}/ui/#/events?tail=on");
-    let dir = profile.clone();
-    let (mut devtools, tailing) = tokio::task::spawn_blocking(move || {
-        let mut devtools = Devtools::launch(&browser, &dir);
-        devtools.open(&page);
-        let text = devtools.wait_for(status, "Tailing", Duration::from_secs(30));
-        (devtools, text)
-    })
-    .await
-    .unwrap();
-    let started = std::time::Instant::now();
-    assert!(tailing.contains("1 partitions"), "{tailing}");
-    let bootstrap = broker.bootstrap.clone();
-    let busy = topic.clone();
-    let flood = tokio::task::spawn_blocking(move || {
-        kafka::produce_paced(&bootstrap, &busy, 0, 10_000, Some(2_000), 1_700_000_000_000)
-    });
-    let (tail, ended, late) = tokio::task::spawn_blocking(move || {
-        let ended = devtools.wait_for(status, "The tail ended", Duration::from_secs(60));
-        let late = started.elapsed().saturating_sub(duration);
-        let tail = devtools.eval("document.querySelector('[aria-label=\"Live tail\"]').outerHTML");
-        (tail.as_str().unwrap().to_string(), ended, late)
-    })
-    .await
-    .unwrap();
-    flood.await.unwrap();
-    assert!(ended.contains("it reached its maximum duration"), "{ended}");
-    assert!(
-        late < Duration::from_secs(3),
-        "the page showed the end {late:?} late"
-    );
-    let rows = tail.matches("<tr>").count() - 1;
-    assert_eq!(rows, 500, "rows drawn");
-    let first = tail.find(">k-").unwrap();
-    assert!(
-        tail[first..].starts_with(">k-9999<"),
-        "newest first: {}",
-        &tail[first..first + 20]
-    );
-    let _ = std::fs::remove_dir_all(&profile);
-    drop(broker);
 }

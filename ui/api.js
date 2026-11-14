@@ -172,7 +172,7 @@ export function readStream({ signal, onOpen, onEvent }) {
 }
 
 /**
- * GET /api/v1/<path> of the event browser (ADR 0025), with its credential. Resolves to
+ * GET /api/v1/<path> of the events API (ADR 0025, ADR 0027), with its credential. Resolves to
  * `{ ok, status, data }` for every answer (`data`: its JSON, null when it has none), so the page
  * can show why the hub refused; throws AuthError on 401 and an Error on a network error.
  */
