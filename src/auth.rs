@@ -344,10 +344,11 @@ fn may_send(patterns: &[Pattern], type_name: &str) -> bool {
     })
 }
 
-/// True when `pattern` covers some type of the event browser's namespace.
+/// True when `pattern` reaches for the event browser's namespace: a prefix of or within it, or
+/// one of its types. A bare `*` (an entry's "everything else") does not count.
 fn covers_events(pattern: &Pattern) -> bool {
     match pattern {
-        Pattern::Any => true,
+        Pattern::Any => false,
         Pattern::Prefix(prefix) => {
             EVENTS_NAMESPACE.starts_with(prefix.as_str()) || prefix.starts_with(EVENTS_NAMESPACE)
         }
@@ -3050,10 +3051,11 @@ event-browser = false
             .filter(|l| l.message.contains("never grants"))
             .map(|l| l.field("pattern").unwrap_or_default().to_string())
             .collect();
+        // A bare `*` is the usual "everything else" of an entry, not a reach for the namespace:
+        // no warning for it.
         assert_eq!(
             warned,
             [
-                "*",
                 "kraken.*",
                 "kraken.events.*",
                 "kraken.events.Search",

@@ -289,6 +289,10 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
         );
         r["allHeaders"] = json!([{"name": "type", "value": "a.Placed"},
             {"name": "bin", "value": null, "valueHex": "00ff"}]);
+        if request["position"] == "2" {
+            // A browser answering a place of any length: the audit line cuts it.
+            r["source"] = "s".repeat(5000).into();
+        }
         if request["payload"] == true {
             if request["position"] == "1" {
                 r["payloadBase64"] = "//4=".into();
@@ -378,6 +382,39 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     let (status, _) = get(secure, &format!("/api/v1/events?q={secret}"), Some(READ)).await;
     assert_eq!(status, 200);
     assert_eq!(fake.last(SEARCH).request["filters"]["q"], secret.as_str());
+    let (status, d) = get(secure, "/api/v1/events/kraken.events/0/2", Some(READ)).await;
+    assert_eq!(status, 200, "{d}");
+    // A payload search the hub refuses (a filter over the browser's bound) is not audited: it
+    // never reaches the browser.
+    let asked = fake.seen().len();
+    let long = "t".repeat(2000);
+    let (status, _) = get(
+        secure,
+        &format!("/api/v1/events?q={secret}&type={long}"),
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(fake.seen().len(), asked);
+    // An audited source is cut like any client-chosen string.
+    let long_source = "s".repeat(1000);
+    let (status, _) = get(
+        secure,
+        &format!("/api/v1/events?q={secret}&source={long_source}"),
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // A permitted tail forwards `q` and is audited as a tail.
+    let mut fake = fake;
+    let path = format!("/api/v1/events/tail?q={secret}");
+    let sse = tokio::spawn(async move { browser::sse(secure, &path, Some(READ)).await });
+    let mut tail = fake.next_tail().await;
+    assert_eq!(tail.request["filters"]["q"], secret.as_str());
+    tail.start(1).await;
+    let mut sse = sse.await.unwrap();
+    assert_eq!(sse.status, 200);
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
 
     // One audit line per payload served (write token once, dashboard token twice), with the
     // caller and the record; one line for the payload search, without the text; never the
@@ -387,7 +424,7 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
         .iter()
         .filter(|l| l.message == "event payload served")
         .collect();
-    assert_eq!(audits.len(), 3, "{audits:#?}");
+    assert_eq!(audits.len(), 4, "{audits:#?}");
     assert_eq!(audits[0].field("caller"), Some("write-token"));
     assert_eq!(audits[1].field("caller"), Some("dashboard-token"));
     assert_eq!(
@@ -401,12 +438,20 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     );
     assert!(audits[1].field("correlation_id").is_some());
     assert_eq!(audits[2].field("position"), Some("1"));
+    assert_eq!(audits[3].field("position"), Some("2"));
+    assert_eq!(audits[3].field("source"), Some("s".repeat(128).as_str()));
     let searches: Vec<_> = lines
         .iter()
         .filter(|l| l.message == "event payload search")
         .collect();
-    assert_eq!(searches.len(), 1, "{searches:#?}");
+    assert_eq!(searches.len(), 3, "{searches:#?}");
     assert_eq!(searches[0].field("caller"), Some("dashboard-token"));
+    assert_eq!(searches[0].field("tail"), Some("false"));
+    assert_eq!(searches[1].field("source"), Some("s".repeat(128).as_str()));
+    assert_eq!(
+        (searches[2].field("tail"), searches[2].field("caller")),
+        (Some("true"), Some("dashboard-token"))
+    );
     assert!(
         lines.iter().all(|l| !l.text().contains(&secret)),
         "a payload or a searched text was logged"
@@ -745,4 +790,58 @@ async fn the_hub_bounds_its_open_tails() {
         fake.seen().iter().filter(|s| s.type_name == TAIL).count(),
         1
     );
+}
+
+/// The hub validates what it can before asking: `limit=0` (the browser takes 1 and more) and a
+/// lag `source` over the browser's bound are 400 and never reach the browser.
+#[tokio::test]
+async fn the_hub_refuses_a_zero_limit_and_a_long_lag_source() {
+    let (grpc, http) = hub(config()).await;
+    let fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (status, body) = get(http, "/api/v1/events?limit=0", None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("limit must be a positive number"))
+    );
+    let long = "s".repeat(1025);
+    let (status, body) = get(http, &format!("/api/v1/events/lag?source={long}"), None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("source is longer than 1024 bytes"))
+    );
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+    let (status, _) = get(http, "/api/v1/events/lag?source=kraken.events", None).await;
+    assert_eq!(status, 200);
+}
+
+/// A hub that stops ends every open tail with `shutdown`, not `failed`, although its sessions
+/// (the browser's among them) are closed in the same shutdown.
+#[tokio::test]
+async fn a_hub_that_stops_ends_its_tails_with_shutdown() {
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (grpc, http) = (
+        grpc_listener.local_addr().unwrap(),
+        http_listener.local_addr().unwrap(),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        kraken_hub::serve_with_shutdown(config(), grpc_listener, Some(http_listener), async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (mut sse, _tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
+    stop.send(()).unwrap();
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (name.as_str(), data.as_str()),
+        ("end", "{\"reason\":\"shutdown\"}")
+    );
+    assert_eq!(sse.next(Duration::from_secs(5)).await, None);
 }

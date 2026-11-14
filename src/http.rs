@@ -446,22 +446,31 @@ impl<'a> EventCall<'a> {
             .map_err(Refusal::from_route)
     }
 
-    /// For a search or a tail that filters on the payload (`q`): the payload rules, and the
-    /// audit line of a payload search (without the searched text). `true` when `q` is sent.
+    /// For a search or a tail that filters on the payload (`q`): the payload rules. `Some` with
+    /// the caller when `q` is sent; [`EventCall::audit_payload_search`] writes its audit line once
+    /// the request is built.
     fn payload_filter(
         &self,
         params: &events::Params,
         headers: &HeaderMap,
-    ) -> Result<bool, Refusal> {
+    ) -> Result<Option<&'static str>, Refusal> {
         if !params.wants_payload() {
-            return Ok(false);
+            return Ok(None);
         }
-        let caller = events::payload_access(&self.s.config, presented(headers))
-            .map_err(Refusal::Forbidden)?;
-        let source = params.source.as_deref().unwrap_or_default();
+        events::payload_access(&self.s.config, presented(headers))
+            .map(Some)
+            .map_err(Refusal::Forbidden)
+    }
+
+    /// The audit line of a payload search (without the searched text), for a request the hub
+    /// validated and is about to send; values cut as every client-chosen string in a log.
+    fn audit_payload_search(&self, caller: Option<&'static str>, params: &events::Params) {
+        let Some(caller) = caller else {
+            return;
+        };
+        let source = crate::auth::clip(params.source.as_deref().unwrap_or_default());
         let tail = self.kind == "tail";
         tracing::info!(caller, source, tail, correlation_id = %self.correlation_id, "event payload search");
-        Ok(true)
     }
 
     /// The answer: `value` as JSON, or the refusal, counted and tagged with the correlation id.
@@ -516,11 +525,12 @@ async fn api_events(
     let call = EventCall::new(&s, "search", &headers);
     let page = async {
         call.installed()?;
-        let with_q = call.payload_filter(&params, &headers)?;
+        let q_caller = call.payload_filter(&params, &headers)?;
         let budget = events::search_budget(call.deadline(events::SEARCH));
         let request = params
-            .search_request(with_q, budget)
+            .search_request(q_caller.is_some(), budget)
             .map_err(Refusal::BadRequest)?;
+        call.audit_payload_search(q_caller, &params);
         let page = events::read_page(&call.ask(events::SEARCH, request).await?)?;
         s.metrics.event_scanned(page.scanned);
         Ok(page)
@@ -549,11 +559,12 @@ async fn api_event(
     {
         let r = &detail.summary;
         s.metrics.event_payload_view();
+        // The place is the browser's answer: cut like any string a peer chose.
         tracing::info!(
             caller,
-            source = %r.source,
-            segment = %r.segment,
-            position = %r.position,
+            source = %crate::auth::clip(&r.source),
+            segment = %crate::auth::clip(&r.segment),
+            position = %crate::auth::clip(&r.position),
             size = r.size,
             correlation_id = %call.correlation_id,
             "event payload served"
@@ -588,7 +599,7 @@ async fn api_event_lag(
 ) -> Response {
     let call = EventCall::new(&s, "lag", &headers);
     let lag = async {
-        let request = events::lag_request(query.source.as_deref());
+        let request = events::lag_request(query.source.as_deref()).map_err(Refusal::BadRequest)?;
         events::read::<events::LagView>(&call.ask(events::LAG, request).await?)
     };
     call.answer(lag.await)
@@ -631,14 +642,15 @@ async fn api_events_tail(
                 s.config.event_max_tails
             ))
         })?;
-        let with_q = call.payload_filter(&params, &headers)?;
+        let q_caller = call.payload_filter(&params, &headers)?;
         let request = params
             .tail_request(
-                with_q,
+                q_caller.is_some(),
                 events::tail_heartbeat(&s.config),
                 events::tail_duration(&s.config),
             )
             .map_err(Refusal::BadRequest)?;
+        call.audit_payload_search(q_caller, &params);
         let mut parts = s.router.stream_internal(
             events::TAIL,
             request.to_string().into_bytes(),

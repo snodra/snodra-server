@@ -438,6 +438,17 @@ async fn run_stream(
             .await;
         return;
     }
+    // ...and the hub sends them as service `kraken-hub`: no client may claim that name.
+    if first.service_name == crate::router::HUB_SERVICE {
+        warn!(service = %crate::auth::clip(&first.service_name), instance = %crate::auth::clip(&first.instance_id), "register with the hub's own service name");
+        let _ = tx
+            .send(Err(Status::invalid_argument(format!(
+                "Register.service_name must not be {}: the hub's own requests use it",
+                crate::router::HUB_SERVICE
+            ))))
+            .await;
+        return;
+    }
     if first.initial_permits == 0 {
         warn!(service = %crate::auth::clip(&first.service_name), instance = %crate::auth::clip(&first.instance_id), "register without permits");
         let _ = tx

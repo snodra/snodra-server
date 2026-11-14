@@ -85,6 +85,26 @@ async fn an_instance_id_with_the_hubs_reserved_prefix_is_refused() {
     other.expect_ack().await;
 }
 
+/// The hub's own requests are sent as service `kraken-hub`: no client may register as it.
+#[tokio::test]
+async fn the_hubs_own_service_name_is_refused() {
+    let addr = start_hub(Config::default()).await;
+    let mut client = FakeClient::connect(addr).await;
+    client.send_register("kraken-hub", &["svc.Do"], &[]).await;
+    let status = client.expect_closed().await;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "Register.service_name must not be kraken-hub: the hub's own requests use it"
+    );
+    // Anything else is an ordinary service name.
+    let mut other = FakeClient::connect(addr).await;
+    other
+        .send_register("kraken-hub-tools", &["svc.Do"], &[])
+        .await;
+    other.expect_ack().await;
+}
+
 #[tokio::test]
 async fn duplicate_type_owner_closes_with_already_exists() {
     let addr = start_hub(Config::default()).await;

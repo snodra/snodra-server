@@ -122,7 +122,7 @@ cargo run
 | `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters); at most `20s`, the 30 s reset lease minus its 10 s renewal period |
 | `KRAKEN_HUB_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
 | `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS` | `false` | ask the [event browser](#event-browser) for event payloads (record detail, `q`) for a request that presents the dashboard or write token (a token must be configured too) |
-| `KRAKEN_HUB_EVENT_MAX_TAILS` | `4` | event tails open at once on this hub; one more is 429 |
+| `KRAKEN_HUB_EVENT_MAX_TAILS` | `4` | event tails open at once on this hub (1 to 1024); one more is 429 |
 
 The event browser's own settings (sources, scan and time budgets, concurrent searches and tails, tail duration) are the
 `kraken-event-browser` add-on's. `KRAKEN_HUB_KAFKA_BOOTSTRAP`, `KRAKEN_HUB_EVENT_TOPICS`,
@@ -509,7 +509,9 @@ types `kraken.events.Search`, `kraken.events.Get`, `kraken.events.Sources`, `kra
 `kraken.events.Tail` (a streaming query). Each `/api/v1/events*` call becomes one hub-internal query to a live browser
 instance (`Router::query_internal`, `Router::stream_internal`), routed, timed and flow-controlled like a client's;
 `src/events.rs` builds the requests, reads the answers and keeps the payload rules. Whether a browser is installed is
-read from the registry (a handler of `kraken.events.Search`), not from a setting.
+read from the registry (a handler of `kraken.events.Search`), not from a setting, and per hub: a hub answers the
+events routes only while a browser is connected to *that* hub. The add-on connects to every hub of its list, as every
+service instance does, so each hub of a deployment has it.
 
 | Route under `/api/v1/` | Query | Answer |
 |---|---|---|
@@ -524,13 +526,14 @@ service (the record header `source`). Empty parameters count as absent; times ar
 
 - **Reads** like every `/api/v1/` read: the dashboard token, or the write token. No browser connected: every route is
   404 `{"error":"event browser not installed"}` (the Events page leaves the navigation).
-- **Errors:** the hub refuses itself, before asking, what it can tell is wrong: 400 for a `limit` that is not a whole
-  number, a tail with `from`, `to` or `cursor`, a filter, source or cursor over 1 KiB, a segment or position over
-  128 bytes. The browser's own errors map to 400 (`invalid`), 404 (`not-found`), 429 with `Retry-After: 1` (`busy`) and
-  503 (`unavailable`), with its message (cut to 512 bytes); a request it could not decode (`INVALID_REQUEST`) is 400
-  "the event browser could not read the request"; no answer within the deadline is 504; anything else (the browser
-  left, its own error without those details, an answer that is not the expected JSON or over 2 MiB, a tail part over
-  64 KiB) is 502 "the event browser failed to answer", never the browser's raw words.
+- **Errors:** the hub refuses itself, before asking, what it can tell is wrong: 400 for a `limit` that is not a
+  positive whole number, a tail with `from`, `to` or `cursor`, a filter, cursor or source (of a search, a tail or the
+  lag) over 1 KiB, a segment or position over 128 bytes. The browser's own errors map to 400 (`invalid`), 404
+  (`not-found`), 429 with `Retry-After: 1` (`busy`) and 503 (`unavailable`), with its message (cut to 512 bytes); a
+  request it could not decode (`INVALID_REQUEST`) is 400 "the event browser could not read the request"; no answer
+  within the deadline is 504; anything else (the browser left, its own error without those details, an answer that is
+  not the expected JSON or over 2 MiB, a tail part over 64 KiB) is 502 "the event browser failed to answer", never the
+  browser's raw words.
 - **Deadlines:** a point query asks a 30 s timeout, clamped by the router as any client's (`KRAKEN_HUB_MAX_TIMEOUT_MS`,
   and `KRAKEN_HUB_TIMEOUT_OVERRIDES` per `kraken.events.*` type); a search asks the browser for a time budget 2 s under
   that deadline, so it answers what it found (`stoppedBy: "timeBudget"`) before the hub gives up.
@@ -539,7 +542,7 @@ service (the record header `source`). Empty parameters count as absent; times ar
   turns each `heartbeat` part into the SSE heartbeat, stamped with the hub's clock, and a longest duration 2 s under
   `KRAKEN_HUB_MAX_STREAM_DURATION`. A reader that leaves cancels the browser's tail (`Cancel`); a browser that goes away
   or sends a part the hub cannot read ends the stream with `end` `failed`; this hub stopping ends it with `shutdown`.
-  At most `KRAKEN_HUB_EVENT_MAX_TAILS` (4) tails are open on a hub; one more is 429.
+  At most `KRAKEN_HUB_EVENT_MAX_TAILS` (4, at most 1024) tails are open on a hub; one more is 429.
 - **Payloads** (the detail, `q`) only with `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS=true`, a dashboard or write token
   configured, and one presented: only then does the hub ask the browser for the payload (`Get.payload: true`) or send
   `q`. Otherwise `"payload": {"hidden": "payloads-off" | "no-token-configured" | "no-token-presented", "reason":
@@ -551,7 +554,9 @@ service (the record header `source`). Empty parameters count as absent; times ar
 - **Who asked:** each query carries the headers `userId` (the token presented, `dashboard-token` or `write-token`,
   when one was) and `correlationId` (the request's `X-Correlation-Id` when it is 1 to 128 visible ASCII characters,
   else a fresh one); every answer carries `X-Correlation-Id` back, and the audit lines the same id. The sender is the
-  hub itself (service `kraken-hub`, instance `kraken-hub/<uuid>`, a prefix no client may register).
+  hub itself (service `kraken-hub`, instance `kraken-hub/<uuid>`: no client may register that service name or that
+  instance prefix). The browser treats `userId` and `correlationId` as information for its logs, not as an identity:
+  any client allowed to send a `kraken.events.*` type can set them.
 - **Bounds** of the reads (records scanned, results, time per search, concurrent searches and tails, tail duration,
   buffer for a slow reader) are the add-on's settings.
 - **Metrics:** `kraken_hub_event_browser_requests_total{kind=search|record|sources|lag|tail,
@@ -567,6 +572,11 @@ To install a browser under access control, give its credential the `event-browse
 name = "kraken-event-browser"
 event-browser = true
 ```
+
+With `KRAKEN_HUB_AUTH_MODE` `off` (the default) or `permissive`, the ACL decides nothing: any connected client may
+register the `kraken.events.*` types or send them, and a client that sends them reads events straight from the
+browser, without the hub's payload rules or audit lines. Run the browser with access control enforced wherever those
+rules matter.
 
 ```bash
 H="Authorization: Bearer $KRAKEN_HUB_DASHBOARD_TOKEN"
@@ -597,7 +607,8 @@ send    = ["orders.*"]               # types it may send, in every request mode
 Patterns are an exact type, `prefix.*` or `*`. `control = true` lets the entry's credentials call the
 [processor controls](#processor-control); `event-browser = true` lets them register the event browser's
 reserved `kraken.events.*` query types (`kraken-event-browser`), which no `handle` pattern grants, not even
-`*` (a `handle` pattern that covers them, `*` or `kraken.*` too, logs a warning when the file is read). Sending a
+`*` (a `handle` pattern that reaches for them, `kraken.*`, `kraken.events.*` or one of the types, logs a warning when
+the file is read; a bare `*` does not). Sending a
 `kraken.events.*` type likewise needs a `send` pattern that names it, `kraken.events.*` or the type itself (`*` and
 `kraken.*` do not grant it): an operator who grants one lets that service read events directly from the browser,
 without the hub's payload rules. `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
@@ -616,7 +627,7 @@ without the hub's payload rules. `contexts` only accepts `["default"]`. Generate
 | a handled `kraken.events.*` type without `event-browser = true` | stream closed with `PERMISSION_DENIED` "service `<s>` may not handle type `<t>`: kraken.events.* types need the event-browser right" | logged, counted (`event_browser_denied`), allowed |
 | a handled `kraken.events.*` type and another type outside `handle` | as above: the event-browser denial is the one reported | as above |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription); for a `kraken.events.*` type, a `send` without a pattern naming `kraken.events` | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
-| a `Register` whose instance id starts with `kraken-hub/` (reserved for the hub's own requests) | stream closed with `INVALID_ARGUMENT`, in every mode | the same |
+| a `Register` whose instance id starts with `kraken-hub/` or whose service name is `kraken-hub` (reserved for the hub's own requests) | stream closed with `INVALID_ARGUMENT`, in every mode | the same |
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
 | the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
 

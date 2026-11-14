@@ -286,7 +286,9 @@ impl Params {
             let limit = limit
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| "limit must be a positive number".to_string())?;
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| "limit must be a positive number".to_string())?;
             request.insert("limit".to_string(), limit.into());
         }
         if let Some(cursor) = present(&self.cursor) {
@@ -336,12 +338,13 @@ pub fn get_request(
     Ok(json!({ "source": source, "segment": segment, "position": position, "payload": payload }))
 }
 
-/// `kraken.events.Lag` of `source` (the browser's default when absent).
-pub fn lag_request(source: Option<&str>) -> Value {
-    match source.filter(|s| !s.is_empty()) {
-        Some(source) => json!({ "source": source }),
+/// `kraken.events.Lag` of `source` (the browser's default when absent); `Err` with the reason
+/// for a 400 when the source is longer than the browser takes.
+pub fn lag_request(source: Option<&str>) -> Result<Value, String> {
+    Ok(match source.filter(|s| !s.is_empty()) {
+        Some(source) => json!({ "source": bounded("source", source, MAX_FILTER)? }),
         None => json!({}),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -644,7 +647,10 @@ fn read_bounded<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T, Refu
         return Err(Refusal::Failed);
     }
     serde_json::from_slice(bytes).map_err(|e| {
-        tracing::warn!(error = %e, "event browser answer malformed: dropped");
+        tracing::warn!(
+            error = %crate::auth::clip(&e.to_string()),
+            "event browser answer malformed: dropped"
+        );
         Refusal::Failed
     })
 }
@@ -817,7 +823,7 @@ mod tests {
                 .unwrap(),
             json!({"filters": {}, "timeoutMs": 1500})
         );
-        for limit in ["ten", "-1", "1.5"] {
+        for limit in ["ten", "-1", "1.5", "0", " 0 "] {
             let bad = params(&[("limit", limit)]).search_request(false, Duration::from_secs(1));
             assert_eq!(
                 bad.unwrap_err(),
@@ -857,6 +863,52 @@ mod tests {
             format!("position is longer than {MAX_PLACE} bytes")
         );
         assert!(get_request(&"s".repeat(MAX_FILTER + 1), "1", "1", false).is_err());
+    }
+
+    #[test]
+    fn a_lag_request_bounds_its_source() {
+        assert_eq!(lag_request(None).unwrap(), json!({}));
+        assert_eq!(lag_request(Some("")).unwrap(), json!({}));
+        assert_eq!(
+            lag_request(Some("kraken.events")).unwrap(),
+            json!({"source": "kraken.events"})
+        );
+        assert!(lag_request(Some(&"s".repeat(MAX_FILTER))).is_ok());
+        assert_eq!(
+            lag_request(Some(&"s".repeat(MAX_FILTER + 1))).unwrap_err(),
+            format!("source is longer than {MAX_FILTER} bytes")
+        );
+    }
+
+    /// serde's error text quotes what it could not read; the warning about a malformed answer
+    /// carries it cut, never a browser-chosen string of any length.
+    #[test]
+    fn a_malformed_answer_is_logged_cut() {
+        crate::telemetry::test_support::capture_logs();
+        let marker = "m".repeat(10);
+        let answer = format!("{{\"source\":\"{marker}{}\"}}", "y".repeat(10_000));
+        assert_eq!(read::<SearchPage>(answer.as_bytes()), Err(Refusal::Failed));
+        let answer = format!(
+            "{{\"source\":\"s\",\"results\":[],\"scanned\":\"{marker}{}\"}}",
+            "y".repeat(10_000)
+        );
+        assert_eq!(read::<SearchPage>(answer.as_bytes()), Err(Refusal::Failed));
+        let lines: Vec<_> = crate::telemetry::test_support::logged()
+            .into_iter()
+            .filter(|l| l.message.contains("malformed"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the malformed answers were not logged: {lines:?}"
+        );
+        for line in lines {
+            let error = line.field("error").unwrap_or_default();
+            assert!(
+                error.chars().count() <= crate::auth::MAX_LOGGED_CHARS,
+                "{error}"
+            );
+        }
     }
 
     #[test]

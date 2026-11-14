@@ -179,7 +179,7 @@ pub struct Config {
     /// default false.
     pub event_payloads: bool,
     /// Event tails (`/api/v1/events/tail`) open at once on this hub; one more is answered 429.
-    /// `KRAKEN_HUB_EVENT_MAX_TAILS`, default 4, positive.
+    /// `KRAKEN_HUB_EVENT_MAX_TAILS`, default 4, 1 to [`MAX_EVENT_TAILS`].
     pub event_max_tails: usize,
     /// The settings of [`REMOVED_SETTINGS`] the environment still sets: they are not read, and
     /// each is a startup warning ([`Config::security_warnings`]).
@@ -703,8 +703,11 @@ impl Config {
         if let Some(url) = &self.grafana_url {
             check_link_url(url).context("KRAKEN_HUB_GRAFANA_URL")?;
         }
-        if self.event_max_tails == 0 {
-            bail!("KRAKEN_HUB_EVENT_MAX_TAILS must be positive");
+        if self.event_max_tails == 0 || self.event_max_tails > MAX_EVENT_TAILS {
+            bail!(
+                "KRAKEN_HUB_EVENT_MAX_TAILS ({}) must be 1 to {MAX_EVENT_TAILS}",
+                self.event_max_tails
+            );
         }
         // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
         if self.heartbeat_interval * 2 > self.heartbeat_timeout {
@@ -931,6 +934,10 @@ fn check_dashboard_token(name: &str, token: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Event tails open at once on one hub at most (`KRAKEN_HUB_EVENT_MAX_TAILS`; the event
+/// browser's own bound on concurrent calls is the same).
+pub const MAX_EVENT_TAILS: usize = 1024;
 
 /// Peer hubs a dashboard merges at most (`KRAKEN_HUB_PEERS`).
 pub const MAX_PEERS: usize = 16;
@@ -2266,10 +2273,14 @@ mod tests {
         .unwrap();
         assert!(c.event_payloads);
         assert_eq!(c.event_max_tails, 1);
+        let most = with_env(&[("KRAKEN_HUB_EVENT_MAX_TAILS", "1024")]).unwrap();
+        assert_eq!(most.event_max_tails, MAX_EVENT_TAILS);
         for (var, value) in [
             ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "maybe"),
             ("KRAKEN_HUB_EVENT_MAX_TAILS", "0"),
             ("KRAKEN_HUB_EVENT_MAX_TAILS", "many"),
+            ("KRAKEN_HUB_EVENT_MAX_TAILS", "1025"),
+            ("KRAKEN_HUB_EVENT_MAX_TAILS", "18446744073709551615"),
         ] {
             let err = with_env(&[(var, value)]).expect_err(&format!("{var}={value:?}"));
             assert!(err.to_string().contains(var), "{var}: {err:#}");

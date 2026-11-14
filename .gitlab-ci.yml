@@ -5,7 +5,7 @@ workflow:
     - when: never
 
 # Shell-executor pipeline: the runners have Rust, protoc, Docker and buildx installed.
-# Images and services are intentionally not used; Testcontainers talks to the host daemon.
+# Images and services are intentionally not used.
 
 stages:
   - check
@@ -14,7 +14,6 @@ stages:
 
 variables:
   CARGO_TERM_COLOR: always
-  TESTCONTAINERS_RYUK_DISABLED: "true"
 
 fmt:
   stage: check
