@@ -509,7 +509,8 @@ types `kraken.events.Search`, `kraken.events.Get`, `kraken.events.Sources`, `kra
 `kraken.events.Tail` (a streaming query). Each `/api/v1/events*` call becomes one hub-internal query to a live browser
 instance (`Router::query_internal`, `Router::stream_internal`), routed, timed and flow-controlled like a client's;
 `src/events.rs` builds the requests, reads the answers and keeps the payload rules. Whether a browser is installed is
-read from the registry (a handler of `kraken.events.Search`), not from a setting, and per hub: a hub answers the
+read from the registry (a live instance handling `kraken.events.Search`; not the type's owner kept through
+`KRAKEN_HUB_OWNER_GRACE` after the last browser left), not from a setting, and per hub: a hub answers the
 events routes only while a browser is connected to *that* hub. The add-on connects to every hub of its list, as every
 service instance does, so each hub of a deployment has it.
 
@@ -527,8 +528,9 @@ service (the record header `source`). Empty parameters count as absent; times ar
 - **Reads** like every `/api/v1/` read: the dashboard token, or the write token. No browser connected: every route is
   404 `{"error":"event browser not installed"}` (the Events page leaves the navigation).
 - **Errors:** the hub refuses itself, before asking, what it can tell is wrong: 400 for a `limit` that is not a
-  positive whole number, a tail with `from`, `to` or `cursor`, a filter, cursor or source (of a search, a tail or the
-  lag) over 1 KiB, a segment or position over 128 bytes. The browser's own errors map to 400 (`invalid`), 404
+  positive whole number, a tail with `from`, `to` or `cursor`, a filter or source (of a search, a tail or the lag)
+  over 1 KiB, a cursor over 64 KiB (the browser's bound: it holds a place per segment; a GET's URI is at most 65 534
+  bytes, 414 beyond, so a cursor of up to some 65 000 bytes, about 2 400 segments, fits), a segment or position over 128 bytes. The browser's own errors map to 400 (`invalid`), 404
   (`not-found`), 429 with `Retry-After: 1` (`busy`) and 503 (`unavailable`), with its message (cut to 512 bytes); a
   request it could not decode (`INVALID_REQUEST`) is 400 "the event browser could not read the request"; no answer
   within the deadline is 504; anything else (the browser left, its own error without those details, an answer that is

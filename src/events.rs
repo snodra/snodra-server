@@ -48,9 +48,11 @@ pub const MAX_PART: usize = 64 * 1024;
 pub const MAX_MESSAGE: usize = 512;
 /// The longest correlation id the hub takes from a request (`X-Correlation-Id`).
 pub const MAX_CORRELATION_ID: usize = 128;
-/// A filter value, a source and a cursor are at most this many bytes (the browser's bound,
-/// checked before asking).
+/// A filter value and a source are at most this many bytes (the browser's bound, checked
+/// before asking).
 pub const MAX_FILTER: usize = 1024;
+/// A cursor is at most this many bytes (the browser's bound: it holds a place per segment).
+pub const MAX_CURSOR: usize = 64 * 1024;
 /// A segment and a position are at most this many bytes (the browser's bound).
 pub const MAX_PLACE: usize = 128;
 /// The heartbeat the hub asks of a tail at most (its SSE heartbeat of ADR 0025)...
@@ -69,9 +71,10 @@ pub const LIBRARY_HEADERS: [&str; 7] = [
     "traceparent",
 ];
 
-/// True while an event browser is connected: some session handles [`SEARCH`].
+/// True while an event browser is connected: a live instance handles [`SEARCH`] (not a type
+/// kept through its owner's grace after the last browser left, when every call is a 404).
 pub fn installed(registry: &Registry) -> bool {
-    registry.has_owner(&ContextId::default(), SEARCH)
+    registry.has_live_handler(&ContextId::default(), SEARCH)
 }
 
 /// The request's correlation id when it brings a usable one (1 to [`MAX_CORRELATION_ID`] visible
@@ -292,7 +295,7 @@ impl Params {
             request.insert("limit".to_string(), limit.into());
         }
         if let Some(cursor) = present(&self.cursor) {
-            let cursor = bounded("cursor", cursor, MAX_FILTER)?;
+            let cursor = bounded("cursor", cursor, MAX_CURSOR)?;
             request.insert("cursor".to_string(), Value::from(cursor));
         }
         request.insert("timeoutMs".to_string(), ms(budget).into());
@@ -831,9 +834,26 @@ mod tests {
                 "{limit}"
             );
         }
+        // A cursor holds a place per segment: up to the browser's 64 KiB, passed verbatim.
+        let cursor = "c".repeat(4096);
+        let request = params(&[("cursor", &cursor)])
+            .search_request(false, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(request["cursor"], cursor.as_str());
+        assert!(
+            params(&[("cursor", &"c".repeat(MAX_CURSOR))])
+                .search_request(false, Duration::from_secs(1))
+                .is_ok()
+        );
+        assert_eq!(
+            params(&[("cursor", &"c".repeat(MAX_CURSOR + 1))])
+                .search_request(false, Duration::from_secs(1))
+                .unwrap_err(),
+            format!("cursor is longer than {MAX_CURSOR} bytes")
+        );
         // The browser's bounds, checked before asking: a filter value of at most 1 KiB.
         let long = "x".repeat(MAX_FILTER + 1);
-        for name in ["from", "type", "service", "q", "source", "cursor"] {
+        for name in ["from", "type", "service", "q", "source"] {
             let err = params(&[(name, &long)])
                 .search_request(true, Duration::from_secs(1))
                 .unwrap_err();
@@ -963,6 +983,16 @@ mod tests {
         }
         let long = "x".repeat(MAX_CORRELATION_ID + 1);
         assert_ne!(correlation_id(Some(&long)), long);
+    }
+
+    #[test]
+    fn a_page_carries_a_long_cursor_back_intact() {
+        let cursor = "c".repeat(MAX_CURSOR);
+        let answer = format!(
+            "{{\"source\":\"kraken.events\",\"results\":[],\"scanned\":1,\"exhausted\":false,\"stoppedBy\":\"limit\",\"cursor\":\"{cursor}\"}}"
+        );
+        let page = read_page(answer.as_bytes()).unwrap();
+        assert_eq!(page.cursor.as_deref(), Some(cursor.as_str()));
     }
 
     #[test]

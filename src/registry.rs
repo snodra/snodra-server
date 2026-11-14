@@ -788,6 +788,27 @@ impl Registry {
         self.inner.lock().unwrap().types.contains_key(type_name)
     }
 
+    /// True when a live instance of an owner of `type_name` lists the type. Unlike
+    /// [`Registry::has_owner`], a type kept through its owner's grace (no instance left) has no
+    /// live handler.
+    pub fn has_live_handler(&self, ctx: &ContextId, type_name: &str) -> bool {
+        check_context(ctx);
+        let inner = self.inner.lock().unwrap();
+        let Some(owner) = inner.types.get(type_name) else {
+            return false;
+        };
+        owner
+            .live_services()
+            .filter_map(|s| inner.services.get(s))
+            .flat_map(|svc| svc.instances.iter())
+            .any(|id| {
+                inner
+                    .instances
+                    .get(id)
+                    .is_some_and(|e| e.types.iter().any(|(t, _)| t == type_name))
+            })
+    }
+
     pub fn service_of(&self, ctx: &ContextId, instance_id: &str) -> Option<String> {
         check_context(ctx);
         let inner = self.inner.lock().unwrap();
@@ -1169,6 +1190,24 @@ mod tests {
         assert_eq!(r.pick(&D, "t.X", ""), no_live);
         assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 1);
         assert_eq!(r.pick(&D, "t.X", ""), Err(PickError::UnknownType));
+    }
+
+    /// A type kept through its owner's grace has an owner but no live handler.
+    #[test]
+    fn a_live_handler_is_a_live_instance_listing_the_type() {
+        let r = reg();
+        assert!(!r.has_live_handler(&D, "t.X"));
+        r.register(&D, "a", "A", &s(&["t.X"]), &[]).unwrap();
+        assert!(r.has_live_handler(&D, "t.X"));
+        assert!(!r.has_live_handler(&D, "t.Y"));
+        r.unregister(&D, "a", Instant::now());
+        assert!(r.has_owner(&D, "t.X"), "kept through the grace");
+        assert!(!r.has_live_handler(&D, "t.X"));
+        // An instance of the owner that does not list the type is no handler of it.
+        r.register(&D, "b", "A", &s(&["t.Z"]), &[]).unwrap();
+        assert!(!r.has_live_handler(&D, "t.X"));
+        r.register(&D, "c", "A", &s(&["t.X", "t.Z"]), &[]).unwrap();
+        assert!(r.has_live_handler(&D, "t.X"));
     }
 
     #[test]

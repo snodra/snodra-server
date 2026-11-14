@@ -138,6 +138,50 @@ async fn events_api_404_without_browser() {
         assert!(Instant::now() < deadline, "still {status}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The hub keeps the types' owner through its owner grace, but no browser is installed:
+    // the version says so as soon as the routes are 404 (the dashboard hides the page).
+    let (_, version) = get(http, "/api/v1/version", None).await;
+    assert_eq!(version["eventBrowser"]["installed"], false, "{version}");
+}
+
+/// The browser's cursor holds a place per segment (up to 64 KiB): the hub passes a long one
+/// verbatim, both ways, and refuses only one over the browser's bound.
+#[tokio::test]
+async fn a_long_cursor_reaches_the_browser_verbatim() {
+    let (grpc, http) = hub(config()).await;
+    let long = "c".repeat(4096);
+    let back = long.clone();
+    let fake = FakeBrowser::start(grpc, move |type_name, request| match type_name {
+        SEARCH => {
+            let mut p = page(vec![]);
+            p["cursor"] = back.clone().into();
+            let _ = request;
+            Answer::Json(p)
+        }
+        _ => defaults(type_name, request),
+    })
+    .await;
+    until_installed(http).await;
+    let (status, body) = get(http, &format!("/api/v1/events?cursor={long}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(fake.last(SEARCH).request["cursor"], long.as_str());
+    assert_eq!(
+        body["cursor"],
+        long.as_str(),
+        "the answer's cursor comes back intact"
+    );
+    // A GET's URI is at most 65 534 bytes (the `http` crate's bound): a cursor of 60 KiB (some
+    // 2 200 segments) is read and passed on...
+    let longest = "c".repeat(60 * 1024);
+    let (status, body) = get(http, &format!("/api/v1/events?cursor={longest}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(fake.last(SEARCH).request["cursor"], longest.as_str());
+    // ...one of the browser's full 64 KiB makes the URI too long: 414 before anything is asked.
+    let asked = fake.seen().len();
+    let full = "c".repeat(64 * 1024 + 1);
+    let (status, _) = get(http, &format!("/api/v1/events?cursor={full}"), None).await;
+    assert_eq!(status, 414);
+    assert_eq!(fake.seen().len(), asked, "never reaches the browser");
 }
 
 #[tokio::test]
