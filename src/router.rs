@@ -72,7 +72,9 @@ use crate::telemetry::{
 
 mod internal;
 
-pub use internal::{HUB_SERVICE, MAX_INTERNAL_STREAM_CREDIT, RouteError};
+pub use internal::{
+    HUB_SERVICE, INSTANCE_PREFIX as HUB_INSTANCE_PREFIX, MAX_INTERNAL_STREAM_CREDIT, RouteError,
+};
 
 /// How long a terminal message waits for room in a full sender buffer before it is given up.
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);

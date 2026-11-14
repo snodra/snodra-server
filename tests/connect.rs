@@ -64,6 +64,27 @@ async fn request_before_register_closes_with_failed_precondition() {
     assert_eq!(status.message(), "first message must be Register");
 }
 
+/// The hub's own request sessions use instance ids `kraken-hub/<uuid>` (ADR 0027): a client may
+/// not register one.
+#[tokio::test]
+async fn an_instance_id_with_the_hubs_reserved_prefix_is_refused() {
+    let addr = start_hub(Config::default()).await;
+    let mut client = FakeClient::connect(addr).await;
+    client.instance_id = "kraken-hub/1234".to_string();
+    client.send_register("svc", &["svc.Do"], &[]).await;
+    let status = client.expect_closed().await;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "Register.instance_id must not start with kraken-hub/: the hub's own requests use it"
+    );
+    // Anything else is an ordinary instance id.
+    let mut other = FakeClient::connect(addr).await;
+    other.instance_id = "kraken-hubx/1".to_string();
+    other.send_register("svc", &["svc.Do"], &[]).await;
+    other.expect_ack().await;
+}
+
 #[tokio::test]
 async fn duplicate_type_owner_closes_with_already_exists() {
     let addr = start_hub(Config::default()).await;

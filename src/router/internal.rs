@@ -8,10 +8,12 @@
 //! side ends it as a client that goes away would: a dropped query future drops the pending
 //! request, a dropped stream receiver sends the handler `Cancel`.
 //!
-//! The hub acts as itself: the sender is service [`HUB_SERVICE`] (metrics, edges, logs), its
-//! session has no principal (the ACL judges clients, not the hub), and the handler gets a plain
-//! `Request` with no headers, so no `authorization` (no forwarded user) and no correlation id.
+//! The hub acts as itself: the sender is service [`HUB_SERVICE`] (metrics, edges, logs) and its
+//! session has no principal (the ACL judges clients, not the hub). The caller's metadata (for the
+//! dashboard: `userId` and `correlationId`, so the handler can log who asked) travels as the
+//! request's headers; the hub never forwards an `authorization` credential.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,18 +32,20 @@ use crate::registry::InstanceId;
 /// The service the hub sends its own requests as.
 pub const HUB_SERVICE: &str = "kraken-hub";
 
-/// The instance id prefix of the hub's request sessions (`kraken-hub/<uuid>`).
-const INSTANCE_PREFIX: &str = "kraken-hub/";
+/// The instance id prefix of the hub's request sessions (`kraken-hub/<uuid>`); a client may not
+/// register an instance id that starts with it.
+pub const INSTANCE_PREFIX: &str = "kraken-hub/";
 
 /// The most credit an internal stream holds: the receiver's buffer is that large.
 pub const MAX_INTERNAL_STREAM_CREDIT: u32 = 1024;
 
 /// Why a hub-originated request failed: the `Error` the router answers a client with, or a
-/// handler's own error.
+/// handler's own error with its machine-readable `details` (empty for the router's own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteError {
     pub code: ErrorCode,
     pub message: String,
+    pub details: Vec<u8>,
 }
 
 impl RouteError {
@@ -49,6 +53,7 @@ impl RouteError {
         Self {
             code: ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Unspecified),
             message: e.message,
+            details: e.details,
         }
     }
 
@@ -57,6 +62,7 @@ impl RouteError {
         Self {
             code: ErrorCode::Cancelled,
             message: "the hub ended the request".to_string(),
+            details: Vec::new(),
         }
     }
 }
@@ -144,13 +150,15 @@ fn timeout_ms(timeout: Duration) -> u32 {
 impl Router {
     /// Asks the handler of query `type_name` and waits for its answer: routed, flow-controlled
     /// and timed (`timeout`, under the hub's per-type override and maximum) like a client's
-    /// unary query. `Err` carries the router's error (`NO_HANDLER`, `TIMEOUT`, ...) or the
-    /// handler's. Dropping the future drops the request, as a client that leaves does.
+    /// unary query; `headers` are the request's metadata. `Err` carries the router's error
+    /// (`NO_HANDLER`, `TIMEOUT`, ...) or the handler's. Dropping the future drops the request, as
+    /// a client that leaves does.
     pub async fn query_internal(
         self: &Arc<Self>,
         type_name: &str,
         payload: Vec<u8>,
         timeout: Duration,
+        headers: HashMap<String, String>,
     ) -> Result<Vec<u8>, RouteError> {
         let mut sender = InternalSender::open(self, 2);
         let id = uuid::Uuid::new_v4().to_string();
@@ -159,6 +167,7 @@ impl Router {
             kind: RequestKind::Query as i32,
             r#type: type_name.to_string(),
             payload,
+            headers,
             timeout_ms: timeout_ms(timeout),
             mode: RequestMode::Unary as i32,
             ..Request::default()
@@ -177,15 +186,18 @@ impl Router {
     /// Opens streaming query `type_name` with `credit` (0: the default of a client's stream; at
     /// most [`MAX_INTERNAL_STREAM_CREDIT`]): its parts arrive on the receiver in order, then the
     /// channel closes, after an `Err` when the stream failed (the router's error, such as
-    /// `NO_HANDLER` or the idle `TIMEOUT`, or the handler's). The credit is the receiver's
-    /// buffer: the handler is granted one more part each time the receiver takes one, so it
-    /// never runs more than `credit` parts ahead of the reader. Dropping the receiver cancels
-    /// the stream at the handler (`Cancel`, reason `receiver dropped`).
+    /// `NO_HANDLER` or the idle `TIMEOUT`, or the handler's); `headers` are the request's
+    /// metadata. The credit is the receiver's buffer: the slots the reader frees go back to the
+    /// handler in batches of half the credit (at least one), so it never runs more than `credit`
+    /// parts ahead of the reader and a busy stream costs a `Flow` per batch, not per part.
+    /// Dropping the receiver cancels the stream at the handler (`Cancel`, reason
+    /// `receiver dropped`).
     pub fn stream_internal(
         self: &Arc<Self>,
         type_name: &str,
         payload: Vec<u8>,
         credit: u32,
+        headers: HashMap<String, String>,
     ) -> mpsc::Receiver<Result<Vec<u8>, RouteError>> {
         let credit = match credit {
             0 => DEFAULT_STREAM_CREDIT,
@@ -205,31 +217,41 @@ impl Router {
             kind: RequestKind::Query as i32,
             r#type: type_name.to_string(),
             payload,
+            headers,
             mode: RequestMode::Streaming as i32,
             initial_credit: credit,
             ..Request::default()
         });
-        tokio::spawn(relay_stream(sender, id, out, held));
+        tokio::spawn(relay_stream(sender, id, out, held, (credit / 2).max(1)));
         rx
     }
 }
 
 /// Moves the parts of internal stream `id` to the receiver, each into a slot held for it, and
-/// grants the handler a credit for every slot the reader frees.
+/// grants the handler the slots the reader frees, `batch` at a time.
 async fn relay_stream(
     mut sender: InternalSender,
     id: String,
     out: Parts,
     mut held: Vec<OwnedPermit<Result<Vec<u8>, RouteError>>>,
+    batch: u32,
 ) {
+    // Slots freed by the reader and not granted yet.
+    let mut freed = 0;
     let failed = loop {
         tokio::select! {
             msg = sender.next(&id) => match msg {
                 Some(server_message::Message::Part(part)) => {
                     // The router ends a stream whose handler outruns its credit, so a slot is
                     // always held for a part it relays.
-                    if let Some(slot) = held.pop() {
-                        slot.send(Ok(part.payload));
+                    match held.pop() {
+                        Some(slot) => {
+                            slot.send(Ok(part.payload));
+                        }
+                        None => tracing::warn!(
+                            request = %id,
+                            "internal stream part without a held slot dropped"
+                        ),
                     }
                 }
                 Some(server_message::Message::End(end)) => {
@@ -242,10 +264,14 @@ async fn relay_stream(
             slot = out.clone().reserve_owned() => match slot {
                 Ok(slot) => {
                     held.push(slot);
-                    let flow = FlowMsg { request_id: id.clone(), credits: 1 };
-                    sender
-                        .router
-                        .on_flow_from(&sender.ctx, &sender.instance, sender.token, flow);
+                    freed += 1;
+                    if freed >= batch {
+                        let flow = FlowMsg { request_id: id.clone(), credits: freed };
+                        freed = 0;
+                        sender
+                            .router
+                            .on_flow_from(&sender.ctx, &sender.instance, sender.token, flow);
+                    }
                 }
                 Err(_) => {
                     let cancel = Cancel {
@@ -278,6 +304,7 @@ mod tests {
     use crate::registry::Registry;
     use crate::session::{SessionMeta, Sessions};
     use crate::telemetry::Metrics;
+    use std::collections::HashMap;
     use tokio_util::sync::CancellationToken;
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
@@ -290,6 +317,7 @@ mod tests {
     /// and [`TAIL`], opened with `permits`.
     struct Fx {
         router: Arc<Router>,
+        registry: Arc<Registry>,
         sessions: Arc<Sessions>,
         handler: mpsc::Receiver<Result<ServerMessage, tonic::Status>>,
         token: u64,
@@ -332,10 +360,24 @@ mod tests {
             .unwrap();
         Fx {
             router,
+            registry,
             sessions,
             handler,
             token,
         }
+    }
+
+    /// No request metadata.
+    fn none() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    /// The metadata the dashboard's calls carry: who asked and a correlation id.
+    fn meta() -> HashMap<String, String> {
+        HashMap::from([
+            ("userId".to_string(), "dashboard-token".to_string()),
+            ("correlationId".to_string(), "c-1".to_string()),
+        ])
     }
 
     /// Lets the spawned tasks (the hub's side of an internal stream) run.
@@ -406,7 +448,12 @@ mod tests {
         let router = Arc::clone(&f.router);
         let call = tokio::spawn(async move {
             router
-                .query_internal(SEARCH, b"{\"q\":1}".to_vec(), Duration::from_secs(3))
+                .query_internal(
+                    SEARCH,
+                    b"{\"q\":1}".to_vec(),
+                    Duration::from_secs(3),
+                    meta(),
+                )
                 .await
         });
         settle().await;
@@ -422,7 +469,8 @@ mod tests {
         );
         assert_eq!(r.payload, b"{\"q\":1}");
         assert_eq!(r.timeout_ms, 3000);
-        assert!(r.headers.is_empty(), "no forwarded user: {:?}", r.headers);
+        // The metadata travels as request headers; the hub still forwards no credential.
+        assert_eq!(r.headers, meta());
         f.reply(&r.id, reply::Result::Payload(b"[1]".to_vec()));
         assert_eq!(call.await.unwrap(), Ok(b"[1]".to_vec()));
         assert_eq!(f.router.in_flight(), 0);
@@ -433,7 +481,7 @@ mod tests {
         let router = Arc::clone(&f.router);
         let call = tokio::spawn(async move {
             router
-                .query_internal(SEARCH, vec![], Duration::from_secs(3))
+                .query_internal(SEARCH, vec![], Duration::from_secs(3), none())
                 .await
         });
         let r = f.next_request().await;
@@ -453,7 +501,7 @@ mod tests {
         // No handler: the router's own answer.
         let err = f
             .router
-            .query_internal("kraken.events.Lag", vec![], Duration::from_secs(3))
+            .query_internal("kraken.events.Lag", vec![], Duration::from_secs(3), none())
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NoHandler);
@@ -475,7 +523,7 @@ mod tests {
         let router = Arc::clone(&f.router);
         let call = tokio::spawn(async move {
             router
-                .query_internal(SEARCH, vec![], Duration::from_secs(3))
+                .query_internal(SEARCH, vec![], Duration::from_secs(3), none())
                 .await
         });
         let r = f.next_request().await;
@@ -486,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn internal_stream_respects_credit() {
         let mut f = fixture(PERMITS);
-        let mut rx = f.router.stream_internal(TAIL, b"{}".to_vec(), 2);
+        let mut rx = f.router.stream_internal(TAIL, b"{}".to_vec(), 2, none());
         let r = f.next_request().await;
         assert_eq!(r.r#type, TAIL);
         assert_eq!(
@@ -523,7 +571,7 @@ mod tests {
         assert_eq!(f.sessions(), 1);
 
         // A handler that ignores the credit is stopped by the router, as for any sender.
-        let mut rx = f.router.stream_internal(TAIL, vec![], 1);
+        let mut rx = f.router.stream_internal(TAIL, vec![], 1, none());
         let target = f.next_request().await.id;
         f.part(&target, 0, b"a");
         f.part(&target, 1, b"over");
@@ -540,7 +588,8 @@ mod tests {
     #[tokio::test]
     async fn internal_stream_receiver_drop_cancels_the_handler() {
         let mut f = fixture(PERMITS);
-        let mut rx = f.router.stream_internal(TAIL, vec![], 4);
+        // A credit of two goes back one at a time.
+        let mut rx = f.router.stream_internal(TAIL, vec![], 2, none());
         let target = f.next_request().await.id;
         f.part(&target, 0, b"a");
         assert_eq!(rx.recv().await, Some(Ok(b"a".to_vec())));
@@ -571,7 +620,7 @@ mod tests {
         let router = Arc::clone(&f.router);
         let call = tokio::spawn(async move {
             router
-                .query_internal(SEARCH, vec![], Duration::from_secs(3))
+                .query_internal(SEARCH, vec![], Duration::from_secs(3), none())
                 .await
         });
         let r = f.next_request().await;
@@ -581,6 +630,9 @@ mod tests {
         assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
         // The handler's late answer goes nowhere.
         f.reply(&r.id, reply::Result::Payload(vec![1]));
+        settle().await;
+        assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
+        f.nothing_for_the_handler();
     }
 
     #[tokio::test(start_paused = true)]
@@ -588,7 +640,7 @@ mod tests {
         let mut f = fixture(PERMITS);
         let err = f
             .router
-            .query_internal(SEARCH, vec![], Duration::from_millis(100))
+            .query_internal(SEARCH, vec![], Duration::from_millis(100), none())
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Timeout);
@@ -596,7 +648,7 @@ mod tests {
         assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
 
         // A stream with no part within the timeout ends with TIMEOUT and cancels the handler.
-        let mut rx = f.router.stream_internal(TAIL, vec![], 4);
+        let mut rx = f.router.stream_internal(TAIL, vec![], 4, none());
         let target = f.next_request().await.id;
         let err = rx.recv().await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::Timeout);
@@ -606,6 +658,127 @@ mod tests {
             other => panic!("expected a cancel, got {other:?}"),
         }
         settle().await;
+        assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
+    }
+    #[tokio::test]
+    async fn internal_stream_credits_go_back_in_batches_of_half_the_credit() {
+        let mut f = fixture(PERMITS);
+        let mut rx = f.router.stream_internal(TAIL, vec![], 4, none());
+        let target = f.next_request().await.id;
+        for seq in 0..4 {
+            f.part(&target, seq, b"p");
+        }
+        // The first part read frees one slot: not yet half the credit, so no Flow.
+        assert_eq!(rx.recv().await, Some(Ok(b"p".to_vec())));
+        settle().await;
+        f.nothing_for_the_handler();
+        // The second makes two: one Flow of two credits.
+        assert_eq!(rx.recv().await, Some(Ok(b"p".to_vec())));
+        settle().await;
+        match f.next().await {
+            server_message::Message::Flow(flow) => assert_eq!(flow.credits, 2),
+            other => panic!("expected a flow, got {other:?}"),
+        }
+        f.nothing_for_the_handler();
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn internal_stream_carries_the_handlers_error_after_its_parts() {
+        let mut f = fixture(PERMITS);
+        let mut rx = f.router.stream_internal(TAIL, vec![], 4, none());
+        let target = f.next_request().await.id;
+        f.part(&target, 0, b"a");
+        f.part(&target, 1, b"b");
+        let end = ReplyEnd {
+            request_id: target.clone(),
+            error: Some(ProtoError {
+                request_id: target.clone(),
+                code: ErrorCode::HandlerError as i32,
+                message: "the feed died".into(),
+                details: b"{\"error\":\"unavailable\"}".to_vec(),
+            }),
+            ..ReplyEnd::default()
+        };
+        f.router.on_stream_end_from(&D, "e1", f.token, end);
+        assert_eq!(rx.recv().await, Some(Ok(b"a".to_vec())));
+        assert_eq!(rx.recv().await, Some(Ok(b"b".to_vec())));
+        let err = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str(), err.details.as_slice()),
+            (
+                ErrorCode::HandlerError,
+                "the feed died",
+                b"{\"error\":\"unavailable\"}".as_slice()
+            )
+        );
+        assert_eq!(rx.recv().await, None);
+        settle().await;
+        assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn internal_stream_without_a_handler_fails_at_once() {
+        let f = fixture(PERMITS);
+        let mut rx = f
+            .router
+            .stream_internal("kraken.events.Nothing", vec![], 4, none());
+        let err = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoHandler);
+        assert_eq!(rx.recv().await, None);
+        settle().await;
+        assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn internal_stream_credit_defaults_and_is_clamped() {
+        let mut f = fixture(PERMITS);
+        let rx = f.router.stream_internal(TAIL, vec![], 0, none());
+        assert_eq!(f.next_request().await.initial_credit, DEFAULT_STREAM_CREDIT);
+        drop(rx);
+        settle().await;
+        assert!(matches!(f.next().await, server_message::Message::Cancel(_)));
+        let rx = f
+            .router
+            .stream_internal(TAIL, vec![], MAX_INTERNAL_STREAM_CREDIT + 1000, none());
+        assert_eq!(
+            f.next_request().await.initial_credit,
+            MAX_INTERNAL_STREAM_CREDIT
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_sweep_ends_internal_requests_as_cancelled() {
+        let mut f = fixture(PERMITS);
+        let router = Arc::clone(&f.router);
+        let call = tokio::spawn(async move {
+            router
+                .query_internal(SEARCH, vec![], Duration::from_secs(3), none())
+                .await
+        });
+        let mut rx = f.router.stream_internal(TAIL, vec![], 4, none());
+        f.next_request().await;
+        f.next_request().await;
+        // What the hub does at shutdown (`serve_with_shutdown`) to every session, here to the
+        // hub's own only (a handler swept first would answer HANDLER_DISCONNECTED instead).
+        for (ctx, id, token) in f.sessions.all_with_tokens() {
+            if id == "e1" {
+                continue;
+            }
+            if let Some(tx) = f.sessions.sender(&ctx, &id) {
+                let _ = tx.try_send(Err(tonic::Status::unavailable("hub shutting down")));
+            }
+            crate::service::disconnect(&f.registry, &f.sessions, &f.router, &ctx, &id, token);
+        }
+        let ended = RouteError {
+            code: ErrorCode::Cancelled,
+            message: "the hub ended the request".to_string(),
+            details: Vec::new(),
+        };
+        assert_eq!(call.await.unwrap(), Err(ended.clone()));
+        assert_eq!(rx.recv().await, Some(Err(ended)));
+        assert_eq!(rx.recv().await, None);
         assert_eq!((f.router.in_flight(), f.sessions()), (0, 1));
     }
 }
