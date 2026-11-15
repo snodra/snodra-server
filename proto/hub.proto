@@ -168,9 +168,11 @@ message InstanceStatus {
 enum ProcessorState {
   // Never sent on purpose; a value this hub does not know reads as this.
   PROCESSOR_STATE_UNSPECIFIED = 0;
-  // Started, but no segment is assigned to it yet, or a reassignment is in progress.
+  // Started, but before its first assignment, or while a reassignment is in progress (a
+  // revocation not yet followed by an assignment). An instance whose assignment is empty is idle,
+  // RUNNING.
   PROCESSOR_STARTING = 1;
-  // Segments assigned and records flowing (or none waiting).
+  // Assigned (possibly no segment: idle) and records flowing (or none waiting).
   PROCESSOR_RUNNING = 2;
   // A record exhausted its attempts in the last 60 s, or the reader reports an error.
   PROCESSOR_FAILING = 3;
@@ -196,7 +198,8 @@ message ProcessorStatus {
   string source = 3;
   // See ProcessorState.
   ProcessorState state = 4;
-  // The segments assigned to this instance, sorted by segment; empty while none is.
+  // The segments assigned to this instance, in the hub's segment order: decimal names by value,
+  // then the rest by bytes; empty while none is.
   repeated SegmentStatus segments = 5;
   // Records whose stage 1 (the processor's event handlers) completed, handled or found to be a
   // duplicate.
@@ -204,8 +207,8 @@ message ProcessorStatus {
   // Records that exhausted their attempts: parked as a dead letter, sent to the event
   // store's dead-letter destination or skipped (mode "log").
   uint64 failed_total = 7;
-  // The processor's letters in the service's dead_letters collection, over all instances,
-  // sampled every 30 s; 0 when dead_letter_mode is not "collection".
+  // The processor's letters in the service's message store, over all instances, sampled every
+  // 30 s; 0 when dead_letter_mode is not "collection".
   uint64 dead_letters = 8;
   // The message of the latest failure (never a payload or a stack trace), at most 512 bytes
   // (cut at a UTF-8 boundary); empty when none.
@@ -215,8 +218,8 @@ message ProcessorStatus {
   // The event types the processor's handlers handle (stage 1), sorted; "default" also lists the
   // event types its sagas handle.
   repeated string event_types = 11;
-  // Where a record goes once its attempts are exhausted: "collection" (the dead_letters
-  // collection, the default), "event-store" (the event store's own dead-letter
+  // Where a record goes once its attempts are exhausted: "collection" (a dead letter in the
+  // service's message store, the default), "event-store" (the event store's own dead-letter
   // destination) or "log" (logged and skipped).
   string dead_letter_mode = 12;
   // A replay range is open on this instance's segments (ADR 0023): records below a
@@ -275,8 +278,8 @@ message ControlRequest {
   }
 }
 
-// Persist "paused" in the service's processor_control collection and stop consuming without
-// leaving the subscription. Answered with ok.
+// Persist "paused" in the service's message store (its processor control) and stop consuming
+// without leaving the subscription. Answered with ok.
 message ProcessorPause {}
 
 // Persist "not paused" and consume again. Answered with ok.
@@ -567,7 +570,8 @@ message Request {
   // Streaming and subscriptions: credits the sender grants before its first Flow.
   uint32 initial_credit = 11;
   // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
-  // remaining targets are dropped; the targets are not cancelled.
+  // remaining targets are dropped; a target already forwarded is sent a Cancel, one still queued
+  // leaves its queue.
   uint32 max_results = 12;
 }
 
@@ -639,7 +643,10 @@ message ReplyPart {
   // The service and instance that answered.
   string responder_service = 4;
   string responder_instance = 5;
-  // 0, 1, 2, ... in the order the hub sent the parts of this request.
+  // Scatter-gather: 0, 1, 2, ... in the order the hub sent the parts. Streaming: the handler's own
+  // number, 1, 2, 3, ... per request with no gap, relayed unchanged. Subscription: the hub's own,
+  // 1 for the initial result, then 2, 3, ... for the updates. A gap a sender sees in a stream or a
+  // subscription is a part the hub dropped.
   uint64 seq = 6;
 }
 
