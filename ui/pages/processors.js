@@ -179,15 +179,17 @@ function resetBody(choice, time, positions) {
     const ms = Date.parse(time.value);
     return Number.isFinite(ms) ? { to: { timestampMs: ms } } : 'Choose the time to reset to.';
   }
+  // Positions are opaque strings: one segment per line, split on the first `=` only, so a
+  // position may hold `,` or `=`.
   const list = [];
-  for (const part of positions.value.split(',').map((x) => x.trim()).filter(Boolean)) {
-    const at = part.indexOf('=');
-    const segment = at > 0 ? part.slice(0, at).trim() : '';
-    const position = at > 0 ? part.slice(at + 1).trim() : '';
-    if (!segment || !position) return `"${part}" is not segment=position.`;
+  for (const line of positions.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)) {
+    const at = line.indexOf('=');
+    const segment = at > 0 ? line.slice(0, at).trim() : '';
+    const position = at > 0 ? line.slice(at + 1).trim() : '';
+    if (!segment || !position) return `"${line}" is not segment=position.`;
     list.push({ segment, position });
   }
-  return list.length ? { to: { positions: list } } : 'List the positions as segment=position, separated by commas.';
+  return list.length ? { to: { positions: list } } : 'List the positions, one segment=position per line.';
 }
 
 /** The reset dialog: the target and what a reset does; resolves to the request body or null. */
@@ -197,7 +199,7 @@ async function askReset(service, p) {
     h('input', { type: 'radio', name: 'reset-to', value, checked: value === choice, on: { change: () => { choice = value; } } }),
     label);
   const time = h('input', { type: 'datetime-local', step: '1', 'aria-label': 'Reset to this time' });
-  const positions = h('input', { type: 'text', placeholder: '0=120, 1=98', 'aria-label': 'Positions as segment=position', spellcheck: 'false' });
+  const positions = h('textarea', { rows: '3', placeholder: '0=120\n1=98', 'aria-label': 'Positions, one segment=position per line', spellcheck: 'false' });
   const confirmed = await controls.confirmDialog({
     title: `Reset ${p.name} of ${service}?`,
     lines: [

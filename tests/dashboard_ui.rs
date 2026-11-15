@@ -1140,6 +1140,104 @@ async fn unsupported_refusal_reaches_the_dashboard() {
     drop(b1);
 }
 
+/// The reset dialog takes explicit positions one `segment=position` per line, split on the first
+/// `=` only: positions are opaque strings, so one may hold `,` or `=`. The instance is sent them
+/// unchanged (only the whitespace around a segment and a position is dropped).
+#[tokio::test]
+async fn reset_dialog_takes_one_opaque_position_per_line() {
+    use common::control::{ControlClient, ok_to_everything};
+    use kraken_hub::proto::{SegmentPosition, control_request, reset_target};
+    const WRITE: &str = "write-token-0123456789abcdef";
+    let Some(browser) = browser() else {
+        eprintln!("no Chrome or Chromium found: headless check skipped");
+        return;
+    };
+    let (grpc, http) = common::start_hub_with_http(Config {
+        dashboard_write_token: Some(kraken_hub::auth::Secret::new(WRITE)),
+        ..config()
+    })
+    .await;
+    let http: SocketAddr = http.unwrap();
+    let b1 = ControlClient::new(grpc, "service-b", "b-1", &["audit"], ok_to_everything()).await;
+    let _slots = take_stream_slots(http).await;
+    let profile =
+        std::env::temp_dir().join(format!("kraken-hub-ui-positions-{}", std::process::id()));
+    let page = format!("http://{http}/ui/#/processors");
+    let dir = profile.clone();
+    let (placeholder, refusal) = tokio::task::spawn_blocking(move || {
+        let mut devtools = Devtools::launch(&browser, &dir);
+        devtools.open(&page);
+        enable_controls(&mut devtools, WRITE);
+        let open_dialog = |devtools: &mut Devtools| {
+            devtools.eval(
+                "[...document.querySelectorAll('table.processors button')].find((b) => b.textContent === 'Reset…').click()",
+            );
+            devtools.wait_for(
+                "document.querySelector('dialog.confirm') ? 'open' : ''",
+                "open",
+                Duration::from_secs(10),
+            );
+        };
+        let fill = |devtools: &mut Devtools, text: &str| {
+            devtools.eval(&format!(
+                "(() => {{ document.querySelector('input[name=reset-to][value=positions]').click(); \
+                 document.querySelector('dialog.confirm textarea').value = {}; return 'ok'; }})()",
+                serde_json::Value::from(text)
+            ));
+            devtools.eval("document.querySelector('dialog.confirm button.danger').click()");
+        };
+        // A line without `=` is refused in the page, before the hub is asked.
+        open_dialog(&mut devtools);
+        let placeholder = devtools.eval(
+            "document.querySelector('dialog.confirm textarea').getAttribute('placeholder')",
+        );
+        fill(&mut devtools, "0=12\n1");
+        let refusal = devtools.wait_for(
+            "document.querySelector('.control-status')?.textContent ?? ''",
+            "segment=position",
+            Duration::from_secs(10),
+        );
+        open_dialog(&mut devtools);
+        fill(&mut devtools, " 0 = 12,5 \n\n1=a=b,c\r\nseg 2=x\n");
+        devtools.wait_for(
+            "document.querySelector('.control-status')?.textContent ?? ''",
+            "(operation ",
+            Duration::from_secs(30),
+        );
+        (placeholder, refusal)
+    })
+    .await
+    .unwrap();
+    assert_eq!(placeholder, serde_json::json!("0=120\n1=98"));
+    assert_eq!(refusal, "\"1\" is not segment=position.");
+    let seen = b1.wait_for(3, Duration::from_secs(10)).await;
+    let target = seen
+        .iter()
+        .find_map(|r| match &r.action {
+            Some(control_request::Action::ResetExecute(e)) => e.target.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no reset execute in {seen:?}"));
+    let position = |segment: &str, position: &str| SegmentPosition {
+        segment: segment.to_string(),
+        position: position.to_string(),
+    };
+    assert_eq!(
+        target.to,
+        Some(reset_target::To::Positions(
+            kraken_hub::proto::SegmentPositions {
+                positions: vec![
+                    position("0", "12,5"),
+                    position("1", "a=b,c"),
+                    position("seg 2", "x"),
+                ],
+            }
+        ))
+    );
+    let _ = std::fs::remove_dir_all(&profile);
+    drop(b1);
+}
+
 /// The Dead letters page: the processors that keep letters, and one processor's letters as an
 /// instance lists them through the hub, without retry or discard buttons until a write
 /// credential is held.
