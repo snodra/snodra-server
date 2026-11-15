@@ -421,7 +421,7 @@ per session and shows it.
   event_store, capabilities, state, segments[], processed_total, failed_total, dead_letters, last_error,
   last_error_at_ms, event_types, dead_letter_mode, replaying, operation_id}`, `SegmentStatus{segment, position,
   committed, head, lag, replay_until}`). Segments and positions are opaque strings only the event-store add-on reads
-  (a decimal offset for the first-wave stores), empty when unknown; `lag` is a number, `-1` when unknown. Each report
+  (each add-on picks their format), empty when unknown; `lag` is a number, `-1` when unknown. Each report
   replaces the list; it is dropped with the session.
 - **Builder call: bounds.** At most 32 processors per report, 1024 segments, 16 capabilities and 256 event types each;
   names are cut at 64 bytes, subscription and source at 256, the event store and a capability at 64, the last error at
@@ -442,7 +442,7 @@ per session and shows it.
   { "hubId": "hub-a", "nowMs": 1762250000000,
     "services": [ { "serviceName": "service-b", "deadLetters": 2,
       "processors": [ { "name": "orders", "subscription": "service-b.orders", "source": "kraken.events",
-        "eventStore": "kafka", "capabilities": ["browse", "lag", "native-dead-letter", "replay"],
+        "eventStore": "<event store name>", "capabilities": ["browse", "lag", "native-dead-letter", "replay"],
         "deadLetterMode": "collection", "state": "FAILING", "instancesReporting": 2,
         "assignedSegments": 2, "lag": 13, "deadLetters": 2, "processedTotal": 6, "failedTotal": 1,
         "eventTypes": ["examples.OrderPlaced"],
@@ -460,7 +460,9 @@ per session and shows it.
   freshest report (lowest `statusAgeMs`); a peer that does not answer is unreachable. A report also carries
   `replaying`, `operationId` and per segment `replayUntil`; the page shows PAUSED and STOPPED (with the reset's
   operation id) and a replaying badge, and with a write credential Pause, Resume and, only when the processor's event
-  store declares the `replay` capability, Reset (see [Processor control](#processor-control)).
+  store declares the `replay` capability, Reset (see [Processor control](#processor-control)): to the earliest or the
+  latest positions, a time, or explicit positions, one `segment=position` per line, split at the first `=` (a
+  position is opaque and may hold `,` or `=`).
 
 ## Processor control
 
@@ -539,7 +541,10 @@ service (the record header `source`). Empty parameters count as absent; times ar
 - **Deadlines:** a point query asks a 30 s timeout, clamped by the router as any client's (`KRAKEN_HUB_MAX_TIMEOUT_MS`,
   and `KRAKEN_HUB_TIMEOUT_OVERRIDES` per `kraken.events.*` type); a search asks the browser for a time budget 2 s under
   that deadline, so it answers what it found (`stoppedBy: "timeBudget"`) before the hub gives up.
-- **Tail:** the hub answers once the browser's `start` came (a refused tail is an HTTP error, not a stream). It asks a
+- **Tail:** the hub answers once the browser's `start` came (a refused tail is an HTTP error, not a stream). The
+  `start` must arrive within the internal stream's idle timeout (`KRAKEN_HUB_DEFAULT_TIMEOUT_MS`, 5 s by default,
+  counted from the forward to the browser), else the tail is 504; a `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for
+  `kraken.events.Tail` raises it for a source with many segments or a slow store. It asks a
   heartbeat of two fifths of the internal stream's idle timeout (2 s with the default 5 s; between 100 ms and 15 s) and
   turns each `heartbeat` part into the SSE heartbeat, stamped with the hub's clock, and a longest duration 2 s under
   `KRAKEN_HUB_MAX_STREAM_DURATION`. A reader that leaves cancels the browser's tail (`Cancel`); a browser that goes away
@@ -1167,7 +1172,13 @@ src/processors.rs event processor reports (bounds) and the per-service view of /
 src/control.rs    processor control: request/reply correlation, pause and resume, the leased reset, dead letters, audit
 src/assets.rs     embedded ui/ assets, build id, caching
 ui/               the dashboard: index.html, app.css, plain JavaScript modules (no third-party code)
-tests/            integration tests over a real gRPC connection (connect.rs, flow_control.rs, topology.rs, http.rs, dashboard_api.rs, dashboard_ui.rs, cli.rs, auth.rs, jwt.rs, tls.rs, dashboard_auth.rs, processors.rs, control.rs with the fake instance of tests/common/control.rs, proto_sync.rs, dependencies.rs; event_browser.rs with the fake event browser of tests/common/browser.rs)
+tests/            integration tests against an in-process hub over a real gRPC connection (helpers in tests/common/mod.rs):
+                    connect.rs, flow_control.rs, ghost.rs (evicted stalled streams), scatter_gather.rs, streaming.rs,
+                    subscription.rs, topology.rs, instance_status.rs, http.rs, peers.rs, dashboard_api.rs,
+                    dashboard_ui.rs, dashboard_auth.rs, cli.rs, auth.rs, jwt.rs, tls.rs, mtls.rs, processors.rs,
+                    control.rs (with the fake instance of tests/common/control.rs), event_browser.rs (with the fake
+                    event browser of tests/common/browser.rs); proto_sync.rs (proto/hub.proto against the umbrella
+                    checkout) and dependencies.rs (no store client in Cargo.lock or the Dockerfile)
 scripts/          check-proto-sync.sh (SHA-256 of proto/hub.proto against the umbrella copy)
 proto/hub.proto   protocol, synced from the umbrella repo
 ```
@@ -1175,21 +1186,34 @@ proto/hub.proto   protocol, synced from the umbrella repo
 
 ## CI/CD pipeline
 
-Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml); runs on every push and merge request on a Rust image
-with `protobuf-compiler` installed.
+Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml); a pipeline runs for every merge request and for every push to
+`main`, nothing else. The runners use the shell executor (Rust, `protoc`, Docker and buildx installed on the host):
+no job image, no services.
 
 ```mermaid
 flowchart LR
-    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Docker → Harbor"]
+    subgraph check
+      fmt["fmt<br/>cargo fmt --check"]
+      sync["proto-sync"]
+      clippy["clippy<br/>--all-targets --all-features -D warnings"]
+    end
+    check --> test["test<br/>cargo test --all-features"] --> release["release · main only<br/>tag vX.Y.Z, image → Harbor"]
 ```
 
 | Stage | Job | Runs | Produces |
 |---|---|---|---|
-| fmt | `fmt` | always | formatting check |
-| fmt | `proto-sync` | always | `scripts/check-proto-sync.sh` against a fresh umbrella clone: `proto/hub.proto` must match `kraken/protocol/hub.proto` byte for byte |
-| clippy | `clippy` | always | lint with warnings as errors |
-| test | `test` | always | unit and in-process integration tests |
-| docker | `docker` | only on tags `vX.Y.Z` | `harbor.damoreira.ml/kraken-org/kraken-hub:vX.Y.Z` and `:latest` |
+| check | `fmt` | always | `cargo fmt --all -- --check` |
+| check | `proto-sync` | always | `scripts/check-proto-sync.sh` against a fresh clone of the umbrella repo: `proto/hub.proto` must match `kraken/protocol/hub.proto` byte for byte |
+| check | `clippy` | always | `cargo clippy --all-targets --all-features -- -D warnings` |
+| test | `test` | always | `cargo test --all-features`: unit and in-process integration tests |
+| release | `release` | pushes to `main` only, one at a time | the next version and its release (below) |
+
+`release` computes the semantic-version bump from the commits since the latest `v*` tag: `BREAKING CHANGE` or a
+`type!:` subject is major, a `feat` subject minor, anything else patch (`SEMVER_BUMP` or `RELEASE_VERSION` override
+it; nothing to do when `HEAD` is already tagged or no commit is new; `DRY_RUN=true` stops before publishing). It
+then tags `vX.Y.Z` and pushes the tag, builds the `Dockerfile` and pushes `<harbor>/<project>/kraken-hub:X.Y.Z` and
+`:latest`, sets the GitLab group variable `KRAKEN_HUB_IMAGE` to the new image (creating it when missing) so the
+libraries' end-to-end jobs use it, and creates the GitLab release.
 
 The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `kraken-hub:dev`).
 
