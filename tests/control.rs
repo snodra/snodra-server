@@ -264,7 +264,7 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
     assert_eq!(body["replay"], true);
     assert_eq!(
         body["ranges"],
-        json!([{ "partition": 0, "from": 0, "until": 42 }])
+        json!([{ "segment": "0", "from": "0", "until": "42" }])
     );
     assert_eq!(
         (
@@ -320,16 +320,16 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
             kraken_hub::proto::reset_target::To::TimestampMs(1_762_250_000_000),
         ),
         (
-            r#"{"to":{"offsets":[{"partition":1,"offset":7},{"partition":0,"offset":12}]}}"#,
-            kraken_hub::proto::reset_target::To::Offsets(kraken_hub::proto::PartitionOffsets {
-                offsets: vec![
-                    kraken_hub::proto::PartitionOffset {
-                        partition: 0,
-                        offset: 12,
+            r#"{"to":{"positions":[{"segment":"1","position":"7"},{"segment":"0","position":"12"}]}}"#,
+            kraken_hub::proto::reset_target::To::Positions(kraken_hub::proto::SegmentPositions {
+                positions: vec![
+                    kraken_hub::proto::SegmentPosition {
+                        segment: "0".into(),
+                        position: "12".into(),
                     },
-                    kraken_hub::proto::PartitionOffset {
-                        partition: 1,
-                        offset: 7,
+                    kraken_hub::proto::SegmentPosition {
+                        segment: "1".into(),
+                        position: "7".into(),
                     },
                 ],
             }),
@@ -409,6 +409,42 @@ async fn a_prepare_that_times_out_aborts_the_reset() {
     assert_eq!(actions(&b2.seen()), ["prepare", "finish-aborted"]);
 }
 
+/// The hub offers only what the event store declares (ADR 0027): a processor whose freshest
+/// report lacks the `replay` capability gets 409 UNSUPPORTED, and no instance is asked.
+#[tokio::test]
+async fn a_reset_without_the_replay_capability_is_refused_before_anyone_is_asked() {
+    let (grpc, http) = hub(config()).await;
+    let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
+    let b2 = ControlClient::new(grpc, "svc", "b-2", &["audit"], ok_to_everything()).await;
+    // b-2 reports again, the freshest: its event store declares lag only.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut lag_only = common::control::processor("audit");
+    lag_only.event_store = "queue-x".to_string();
+    lag_only.capabilities = vec!["lag".to_string()];
+    b2.report_statuses(vec![lag_only]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    let body = json_of(&r);
+    assert_eq!(body["result"], "refused");
+    assert_eq!(body["code"], "UNSUPPORTED");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("queue-x") && error.contains("replay"),
+        "{error}"
+    );
+    assert!(b1.seen().is_empty(), "b-1 was asked: {:?}", b1.seen());
+    assert!(b2.seen().is_empty(), "b-2 was asked: {:?}", b2.seen());
+
+    // Once the freshest report declares replay again, the reset runs.
+    b2.report(&["audit"]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r = post(http, RESET, r#"{"to":"earliest"}"#).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(actions(&b2.seen())[0], "prepare");
+}
+
 #[tokio::test]
 async fn an_execute_failure_finishes_every_instance_as_aborted() {
     let (grpc, http) = hub(config()).await;
@@ -416,8 +452,8 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
         answering(|req| {
             is(req, "execute").then(|| {
                 Reaction::Reply(refused(
-                    ControlRefusal::GroupNotEmpty,
-                    "members: consumer-7",
+                    ControlRefusal::SubscribersActive,
+                    "subscribers: consumer-7",
                 ))
             })
         })
@@ -429,7 +465,7 @@ async fn an_execute_failure_finishes_every_instance_as_aborted() {
     let body = json_of(&r);
     assert_eq!(body["outcome"], "failed");
     assert_eq!(body["error"]["stage"], "execute");
-    assert_eq!(body["error"]["code"], "GROUP_NOT_EMPTY");
+    assert_eq!(body["error"]["code"], "SUBSCRIBERS_ACTIVE");
     assert_eq!(body["replay"], false);
     let executor = body["executedBy"].as_str().unwrap();
     for b in [&b1, &b2] {
@@ -661,9 +697,9 @@ fn letter(n: usize, long: bool) -> kraken_hub::proto::DeadLetterSummary {
             format!("letter-{n}")
         },
         processor: "audit".into(),
-        topic: "kraken.events".into(),
-        partition: 1,
-        offset: 100 + n as i64,
+        source: "kraken.events".into(),
+        segment: "1".into(),
+        position: (100 + n).to_string(),
         key: "order-7".into(),
         event_id: format!("evt-{n}"),
         event_type: "examples.OrderPlaced".into(),
@@ -744,8 +780,8 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
     assert_eq!(
         body["letters"][0],
         json!({
-            "id": "letter-0", "processor": "audit", "topic": "kraken.events", "partition": 1,
-            "offset": 100, "key": "order-7", "eventId": "evt-0", "eventType": "examples.OrderPlaced",
+            "id": "letter-0", "processor": "audit", "source": "kraken.events", "segment": "1",
+            "position": "100", "key": "order-7", "eventId": "evt-0", "eventType": "examples.OrderPlaced",
             "reason": "HANDLER_FAILED", "errorType": "IllegalStateException", "errorMessage": "boom ",
             "blockedBy": "", "attempts": 3, "parkedAtMs": 1762250000000i64, "lastAttemptAtMs": 1762250001000i64,
         })
@@ -833,7 +869,7 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
     let (grpc, http) = hub(config()).await;
     let b1 = ControlClient::new(grpc, "svc", "b-1", &["audit"], ok_to_everything()).await;
     let many: Vec<String> = (0..1025)
-        .map(|p| format!("{{\"partition\":{p},\"offset\":0}}"))
+        .map(|p| format!("{{\"segment\":\"{p}\",\"position\":\"0\"}}"))
         .collect();
     for (body, why) in [
         ("".to_string(), "no target"),
@@ -844,12 +880,15 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
         ),
         ("not json".to_string(), "not JSON"),
         (
-            format!("{{\"to\":{{\"offsets\":[{}]}}}}", many.join(",")),
-            "1025 offsets",
+            format!("{{\"to\":{{\"positions\":[{}]}}}}", many.join(",")),
+            "1025 positions",
         ),
         (
-            format!("{{\"to\":\"earliest\",\"pad\":\"{}\"}}", "x".repeat(5000)),
-            "over 4 KiB",
+            format!(
+                "{{\"to\":\"earliest\",\"pad\":\"{}\"}}",
+                "x".repeat(65 * 1024)
+            ),
+            "over 64 KiB",
         ),
     ] {
         let r = post(http, RESET, &body).await;
@@ -858,7 +897,24 @@ async fn bodies_are_bounded_and_checked_before_anyone_is_asked() {
     }
     let r = post(http, PAUSE, &"x".repeat(5000)).await;
     assert_eq!(r.status, 400, "every control call bounds its body");
+    assert!(
+        json_of(&r)["error"]
+            .as_str()
+            .unwrap()
+            .contains("larger than 4096 bytes"),
+        "{}",
+        r.body
+    );
     assert!(b1.seen().is_empty(), "nobody was asked");
+
+    // A reset may name every one of 1024 segments with the longest decimal positions.
+    let all: Vec<String> = (0..1024)
+        .map(|p| format!("{{\"segment\":\"{p}\",\"position\":\"{}\"}}", u64::MAX))
+        .collect();
+    let body = format!("{{\"to\":{{\"positions\":[{}]}}}}", all.join(","));
+    assert!(body.len() > 50 * 1024, "{}", body.len());
+    let r = post(http, RESET, &body).await;
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 // ---- access control ----

@@ -109,7 +109,7 @@ export default {
       () => controls.confirmDialog({
         title: `Discard letter ${l.id}?`,
         lines: [
-          `The record at partition ${l.partition}, offset ${l.offset} (${l.eventType || 'no type'}, key ${l.key || 'none'}) of ${last.processor} in ${last.service} is never handled; this cannot be undone.`,
+          `The record at segment ${str(l.segment) || 'unknown'}, position ${str(l.position) || 'unknown'} of ${str(l.source) || 'the source'} (${l.eventType || 'no type'}, key ${l.key || 'none'}) of ${last.processor} in ${last.service} is never handled; this cannot be undone.`,
           'Letters of the same key parked behind it are retried next.',
         ],
         confirm: 'Discard',
@@ -157,7 +157,7 @@ export default {
         fill(body, h('section', { class: 'card' }, head, h('p', { class: 'empty' }, 'No dead letters.')));
         return;
       }
-      const headers = ['Letter', 'Reason', 'Event type', 'Key', { label: 'Partition', class: 'num' }, { label: 'Offset', class: 'num' },
+      const headers = ['Letter', 'Reason', 'Event type', 'Key', { label: 'Segment', class: 'num' }, { label: 'Position', class: 'num' },
         { label: 'Attempts', class: 'num' }, 'Error', 'Parked', 'Blocked by'];
       if (writable) headers.push('Actions');
       const rows = list.map((l) => {
@@ -166,8 +166,8 @@ export default {
           reasonBadge(str(l.reason)),
           { class: 'mono', content: str(l.eventType) || '—' },
           { class: 'mono', content: str(l.key) || '—' },
-          { class: 'num', content: fmt.int(num(l.partition)) },
-          { class: 'num', content: fmt.int(num(l.offset)) },
+          { class: 'num mono', content: str(l.segment) || '—' },
+          { class: 'num mono', content: str(l.position) || '—' },
           { class: 'num', content: fmt.int(num(l.attempts)) },
           { title: str(l.errorMessage), content: [str(l.errorType) ? h('span', { class: 'mono' }, `${str(l.errorType)}: `) : null, str(l.errorMessage) || '—'] },
           { class: 'nowrap', title: l.parkedAtMs ? fmt.time(l.parkedAtMs) : '', content: l.parkedAtMs ? fmt.time(l.parkedAtMs) : '—' },

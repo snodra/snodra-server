@@ -1,34 +1,28 @@
-//! The event browser (ADR 0025) against a real Kafka: search by every filter, newest first over
-//! the partitions, with a cursor; the budgets and the concurrency limits; the record detail and
-//! the payload rules; the tail; consumer groups and their lag, and the lag task of the metrics;
-//! and what happens without Kafka.
-//! Every test keeps its broker in a local, dropped at its end.
+//! The events API over the event browser add-on (ADR 0027), against a fake browser
+//! (`tests/common/browser.rs`): what the hub asks for each call, the neutral answers it passes
+//! on, the payload rules and their audit lines (ADR 0025), the browser's errors as HTTP statuses,
+//! the tail's server-sent events, and what happens without a browser or when it goes away.
 
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::kafka::{self, Member, Rec};
+use common::browser::{
+    self, Answer, FakeBrowser, GET, LAG, SEARCH, SOURCES, TAIL, defaults, page, refusal, summary,
+};
 use common::{FakeClient, http_send};
 use kraken_hub::auth::Secret;
-use kraken_hub::browser::{self, Browser, GroupLag};
 use kraken_hub::config::Config;
-use kraken_hub::proto::{RequestKind, server_message};
-use kraken_hub::telemetry::Metrics;
-use serde_json::Value;
-use tokio_util::sync::CancellationToken;
+use kraken_hub::proto::{ErrorCode, RequestKind, server_message};
+use serde_json::{Value, json};
 
-const T: i64 = 1_700_000_000_000;
 const READ: &str = "a-dashboard-token-0123456789";
 const WRITE: &str = "a-write-token-0123456789";
 
-fn config(bootstrap: &str, topics: &[&str]) -> Config {
+fn config() -> Config {
     Config {
         otlp_endpoint: None,
-        kafka_bootstrap: Some(bootstrap.to_string()),
-        event_topics: topics.iter().map(|t| t.to_string()).collect(),
         ..Config::default()
     }
 }
@@ -38,428 +32,359 @@ async fn hub(config: Config) -> (SocketAddr, SocketAddr) {
     (grpc, http.unwrap())
 }
 
-/// `GET path` (30 s at most): the status and the JSON body (`Null` when there is none).
-async fn get(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, Value) {
+/// Opens a tail on `path`: the hub answers once the browser's `start` came, so the fake starts
+/// it (`segments`) while the request waits.
+async fn open_tail(
+    http: SocketAddr,
+    path: &str,
+    fake: &mut FakeBrowser,
+    segments: u64,
+) -> (browser::Sse, browser::Tail) {
+    let path = path.to_string();
+    let sse = tokio::spawn(async move { browser::sse(http, &path, None).await });
+    let mut tail = fake.next_tail().await;
+    tail.start(segments).await;
+    (sse.await.unwrap(), tail)
+}
+
+/// `GET path` (30 s at most) with `headers`: the response and its JSON body (`Null` without one).
+async fn get_with(
+    addr: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (common::HttpResponse, Value) {
     let auth = token.map(|t| format!("Bearer {t}"));
-    let headers: Vec<(&str, &str)> = auth
-        .as_deref()
-        .map(|a| vec![("Authorization", a)])
-        .unwrap_or_default();
+    let mut headers: Vec<(&str, &str)> = extra.to_vec();
+    if let Some(auth) = auth.as_deref() {
+        headers.push(("Authorization", auth));
+    }
     let r = http_send(addr, "GET", path, &headers, b"", Duration::from_secs(30)).await;
     let body = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+    (r, body)
+}
+
+async fn get(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, Value) {
+    let (r, body) = get_with(addr, path, token, &[]).await;
     (r.status, body)
 }
 
-/// The `id` header of every result, in order.
-fn ids(page: &Value) -> Vec<String> {
-    page["results"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no results in {page}"))
-        .iter()
-        .map(|r| r["headers"]["id"].as_str().unwrap_or("").to_string())
-        .collect()
+const ROUTES: [&str; 6] = [
+    "/api/v1/events",
+    "/api/v1/events/kraken.events/0/0",
+    "/api/v1/events/sources",
+    "/api/v1/events/lag",
+    "/api/v1/events/tail",
+    "/api/v1/events?q=x",
+];
+
+/// Waits (5 s at most) until the hub sees the browser (its Register landed).
+async fn until_installed(http: SocketAddr) {
+    until_installed_as(http, None).await;
 }
 
-fn library(partition: i32, ts: i64, key: &str, ty: &str, id: &str) -> Rec {
-    Rec::on(partition)
-        .at(T + ts)
-        .key(key)
-        .header("type", ty)
-        .header("id", id)
-        .header("timestamp", (T + ts).to_string())
-        .payload(format!("{{\"id\":\"{id}\"}}"))
+async fn until_installed_as(http: SocketAddr, token: Option<&str>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, v) = get(http, "/api/v1/version", token).await;
+        if v["eventBrowser"]["installed"] == true {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the browser never showed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
-async fn search_matches_every_filter_newest_first_and_pages_with_a_cursor() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("events");
-    kafka::create_topic(&broker.bootstrap, &topic, 3).await;
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            library(0, 10, "k-1", "orders.Placed", "e-1")
-                .header("correlationId", "c-1")
-                .header("source", "svc-a")
-                .header("userId", "u-1"),
-            library(0, 40, "k-2", "orders.Shipped", "e-2")
-                .header("correlationId", "c-2")
-                .header("source", "svc-b"),
-            library(1, 20, "k-3", "users.Created", "e-3")
-                .header("correlationId", "c-1")
-                .header("userId", "u-2"),
-            library(1, 50, "k-1", "orders.Placed", "e-4")
-                .header("correlationId", "c-3")
-                .header("source", "svc-a"),
-            library(2, 30, "k-4", "orders.Cancelled", "e-5"),
-            library(2, 60, "k-5", "users.Deleted", "e-6").header("correlationId", "c-1"),
-        ],
-    )
-    .await;
-    let (_grpc, http) = hub(config(&broker.bootstrap, &[&topic, "absent"])).await;
-
-    let (status, all) = get(http, "/api/v1/events", None).await;
-    assert_eq!(status, 200, "{all}");
-    assert_eq!(
-        all["topic"],
-        topic.as_str(),
-        "the first topic is the default"
-    );
-    assert_eq!(ids(&all), ["e-6", "e-4", "e-2", "e-5", "e-3", "e-1"]);
-    assert_eq!(all["scanned"], 6);
-    assert_eq!(all["exhausted"], true);
-    assert!(
-        all["stoppedBy"].is_null() && all["cursor"].is_null(),
-        "{all}"
-    );
-    let first = &all["results"][0];
-    assert_eq!(
-        (&first["partition"], &first["offset"], &first["timestamp"]),
-        (&Value::from(2), &Value::from(1), &Value::from(T + 60))
-    );
-    assert_eq!(first["key"], "k-5");
-    assert_eq!(first["headers"]["type"], "users.Deleted");
-    assert_eq!(first["size"], "{\"id\":\"e-6\"}".len());
-    assert!(
-        !all.to_string().contains("{\\\"id\\\""),
-        "no payload in a result: {all}"
-    );
-
-    let search = |query: String| {
-        let path = format!("/api/v1/events?topic={topic}&{query}");
-        async move {
-            let (status, page) = get(http, &path, None).await;
-            assert_eq!(status, 200, "{path}: {page}");
-            ids(&page)
-        }
-    };
-    for (query, want) in [
-        ("key=k-1", vec!["e-4", "e-1"]),
-        ("type=orders.Placed", vec!["e-4", "e-1"]),
-        ("type=orders.*", vec!["e-4", "e-2", "e-5", "e-1"]),
-        ("type=orders", vec![]),
-        ("source=svc-a", vec!["e-4", "e-1"]),
-        ("correlationId=c-1", vec!["e-6", "e-3", "e-1"]),
-        ("userId=u-2", vec!["e-3"]),
-        ("eventId=e-5", vec!["e-5"]),
-        ("type=orders.*&key=k-1&source=svc-a", vec!["e-4", "e-1"]),
-        (
-            &format!("from={}&to={}", T + 20, T + 50),
-            vec!["e-4", "e-2", "e-5", "e-3"],
-        ),
-        (
-            "from=2023-11-14T22:13:20.030Z",
-            vec!["e-6", "e-4", "e-2", "e-5"],
-        ),
-        ("to=2023-11-14T23:13:20.020%2B01:00", vec!["e-3", "e-1"]),
-    ] {
-        assert_eq!(search(query.to_string()).await, want, "{query}");
+async fn events_api_404_without_browser() {
+    let (grpc, http) = hub(config()).await;
+    for path in ROUTES {
+        let (status, body) = get(http, path, None).await;
+        assert_eq!(
+            (status, body),
+            (404, json!({"error": "event browser not installed"})),
+            "{path}"
+        );
     }
+    let (_, version) = get(http, "/api/v1/version", None).await;
+    assert_eq!(
+        version["eventBrowser"],
+        json!({"installed": false, "payloads": false})
+    );
+    let (_, settings) = get(http, "/api/v1/settings", None).await;
+    let names: Vec<&str> = settings["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"KRAKEN_HUB_EVENT_BROWSER_PAYLOADS"));
+    assert!(names.contains(&"KRAKEN_HUB_EVENT_MAX_TAILS"));
+    assert!(names.iter().all(|n| !n.contains("KAFKA")), "{names:?}");
 
-    // Pages of two: together they are the whole result, in the same order, nothing twice.
-    let mut pages = Vec::new();
-    let mut cursor: Option<String> = None;
+    // A browser connects: the routes answer; it leaves: 404 again.
+    let fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (status, body) = get(http, "/api/v1/events/sources", None).await;
+    assert_eq!(status, 200, "{body}");
+    fake.disconnect();
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let path = match &cursor {
-            Some(c) => format!("/api/v1/events?topic={topic}&limit=2&cursor={c}"),
-            None => format!("/api/v1/events?topic={topic}&limit=2"),
-        };
-        let (status, page) = get(http, &path, None).await;
-        assert_eq!(status, 200, "{page}");
-        pages.push(ids(&page));
-        if page["exhausted"] == true {
-            assert!(page["cursor"].is_null());
+        let (status, body) = get(http, "/api/v1/events", None).await;
+        if status == 404 {
+            assert_eq!(body["error"], "event browser not installed");
             break;
         }
-        assert_eq!(page["stoppedBy"], "limit");
-        cursor = Some(page["cursor"].as_str().unwrap().to_string());
-        assert!(pages.len() < 10, "{pages:?}");
+        assert!(Instant::now() < deadline, "still {status}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        pages,
-        vec![vec!["e-6", "e-4"], vec!["e-2", "e-5"], vec!["e-3", "e-1"]]
-    );
-
-    // A cursor only continues its own search.
-    let (_, page) = get(http, &format!("/api/v1/events?topic={topic}&limit=2"), None).await;
-    let c = page["cursor"].as_str().unwrap();
-    let (status, body) = get(
-        http,
-        &format!("/api/v1/events?topic={topic}&limit=2&type=x&cursor={c}"),
-        None,
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("another search"));
-    for bad in [
-        format!("/api/v1/events?topic={topic}&cursor=%25%25"),
-        "/api/v1/events?topic=not-configured".to_string(),
-        format!("/api/v1/events?topic={topic}&limit=101"),
-        format!("/api/v1/events?topic={topic}&from=tomorrow"),
-        format!("/api/v1/events?topic={topic}&from=20&to=10"),
-    ] {
-        let (status, body) = get(http, &bad, None).await;
-        assert_eq!(status, 400, "{bad}: {body}");
-        assert!(body["error"].is_string(), "{body}");
-    }
-
-    // A configured topic that does not exist is missing, not an error (and is not created).
-    let (status, body) = get(http, "/api/v1/events?topic=absent", None).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["missing"], true);
-    assert_eq!(body["results"], Value::Array(vec![]));
-    let (status, _) = get(http, "/api/v1/events?topic=absent", None).await;
-    assert_eq!(status, 200);
-    let (_, again) = get(http, "/api/v1/events?topic=absent", None).await;
-    assert_eq!(again["missing"], true, "the browser created the topic");
-    drop(broker);
+    // The hub keeps the types' owner through its owner grace, but no browser is installed:
+    // the version says so as soon as the routes are 404 (the dashboard hides the page).
+    let (_, version) = get(http, "/api/v1/version", None).await;
+    assert_eq!(version["eventBrowser"]["installed"], false, "{version}");
 }
 
-/// Producers set `CreateTime`, so a partition's timestamps need not rise: `to` still finds a
-/// record written after a later-stamped one (within [`kraken_hub::browser::TO_SKEW`]), and `from`
-/// and `to` hold for every record.
+/// The browser's cursor holds a place per segment (up to 64 KiB): the hub passes a long one
+/// verbatim, both ways, and refuses only one over the browser's bound.
 #[tokio::test]
-async fn from_and_to_find_records_with_out_of_order_timestamps() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("skew");
-    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            library(0, 10, "k", "s.A", "e-10"),
-            library(0, 100, "k", "s.A", "e-100"),
-            library(0, 20, "k", "s.A", "e-20"),
-            library(0, 60_000, "k", "s.A", "e-60000"),
-            library(0, 30, "k", "s.A", "e-30"),
-            library(0, 5, "k", "s.A", "e-5"),
-        ],
-    )
-    .await;
-    let (_g, http) = hub(config(&broker.bootstrap, &[&topic])).await;
-    for (query, want) in [
-        (
-            format!("to={}", T + 50),
-            vec!["e-5", "e-30", "e-20", "e-10"],
-        ),
-        (
-            format!("from={}&to={}", T + 15, T + 50),
-            vec!["e-30", "e-20"],
-        ),
-        (format!("from={}", T + 50), vec!["e-60000", "e-100"]),
-    ] {
-        let (status, page) = get(http, &format!("/api/v1/events?{query}"), None).await;
-        assert_eq!(status, 200, "{query}: {page}");
-        assert_eq!(ids(&page), want, "{query}");
-    }
-    drop(broker);
-}
-
-/// Records compressed by their producer (any codec a Kafka client may use) are found and read.
-#[tokio::test]
-async fn compressed_records_are_found_and_read() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("codecs");
-    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
-    for (i, codec) in ["gzip", "snappy", "lz4", "zstd"].into_iter().enumerate() {
-        let record = library(0, i as i64, codec, "c.Packed", &format!("e-{codec}"));
-        kafka::produce_compressed(&broker.bootstrap, &topic, &[record], codec).await;
-    }
-    let (_g, http) = hub(config(&broker.bootstrap, &[&topic])).await;
-    let (status, page) = get(http, "/api/v1/events", None).await;
-    assert_eq!(status, 200, "{page}");
-    assert_eq!(ids(&page), ["e-zstd", "e-lz4", "e-snappy", "e-gzip"]);
-    let (status, detail) = get(http, &format!("/api/v1/events/{topic}/0/3"), None).await;
-    assert_eq!(status, 200, "{detail}");
-    assert_eq!(detail["key"], "zstd");
-    assert_eq!(detail["headers"]["id"], "e-zstd");
-    drop(broker);
-}
-
-/// Many partitions read at once: every page of a search with a cursor continues the last, and
-/// together they are the whole list, newest first, nothing twice.
-#[tokio::test]
-async fn many_partitions_page_newest_first_without_skipping_or_repeating() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("wide");
-    kafka::create_topic(&broker.bootstrap, &topic, 24).await;
-    let records: Vec<Rec> = (0..24 * 30)
-        .map(|i| {
-            let ty = if i % 3 == 0 { "w.Hit" } else { "w.Miss" };
-            // Rising within a partition, interleaved across them.
-            let ts = (i / 24) * 100 + (i % 24) * 37 % 100;
-            library(i % 24, ts as i64, "k", ty, &format!("e-{i}"))
-        })
-        .collect();
-    kafka::produce(&broker.bootstrap, &topic, &records).await;
-    let (_g, http) = hub(Config {
-        event_search_max_results: 1000,
-        ..config(&broker.bootstrap, &[&topic])
-    })
-    .await;
-
-    let (status, all) = get(http, "/api/v1/events?type=w.Hit&limit=1000", None).await;
-    assert_eq!(status, 200, "{all}");
-    assert_eq!(all["exhausted"], true, "{all}");
-    let whole = ids(&all);
-    assert_eq!(whole.len(), 24 * 10);
-    let times: Vec<i64> = all["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["timestamp"].as_i64().unwrap())
-        .collect();
-    assert!(times.windows(2).all(|w| w[0] >= w[1]), "{times:?}");
-
-    let mut got = Vec::new();
-    let mut cursor: Option<String> = None;
-    for pages in 1.. {
-        assert!(pages <= 40, "{} of {} found", got.len(), whole.len());
-        let path = match &cursor {
-            Some(c) => format!("/api/v1/events?type=w.Hit&limit=7&cursor={c}"),
-            None => "/api/v1/events?type=w.Hit&limit=7".to_string(),
-        };
-        let (status, page) = get(http, &path, None).await;
-        assert_eq!(status, 200, "{page}");
-        got.extend(ids(&page));
-        match page["cursor"].as_str() {
-            Some(c) => cursor = Some(c.to_string()),
-            None => break,
+async fn a_long_cursor_reaches_the_browser_verbatim() {
+    let (grpc, http) = hub(config()).await;
+    let long = "c".repeat(4096);
+    let back = long.clone();
+    let fake = FakeBrowser::start(grpc, move |type_name, request| match type_name {
+        SEARCH => {
+            let mut p = page(vec![]);
+            p["cursor"] = back.clone().into();
+            let _ = request;
+            Answer::Json(p)
         }
-    }
-    assert_eq!(got, whole);
-    drop(broker);
+        _ => defaults(type_name, request),
+    })
+    .await;
+    until_installed(http).await;
+    let (status, body) = get(http, &format!("/api/v1/events?cursor={long}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(fake.last(SEARCH).request["cursor"], long.as_str());
+    assert_eq!(
+        body["cursor"],
+        long.as_str(),
+        "the answer's cursor comes back intact"
+    );
+    // A GET's URI is at most 65 534 bytes (the `http` crate's bound): a cursor of 60 KiB (some
+    // 2 200 segments) is read and passed on...
+    let longest = "c".repeat(60 * 1024);
+    let (status, body) = get(http, &format!("/api/v1/events?cursor={longest}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(fake.last(SEARCH).request["cursor"], longest.as_str());
+    // ...one of the browser's full 64 KiB makes the URI too long: 414 before anything is asked.
+    let asked = fake.seen().len();
+    let full = "c".repeat(64 * 1024 + 1);
+    let (status, _) = get(http, &format!("/api/v1/events?cursor={full}"), None).await;
+    assert_eq!(status, 414);
+    assert_eq!(fake.seen().len(), asked, "never reaches the browser");
 }
 
 #[tokio::test]
-async fn budgets_stop_a_search_and_concurrency_is_bounded() {
-    let broker = kafka::kafka().await;
-    let big = kafka::unique("big");
-    kafka::create_topic(&broker.bootstrap, &big, 1).await;
-    let bootstrap = broker.bootstrap.clone();
-    let topic = big.clone();
-    tokio::task::spawn_blocking(move || kafka::produce_many(&bootstrap, &topic, 0, 300_000, T))
-        .await
-        .unwrap();
-
-    // The scan budget: 100 records read, nothing found, a cursor that moves on.
-    let (_g, scan) = hub(Config {
-        event_search_max_scanned: 100,
-        ..config(&broker.bootstrap, &[&big])
-    })
-    .await;
-    let (status, page) = get(scan, "/api/v1/events?key=nope", None).await;
-    assert_eq!(status, 200, "{page}");
-    assert_eq!(page["stoppedBy"], "scanBudget");
-    assert_eq!(page["scanned"], 100);
-    assert_eq!(page["exhausted"], false);
-    assert_eq!(page["results"], Value::Array(vec![]));
-    let c = page["cursor"].as_str().unwrap();
-    let (_, next) = get(scan, &format!("/api/v1/events?key=nope&cursor={c}"), None).await;
-    assert_eq!(next["stoppedBy"], "scanBudget");
-    assert_ne!(next["cursor"], page["cursor"], "the next page moved on");
-    // The newest records come first: the last ones written.
-    let (_, newest) = get(scan, "/api/v1/events?limit=3", None).await;
-    let keys: Vec<&str> = newest["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["key"].as_str().unwrap())
-        .collect();
-    assert_eq!(keys, ["k-299999", "k-299998", "k-299997"]);
-
-    // The time budget, and one search at a time.
-    let (_g, slow) = hub(Config {
-        event_search_max_scanned: 10_000_000,
-        event_search_timeout: Duration::from_millis(300),
-        event_max_searches: 1,
-        ..config(&broker.bootstrap, &[&big])
-    })
-    .await;
-    let first = tokio::spawn(async move { get(slow, "/api/v1/events?key=nope", None).await });
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let busy = http_send(
-        slow,
-        "GET",
-        "/api/v1/events?key=nope",
-        &[],
-        b"",
-        Duration::from_secs(10),
-    )
-    .await;
-    assert_eq!(busy.status, 429, "{}", busy.body);
-    assert!(busy.header("retry-after").is_some());
-    let (status, page) = first.await.unwrap();
-    assert_eq!(status, 200, "{page}");
-    assert_eq!(page["stoppedBy"], "timeBudget");
-    let scanned = page["scanned"].as_u64().unwrap();
-    assert!(scanned < 300_000, "{scanned}");
-    assert!(page["cursor"].is_string());
-    // The slot is given back.
-    let (status, _) = get(slow, "/api/v1/events?limit=1", None).await;
-    assert_eq!(status, 200);
-    drop(broker);
-}
-
-#[tokio::test]
-async fn the_record_detail_serves_the_payload_only_under_the_rules_and_audits_it() {
-    kafka::capture_logs();
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("detail");
-    kafka::create_topic(&broker.bootstrap, &topic, 1).await;
-    let secret = format!("s3cr3t-{}", uuid::Uuid::now_v7().simple());
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            Rec::on(0)
-                .at(T)
-                .key(b"k\xff".to_vec())
-                .header("type", "a.Placed")
-                .header("id", "e-1")
-                .header("bin", b"\x00\xff".to_vec())
-                .payload(format!("{{\"secret\":\"{secret}\"}}")),
-            Rec::on(0)
-                .at(T + 1)
-                .header("type", "a.Raw")
-                .payload(b"\xff\xfe".to_vec()),
-        ],
-    )
-    .await;
-    let base = config(&broker.bootstrap, &[&topic]);
-    let record = format!("/api/v1/events/{topic}/0/0");
-
-    // The switch is off: hidden, whatever the token.
-    let (_g, off) = hub(Config {
+async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
+    let (grpc, http) = hub(Config {
         dashboard_token: Some(Secret::new(READ)),
-        ..base.clone()
+        ..config()
     })
     .await;
-    let (status, d) = get(off, &record, Some(READ)).await;
+    let fake = FakeBrowser::start(grpc, |type_name, request| match type_name {
+        SEARCH => {
+            let mut hit = summary(
+                "3",
+                "42",
+                1_730_000_000_000,
+                "order-42",
+                json!({"type": "orders.Placed", "id": "e-1", "x-private": "nope"}),
+            );
+            // A summary never carries a payload, whatever the browser sends.
+            hit["payload"] = "secret".into();
+            let mut p = page(vec![hit]);
+            p["cursor"] = "eyJmIjoi".into();
+            p["exhausted"] = false.into();
+            p["stoppedBy"] = "limit".into();
+            p["debug"] = "dropped".into();
+            Answer::Json(p)
+        }
+        LAG => Answer::Json(
+            json!({"source": request["source"].as_str().unwrap_or("kraken.events"),
+            "subscriptions": [{"subscription": "orders.projector", "state": "Empty", "members": 0,
+            "segments": [{"segment": "0", "committed": "4", "head": "10", "lag": 6},
+                         {"segment": "1", "committed": null, "head": "3", "lag": null}],
+            "lag": 6}], "truncated": false}),
+        ),
+        _ => defaults(type_name, request),
+    })
+    .await;
+    until_installed_as(http, Some(READ)).await;
+
+    let path = "/api/v1/events?source=kraken.events&from=2026-11-05T10:00:00Z&to=1730000000000\
+&type=orders.*&key=order-42&service=service-b&correlationId=c-1&userId=u-1&eventId=&limit=20\
+&cursor=abc";
+    let (r, body) = get_with(http, path, Some(READ), &[("X-Correlation-Id", "corr-7")]).await;
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.header("x-correlation-id"), Some("corr-7"));
+    assert_eq!(
+        body,
+        json!({"source": "kraken.events", "results": [{"source": "kraken.events",
+            "segment": "3", "position": "42", "timestamp": 1_730_000_000_000_i64,
+            "key": "order-42", "headers": {"type": "orders.Placed", "id": "e-1"}, "size": 17}],
+            "scanned": 2, "exhausted": false, "stoppedBy": "limit", "cursor": "eyJmIjoi"})
+    );
+    let seen = fake.last(SEARCH);
+    let timeout = seen.request["timeoutMs"].as_u64().unwrap();
+    assert!((1..30_000).contains(&timeout), "{timeout}");
+    assert_eq!(
+        seen.request,
+        json!({"source": "kraken.events", "filters": {"from": "2026-11-05T10:00:00Z",
+            "to": "1730000000000", "type": "orders.*", "key": "order-42",
+            "source": "service-b", "correlationId": "c-1", "userId": "u-1"},
+            "limit": 20, "cursor": "abc", "timeoutMs": timeout})
+    );
+    // Who asked and the correlation id travel with the query.
+    assert_eq!(seen.headers["userId"], "dashboard-token");
+    assert_eq!(seen.headers["correlationId"], "corr-7");
+    assert!(!seen.headers.contains_key("authorization"));
+
+    // Without a correlation id the hub makes one and answers it.
+    let (r, _) = get_with(http, "/api/v1/events", Some(READ), &[]).await;
+    let made = r.header("x-correlation-id").unwrap().to_string();
+    assert_eq!(fake.last(SEARCH).headers["correlationId"], made);
+
+    // Sources and lag, as the browser says them.
+    let (status, sources) = get(http, "/api/v1/events/sources", Some(READ)).await;
+    assert_eq!(status, 200);
+    assert_eq!(sources["sources"][0]["segments"][0]["head"], "2");
+    assert_eq!(fake.last(SOURCES).request, json!({}));
+    let (status, lag) = get(
+        http,
+        "/api/v1/events/lag?source=kraken.events.dlt",
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 200, "{lag}");
+    assert_eq!(
+        fake.last(LAG).request,
+        json!({"source": "kraken.events.dlt"})
+    );
+    assert_eq!(lag["source"], "kraken.events.dlt");
+    assert_eq!(
+        lag["subscriptions"][0]["segments"][1]["committed"],
+        Value::Null
+    );
+    assert_eq!(lag["subscriptions"][0]["lag"], 6);
+
+    // What the hub can tell is wrong never reaches the browser.
+    let asked = fake.seen().len();
+    for (path, want) in [
+        (
+            "/api/v1/events?limit=ten",
+            "limit must be a positive number",
+        ),
+        (
+            "/api/v1/events?limit=1.5",
+            "limit must be a positive number",
+        ),
+        (
+            "/api/v1/events/tail?from=1",
+            "a tail takes no from: it starts at the end",
+        ),
+    ] {
+        let (status, body) = get(http, path, Some(READ)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (400, Some(want)),
+            "{path}"
+        );
+    }
+    let long = "x".repeat(1025);
+    let (status, _) = get(http, &format!("/api/v1/events?type={long}"), Some(READ)).await;
+    assert_eq!(status, 400);
+    let (status, _) = get(
+        http,
+        &format!("/api/v1/events/kraken.events/{}/0", "1".repeat(129)),
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(fake.seen().len(), asked);
+
+    // The routes are dashboard reads: the token is needed.
+    for path in ROUTES {
+        let (status, _) = get(http, path, None).await;
+        assert_eq!(status, 401, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn payload_rules_stay_in_the_hub_and_are_audited() {
+    common::browser::capture_logs();
+    let secret = format!("s3cr3t-{}", uuid::Uuid::now_v7().simple());
+    let record = |request: &Value, secret: &str| {
+        let mut r = summary(
+            "0",
+            request["position"].as_str().unwrap(),
+            1,
+            "k\\xff",
+            json!({"type": "a.Placed", "id": "e-1"}),
+        );
+        r["allHeaders"] = json!([{"name": "type", "value": "a.Placed"},
+            {"name": "bin", "value": null, "valueHex": "00ff"}]);
+        if request["position"] == "2" {
+            // A browser answering a place of any length: the audit line cuts it.
+            r["source"] = "s".repeat(5000).into();
+        }
+        if request["payload"] == true {
+            if request["position"] == "1" {
+                r["payloadBase64"] = "//4=".into();
+            } else {
+                r["payload"] = format!("{{\"secret\":\"{secret}\"}}").into();
+            }
+        }
+        r
+    };
+    let start = |grpc, secret: String| {
+        FakeBrowser::start(grpc, move |type_name, request| match type_name {
+            GET => Answer::Json(record(request, &secret)),
+            _ => defaults(type_name, request),
+        })
+    };
+
+    // The switch is off: hidden, whatever the token; the payload is not even asked.
+    let (grpc, off) = hub(Config {
+        dashboard_token: Some(Secret::new(READ)),
+        ..config()
+    })
+    .await;
+    let fake = start(grpc, secret.clone()).await;
+    until_installed_as(off, Some(READ)).await;
+    let (status, d) = get(off, "/api/v1/events/kraken.events/0/0", Some(READ)).await;
     assert_eq!(status, 200, "{d}");
+    assert_eq!(fake.last(GET).request["payload"], false);
     assert_eq!(d["payload"]["hidden"], "payloads-off");
     assert_eq!(d["key"], "k\\xff");
-    assert_eq!(d["headers"]["type"], "a.Placed");
-    let bin = d["allHeaders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|h| h["name"] == "bin")
-        .unwrap();
-    assert_eq!(bin["valueHex"], "00ff");
-    assert!(bin["value"].is_null());
+    assert_eq!(d["allHeaders"][1]["valueHex"], "00ff");
+    let asked = fake.seen().len();
     let (status, q) = get(off, &format!("/api/v1/events?q={secret}"), Some(READ)).await;
-    assert_eq!(status, 403, "{q}");
-    assert_eq!(q["hidden"], "payloads-off");
+    assert_eq!((status, &q["hidden"]), (403, &Value::from("payloads-off")));
+    assert_eq!(
+        fake.seen().len(),
+        asked,
+        "a refused q never reaches the browser"
+    );
 
     // On, but the hub has no token to present.
-    let (_g, open) = hub(Config {
+    let (grpc, open) = hub(Config {
         event_payloads: true,
-        ..base.clone()
+        ..config()
     })
     .await;
-    let (_, d) = get(open, &record, None).await;
+    let _fake = start(grpc, secret.clone()).await;
+    until_installed(open).await;
+    let (_, d) = get(open, "/api/v1/events/kraken.events/0/0", None).await;
     assert_eq!(d["payload"]["hidden"], "no-token-configured");
     let (status, q) = get(open, &format!("/api/v1/events?q={secret}"), None).await;
     assert_eq!(
@@ -467,478 +392,246 @@ async fn the_record_detail_serves_the_payload_only_under_the_rules_and_audits_it
         (403, &Value::from("no-token-configured"))
     );
 
-    // On, a write token configured (reads stay open), but not presented; then presented.
-    let (_g, writer) = hub(Config {
+    // On, a write token configured (reads stay open), not presented; then presented.
+    let (grpc, writer) = hub(Config {
         event_payloads: true,
         dashboard_write_token: Some(Secret::new(WRITE)),
-        ..base.clone()
+        ..config()
     })
     .await;
-    let (_, d) = get(writer, &record, None).await;
+    let fake = start(grpc, secret.clone()).await;
+    until_installed(writer).await;
+    let (_, d) = get(writer, "/api/v1/events/kraken.events/0/0", None).await;
     assert_eq!(d["payload"]["hidden"], "no-token-presented");
     assert!(!d.to_string().contains(&secret));
-    let (_, d) = get(writer, &record, Some(WRITE)).await;
+    let (_, d) = get(writer, "/api/v1/events/kraken.events/0/0", Some(WRITE)).await;
+    assert_eq!(fake.last(GET).request["payload"], true);
     assert_eq!(d["payload"], format!("{{\"secret\":\"{secret}\"}}"));
 
-    // On, both tokens: the dashboard token sees the payloads and may search them.
-    let (_g, secure) = hub(Config {
+    // On, both tokens: the dashboard token sees payloads and may search them.
+    let (grpc, secure) = hub(Config {
         event_payloads: true,
         dashboard_token: Some(Secret::new(READ)),
         dashboard_write_token: Some(Secret::new(WRITE)),
-        ..base.clone()
+        ..config()
     })
     .await;
-    let (status, _) = get(secure, &record, None).await;
-    assert_eq!(status, 401, "reads need the token");
-    let (_, d) = get(secure, &record, Some(READ)).await;
+    let fake = start(grpc, secret.clone()).await;
+    until_installed_as(secure, Some(READ)).await;
+    let (_, d) = get(secure, "/api/v1/events/kraken.events/0/0", Some(READ)).await;
     assert_eq!(d["payload"], format!("{{\"secret\":\"{secret}\"}}"));
-    assert!(d.get("payloadTruncated").is_none());
-    let (_, raw) = get(secure, &format!("/api/v1/events/{topic}/0/1"), Some(READ)).await;
+    let (_, raw) = get(secure, "/api/v1/events/kraken.events/0/1", Some(READ)).await;
     assert_eq!(raw["payloadBase64"], "//4=");
     assert!(raw.get("payload").is_none(), "{raw}");
-    let (status, q) = get(secure, &format!("/api/v1/events?q={secret}"), Some(READ)).await;
-    assert_eq!(status, 200, "{q}");
-    assert_eq!(ids(&q), ["e-1"]);
-    assert!(
-        !q.to_string().contains(&secret),
-        "a result never carries the payload"
-    );
+    let (status, _) = get(secure, &format!("/api/v1/events?q={secret}"), Some(READ)).await;
+    assert_eq!(status, 200);
+    assert_eq!(fake.last(SEARCH).request["filters"]["q"], secret.as_str());
+    let (status, d) = get(secure, "/api/v1/events/kraken.events/0/2", Some(READ)).await;
+    assert_eq!(status, 200, "{d}");
+    // A payload search the hub refuses (a filter over the browser's bound) is not audited: it
+    // never reaches the browser.
+    let asked = fake.seen().len();
+    let long = "t".repeat(2000);
+    let (status, _) = get(
+        secure,
+        &format!("/api/v1/events?q={secret}&type={long}"),
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(fake.seen().len(), asked);
+    // An audited source is cut like any client-chosen string.
+    let long_source = "s".repeat(1000);
+    let (status, _) = get(
+        secure,
+        &format!("/api/v1/events?q={secret}&source={long_source}"),
+        Some(READ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // A permitted tail forwards `q` and is audited as a tail.
+    let mut fake = fake;
+    let path = format!("/api/v1/events/tail?q={secret}");
+    let sse = tokio::spawn(async move { browser::sse(secure, &path, Some(READ)).await });
+    let mut tail = fake.next_tail().await;
+    assert_eq!(tail.request["filters"]["q"], secret.as_str());
+    tail.start(1).await;
+    let mut sse = sse.await.unwrap();
+    assert_eq!(sse.status, 200);
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
 
-    // Out of range, unknown partition, unconfigured topic.
-    for (path, want) in [
-        (format!("/api/v1/events/{topic}/0/2"), 404),
-        (format!("/api/v1/events/{topic}/0/-1"), 400),
-        (format!("/api/v1/events/{topic}/7/0"), 404),
-        (format!("/api/v1/events/{topic}/x/0"), 400),
-        ("/api/v1/events/elsewhere/0/0".to_string(), 400),
-    ] {
-        let (status, body) = get(secure, &path, Some(READ)).await;
-        assert_eq!(status, want, "{path}: {body}");
-    }
-
-    // One audit line per payload served (three: write token, dashboard token twice), with the
-    // caller and the record; never the payload, in any line.
-    let lines = kafka::logged();
+    // One audit line per payload served (write token once, dashboard token twice), with the
+    // caller and the record; one line for the payload search, without the text; never the
+    // payload in any line.
+    let lines = common::browser::logged();
     let audits: Vec<_> = lines
         .iter()
-        .filter(|l| l.message == "event payload served" && l.field("topic") == Some(&topic))
+        .filter(|l| l.message == "event payload served")
         .collect();
-    assert_eq!(audits.len(), 3, "{audits:#?}");
+    assert_eq!(audits.len(), 4, "{audits:#?}");
     assert_eq!(audits[0].field("caller"), Some("write-token"));
     assert_eq!(audits[1].field("caller"), Some("dashboard-token"));
     assert_eq!(
         (
-            audits[1].field("partition"),
-            audits[1].field("offset"),
-            audits[1].field("size")
+            audits[1].field("source"),
+            audits[1].field("segment"),
+            audits[1].field("position"),
+            audits[1].field("size"),
         ),
-        (
-            Some("0"),
-            Some("0"),
-            Some(
-                format!("{{\"secret\":\"{secret}\"}}")
-                    .len()
-                    .to_string()
-                    .as_str()
-            )
-        )
+        (Some("kraken.events"), Some("0"), Some("0"), Some("17"))
     );
-    assert_eq!(audits[2].field("offset"), Some("1"));
+    assert!(audits[1].field("correlation_id").is_some());
+    assert_eq!(audits[2].field("position"), Some("1"));
+    assert_eq!(audits[3].field("position"), Some("2"));
+    assert_eq!(audits[3].field("source"), Some("s".repeat(128).as_str()));
+    let searches: Vec<_> = lines
+        .iter()
+        .filter(|l| l.message == "event payload search")
+        .collect();
+    assert_eq!(searches.len(), 3, "{searches:#?}");
+    assert_eq!(searches[0].field("caller"), Some("dashboard-token"));
+    assert_eq!(searches[0].field("tail"), Some("false"));
+    assert_eq!(searches[1].field("source"), Some("s".repeat(128).as_str()));
+    assert_eq!(
+        (searches[2].field("tail"), searches[2].field("caller")),
+        (Some("true"), Some("dashboard-token"))
+    );
     assert!(
         lines.iter().all(|l| !l.text().contains(&secret)),
-        "a payload was logged"
+        "a payload or a searched text was logged"
     );
-    drop(broker);
 }
 
+/// Even if a (buggy or hostile) browser sends payload fields the hub did not ask for, the hub
+/// drops them: in a record, a search result and a tail record.
 #[tokio::test]
-async fn a_tail_delivers_new_records_ends_on_time_and_drops_a_slow_reader() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("tail");
-    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[library(0, 0, "old", "t.Hit", "before")],
+async fn payload_dropped_when_not_asked() {
+    let (grpc, http) = hub(config()).await;
+    let hostile = |type_name: &str, request: &Value| {
+        let leak = |mut v: Value| {
+            v["payload"] = "SECRET".into();
+            v["payloadBase64"] = "U0VDUkVU".into();
+            v["payloadTruncated"] = true.into();
+            v
+        };
+        match type_name {
+            GET => {
+                let mut r = summary("0", "0", 1, "k", json!({}));
+                r["allHeaders"] = json!([]);
+                Answer::Json(leak(r))
+            }
+            SEARCH => Answer::Json(page(vec![leak(summary("0", "0", 1, "k", json!({})))])),
+            _ => defaults(type_name, request),
+        }
+    };
+    let mut fake = FakeBrowser::start(grpc, hostile).await;
+    until_installed(http).await;
+    let (status, d) = get(http, "/api/v1/events/kraken.events/0/0", None).await;
+    assert_eq!(status, 200, "{d}");
+    assert_eq!(fake.last(GET).request["payload"], false);
+    assert_eq!(d["payload"]["hidden"], "payloads-off");
+    let (_, s) = get(http, "/api/v1/events", None).await;
+    let (mut tail, mut t) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    t.part(
+        json!({"record": {"source": "kraken.events", "segment": "0", "position": "5",
+        "headers": {}, "size": 6, "payload": "SECRET", "payloadBase64": "U0VDUkVU"}}),
     )
     .await;
-    let (_g, short) = hub(Config {
-        event_tail_duration: Duration::from_secs(2),
-        event_max_tails: 1,
-        ..config(&broker.bootstrap, &[&topic])
-    })
-    .await;
-
-    let started = Instant::now();
-    let mut tail = kafka::sse(short, "/api/v1/events/tail?type=t.Hit", None).await;
-    assert_eq!(tail.status, 200);
-    let (name, data) = tail.next(Duration::from_secs(10)).await.unwrap();
-    assert_eq!(name, "start", "{data}");
-    let busy = common::http_request(short, "GET", "/api/v1/events/tail", &[]).await;
-    assert_eq!(busy.status, 429, "one tail at a time: {}", busy.body);
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            library(1, 1, "k", "t.Miss", "miss"),
-            library(1, 2, "k", "t.Hit", "hit"),
-        ],
-    )
-    .await;
-    let (name, data) = tail.next(Duration::from_secs(10)).await.unwrap();
+    assert_eq!(tail.next(Duration::from_secs(5)).await.unwrap().0, "start");
+    let (name, record) = tail.next(Duration::from_secs(5)).await.unwrap();
     assert_eq!(name, "record");
-    let record: Value = serde_json::from_str(&data).unwrap();
-    assert_eq!(record["headers"]["id"], "hit", "{record}");
-    assert!(record.get("payload").is_none(), "never a payload: {record}");
-    let (name, data) = tail.next(Duration::from_secs(10)).await.unwrap();
-    assert_eq!(name, "end");
-    assert_eq!(
-        serde_json::from_str::<Value>(&data).unwrap()["reason"],
-        "maxDuration"
-    );
-    assert!(started.elapsed() >= Duration::from_secs(2));
-    assert!(tail.next(Duration::from_secs(5)).await.is_none(), "closed");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut again = kafka::sse(short, "/api/v1/events/tail", None).await;
-    assert_eq!(again.status, 200, "the slot was given back");
-    assert_eq!(
-        again.next(Duration::from_secs(10)).await.unwrap().0,
-        "start"
-    );
-    drop(again);
-
-    // A reader that does not read: its tail ends, and the slot comes back.
-    let (_g, long) = hub(Config {
-        event_max_tails: 1,
-        ..config(&broker.bootstrap, &[&topic])
-    })
-    .await;
-    let mut slow = kafka::sse(long, "/api/v1/events/tail", None).await;
-    assert_eq!(slow.next(Duration::from_secs(10)).await.unwrap().0, "start");
-    let bootstrap = broker.bootstrap.clone();
-    let flood = topic.clone();
-    tokio::task::spawn_blocking(move || kafka::produce_many(&bootstrap, &flood, 0, 30_000, T))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut records = 0;
-    let end = loop {
-        match slow.next(Duration::from_secs(20)).await {
-            Some((name, _)) if name == "record" => records += 1,
-            Some((name, data)) if name == "end" => break data,
-            Some((name, data)) => panic!("unexpected {name}: {data}"),
-            None => panic!("closed without an end after {records} records"),
-        }
-    };
-    assert_eq!(
-        serde_json::from_str::<Value>(&end).unwrap()["reason"],
-        "slowReader"
-    );
-    assert!(records < 30_000, "{records}");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let next = kafka::sse(long, "/api/v1/events/tail", None).await;
-    assert_eq!(next.status, 200);
-    drop((tail, slow, next));
-    drop(broker);
-}
-
-#[tokio::test]
-async fn consumer_groups_show_lag_with_and_without_members_and_the_hub_creates_none() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("groups");
-    let other = kafka::unique("other");
-    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
-    kafka::create_topic(&broker.bootstrap, &other, 1).await;
-    let mut records: Vec<Rec> = (0..10).map(|i| library(0, i, "k", "a.B", "e")).collect();
-    records.extend((0..5).map(|i| library(1, i, "k", "a.B", "e")));
-    kafka::produce(&broker.bootstrap, &topic, &records).await;
-    let before = kafka::groups(&broker.bootstrap);
-
-    let bootstrap = broker.bootstrap.clone();
-    let (t, o) = (topic.clone(), other.clone());
-    let live = tokio::task::spawn_blocking(move || {
-        kafka::commit(&bootstrap, "g-empty", &t, &[(0, 4), (1, 5)]);
-        kafka::commit(&bootstrap, "g-elsewhere", &o, &[(0, 0)]);
-        // Named like the browser's group.id: listed like any other (the hub has none of its own).
-        kafka::commit(&bootstrap, "kraken-hub-browser-planted", &o, &[(0, 0)]);
-        Member::join(&bootstrap, "g-live", &t, &[(0, 10), (1, 2)])
-    })
-    .await
-    .unwrap();
-
-    let (grpc, http) = hub(config(&broker.bootstrap, &[&topic, &other])).await;
-    let (status, view) = get(http, "/api/v1/consumer-groups", None).await;
-    assert_eq!(status, 200, "{view}");
-    assert_eq!(view["topic"], topic.as_str());
-    assert_eq!(view["truncated"], false);
-    let groups = view["groups"].as_array().unwrap();
-    let names: Vec<&str> = groups
-        .iter()
-        .map(|g| g["groupId"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["g-empty", "g-live"], "by lag, descending: {view}");
-    let empty = &groups[0];
-    assert_eq!(
-        (&empty["members"], &empty["lag"]),
-        (&Value::from(0), &Value::from(6))
-    );
-    assert_eq!(empty["state"], "Empty");
-    assert_eq!(empty["topic"], topic.as_str());
-    assert_eq!(
-        empty["partitions"],
-        serde_json::json!([
-            {"partition": 0, "committed": 4, "highWatermark": 10, "lag": 6},
-            {"partition": 1, "committed": 5, "highWatermark": 5, "lag": 0},
-        ])
-    );
-    let live_view = &groups[1];
-    assert_eq!(
-        (&live_view["members"], &live_view["lag"]),
-        (&Value::from(1), &Value::from(3))
-    );
-    assert_eq!(live_view["state"], "Stable");
-    let (_, elsewhere) = get(
-        http,
-        &format!("/api/v1/consumer-groups?topic={other}"),
-        None,
-    )
-    .await;
-    let names: Vec<&str> = elsewhere["groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|g| g["groupId"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["g-elsewhere", "kraken-hub-browser-planted"]);
-    let (status, _) = get(http, "/api/v1/consumer-groups?topic=nope", None).await;
-    assert_eq!(status, 400);
-
-    // Everything the browser does, then the broker's groups: only the test's own are new.
-    let _ = get(http, "/api/v1/events?limit=5", None).await;
-    let _ = get(http, &format!("/api/v1/events/{topic}/0/0"), None).await;
-    let mut tail = kafka::sse(http, "/api/v1/events/tail", None).await;
-    assert_eq!(tail.next(Duration::from_secs(10)).await.unwrap().0, "start");
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[library(0, 99, "k", "a.B", "x")],
-    )
-    .await;
-    assert_eq!(
-        tail.next(Duration::from_secs(10)).await.unwrap().0,
-        "record"
-    );
-    drop(tail);
-    let _ = get(http, "/api/v1/consumer-groups", None).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let after = kafka::groups(&broker.bootstrap);
-    let new: Vec<&String> = after.difference(&before).collect();
-    assert_eq!(
-        new,
-        [
-            "g-elsewhere",
-            "g-empty",
-            "g-live",
-            "kraken-hub-browser-planted"
-        ],
-        "{after:?}"
-    );
-    assert!(
-        after
-            .iter()
-            .all(|g| !g.starts_with("kraken-hub") || g == "kraken-hub-browser-planted"),
-        "{after:?}"
-    );
-    drop((live, grpc));
-    drop(broker);
-}
-
-/// The consumer-group lag task (ADR 0026) reads every group with a committed offset on every
-/// configured topic, a group without a live member too, and the next run sees new records.
-#[tokio::test]
-async fn the_group_lag_task_reads_every_group_of_every_topic() {
-    let broker = kafka::kafka().await;
-    let topic = kafka::unique("lag");
-    let other = kafka::unique("lag-other");
-    kafka::create_topic(&broker.bootstrap, &topic, 2).await;
-    kafka::create_topic(&broker.bootstrap, &other, 1).await;
-    let mut records: Vec<Rec> = (0..10).map(|i| library(0, i, "k", "a.B", "e")).collect();
-    records.extend((0..5).map(|i| library(1, i, "k", "a.B", "e")));
-    kafka::produce(&broker.bootstrap, &topic, &records).await;
-    let three: Vec<Rec> = (0..3).map(|i| library(0, i, "k", "a.B", "e")).collect();
-    kafka::produce(&broker.bootstrap, &other, &three).await;
-    let bootstrap = broker.bootstrap.clone();
-    let (t, o) = (topic.clone(), other.clone());
-    let live = tokio::task::spawn_blocking(move || {
-        kafka::commit(&bootstrap, "g-empty", &t, &[(0, 4), (1, 5)]);
-        kafka::commit(&bootstrap, "g-other", &o, &[(0, 1)]);
-        Member::join(&bootstrap, "g-live", &t, &[(0, 10), (1, 2)])
-    })
-    .await
-    .unwrap();
-
-    let browser = Browser::new(
-        Arc::new(config(&broker.bootstrap, &[&topic, &other])),
-        Metrics::noop(),
-    );
-    let lag = Arc::new(GroupLag::default());
-    let stopping = CancellationToken::new();
-    let task = tokio::spawn(browser::run_group_lag(
-        browser,
-        Arc::clone(&lag),
-        Duration::from_secs(1),
-        stopping.clone(),
-    ));
-    let expect = |groups: &[(&str, &str, i64)]| -> Vec<(String, String, i64)> {
-        let mut v: Vec<(String, String, i64)> = groups
-            .iter()
-            .map(|(t, g, l)| (t.to_string(), g.to_string(), *l))
-            .collect();
-        v.sort();
-        v
-    };
-    let first = expect(&[
-        (&topic, "g-empty", 6),
-        (&topic, "g-live", 3),
-        (&other, "g-other", 2),
-    ]);
-    wait_for_lag(&lag, &first).await;
-
-    kafka::produce(
-        &broker.bootstrap,
-        &topic,
-        &[
-            library(0, 50, "k", "a.B", "e"),
-            library(0, 51, "k", "a.B", "e"),
-        ],
-    )
-    .await;
-    let second = expect(&[
-        (&topic, "g-empty", 8),
-        (&topic, "g-live", 5),
-        (&other, "g-other", 2),
-    ]);
-    wait_for_lag(&lag, &second).await;
-
-    stopping.cancel();
-    tokio::time::timeout(Duration::from_secs(10), task)
-        .await
-        .expect("the task stops")
-        .unwrap();
-    drop(live);
-    drop(broker);
-}
-
-/// Waits (30 s at most) until the lag task's reading is `want`.
-async fn wait_for_lag(lag: &GroupLag, want: &[(String, String, i64)]) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let got = lag.points();
-        if got == want {
-            return;
-        }
-        assert!(Instant::now() < deadline, "want {want:?}, got {got:?}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// The lag task against a broker that never answers runs on its own slot and the blocking
-/// pool: routing goes on as always, and the dashboard's searches keep their slots.
-#[tokio::test]
-async fn a_hanging_group_lag_task_never_blocks_routing() {
-    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let bootstrap = silent.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in silent.incoming() {
-            held.push(stream);
-        }
-    });
-    let (grpc, http) = hub(Config {
-        event_search_timeout: Duration::from_secs(2),
-        event_max_searches: 1,
-        group_lag_interval: Duration::from_secs(1),
-        ..config(&bootstrap, &["kraken.events", "kraken.events.dlt"])
-    })
-    .await;
-    let mut handler = FakeClient::register(grpc, "service-b", &[], &["b.Count"]).await;
-    let mut sender = FakeClient::register(grpc, "service-a", &[], &[]).await;
-    // Several lag runs hang on the broker meanwhile; every request is routed at once.
-    for i in 0..6 {
-        let id = format!("r{i}");
-        let routed = Instant::now();
-        sender
-            .tx
-            .send(FakeClient::request(
-                &id,
-                RequestKind::Query,
-                "b.Count",
-                "",
-                0,
-            ))
-            .await
-            .unwrap();
-        loop {
-            match handler.next().await {
-                Some(Ok(m)) => match m.message {
-                    Some(server_message::Message::Request(_)) => break,
-                    _ => continue,
-                },
-                other => panic!("{other:?}"),
-            }
-        }
-        handler
-            .tx
-            .send(FakeClient::reply_ok(&id, b"1"))
-            .await
-            .unwrap();
-        loop {
-            match sender.next().await {
-                Some(Ok(m)) => match m.message {
-                    Some(server_message::Message::Reply(_)) => break,
-                    _ => continue,
-                },
-                other => panic!("{other:?}"),
-            }
-        }
+    for text in [d.to_string(), s.to_string(), record] {
         assert!(
-            routed.elapsed() < Duration::from_millis(500),
-            "{id}: {:?}",
-            routed.elapsed()
+            !text.contains("SECRET")
+                && !text.contains("U0VDUkVU")
+                && !text.contains("payloadTruncated"),
+            "{text}"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    // The one search slot is the dashboard's: a listing gets it (and fails on the broker).
-    let (status, body) = get(http, "/api/v1/consumer-groups", None).await;
-    assert_eq!(status, 503, "{body}");
-}
-
-/// A bootstrap address nothing listens on.
-fn closed_port() -> String {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = closed.local_addr().unwrap().port();
-    drop(closed);
-    format!("127.0.0.1:{port}")
 }
 
 #[tokio::test]
-async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
+async fn browser_errors_map_to_http_statuses() {
     let (grpc, http) = hub(Config {
-        event_search_timeout: Duration::from_secs(2),
-        ..config(&closed_port(), &["kraken.events"])
+        timeout_overrides: [(GET.to_string(), Duration::from_millis(300))].into(),
+        ..config()
     })
     .await;
-    let searches: Vec<_> = [
-        "/api/v1/events",
-        "/api/v1/events/kraken.events/0/0",
-        "/api/v1/consumer-groups",
-        "/api/v1/events/tail",
-    ]
-    .into_iter()
-    .map(|path| tokio::spawn(async move { (path, get(http, path, None).await) }))
-    .collect();
+    let _fake = FakeBrowser::start(grpc, |type_name, request| {
+        let key = request["filters"]["key"].as_str().unwrap_or_default();
+        match (type_name, key) {
+            (SEARCH, "invalid") => refusal("invalid", "the cursor belongs to another search"),
+            (SEARCH, "missing") => refusal("not-found", "no such source"),
+            (SEARCH, "busy") => refusal("busy", "4 searches are running"),
+            (SEARCH, "down") => refusal("unavailable", "the event store did not answer"),
+            (SEARCH, "odd") => refusal("exploded", "stack trace here"),
+            (SEARCH, "raw") => Answer::Error {
+                code: ErrorCode::HandlerError,
+                message: "internal: stack trace here".into(),
+                details: b"not json".to_vec(),
+            },
+            (SEARCH, "undecodable") => Answer::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "invalid type: string \"50\", expected u64".into(),
+                details: vec![],
+            },
+            (SEARCH, "garbage") => Answer::Raw(b"{\"source\":".to_vec()),
+            (SEARCH, "huge") => Answer::Raw(vec![b' '; 3 * 1024 * 1024]),
+            (GET, _) => Answer::Silent,
+            _ => defaults(type_name, request),
+        }
+    })
+    .await;
+    until_installed(http).await;
+    for (key, status, message) in [
+        ("invalid", 400, "the cursor belongs to another search"),
+        ("missing", 404, "no such source"),
+        ("busy", 429, "4 searches are running"),
+        ("down", 503, "the event store did not answer"),
+        ("odd", 502, "the event browser failed to answer"),
+        ("raw", 502, "the event browser failed to answer"),
+        (
+            "undecodable",
+            400,
+            "the event browser could not read the request",
+        ),
+        ("garbage", 502, "the event browser failed to answer"),
+        ("huge", 502, "the event browser failed to answer"),
+    ] {
+        let (r, body) = get_with(http, &format!("/api/v1/events?key={key}"), None, &[]).await;
+        assert_eq!(
+            (r.status, body["error"].as_str()),
+            (status, Some(message)),
+            "{key}"
+        );
+        assert!(!r.body.contains("stack trace"), "{key}: {}", r.body);
+        if status == 429 {
+            assert_eq!(r.header("retry-after"), Some("1"));
+        }
+    }
+    let (status, body) = get(http, "/api/v1/events/kraken.events/0/0", None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (504, Some("the event browser did not answer in time"))
+    );
+}
 
-    // While the browser waits for Kafka, a query is routed as always.
+/// While a search waits for the browser, routing goes on as always.
+#[tokio::test]
+async fn routing_goes_on_while_a_search_waits() {
+    let (grpc, http) = hub(Config {
+        timeout_overrides: [(SEARCH.to_string(), Duration::from_secs(2))].into(),
+        ..config()
+    })
+    .await;
+    let _fake = FakeBrowser::start(grpc, |type_name, request| match type_name {
+        SEARCH => Answer::Silent,
+        _ => defaults(type_name, request),
+    })
+    .await;
+    until_installed(http).await;
+    let search = tokio::spawn(async move { get(http, "/api/v1/events", None).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut handler = FakeClient::register(grpc, "service-b", &[], &["b.Count"]).await;
     let mut sender = FakeClient::register(grpc, "service-a", &[], &[]).await;
     let routed = Instant::now();
@@ -955,10 +648,8 @@ async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
         .unwrap();
     loop {
         match handler.next().await {
-            Some(Ok(m)) => match m.message {
-                Some(server_message::Message::Request(_)) => break,
-                _ => continue,
-            },
+            Some(Ok(m)) if matches!(m.message, Some(server_message::Message::Request(_))) => break,
+            Some(Ok(_)) => continue,
             other => panic!("{other:?}"),
         }
     }
@@ -969,10 +660,8 @@ async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
         .unwrap();
     loop {
         match sender.next().await {
-            Some(Ok(m)) => match m.message {
-                Some(server_message::Message::Reply(_)) => break,
-                _ => continue,
-            },
+            Some(Ok(m)) if matches!(m.message, Some(server_message::Message::Reply(_))) => break,
+            Some(Ok(_)) => continue,
             other => panic!("{other:?}"),
         }
     }
@@ -981,156 +670,222 @@ async fn an_unreachable_kafka_answers_503_and_routing_goes_on() {
         "{:?}",
         routed.elapsed()
     );
-    assert!(
-        kraken_hub::health_probe(grpc).await.unwrap(),
-        "still SERVING"
+    assert!(!search.is_finished(), "the search still waits");
+    let (status, _) = search.await.unwrap();
+    assert_eq!(status, 504);
+}
+
+#[tokio::test]
+async fn a_tail_streams_start_records_heartbeats_and_end() {
+    let (grpc, http) = hub(config()).await;
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    // A payload filter without the payload rules is refused before any tail.
+    let (status, body) = get(http, "/api/v1/events/tail?q=x", None).await;
+    assert_eq!(
+        (status, &body["hidden"]),
+        (403, &Value::from("payloads-off"))
     );
-    let (status, _) = get(http, "/api/v1/topology", None).await;
-    assert_eq!(status, 200);
 
-    for search in searches {
-        let (path, (status, body)) = search.await.unwrap();
-        assert_eq!(status, 503, "{path}: {body}");
-        assert!(body["error"].as_str().unwrap().contains("Kafka"), "{body}");
-    }
-}
+    let (mut sse, mut tail) =
+        open_tail(http, "/api/v1/events/tail?type=orders.*", &mut fake, 6).await;
+    // The heartbeat is asked well below the internal stream's idle timeout (5 s), the duration
+    // within the hub's longest stream (10 min).
+    let heartbeat = tail.request["heartbeatMs"].as_u64().unwrap();
+    assert!((100..5000).contains(&heartbeat), "{heartbeat}");
+    assert!(tail.request["maxDurationMs"].as_u64().unwrap() < 600_000);
+    assert_eq!(tail.request["filters"], json!({"type": "orders.*"}));
+    assert!(tail.headers.contains_key("correlationId"));
+    assert_eq!(sse.status, 200);
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "start");
+    let start: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        start,
+        json!({"source": "kraken.events", "segments": 6, "endsAtMs": 1_900_000_000_000_i64})
+    );
+    tail.part(json!({"record": summary("2", "9", 5, "k-1", json!({"type": "orders.Placed"}))}))
+        .await;
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "record");
+    let record: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        (record["segment"].as_str(), record["position"].as_str()),
+        (Some("2"), Some("9"))
+    );
+    tail.part(json!({"heartbeat": {"nowMs": 1}})).await;
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "heartbeat");
+    let now: Value = serde_json::from_str(&data).unwrap();
+    assert!(now["nowMs"].as_i64().unwrap() > 1, "the hub's clock: {now}");
+    tail.part(json!({"end": {"reason": "maxDuration"}})).await;
+    tail.close().await;
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (name.as_str(), data.as_str()),
+        ("end", "{\"reason\":\"maxDuration\"}")
+    );
+    assert_eq!(
+        sse.next(Duration::from_secs(5)).await,
+        None,
+        "nothing after the end"
+    );
 
-/// A tail request that is dropped while its Kafka setup still runs keeps its slot until that
-/// setup ends: opening and aborting tails never runs more setups than the tail limit.
-#[tokio::test]
-async fn an_aborted_tail_keeps_its_slot_until_its_kafka_setup_ends() {
-    use tokio::io::AsyncWriteExt;
-    let budget = Duration::from_secs(3);
-    let (_g, http) = hub(Config {
-        event_search_timeout: budget,
-        event_max_tails: 4,
-        ..config(&closed_port(), &["kraken.events"])
-    })
-    .await;
-    let opened = Instant::now();
-    for _ in 0..8 {
-        let mut client = tokio::net::TcpStream::connect(http).await.unwrap();
-        let request = format!("GET /api/v1/events/tail HTTP/1.1\r\nHost: {http}\r\n\r\n");
-        client.write_all(request.as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        drop(client);
-    }
-    // Every setup still waits for Kafka: a fifth tail is refused.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let busy = http_send(
-        http,
-        "GET",
-        "/api/v1/events/tail",
-        &[],
-        b"",
-        Duration::from_secs(30),
-    )
-    .await;
-    assert_eq!(busy.status, 429, "{}", busy.body);
-    assert!(opened.elapsed() < budget, "{:?}", opened.elapsed());
-    // The setups end at their budget and give their slots back.
-    tokio::time::sleep_until((opened + budget + Duration::from_secs(1)).into()).await;
-    let (status, body) = get(http, "/api/v1/events/tail", None).await;
-    assert_eq!(status, 503, "{body}");
-}
-
-/// A broker that accepts connections and never answers: every call is 503 at its budget, and its
-/// consumer closes within the close grace, so the slot is free again by the budget plus the grace.
-#[tokio::test]
-async fn a_silent_broker_frees_every_slot_within_the_budget_and_the_close_grace() {
-    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let bootstrap = silent.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in silent.incoming() {
-            held.push(stream);
+    // A reader that leaves cancels the browser's tail.
+    let (sse, mut tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    let id = tail.id.clone();
+    drop(sse);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Parts keep the hub writing, so it notices the reader is gone.
+        tail.part(json!({"heartbeat": {"nowMs": 1}})).await;
+        if fake.cancelled().contains(&id) {
+            break;
         }
-    });
-    let budget = Duration::from_secs(2);
-    let (_g, http) = hub(Config {
-        event_search_timeout: budget,
-        event_max_searches: 1,
-        event_max_tails: 1,
-        ..config(&bootstrap, &["kraken.events"])
+        assert!(Instant::now() < deadline, "the tail was not cancelled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A refused tail is refused before any event.
+    let (grpc, http) = hub(config()).await;
+    let _busy = FakeBrowser::start(grpc, |type_name, request| match type_name {
+        TAIL => refusal("busy", "4 tails are open"),
+        _ => defaults(type_name, request),
     })
     .await;
-    for path in [
-        "/api/v1/events",
-        "/api/v1/events/kraken.events/0/0",
-        "/api/v1/consumer-groups",
-        "/api/v1/events/tail",
-    ] {
-        let started = Instant::now();
-        let (status, body) = get(http, path, None).await;
-        assert_eq!(status, 503, "{path}: {body}");
-        let freed = started + budget + kraken_hub::browser::CLOSE_GRACE;
-        tokio::time::sleep_until(freed.into()).await;
-        let (status, body) = get(http, path, None).await;
-        assert_eq!(status, 503, "{path}: the slot is free again: {body}");
-    }
+    until_installed(http).await;
+    let (r, body) = get_with(http, "/api/v1/events/tail", None, &[]).await;
+    assert_eq!(
+        (r.status, body["error"].as_str()),
+        (429, Some("4 tails are open"))
+    );
+    assert_eq!(r.header("retry-after"), Some("1"));
 }
 
 #[tokio::test]
-async fn without_a_bootstrap_the_browser_is_off() {
-    let (_g, http) = hub(Config {
-        otlp_endpoint: None,
-        ..Config::default()
-    })
-    .await;
-    for path in [
-        "/api/v1/events",
-        "/api/v1/events/kraken.events/0/0",
-        "/api/v1/events/tail",
-        "/api/v1/consumer-groups",
-    ] {
-        let (status, body) = get(http, path, None).await;
-        assert_eq!(status, 404, "{path}");
-        assert_eq!(
-            body["error"],
-            "event browser disabled: set KRAKEN_HUB_KAFKA_BOOTSTRAP"
-        );
-    }
-    let (_, version) = get(http, "/api/v1/version", None).await;
+async fn tail_ends_when_browser_disconnects() {
+    let (grpc, http) = hub(config()).await;
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (mut sse, tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 2).await;
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
+    drop(tail);
+    fake.disconnect();
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
     assert_eq!(
-        version["eventBrowser"],
-        serde_json::json!({"enabled": false, "payloads": false, "topics": []})
+        (name.as_str(), data.as_str()),
+        ("end", "{\"reason\":\"failed\"}")
     );
-    let (_, settings) = get(http, "/api/v1/settings", None).await;
-    let names: Vec<&str> = settings["settings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["name"].as_str().unwrap())
-        .collect();
-    for name in [
-        "KRAKEN_HUB_KAFKA_BOOTSTRAP",
-        "KRAKEN_HUB_EVENT_TOPICS",
-        "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS",
-        "KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED",
-        "KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS",
-        "KRAKEN_HUB_EVENT_SEARCH_TIMEOUT",
-        "KRAKEN_HUB_EVENT_MAX_SEARCHES",
-        "KRAKEN_HUB_EVENT_MAX_TAILS",
-        "KRAKEN_HUB_EVENT_TAIL_DURATION",
-        "KRAKEN_HUB_GROUP_LAG_INTERVAL",
-    ] {
-        assert!(names.contains(&name), "{name} missing");
-    }
+    assert_eq!(sse.next(Duration::from_secs(5)).await, None);
+    let (status, body) = get(http, "/api/v1/events/tail", None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (404, Some("event browser not installed"))
+    );
+}
 
-    // On: the version says so; payloads are viewable only with the switch and a token.
-    let (_g, on) = hub(Config {
-        event_payloads: true,
-        dashboard_token: Some(Secret::new(READ)),
-        ..config("kafka:9092", &["kraken.events", "kraken.events.dlt"])
+/// A tail part the hub cannot read ends the tail as failed and cancels the browser's stream.
+#[tokio::test]
+async fn a_malformed_tail_part_ends_the_tail() {
+    let (grpc, http) = hub(config()).await;
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (mut sse, mut tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
+    tail.raw(b"{\"record\": 42}").await;
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (name.as_str(), data.as_str()),
+        ("end", "{\"reason\":\"failed\"}")
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fake.cancelled().contains(&tail.id) {
+        assert!(Instant::now() < deadline, "not cancelled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A first part that is not `start` is a failed call (502), not a stream.
+    let sse_task = tokio::spawn(async move { get(http, "/api/v1/events/tail", None).await });
+    let mut tail = fake.next_tail().await;
+    tail.part(json!({"heartbeat": {"nowMs": 1}})).await;
+    let (status, _) = sse_task.await.unwrap();
+    assert_eq!(status, 502);
+}
+
+#[tokio::test]
+async fn the_hub_bounds_its_open_tails() {
+    let (grpc, http) = hub(Config {
+        event_max_tails: 1,
+        ..config()
     })
     .await;
-    let (_, version) = get(on, "/api/v1/version", Some(READ)).await;
-    assert_eq!(
-        version["eventBrowser"],
-        serde_json::json!({
-            "enabled": true,
-            "payloads": true,
-            "topics": ["kraken.events", "kraken.events.dlt"],
-        })
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (_first, _tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    let (r, body) = get_with(http, "/api/v1/events/tail", None, &[]).await;
+    assert_eq!(r.status, 429, "{body}");
+    assert_eq!(r.header("retry-after"), Some("1"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("KRAKEN_HUB_EVENT_MAX_TAILS")
     );
+    assert_eq!(
+        fake.seen().iter().filter(|s| s.type_name == TAIL).count(),
+        1
+    );
+}
+
+/// The hub validates what it can before asking: `limit=0` (the browser takes 1 and more) and a
+/// lag `source` over the browser's bound are 400 and never reach the browser.
+#[tokio::test]
+async fn the_hub_refuses_a_zero_limit_and_a_long_lag_source() {
+    let (grpc, http) = hub(config()).await;
+    let fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (status, body) = get(http, "/api/v1/events?limit=0", None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("limit must be a positive number"))
+    );
+    let long = "s".repeat(1025);
+    let (status, body) = get(http, &format!("/api/v1/events/lag?source={long}"), None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (400, Some("source is longer than 1024 bytes"))
+    );
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+    let (status, _) = get(http, "/api/v1/events/lag?source=kraken.events", None).await;
+    assert_eq!(status, 200);
+}
+
+/// A hub that stops ends every open tail with `shutdown`, not `failed`, although its sessions
+/// (the browser's among them) are closed in the same shutdown.
+#[tokio::test]
+async fn a_hub_that_stops_ends_its_tails_with_shutdown() {
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (grpc, http) = (
+        grpc_listener.local_addr().unwrap(),
+        http_listener.local_addr().unwrap(),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        kraken_hub::serve_with_shutdown(config(), grpc_listener, Some(http_listener), async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    let mut fake = FakeBrowser::start(grpc, defaults).await;
+    until_installed(http).await;
+    let (mut sse, _tail) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
+    assert_eq!(sse.next(Duration::from_secs(5)).await.unwrap().0, "start");
+    stop.send(()).unwrap();
+    let (name, data) = sse.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (name.as_str(), data.as_str()),
+        ("end", "{\"reason\":\"shutdown\"}")
+    );
+    assert_eq!(sse.next(Duration::from_secs(5)).await, None);
 }

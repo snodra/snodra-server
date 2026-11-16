@@ -1,8 +1,9 @@
-// Events (ADR 0025, P7): a read-only browser over the Kafka topics this hub lists
-// (KRAKEN_HUB_EVENT_TOPICS). A search runs newest first over every partition and pages with the
-// hub's cursor; a record opens to its headers and, where this hub serves payloads to the token the
-// tab holds, its payload; the tail prepends new records as they come. This hub only: every hub
-// reads the same Kafka. Everything is rendered as text (h / textContent), payloads included.
+// Events (ADR 0025, ADR 0027): a read-only browser over the event store, through the event browser
+// add-on connected to this hub (kraken-event-browser); the page is hidden while none is. A search
+// runs newest first over every segment of a source and pages with the browser's cursor; a record
+// opens to its headers and, where this hub serves payloads to the token the tab holds, its
+// payload; the tail prepends new records as they come. This hub only: every hub's browser reads
+// the same event store. Everything is rendered as text (h / textContent), payloads included.
 
 import { badge, fill, h, row, table } from '../dom.js';
 import * as fmt from '../format.js';
@@ -26,7 +27,7 @@ const RANGES = [
 const FIELDS = [
   ['type', 'Type', 'orders.OrderPlaced or orders.*'],
   ['key', 'Key', 'record key, exact'],
-  ['source', 'Source', 'service, exact'],
+  ['service', 'Service', 'publishing service, exact'],
   ['correlationId', 'Correlation id', 'exact'],
   ['userId', 'User id', 'exact'],
   ['eventId', 'Event id', 'exact'],
@@ -34,24 +35,30 @@ const FIELDS = [
 
 const STOPPED = {
   limit: 'stopped at the page size',
-  scanBudget: 'stopped by the scan budget (KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED)',
-  timeBudget: 'stopped by the time budget (KRAKEN_HUB_EVENT_SEARCH_TIMEOUT)',
+  scanBudget: 'stopped by the event browser\'s scan budget',
+  timeBudget: 'stopped by the event browser\'s time budget',
 };
 
 const ENDED = {
-  maxDuration: 'it reached its maximum duration (KRAKEN_HUB_EVENT_TAIL_DURATION)',
-  slowReader: 'this page fell too far behind and the hub dropped it',
-  shutdown: 'the hub is shutting down',
+  maxDuration: 'it reached its maximum duration',
+  slowReader: 'this page fell too far behind and the event browser dropped it',
+  shutdown: 'the hub or the event browser is shutting down',
+  failed: 'the event browser stopped answering',
 };
+
+const NOT_INSTALLED = 'No event browser is connected to this hub: run the kraken-event-browser add-on (a service whose ACL entry has the event-browser right).';
 
 const str = (x) => (typeof x === 'string' ? x : '');
 const isObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 
-/** The browser facts of /api/v1/version, or null when the browser is off. */
+/** The browser facts of /api/v1/version, or null when no browser is installed. */
 function browserOf(ctx) {
   const eb = ctx.version && ctx.version.eventBrowser;
-  return eb && eb.enabled ? eb : null;
+  return eb && eb.installed ? eb : null;
 }
+
+/** True for the hub's answer while no event browser is connected. */
+const notInstalled = (answer) => answer && answer.status === 404 && answer.data && answer.data.error === 'event browser not installed';
 
 /** epoch ms of a datetime-local value, or null. */
 function localMs(value) {
@@ -62,7 +69,7 @@ function localMs(value) {
 /** The API query of a search from the page's parameters (the time range resolved now). */
 function searchQuery(params, eb) {
   const q = new URLSearchParams();
-  q.set('topic', params.get('topic') || eb.topics[0]);
+  if (params.get('source')) q.set('source', params.get('source'));
   const range = params.get('range') || 'all';
   const preset = RANGES.find((r) => r[0] === range);
   if (preset && preset[2]) q.set('from', String(Date.now() - preset[2]));
@@ -88,25 +95,26 @@ function tailQuery(params, eb) {
   return q;
 }
 
-/** `#/events?...` searching `topic` for `name` = `value` only. */
-function searchHref(topic, name, value) {
-  const p = new URLSearchParams({ topic, [name]: value });
+/** `#/events?...` searching `source` for `name` = `value` only. */
+function searchHref(source, name, value) {
+  const p = new URLSearchParams({ source, [name]: value });
   return `#/events?${p}`;
 }
 
 /** The API path of one record. */
-const recordPath = (topic, partition, offset) => `events/${encodeURIComponent(topic)}/${partition}/${offset}`;
+const recordPath = (source, segment, position) => `events/${[source, segment, position].map((x) => encodeURIComponent(str(x))).join('/')}`;
 
 async function load(ctx) {
   const eb = browserOf(ctx);
   if (!eb) return { disabled: true };
   const query = searchQuery(ctx.params, eb);
   const record = ctx.params.get('record');
-  const [search, detail] = await Promise.all([
+  const [sources, search, detail] = await Promise.all([
+    ctx.api.browse('events/sources'),
     ctx.api.browse(`events?${query}`),
     record ? ctx.api.browse(`events/${record}`) : Promise.resolve(null),
   ]);
-  return { eb, query: query.toString(), search, detail };
+  return { eb, query: query.toString(), sources, search, detail };
 }
 
 /** A summary's cells for the results and the tail. */
@@ -116,19 +124,19 @@ function cells(r, open) {
   const corr = str(headers.correlationId);
   return [
     { class: 'nowrap', content: Number.isFinite(r.timestamp) ? fmt.time(r.timestamp) : '—' },
-    { class: 'mono', content: type ? h('a', { href: searchHref(r.topic, 'type', type), title: 'Search by this type' }, type) : '—' },
+    { class: 'mono', content: type ? h('a', { href: searchHref(r.source, 'type', type), title: 'Search by this type' }, type) : '—' },
     { class: 'mono', content: r.key === null || r.key === undefined ? h('span', { class: 'dim' }, 'none') : [str(r.key), r.keyTruncated ? '…' : ''] },
     {
       class: 'num nowrap',
       content: h('button', { type: 'button', class: 'linkish', title: 'Show this record', on: { click: () => open(r) } },
-        `${r.partition} / ${r.offset}`),
+        `${str(r.segment)} / ${str(r.position)}`),
     },
     { class: 'mono', content: str(headers.source) || '—' },
-    { class: 'mono', content: corr ? h('a', { href: searchHref(r.topic, 'correlationId', corr), title: 'Search by this correlation id' }, corr) : '—' },
+    { class: 'mono', content: corr ? h('a', { href: searchHref(r.source, 'correlationId', corr), title: 'Search by this correlation id' }, corr) : '—' },
   ];
 }
 
-const HEADERS = ['Time', 'Type', 'Key', { label: 'Partition / offset', class: 'num' }, 'Source', 'Correlation id'];
+const HEADERS = ['Time', 'Type', 'Key', { label: 'Segment / position', class: 'num' }, { label: 'Service', title: 'The publishing service (header source)' }, 'Correlation id'];
 
 /** The payload of a record detail, as text. */
 function payloadView(d) {
@@ -174,13 +182,19 @@ export default {
     const eb = browserOf(ctx);
     if (!eb) {
       root.append(h('h1', null, 'Events'),
-        h('section', { class: 'card' }, h('p', { class: 'empty' }, 'The event browser is off on this hub: set KRAKEN_HUB_KAFKA_BOOTSTRAP.')));
+        h('section', { class: 'card' }, h('p', { class: 'empty' }, NOT_INSTALLED)));
       return { update() {} };
     }
 
-    // The form: every field writes the URL, Search runs it.
-    const topic = h('select', { 'aria-label': 'Topic' },
-      eb.topics.map((t) => h('option', { value: t, selected: t === (ctx.params.get('topic') || eb.topics[0]) }, t)));
+    // The form: every field writes the URL, Search runs it. The sources come with each load.
+    const source = h('select', { 'aria-label': 'Source' });
+    const fillSources = (answer) => {
+      const list = answer && answer.ok && isObject(answer.data) && Array.isArray(answer.data.sources) ? answer.data.sources : [];
+      const names = list.map((x) => str(x.source)).filter(Boolean);
+      const chosen = ctx.params.get('source') || names[0] || '';
+      if (chosen && !names.includes(chosen)) names.push(chosen);
+      fill(source, names.map((name) => h('option', { value: name, selected: name === chosen }, name)));
+    };
     const range = h('select', { 'aria-label': 'Time range' },
       RANGES.map(([id, label]) => h('option', { value: id, selected: id === (ctx.params.get('range') || 'all') }, label)));
     const from = h('input', { type: 'datetime-local', step: '1', 'aria-label': 'From', value: ctx.params.get('from') || '' });
@@ -194,11 +208,11 @@ export default {
       ? h('input', { type: 'search', 'aria-label': 'Payload text', placeholder: 'Payload text (contains, case-sensitive)', value: ctx.params.get('q') || '', spellcheck: 'false' })
       : null;
     const form = h('form', { class: 'controls event-form', role: 'search' },
-      topic, range, custom, inputs.map(([, el]) => el), payload,
+      source, range, custom, inputs.map(([, el]) => el), payload,
       h('button', { type: 'submit' }, 'Search'));
     form.addEventListener('submit', (event) => {
       event.preventDefault();
-      const values = { topic: topic.value, range: range.value, record: null };
+      const values = { source: source.value || null, range: range.value, record: null };
       values.from = range.value === 'custom' ? from.value : null;
       values.to = range.value === 'custom' ? to.value : null;
       for (const [name, el] of inputs) values[name] = el.value.trim();
@@ -222,7 +236,7 @@ export default {
       h('section', { class: 'card', 'aria-label': 'Search results' }, results));
 
     const openRecord = async (r) => {
-      const path = recordPath(r.topic, r.partition, r.offset);
+      const path = recordPath(r.source, r.segment, r.position);
       ctx.setParams({ record: path.slice('events/'.length) });
       fill(detail, h('section', { class: 'card' }, h('p', { class: 'empty' }, 'Loading the record…')));
       try {
@@ -250,7 +264,7 @@ export default {
       const fact = (k, v) => [h('dt', null, k), h('dd', null, v)];
       const all = Array.isArray(d.allHeaders) ? d.allHeaders : [];
       fill(detail, h('section', { class: 'card', 'aria-label': 'Record' },
-        h('div', { class: 'card-head' }, h('h2', null, `${str(d.topic)} ${d.partition} / ${d.offset}`), close),
+        h('div', { class: 'card-head' }, h('h2', null, `${str(d.source)} ${str(d.segment)} / ${str(d.position)}`), close),
         h('dl', { class: 'facts' },
           fact('Time', Number.isFinite(d.timestamp) ? fmt.time(d.timestamp) : '—'),
           fact('Key', d.key === null || d.key === undefined ? 'none' : h('span', { class: 'mono' }, str(d.key))),
@@ -270,9 +284,9 @@ export default {
     };
 
     const statsText = (s) => {
-      if (s.missing) return `Topic ${s.topic} does not exist on the broker.`;
+      if (s.missing) return `Source ${str(s.source)} does not exist in the event store.`;
       const scanned = `Scanned ${fmt.int(s.scanned)} records`;
-      if (s.exhausted) return `${scanned}; every partition searched.`;
+      if (s.exhausted) return `${scanned}; every segment searched.`;
       return `${scanned}, ${STOPPED[s.stoppedBy] || 'stopped'}.`;
     };
 
@@ -311,7 +325,7 @@ export default {
     // ---- tail ----
 
     // Prepends the records that came since the last frame (only the newest that can stay) and
-    // drops the rows beyond MAX_TAIL_ROWS: a busy topic costs one small change per frame.
+    // drops the rows beyond MAX_TAIL_ROWS: a busy source costs one small change per frame.
     const drawTail = () => {
       frame = 0;
       const fresh = pending.slice(-MAX_TAIL_ROWS).reverse();
@@ -365,7 +379,7 @@ export default {
             return;
           }
           if (name === 'start') {
-            tailStatus.textContent = `Tailing ${str(value.topic)} (${fmt.int(value.partitions)} partitions) from now until ${fmt.clock(value.endsAtMs)}.`;
+            tailStatus.textContent = `Tailing ${str(value.source)} (${fmt.int(value.segments)} segments) from now until ${fmt.clock(value.endsAtMs)}.`;
           } else if (name === 'record' && isObject(value)) {
             queueTail(value);
           } else if (name === 'end') {
@@ -394,8 +408,14 @@ export default {
     return {
       update(data) {
         if (data.disabled) return;
+        if (notInstalled(data.search)) {
+          meta.textContent = '';
+          fill(results, h('p', { class: 'empty' }, NOT_INSTALLED));
+          return;
+        }
         last = data;
         rows = [];
+        fillSources(last.sources);
         show(last.search, last.query);
         renderDetail(last.detail);
       },

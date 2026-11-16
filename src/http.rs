@@ -8,6 +8,7 @@
 //! entry has `control = true`, whatever the dashboard token; with neither configured they answer
 //! 403 `controls are disabled`.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,22 +23,23 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, Authorizer, ControlRight, Secret};
-use crate::browser::{Browser, Refusal};
 use crate::config::Config;
 use crate::context::ContextId;
 use crate::control::{
     Action, Answer, AnswerView, LetterCall, LetterPage, RetryAllView, RetryView, Target, Verdict,
 };
 use crate::edges::{EdgeSnapshot, WindowTotals};
+use crate::events::Refusal;
 use crate::registry::Registry;
 use crate::router::Router;
 use crate::session::Sessions;
+use crate::telemetry::Metrics;
 use crate::topology::{self, ClockAnchor, Topology};
 use crate::{api, assets, events, processors};
 
@@ -86,8 +88,10 @@ pub struct HttpState {
     pub streams: Arc<AtomicUsize>,
     /// The summary every open stream reads (computed once per tick for all of them).
     pub summaries: Arc<SummaryFeed>,
-    /// The event browser (ADR 0025): off without `KRAKEN_HUB_KAFKA_BOOTSTRAP`.
-    pub browser: Arc<Browser>,
+    /// The hub's instruments (the events API counts its calls, tails and payload views).
+    pub metrics: Arc<Metrics>,
+    /// The slots of `KRAKEN_HUB_EVENT_MAX_TAILS`: event tails open on this hub.
+    pub tails: Arc<Semaphore>,
 }
 
 impl HttpState {
@@ -151,11 +155,12 @@ pub fn app(state: HttpState) -> axum::Router {
             .route("/api/v1/stream", get(api_stream))
             .route("/api/v1/events", get(api_events))
             .route("/api/v1/events/tail", get(api_events_tail))
+            .route("/api/v1/events/sources", get(api_event_sources))
+            .route("/api/v1/events/lag", get(api_event_lag))
             .route(
-                "/api/v1/events/{topic}/{partition}/{offset}",
+                "/api/v1/events/{source}/{segment}/{position}",
                 get(api_event),
-            )
-            .route("/api/v1/consumer-groups", get(api_consumer_groups));
+            );
         // The token check sits inside the CORS layer: a peer's preflight carries no
         // `Authorization` header and must be answered, and a 401 must still carry the CORS
         // headers or the peer's page could not tell a wrong token from a network error.
@@ -358,7 +363,13 @@ async fn api_settings(State(s): State<HttpState>) -> Response {
 }
 
 async fn api_version(State(s): State<HttpState>) -> Response {
-    fresh_json(api::version(&s.config, &s.topology(), &s.build_id))
+    let installed = events::installed(&s.registry);
+    fresh_json(api::version(
+        &s.config,
+        &s.topology(),
+        &s.build_id,
+        installed,
+    ))
 }
 
 /// The event processors of every service, aggregated over its instances (ADR 0022).
@@ -367,217 +378,363 @@ async fn api_processors(State(s): State<HttpState>) -> Response {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Event browser (ADR 0025)
+// Events, over the event browser add-on (ADR 0027; payload rules ADR 0025)
 
-/// The answer to a browser call that has no data, counted under `kind`.
-fn refused(s: &HttpState, kind: &'static str, refusal: Refusal) -> Response {
-    s.browser.count(kind, refusal.outcome());
-    match refusal {
-        Refusal::Disabled => error_json(StatusCode::NOT_FOUND, crate::browser::DISABLED),
-        Refusal::BadRequest(why) => error_json(StatusCode::BAD_REQUEST, &why),
-        Refusal::NotFound(why) => error_json(StatusCode::NOT_FOUND, &why),
-        Refusal::Unavailable(why) => error_json(StatusCode::SERVICE_UNAVAILABLE, &why),
-        Refusal::Forbidden(hidden) => answer_json(
-            StatusCode::FORBIDDEN,
-            &serde_json::json!({ "error": hidden.reason(), "hidden": hidden.code() }),
-        ),
-        Refusal::TooMany(why) => {
-            let mut r = error_json(StatusCode::TOO_MANY_REQUESTS, &why);
-            r.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            r
+/// The request header a caller may bring its correlation id in; every events answer carries the
+/// id it was asked under.
+pub const CORRELATION_HEADER: &str = "x-correlation-id";
+
+/// One `/api/v1/events*` call: what it counts as, who asked (the token presented, as the audit
+/// lines name it) and its correlation id, both sent to the browser with each query.
+struct EventCall<'a> {
+    s: &'a HttpState,
+    kind: &'static str,
+    caller: Option<&'static str>,
+    correlation_id: String,
+}
+
+impl<'a> EventCall<'a> {
+    fn new(s: &'a HttpState, kind: &'static str, headers: &HeaderMap) -> Self {
+        let presented_id = headers
+            .get(CORRELATION_HEADER)
+            .and_then(|v| v.to_str().ok());
+        Self {
+            s,
+            kind,
+            caller: events::caller(&s.config, presented(headers)),
+            correlation_id: events::correlation_id(presented_id),
+        }
+    }
+
+    /// No call reaches the router while no browser is connected.
+    fn installed(&self) -> Result<(), Refusal> {
+        if events::installed(&self.s.registry) {
+            Ok(())
+        } else {
+            Err(Refusal::NotInstalled)
+        }
+    }
+
+    /// The metadata of the hub's queries: who asked and the correlation id.
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut headers =
+            HashMap::from([("correlationId".to_string(), self.correlation_id.clone())]);
+        if let Some(caller) = self.caller {
+            headers.insert("userId".to_string(), caller.to_string());
+        }
+        headers
+    }
+
+    /// How long the hub waits for a point query of `type_name`.
+    fn deadline(&self, type_name: &str) -> Duration {
+        let requested = u32::try_from(events::QUERY_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
+        self.s.config.effective_timeout(type_name, requested)
+    }
+
+    /// Asks the browser `type_name` with `request`; its answer as bytes.
+    async fn ask(&self, type_name: &str, request: serde_json::Value) -> Result<Vec<u8>, Refusal> {
+        self.installed()?;
+        self.s
+            .router
+            .query_internal(
+                type_name,
+                request.to_string().into_bytes(),
+                events::QUERY_TIMEOUT,
+                self.metadata(),
+            )
+            .await
+            .map_err(Refusal::from_route)
+    }
+
+    /// For a search or a tail that filters on the payload (`q`): the payload rules. `Some` with
+    /// the caller when `q` is sent; [`EventCall::audit_payload_search`] writes its audit line once
+    /// the request is built.
+    fn payload_filter(
+        &self,
+        params: &events::Params,
+        headers: &HeaderMap,
+    ) -> Result<Option<&'static str>, Refusal> {
+        if !params.wants_payload() {
+            return Ok(None);
+        }
+        events::payload_access(&self.s.config, presented(headers))
+            .map(Some)
+            .map_err(Refusal::Forbidden)
+    }
+
+    /// The audit line of a payload search (without the searched text), for a request the hub
+    /// validated and is about to send; values cut as every client-chosen string in a log.
+    fn audit_payload_search(&self, caller: Option<&'static str>, params: &events::Params) {
+        let Some(caller) = caller else {
+            return;
+        };
+        let source = crate::auth::clip(params.source.as_deref().unwrap_or_default());
+        let tail = self.kind == "tail";
+        tracing::info!(caller, source, tail, correlation_id = %self.correlation_id, "event payload search");
+    }
+
+    /// The answer: `value` as JSON, or the refusal, counted and tagged with the correlation id.
+    fn answer<T: Serialize>(&self, result: Result<T, Refusal>) -> Response {
+        let mut response = match result {
+            Ok(value) => {
+                self.s.metrics.event_request(self.kind, "ok");
+                fresh_json(value)
+            }
+            Err(refusal) => self.refused(refusal),
+        };
+        self.tag(&mut response);
+        response
+    }
+
+    fn tag(&self, response: &mut Response) {
+        if let Ok(id) = HeaderValue::from_str(&self.correlation_id) {
+            response.headers_mut().insert(CORRELATION_HEADER, id);
+        }
+    }
+
+    /// The answer of a call that has no data, counted.
+    fn refused(&self, refusal: Refusal) -> Response {
+        self.s.metrics.event_request(self.kind, refusal.outcome());
+        match refusal {
+            Refusal::NotInstalled => error_json(StatusCode::NOT_FOUND, events::NOT_INSTALLED),
+            Refusal::BadRequest(why) => error_json(StatusCode::BAD_REQUEST, &why),
+            Refusal::NotFound(why) => error_json(StatusCode::NOT_FOUND, &why),
+            Refusal::Unavailable(why) => error_json(StatusCode::SERVICE_UNAVAILABLE, &why),
+            Refusal::Timeout => error_json(StatusCode::GATEWAY_TIMEOUT, events::TIMED_OUT),
+            Refusal::Failed => error_json(StatusCode::BAD_GATEWAY, events::FAILED),
+            Refusal::Forbidden(hidden) => answer_json(
+                StatusCode::FORBIDDEN,
+                &serde_json::json!({ "error": hidden.reason(), "hidden": hidden.code() }),
+            ),
+            Refusal::Busy(why) => {
+                let mut r = error_json(StatusCode::TOO_MANY_REQUESTS, &why);
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                r
+            }
         }
     }
 }
 
-/// The topic, the filters and, for a payload filter (`q`), the caller who may use it.
-fn browse(
-    s: &HttpState,
-    query: &events::SearchQuery,
-    headers: &HeaderMap,
-    tail: bool,
-) -> Result<(String, events::Filters), Refusal> {
-    let topic = s.browser.topic(query.topic.as_deref())?;
-    let filters = events::Filters::parse(query, tail).map_err(Refusal::BadRequest)?;
-    if filters.q.is_some() {
-        let caller =
-            events::payload_access(&s.config, presented(headers)).map_err(Refusal::Forbidden)?;
-        tracing::info!(caller, topic = %topic, tail, "event payload search");
-    }
-    Ok((topic, filters))
-}
-
-/// `GET /api/v1/events`: one page of a search, newest first (see [`crate::browser`]).
+/// `GET /api/v1/events`: one page of a search, newest first (`kraken.events.Search`).
 async fn api_events(
     State(s): State<HttpState>,
-    Query(query): Query<events::SearchQuery>,
+    Query(params): Query<events::Params>,
     headers: HeaderMap,
 ) -> Response {
-    const KIND: &str = "search";
+    let call = EventCall::new(&s, "search", &headers);
     let page = async {
-        let (topic, filters) = browse(&s, &query, &headers, false)?;
-        let limit = events::parse_limit(query.limit.as_deref(), s.config.event_search_max_results)
+        call.installed()?;
+        let q_caller = call.payload_filter(&params, &headers)?;
+        let budget = events::search_budget(call.deadline(events::SEARCH));
+        let request = params
+            .search_request(q_caller.is_some(), budget)
             .map_err(Refusal::BadRequest)?;
-        let cursor = query
-            .cursor
-            .as_deref()
-            .filter(|c| !c.is_empty())
-            .map(|c| events::Cursor::decode(c, filters.digest(&topic)))
-            .transpose()
-            .map_err(Refusal::BadRequest)?;
-        s.browser.search(topic, filters, limit, cursor).await
+        call.audit_payload_search(q_caller, &params);
+        let page = events::read_page(&call.ask(events::SEARCH, request).await?)?;
+        s.metrics.event_scanned(page.scanned);
+        Ok(page)
     };
-    match page.await {
-        Ok(view) => {
-            s.browser.count(KIND, "ok");
-            fresh_json(view)
-        }
-        Err(refusal) => refused(&s, KIND, refusal),
-    }
+    call.answer(page.await)
 }
 
-/// `GET /api/v1/events/{topic}/{partition}/{offset}`: one record, with every header and, under
-/// the payload rules (ADR 0025), its payload, each served payload audited.
+/// `GET /api/v1/events/{source}/{segment}/{position}`: one record, with every header and, under
+/// the payload rules (ADR 0025), its payload, each served payload audited (`kraken.events.Get`).
 async fn api_event(
     State(s): State<HttpState>,
-    Path((topic, partition, offset)): Path<(String, String, String)>,
+    Path((source, segment, position)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    const KIND: &str = "record";
+    let call = EventCall::new(&s, "record", &headers);
     let access = events::payload_access(&s.config, presented(&headers));
     let detail = async {
-        let topic = s.browser.topic(Some(&topic))?;
-        let partition = partition.parse::<i32>().ok().filter(|p| *p >= 0);
-        let offset = offset.parse::<i64>().ok().filter(|o| *o >= 0);
-        let (Some(partition), Some(offset)) = (partition, offset) else {
-            return Err(Refusal::BadRequest(
-                "the partition and the offset are non-negative numbers".to_string(),
-            ));
-        };
-        s.browser
-            .record(topic, partition, offset, access.map(|_| ()))
-            .await
+        let request = events::get_request(&source, &segment, &position, access.is_ok())
+            .map_err(Refusal::BadRequest)?;
+        let answer = events::read(&call.ask(events::GET, request).await?)?;
+        Ok(events::Detail::of(answer, access))
     };
-    match detail.await {
-        Ok(detail) => {
-            if let Ok(caller) = access
-                && (detail.payload_base64.is_some() || matches!(detail.payload, Some(Some(_))))
-            {
-                let r = &detail.summary;
-                s.browser
-                    .payload_served(caller, &r.topic, r.partition, r.offset, r.size);
-            }
-            s.browser.count(KIND, "ok");
-            fresh_json(detail)
-        }
-        Err(refusal) => refused(&s, KIND, refusal),
+    let detail = detail.await;
+    if let (Ok(detail), Ok(caller)) = (&detail, access)
+        && detail.serves_payload()
+    {
+        let r = &detail.summary;
+        s.metrics.event_payload_view();
+        // The place is the browser's answer: cut like any string a peer chose.
+        tracing::info!(
+            caller,
+            source = %crate::auth::clip(&r.source),
+            segment = %crate::auth::clip(&r.segment),
+            position = %crate::auth::clip(&r.position),
+            size = r.size,
+            correlation_id = %call.correlation_id,
+            "event payload served"
+        );
+    }
+    call.answer(detail)
+}
+
+/// `GET /api/v1/events/sources`: the sources the browser reads, the default first, with their
+/// segments' bounds (`kraken.events.Sources`).
+async fn api_event_sources(State(s): State<HttpState>, headers: HeaderMap) -> Response {
+    let call = EventCall::new(&s, "sources", &headers);
+    let sources = async {
+        events::read::<events::SourcesView>(
+            &call.ask(events::SOURCES, serde_json::json!({})).await?,
+        )
+    };
+    call.answer(sources.await)
+}
+
+#[derive(Deserialize)]
+struct SourceQuery {
+    source: Option<String>,
+}
+
+/// `GET /api/v1/events/lag?source=`: every subscription with a committed position on the
+/// source and its lag, live instances or not (`kraken.events.Lag`).
+async fn api_event_lag(
+    State(s): State<HttpState>,
+    Query(query): Query<SourceQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let call = EventCall::new(&s, "lag", &headers);
+    let lag = async {
+        let request = events::lag_request(query.source.as_deref()).map_err(Refusal::BadRequest)?;
+        events::read::<events::LagView>(&call.ask(events::LAG, request).await?)
+    };
+    call.answer(lag.await)
+}
+
+/// Counts an open tail in `kraken_hub_event_tails` and holds its slot of
+/// `KRAKEN_HUB_EVENT_MAX_TAILS` until dropped.
+struct TailGuard {
+    metrics: Arc<crate::telemetry::Metrics>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for TailGuard {
+    fn drop(&mut self) {
+        self.metrics.event_tails_add(-1);
     }
 }
 
-/// How often a tail sends `event: heartbeat`.
-pub const TAIL_HEARTBEAT: Duration = Duration::from_secs(15);
+fn sse_json(name: &'static str, value: &serde_json::Value) -> Event {
+    Event::default().event(name).data(value.to_string())
+}
 
-/// `GET /api/v1/events/tail`: server-sent events from the end of every partition: `start`, then a
-/// `record` (a summary, never a payload) per matching record, `heartbeat` every
-/// [`TAIL_HEARTBEAT`], and `end` with the reason (`maxDuration`, `slowReader`, `shutdown`).
+/// `GET /api/v1/events/tail`: server-sent events from the end of every segment, read through
+/// `kraken.events.Tail`: `start`, a `record` (a summary, never a payload) per matching record,
+/// `heartbeat` while quiet (the browser's, asked below the hub's stream idle timeout) and `end`
+/// with the reason: the browser's (`maxDuration`, `slowReader`, `shutdown`), `failed` when the
+/// browser went away or broke the stream, `shutdown` when this hub stops. A reader that leaves
+/// cancels the browser's tail. At most `KRAKEN_HUB_EVENT_MAX_TAILS` are open on this hub.
 async fn api_events_tail(
     State(s): State<HttpState>,
-    Query(query): Query<events::SearchQuery>,
+    Query(params): Query<events::Params>,
     headers: HeaderMap,
 ) -> Response {
-    const KIND: &str = "tail";
-    let tail = async {
-        let (topic, filters) = browse(&s, &query, &headers, true)?;
-        let tail = s
-            .browser
-            .tail(topic.clone(), filters, s.stopping.clone())
-            .await?;
-        Ok::<_, Refusal>((topic, tail))
+    let call = EventCall::new(&s, "tail", &headers);
+    let opened = async {
+        call.installed()?;
+        let slot = Arc::clone(&s.tails).try_acquire_owned().map_err(|_| {
+            Refusal::Busy(format!(
+                "{} event tails are open on this hub (KRAKEN_HUB_EVENT_MAX_TAILS); try again shortly",
+                s.config.event_max_tails
+            ))
+        })?;
+        let q_caller = call.payload_filter(&params, &headers)?;
+        let request = params
+            .tail_request(
+                q_caller.is_some(),
+                events::tail_heartbeat(&s.config),
+                events::tail_duration(&s.config),
+            )
+            .map_err(Refusal::BadRequest)?;
+        call.audit_payload_search(q_caller, &params);
+        let mut parts = s.router.stream_internal(
+            events::TAIL,
+            request.to_string().into_bytes(),
+            0,
+            call.metadata(),
+        );
+        // A refused tail fails before its first part; a started one says `start` first.
+        let start = match parts.recv().await {
+            Some(Ok(part)) => match events::read_part(&part)? {
+                events::TailEvent::Start(start) => start,
+                _ => return Err(Refusal::Failed),
+            },
+            Some(Err(e)) => return Err(Refusal::from_route(e)),
+            None => return Err(Refusal::Failed),
+        };
+        Ok((slot, parts, start))
     };
-    let (topic, mut tail) = match tail.await {
-        Ok(started) => started,
-        Err(refusal) => return refused(&s, KIND, refusal),
+    let (slot, mut parts, start) = match opened.await {
+        Ok(opened) => opened,
+        Err(refusal) => {
+            let mut response = call.refused(refusal);
+            call.tag(&mut response);
+            return response;
+        }
     };
-    s.browser.count(KIND, "ok");
-    let (out, events) = tokio::sync::mpsc::channel::<Event>(16);
-    let start = serde_json::json!({
-        "topic": topic,
-        "partitions": tail.partitions,
-        "endsAtMs": tail.ends_at_ms,
-    });
+    s.metrics.event_request(call.kind, "ok");
+    s.metrics.event_tails_add(1);
+    let guard = TailGuard {
+        metrics: Arc::clone(&s.metrics),
+        _slot: slot,
+    };
+    let stopping = s.stopping.clone();
+    let (out, sse) = tokio::sync::mpsc::channel::<Event>(16);
+    let start = serde_json::json!(start);
     tokio::spawn(async move {
-        if out
-            .send(Event::default().event("start").data(start.to_string()))
-            .await
-            .is_err()
-        {
+        let _guard = guard;
+        if out.send(sse_json("start", &start)).await.is_err() {
             return;
         }
-        let mut heartbeat = tokio::time::interval(TAIL_HEARTBEAT);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        heartbeat.tick().await;
+        // `(event, last)`: the event to send and whether the tail ends with it.
+        let end = |reason: &str| {
+            (
+                sse_json("end", &serde_json::json!({ "reason": reason })),
+                true,
+            )
+        };
         loop {
-            let event = tokio::select! {
+            // Leaving the loop drops `parts`, which cancels the browser's tail.
+            let (event, last) = tokio::select! {
                 biased;
                 _ = out.closed() => return,
-                reason = &mut tail.end => {
-                    // Without a reason the tail stopped because this reader left.
-                    let Ok(reason) = reason else { return };
-                    let end = serde_json::json!({ "reason": reason });
-                    let _ = out.send(Event::default().event("end").data(end.to_string())).await;
-                    return;
-                }
-                record = tail.records.recv() => match record {
-                    Some(summary) => match Event::default().event("record").json_data(&summary) {
-                        Ok(event) => event,
-                        Err(_) => continue,
-                    },
-                    // The Kafka side ended; its reason follows on `end`.
-                    None => continue,
+                _ = stopping.cancelled() => end("shutdown"),
+                part = parts.recv() => match part.map(|p| p.map(|bytes| events::read_part(&bytes))) {
+                    Some(Ok(Ok(events::TailEvent::Record(summary)))) => {
+                        match Event::default().event("record").json_data(&summary) {
+                            Ok(event) => (event, false),
+                            Err(_) => continue,
+                        }
+                    }
+                    Some(Ok(Ok(events::TailEvent::Heartbeat(_)))) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis());
+                        let beat = Event::default().event("heartbeat").data(format!("{{\"nowMs\":{now}}}"));
+                        (beat, false)
+                    }
+                    Some(Ok(Ok(events::TailEvent::End(e)))) => end(&e.reason),
+                    // A second start, a malformed part, the browser's error or a stream that
+                    // ended without its `end`: the tail failed.
+                    _ => end("failed"),
                 },
-                _ = heartbeat.tick() => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis());
-                    Event::default().event("heartbeat").data(format!("{{\"nowMs\":{now}}}"))
-                }
             };
-            if out.send(event).await.is_err() {
+            if out.send(event).await.is_err() || last {
                 return;
             }
         }
     });
-    let stream = tokio_stream::wrappers::ReceiverStream::new(events).map(Ok::<_, Infallible>);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(sse).map(Ok::<_, Infallible>);
     let mut response = Sse::new(stream).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    call.tag(&mut response);
     response
-}
-
-#[derive(Deserialize)]
-struct GroupsQuery {
-    topic: Option<String>,
-}
-
-/// `GET /api/v1/consumer-groups?topic=`: every consumer group with committed offsets on the
-/// topic and its lag, members or not.
-async fn api_consumer_groups(
-    State(s): State<HttpState>,
-    Query(query): Query<GroupsQuery>,
-) -> Response {
-    const KIND: &str = "groups";
-    let groups = async {
-        let topic = s.browser.topic(query.topic.as_deref())?;
-        s.browser.groups(topic).await
-    };
-    match groups.await {
-        Ok(view) => {
-            s.browser.count(KIND, "ok");
-            fresh_json(view)
-        }
-        Err(refusal) => refused(&s, KIND, refusal),
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -585,8 +742,11 @@ async fn api_consumer_groups(
 
 /// Every control route starts here.
 const PROCESSOR: &str = "/api/v1/services/{service}/processors/{processor}";
-/// The largest body a control call takes (a reset with its offsets).
+/// The largest body a control call but a reset takes.
 pub const MAX_CONTROL_BODY: usize = 4096;
+/// The largest body a reset takes: room for [`crate::control::MAX_POSITIONS`] positions with
+/// decimal segments and positions (a 1024-segment source with 20-digit positions is about 54 KiB).
+pub const MAX_RESET_BODY: usize = 64 * 1024;
 
 /// The status code of a verdict.
 fn status_of(verdict: Verdict) -> StatusCode {
@@ -631,6 +791,24 @@ fn error_json(status: StatusCode, error: &str) -> Response {
     )
 }
 
+/// The answer to a call the hub refused before asking any instance: why, and the refusal code
+/// when it has one (`UNSUPPORTED`), shaped like an instance's refusal.
+fn refusal_json(refusal: &crate::control::Refusal, service: &str, processor: &str) -> Response {
+    let message = refusal.message(service, processor);
+    answer_json(
+        status_of(refusal.verdict()),
+        &ErrorBody {
+            error: &message,
+            instance_id: None,
+            answer: refusal.code().map(|code| AnswerView {
+                result: "refused",
+                code: Some(code),
+                message: message.clone(),
+            }),
+        },
+    )
+}
+
 /// Runs a control call to the end even when the caller hangs up (a reset half done would hold
 /// every instance until the lease ran out), then answers.
 async fn detached(call: impl Future<Output = Response> + Send + 'static) -> Response {
@@ -640,7 +818,7 @@ async fn detached(call: impl Future<Output = Response> + Send + 'static) -> Resp
 }
 
 /// Judges the write credential of a mutating control call and reads its body (at most
-/// [`MAX_CONTROL_BODY`] bytes). `Ok` carries the caller as the audit line names it: `write-token`
+/// [`MAX_RESET_BODY`] bytes for a reset, else [`MAX_CONTROL_BODY`]). `Ok` carries the caller as the audit line names it: `write-token`
 /// or the service of the ACL entry. A refusal is counted, never logged.
 async fn admit_control(
     s: &HttpState,
@@ -691,13 +869,18 @@ async fn admit_control(
             }
         }
     };
-    match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
+    let limit = if action == Action::Reset {
+        MAX_RESET_BODY
+    } else {
+        MAX_CONTROL_BODY
+    };
+    match axum::body::to_bytes(body, limit).await {
         Ok(bytes) => Ok((caller, bytes)),
         Err(_) => {
             control.refused(action, Verdict::BadRequest.as_str());
             Err(Box::new(error_json(
                 StatusCode::BAD_REQUEST,
-                &format!("the body is larger than {MAX_CONTROL_BODY} bytes, or unreadable"),
+                &format!("the body is larger than {limit} bytes, or unreadable"),
             )))
         }
     }
@@ -749,10 +932,7 @@ async fn fan_out(
             ),
             Err(refusal) => (
                 refusal.verdict(),
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
         };
         control.audit(
@@ -811,10 +991,7 @@ async fn api_reset(
             Err(refusal) => (
                 refusal.verdict(),
                 None,
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
         };
         let outcome = verdict.as_str();
@@ -888,10 +1065,7 @@ async fn letters(
         {
             Err(refusal) => (
                 refusal.verdict(),
-                error_json(
-                    status_of(refusal.verdict()),
-                    &refusal.message(&service, &processor),
-                ),
+                refusal_json(&refusal, &service, &processor),
             ),
             Ok(outcome) => {
                 let verdict = outcome.answer.verdict();
@@ -1208,7 +1382,7 @@ mod tests {
             Metrics::new(opentelemetry::global::meter("test")),
         );
         let anchor = ClockAnchor::now();
-        let browser = Browser::new(Arc::clone(&config), Metrics::noop());
+        let tails = Arc::new(Semaphore::new(config.event_max_tails));
         HttpState {
             registry,
             sessions,
@@ -1221,7 +1395,8 @@ mod tests {
             stopping: CancellationToken::new(),
             streams: Arc::default(),
             summaries: Arc::default(),
-            browser,
+            metrics: Metrics::noop(),
+            tails,
         }
     }
 
@@ -1425,62 +1600,121 @@ mod tests {
         assert!(StreamSlot::acquire(&open).is_some());
     }
 
-    /// The event browser's instruments: every call by kind and outcome, the records a search
-    /// read, the open tails, and one payload view (with its audit line) per payload served.
+    /// An in-process event browser: a session of service `kraken-event-browser` that handles
+    /// the five query types and answers each request with `answer(type, request)` (a tail gets
+    /// its `start` and then nothing until it is cancelled).
+    fn fake_browser(s: &HttpState, answer: fn(&str, &serde_json::Value) -> serde_json::Value) {
+        use crate::proto::{Reply, ReplyPart, reply, server_message};
+        let ctx = ContextId::default();
+        let token = s.sessions.allocate_token();
+        let service = "kraken-event-browser";
+        assert!(
+            s.router
+                .open_session(&ctx, "b1", token, service, 64)
+                .is_ok()
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        s.sessions
+            .insert_with_token(
+                &ctx,
+                "b1",
+                service,
+                crate::session::SessionMeta::default(),
+                tx,
+                CancellationToken::new(),
+                token,
+            )
+            .unwrap();
+        s.router.start_session(&ctx, "b1", token);
+        let types: Vec<String> = [
+            events::SEARCH,
+            events::GET,
+            events::SOURCES,
+            events::LAG,
+            events::TAIL,
+        ]
+        .map(String::from)
+        .into();
+        s.registry
+            .register(&ctx, "b1", service, &[], &types)
+            .unwrap();
+        let router = Arc::clone(&s.router);
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = rx.recv().await {
+                let Some(server_message::Message::Request(r)) = msg.message else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&r.payload).unwrap_or_default();
+                let body = answer(&r.r#type, &request).to_string().into_bytes();
+                router.on_permits(&ctx, "b1", token, 1, 0);
+                if r.r#type == events::TAIL {
+                    let part = ReplyPart {
+                        request_id: r.id.clone(),
+                        payload: body,
+                        ..ReplyPart::default()
+                    };
+                    router.on_stream_part_from(&ctx, "b1", token, part);
+                } else {
+                    let reply = Reply {
+                        request_id: r.id,
+                        result: Some(reply::Result::Payload(body)),
+                    };
+                    router.on_reply_from(&ctx, "b1", token, reply);
+                }
+            }
+        });
+    }
+
+    /// The events API's instruments: every call by kind and outcome, the records a search read,
+    /// the open tails, and one payload view (with its audit line) per payload served.
     #[tokio::test]
-    async fn the_event_browser_counts_calls_scans_tails_and_payload_views() {
-        use rdkafka::config::ClientConfig;
-        use rdkafka::producer::{FutureProducer, FutureRecord};
-        use testcontainers::runners::AsyncRunner;
+    async fn the_events_api_counts_calls_scans_tails_and_payload_views() {
         use tower::ServiceExt;
         crate::telemetry::test_support::capture_logs();
-        let kafka = testcontainers_modules::kafka::apache::Kafka::default()
-            .start()
-            .await
-            .expect("kafka container");
-        let port = kafka
-            .get_host_port_ipv4(testcontainers_modules::kafka::apache::KAFKA_PORT)
-            .await
-            .unwrap();
-        let bootstrap = format!("127.0.0.1:{port}");
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", &bootstrap)
-            .create()
-            .unwrap();
-        for i in 0..3 {
-            producer
-                .send(
-                    FutureRecord::<str, str>::to("kraken.events")
-                        .key("k")
-                        .payload(&format!("{{\"n\":{i}}}")),
-                    Duration::from_secs(20),
-                )
-                .await
-                .unwrap();
-        }
         let metrics = crate::telemetry::test_support::test_metrics();
         let mut s = state();
         s.config = Arc::new(Config {
             otlp_endpoint: None,
-            kafka_bootstrap: Some(bootstrap),
             event_payloads: true,
             dashboard_token: Some(Secret::new("a-dashboard-token-0123456789")),
             ..Config::default()
         });
-        s.browser = Browser::new(Arc::clone(&s.config), Arc::clone(&metrics.metrics));
-        let app = app(s);
+        s.metrics = Arc::clone(&metrics.metrics);
+        let app = app(s.clone());
         let get = |uri: &str| {
             axum::http::Request::builder()
                 .uri(uri)
                 .header(header::AUTHORIZATION, "Bearer a-dashboard-token-0123456789")
+                .header(CORRELATION_HEADER, "c-42")
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
+        // Before a browser connects: 404, counted as not installed.
+        let r = app.clone().oneshot(get("/api/v1/events")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        fake_browser(&s, |type_name, request| match type_name {
+            events::SEARCH => serde_json::json!({"source": "kraken.events", "results": [],
+                "scanned": 3, "exhausted": true, "stoppedBy": null, "cursor": null}),
+            events::GET => {
+                let mut record = serde_json::json!({"source": "kraken.events", "segment": "0",
+                    "position": "1", "timestamp": 1, "key": "k", "headers": {}, "size": 7,
+                    "allHeaders": []});
+                if request["payload"] == true {
+                    record["payload"] = "{\"n\":1}".into();
+                }
+                record
+            }
+            _ => serde_json::json!({"start": {"source": "kraken.events", "segments": 1,
+                "endsAtMs": 1}}),
+        });
         let r = app.clone().oneshot(get("/api/v1/events")).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[CORRELATION_HEADER], "c-42");
         let r = app
             .clone()
-            .oneshot(get("/api/v1/events?topic=other"))
+            .oneshot(get("/api/v1/events?limit=ten"))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -1502,14 +1736,13 @@ mod tests {
         assert_eq!(
             metrics.up_down_total("kraken_hub_event_tails"),
             Some(1),
-            "a tail reading Kafka"
+            "a tail open"
         );
         drop(tail);
-        // The tail notices its reader left at its next poll.
         let deadline = Instant::now() + Duration::from_secs(10);
         while metrics.up_down_total("kraken_hub_event_tails") != Some(0) {
             assert!(Instant::now() < deadline, "the tail did not end");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         let count = |kind: &str, outcome: &str| {
@@ -1525,13 +1758,14 @@ mod tests {
                 .unwrap_or(0);
             (total, by_outcome)
         };
-        assert_eq!(count("search", "bad_request"), (2, 1));
+        assert_eq!(count("search", "bad_request"), (3, 1));
+        assert_eq!(count("search", "not_installed"), (3, 1));
         assert_eq!(count("record", "ok").0, 1);
         assert_eq!(count("tail", "ok").0, 1);
         assert_eq!(
             metrics.histogram_sum("kraken_hub_event_browser_scanned_records"),
             Some((1, 3.0)),
-            "one search that read the three records"
+            "one search that read three records"
         );
         assert_eq!(
             metrics.counter_total("kraken_hub_event_payload_views_total"),
@@ -1544,13 +1778,13 @@ mod tests {
         assert_eq!(audits.len(), 1, "{audits:?}");
         for (field, value) in [
             ("caller", "dashboard-token"),
-            ("topic", "kraken.events"),
-            ("partition", "0"),
-            ("offset", "1"),
+            ("source", "kraken.events"),
+            ("segment", "0"),
+            ("position", "1"),
             ("size", "7"),
+            ("correlation_id", "c-42"),
         ] {
             assert_eq!(audits[0].field(field), Some(value), "{field}");
         }
-        drop(kafka);
     }
 }

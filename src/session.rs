@@ -116,6 +116,10 @@ pub struct Session {
     /// Every type of the latest accepted `Register` (commands, queries, shared queries), for
     /// re-checking the registration when the ACL changes.
     pub handled: Vec<String>,
+    /// The hub's own sender of one hub-originated request ([`Sessions::insert_internal`]): no
+    /// instance, so the topology, the ACL reload, the heartbeat sweep and the instance counts
+    /// skip it.
+    pub internal: bool,
 }
 
 /// What the router needs to know about the sender of a request.
@@ -153,6 +157,10 @@ pub struct ProcessorHolder {
     pub token: u64,
     /// When the hub received the status that lists the processor.
     pub reported_at: Instant,
+    /// The event store that status names for the processor (ADR 0027); empty when it names none.
+    pub event_store: String,
+    /// That event store declares the `replay` capability (a reset is offered only then).
+    pub replay: bool,
 }
 
 /// What the ACL check of a reload needs to know about a session.
@@ -215,6 +223,39 @@ impl Sessions {
         cancel: CancellationToken,
         token: u64,
     ) -> Result<Option<u64>, Superseded> {
+        self.insert_session(ctx, instance_id, service, meta, tx, cancel, token, false)
+    }
+
+    /// A session for the hub's own sender of one request (`crate::router::Router::query_internal`):
+    /// found by the router like any sender, hidden from everything that lists instances. Its
+    /// instance id is never a client's (the caller makes it unique).
+    pub fn insert_internal(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        tx: mpsc::Sender<Result<ServerMessage, Status>>,
+    ) -> u64 {
+        let token = self.allocate_token();
+        let meta = SessionMeta::default();
+        let cancel = CancellationToken::new();
+        self.insert_session(ctx, instance_id, service, meta, tx, cancel, token, true)
+            .expect("a fresh token is the newest");
+        token
+    }
+
+    #[allow(clippy::too_many_arguments)] // the fields of a Session
+    fn insert_session(
+        &self,
+        ctx: &ContextId,
+        instance_id: &str,
+        service: &str,
+        meta: SessionMeta,
+        tx: mpsc::Sender<Result<ServerMessage, Status>>,
+        cancel: CancellationToken,
+        token: u64,
+        internal: bool,
+    ) -> Result<Option<u64>, Superseded> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         // Tokens grow with every stream, so the newest stream of an instance id always wins, in
@@ -233,6 +274,7 @@ impl Sessions {
             cancel,
             status: None,
             handled: Vec::new(),
+            internal,
         };
         let old = inner.insert(instance_id.to_string(), session);
         drop(inner);
@@ -306,6 +348,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .iter()
+            .filter(|(_, s)| !s.internal)
             .map(|(id, s)| AuthView {
                 context: s.context.clone(),
                 instance_id: id.clone(),
@@ -398,7 +441,8 @@ impl Sessions {
         self.remove_if_then(ctx, instance_id, token, |s| s)
     }
 
-    /// Every current session as `(context, instance id, token)`, for a disconnect sweep (shutdown).
+    /// Every current session as `(context, instance id, token)`, for a disconnect sweep (shutdown);
+    /// the hub's own request sessions too, so their requests end with the hub.
     pub fn all_with_tokens(&self) -> Vec<(ContextId, InstanceId, u64)> {
         self.inner
             .lock()
@@ -414,6 +458,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .iter()
+            .filter(|(_, s)| !s.internal)
             .map(|(id, s)| SessionDetail {
                 context: s.context.clone(),
                 instance_id: id.clone(),
@@ -549,7 +594,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.last_heartbeat + timeout < now)
+            .filter(|(_, s)| !s.internal && s.last_heartbeat + timeout < now)
             .map(|(id, s)| (s.context.clone(), id.clone(), s.token))
             .collect()
     }
@@ -566,17 +611,19 @@ impl Sessions {
         let mut known = false;
         let mut holders = Vec::new();
         for (id, s) in inner.iter() {
-            if s.context != *ctx || s.service != service {
+            if s.internal || s.context != *ctx || s.service != service {
                 continue;
             }
             known = true;
             let Some(status) = &s.status else { continue };
-            if status.processors.iter().any(|p| p.name == processor) {
+            if let Some(p) = status.processors.iter().find(|p| p.name == processor) {
                 holders.push(ProcessorHolder {
                     context: s.context.clone(),
                     instance_id: id.clone(),
                     token: s.token,
                     reported_at: status.at,
+                    event_store: p.event_store.clone(),
+                    replay: p.can(crate::processors::CAPABILITY_REPLAY),
                 });
             }
         }
@@ -608,7 +655,7 @@ impl Sessions {
 
     pub fn count_by_service(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
-        for s in self.inner.lock().unwrap().values() {
+        for s in self.inner.lock().unwrap().values().filter(|s| !s.internal) {
             *counts.entry(s.service.clone()).or_insert(0) += 1;
         }
         counts
@@ -627,6 +674,31 @@ mod tests {
     }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn an_internal_session_is_a_sender_but_no_instance() {
+        let sessions = Sessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let token = sessions.insert_internal(&D, "kraken-hub/1", "kraken-hub", tx);
+        // The router finds it as the sender of its request.
+        assert_eq!(sessions.token_of(&D, "kraken-hub/1"), Some(token));
+        let info = sessions.sender_info(&D, "kraken-hub/1").unwrap();
+        assert_eq!(
+            (info.service.as_str(), info.principal),
+            ("kraken-hub", None)
+        );
+        assert!(sessions.sender(&D, "kraken-hub/1").is_some());
+        // Nothing that lists instances sees it: no heartbeat to miss, no ACL entry to judge.
+        assert!(sessions.details().is_empty());
+        assert!(sessions.auth_views().is_empty());
+        assert!(sessions.count_by_service().is_empty());
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert!(sessions.stale(later, Duration::from_secs(1)).is_empty());
+        assert_eq!(sessions.processor_holders(&D, "kraken-hub", "p"), None);
+        // The shutdown sweep ends it with the rest.
+        assert_eq!(sessions.all_with_tokens().len(), 1);
+        assert!(sessions.remove_if(&D, "kraken-hub/1", token).is_some());
+    }
 
     #[test]
     fn an_older_session_never_replaces_a_newer_one() {
@@ -851,8 +923,8 @@ mod tests {
     fn processor(name: &str) -> crate::proto::ProcessorStatus {
         crate::proto::ProcessorStatus {
             name: name.to_string(),
-            group_id: "svc".into(),
-            topic: "kraken.events".into(),
+            subscription: "svc".into(),
+            source: "kraken.events".into(),
             state: crate::proto::ProcessorState::ProcessorRunning as i32,
             dead_letter_mode: "collection".into(),
             ..Default::default()

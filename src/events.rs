@@ -1,19 +1,66 @@
-//! The event browser's rules, without Kafka (ADR 0025): the filters of a search and how a record
-//! matches them, the newest-first merge of the partitions with its cursor, what a record looks
-//! like in a result (a summary, never a payload) and in the detail view, and when a payload may
-//! be served. [`crate::browser`] reads Kafka and feeds records through these.
+//! The dashboard's event pages over the event browser add-on (ADR 0027): the hub reads no event
+//! store itself. Each `/api/v1/events*` call becomes one hub-internal query
+//! ([`crate::router::Router::query_internal`], `stream_internal` for the tail) to a
+//! `kraken-event-browser` instance: `kraken.events.Search`, `Get`, `Sources`, `Lag` and `Tail`.
+//!
+//! This module builds those requests from the HTTP call, reads the browser's answers as untrusted
+//! input (bounded in size, parsed into the hub's own types: whatever the hub does not know is
+//! dropped, malformed JSON is an error, never a panic), maps the browser's errors to HTTP
+//! statuses, and keeps the payload rules of ADR 0025: a payload (and the `q` filter) is asked for
+//! only when the caller may see it, and a payload the hub did not ask for is dropped.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value, json};
 
 use crate::config::Config;
+use crate::context::ContextId;
+use crate::proto::ErrorCode;
+use crate::registry::Registry;
+use crate::router::RouteError;
 
-/// The record headers the libraries write (`kafka/headers.rs`, `EventHeaders.kt`), in the order a
-/// summary lists them.
+/// The event browser's query types (ADR 0027).
+pub const SEARCH: &str = "kraken.events.Search";
+pub const GET: &str = "kraken.events.Get";
+pub const SOURCES: &str = "kraken.events.Sources";
+pub const LAG: &str = "kraken.events.Lag";
+/// The streaming one.
+pub const TAIL: &str = "kraken.events.Tail";
+
+/// The answer of every `/api/v1/events*` call while no browser is connected.
+pub const NOT_INSTALLED: &str = "event browser not installed";
+
+/// What the hub asks as the timeout of a point query (`Request.timeout_ms`); the router clamps
+/// it as any client's (`KRAKEN_HUB_MAX_TIMEOUT_MS`, `KRAKEN_HUB_TIMEOUT_OVERRIDES`).
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// A search's own time budget (`timeoutMs`) ends this long before the hub stops waiting, so the
+/// browser answers what it found rather than the hub timing out.
+pub const ANSWER_MARGIN: Duration = Duration::from_secs(2);
+/// The longest answer of a point query the hub reads: a record with a 256 KiB payload fits even
+/// fully JSON-escaped (the gRPC transport itself stops a message at 4 MiB).
+pub const MAX_ANSWER: usize = 2 * 1024 * 1024;
+/// The longest tail part the hub reads (a summary is a few KiB at most).
+pub const MAX_PART: usize = 64 * 1024;
+/// A browser's error message is cut to this many bytes.
+pub const MAX_MESSAGE: usize = 512;
+/// The longest correlation id the hub takes from a request (`X-Correlation-Id`).
+pub const MAX_CORRELATION_ID: usize = 128;
+/// A filter value and a source are at most this many bytes (the browser's bound, checked
+/// before asking).
+pub const MAX_FILTER: usize = 1024;
+/// A cursor is at most this many bytes (the browser's bound: it holds a place per segment).
+pub const MAX_CURSOR: usize = 64 * 1024;
+/// A segment and a position are at most this many bytes (the browser's bound).
+pub const MAX_PLACE: usize = 128;
+/// The heartbeat the hub asks of a tail at most (its SSE heartbeat of ADR 0025)...
+pub const MAX_HEARTBEAT: Duration = Duration::from_secs(15);
+/// ...and at least (the browser's own floor).
+pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// The record headers the libraries write, the only ones a summary carries.
 pub const LIBRARY_HEADERS: [&str; 7] = [
     "type",
     "id",
@@ -23,152 +70,70 @@ pub const LIBRARY_HEADERS: [&str; 7] = [
     "userId",
     "traceparent",
 ];
-/// A summary's key is cut to this many bytes (at a character boundary).
-pub const MAX_KEY: usize = 128;
-/// A summary's header values are cut to this many bytes.
-pub const MAX_SUMMARY_HEADER: usize = 256;
-/// The detail view lists at most this many headers...
-pub const MAX_HEADERS: usize = 64;
-/// ...names cut to this many bytes...
-pub const MAX_HEADER_NAME: usize = 128;
-/// ...and values to this many.
-pub const MAX_HEADER_VALUE: usize = 1024;
-/// A payload served in the detail view is cut to this many bytes.
-pub const MAX_PAYLOAD: usize = 256 * 1024;
-/// A filter value (and `q`) is at most this many bytes.
-pub const MAX_FILTER: usize = 1024;
-/// Results a search page returns when it names no `limit`.
-pub const DEFAULT_LIMIT: usize = 50;
-/// Records a partition is read backwards by, per Kafka read, at most...
-pub const CHUNK: usize = 500;
-/// ...and at first in a page: each next chunk of a partition is twice the last, so every
-/// partition has its newest records in hand early even on a slow link.
-pub const FIRST_CHUNK: usize = 50;
-/// The longest cursor accepted, in characters.
-pub const MAX_CURSOR: usize = 64 * 1024;
 
-/// `bytes` as text: valid UTF-8 as it is, every byte that is not part of valid UTF-8 as `\xNN`.
-pub fn escaped(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        for b in chunk.invalid() {
-            out.push_str(&format!("\\x{b:02x}"));
+/// True while an event browser is connected: a live instance handles [`SEARCH`] (not a type
+/// kept through its owner's grace after the last browser left, when every call is a 404).
+pub fn installed(registry: &Registry) -> bool {
+    registry.has_live_handler(&ContextId::default(), SEARCH)
+}
+
+/// The request's correlation id when it brings a usable one (1 to [`MAX_CORRELATION_ID`] visible
+/// ASCII characters), else a fresh one.
+pub fn correlation_id(presented: Option<&str>) -> String {
+    match presented {
+        Some(id)
+            if !id.is_empty()
+                && id.len() <= MAX_CORRELATION_ID
+                && id.bytes().all(|b| b.is_ascii_graphic()) =>
+        {
+            id.to_string()
         }
+        _ => uuid::Uuid::new_v4().to_string(),
     }
-    out
 }
 
-/// The longest prefix of `s` of at most `max` bytes that ends at a character boundary, and
-/// whether anything was cut.
-pub fn cut(s: &str, max: usize) -> (&str, bool) {
-    if s.len() <= max {
-        return (s, false);
+/// The time budget a search asks of the browser within the hub's `deadline`.
+pub fn search_budget(deadline: Duration) -> Duration {
+    if deadline > ANSWER_MARGIN * 2 {
+        deadline - ANSWER_MARGIN
+    } else {
+        (deadline / 2).max(Duration::from_millis(1))
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], true)
 }
 
-/// Lowercase hex of `bytes`.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// The heartbeat a tail asks of the browser: two fifths of the idle timeout of the hub's
+/// internal stream (a quiet tail must never idle out; the browser sends one only after that long
+/// without a part), within [`MIN_HEARTBEAT`] and [`MAX_HEARTBEAT`].
+pub fn tail_heartbeat(config: &Config) -> Duration {
+    (config.effective_timeout(TAIL, 0) * 2 / 5).clamp(MIN_HEARTBEAT, MAX_HEARTBEAT)
+}
+
+/// `value` when it is at most `max` bytes, else the reason for a 400.
+fn bounded<'a>(name: &str, value: &'a str, max: usize) -> Result<&'a str, String> {
+    if value.len() > max {
+        Err(format!("{name} is longer than {max} bytes"))
+    } else {
+        Ok(value)
+    }
+}
+
+/// The longest tail the hub asks for: a little under `KRAKEN_HUB_MAX_STREAM_DURATION`, so the
+/// browser ends it (`maxDuration`) before the router would.
+pub fn tail_duration(config: &Config) -> Duration {
+    let max = config.max_stream_duration;
+    if max > ANSWER_MARGIN * 2 {
+        max - ANSWER_MARGIN
+    } else {
+        max / 2
+    }
+}
+
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Records
-
-/// One Kafka record as the browser sees it, borrowed from the consumer.
-#[derive(Debug, Clone, Copy)]
-pub struct RecordView<'a> {
-    pub partition: i32,
-    pub offset: i64,
-    /// The record timestamp in epoch ms; `None` when the record has none.
-    pub timestamp: Option<i64>,
-    pub key: Option<&'a [u8]>,
-    /// Every header in record order: name and value (`None`: a null value).
-    pub headers: &'a [(&'a [u8], Option<&'a [u8]>)],
-    pub payload: Option<&'a [u8]>,
-}
-
-impl<'a> RecordView<'a> {
-    /// The value of the last header named `name` (Kafka's `lastHeader`), when it has one.
-    pub fn header(&self, name: &str) -> Option<&'a [u8]> {
-        self.headers
-            .iter()
-            .rev()
-            .find(|(n, _)| *n == name.as_bytes())
-            .and_then(|(_, v)| *v)
-    }
-}
-
-/// A record in a search result or the tail: where it is, its key, the library headers and the
-/// payload's size. Never the payload.
-#[derive(Serialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Summary {
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
-    pub timestamp: Option<i64>,
-    /// The key as text ([`escaped`]), cut to [`MAX_KEY`] bytes; `None` without a key.
-    pub key: Option<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub key_truncated: bool,
-    /// The library headers the record carries ([`LIBRARY_HEADERS`]), as text cut to
-    /// [`MAX_SUMMARY_HEADER`] bytes.
-    pub headers: BTreeMap<&'static str, String>,
-    /// Payload bytes (0 without a payload).
-    pub size: usize,
-}
-
-impl Summary {
-    pub fn of(topic: &str, r: &RecordView<'_>) -> Self {
-        let (key, key_truncated) = match r.key {
-            Some(k) => {
-                let text = escaped(k);
-                let (shown, cut_off) = cut(&text, MAX_KEY);
-                (Some(shown.to_string()), cut_off)
-            }
-            None => (None, false),
-        };
-        let headers = LIBRARY_HEADERS
-            .iter()
-            .filter_map(|name| {
-                let text = escaped(r.header(name)?);
-                Some((*name, cut(&text, MAX_SUMMARY_HEADER).0.to_string()))
-            })
-            .collect();
-        Self {
-            topic: topic.to_string(),
-            partition: r.partition,
-            offset: r.offset,
-            timestamp: r.timestamp,
-            key,
-            key_truncated,
-            headers,
-            size: r.payload.map_or(0, <[u8]>::len),
-        }
-    }
-}
-
-/// One header of the detail view.
-#[derive(Serialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct HeaderView {
-    /// The name as text ([`escaped`]), cut to [`MAX_HEADER_NAME`] bytes.
-    pub name: String,
-    /// The value when it is UTF-8 (cut to [`MAX_HEADER_VALUE`] bytes); `None` for a null value
-    /// or one that is not UTF-8.
-    pub value: Option<String>,
-    /// The value in hex when it is not UTF-8 (its first [`MAX_HEADER_VALUE`] bytes).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value_hex: Option<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-}
+// Payload rules (ADR 0025)
 
 /// Why a payload is not served: the first condition of ADR 0025 that does not hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,24 +169,282 @@ impl Hidden {
     }
 }
 
-/// Who may see payloads: `Ok` with the caller as the audit line names it (`dashboard-token` or
-/// `write-token`) when the switch is on, a token is configured and `presented` is one of them.
+/// The token `presented` is, as the audit lines name it: `dashboard-token` or `write-token`
+/// (compared in constant time); `None` for no token or another one.
+pub fn caller(config: &Config, presented: Option<&str>) -> Option<&'static str> {
+    let read = config
+        .dashboard_token
+        .as_ref()
+        .is_some_and(|t| t.matches(presented));
+    let write = config
+        .dashboard_write_token
+        .as_ref()
+        .is_some_and(|t| t.matches(presented));
+    if read {
+        Some("dashboard-token")
+    } else if write {
+        Some("write-token")
+    } else {
+        None
+    }
+}
+
+/// Who may see payloads: `Ok` with the caller as the audit line names it when the switch is on,
+/// a token is configured and `presented` is one of them.
 pub fn payload_access(config: &Config, presented: Option<&str>) -> Result<&'static str, Hidden> {
     if !config.event_payloads {
         return Err(Hidden::Off);
     }
-    let read = config.dashboard_token.as_ref();
-    let write = config.dashboard_write_token.as_ref();
-    if read.is_none() && write.is_none() {
+    if config.dashboard_token.is_none() && config.dashboard_write_token.is_none() {
         return Err(Hidden::NoToken);
     }
-    if read.is_some_and(|t| t.matches(presented)) {
-        return Ok("dashboard-token");
+    caller(config, presented).ok_or(Hidden::NotPresented)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests
+
+/// The query string of a search and of a tail, as sent. Empty values count as absent (a form
+/// sends every field). `source` names the event store's source (a topic, a stream); `service`
+/// filters on the publishing service (the record header `source`).
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Params {
+    pub source: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    #[serde(rename = "type")]
+    pub type_name: Option<String>,
+    pub key: Option<String>,
+    pub service: Option<String>,
+    pub correlation_id: Option<String>,
+    pub user_id: Option<String>,
+    pub event_id: Option<String>,
+    pub q: Option<String>,
+    pub limit: Option<String>,
+    pub cursor: Option<String>,
+}
+
+fn present(v: &Option<String>) -> Option<&str> {
+    v.as_deref().filter(|s| !s.is_empty())
+}
+
+impl Params {
+    /// True when the request filters on the payload (`q`): the payload rules decide.
+    pub fn wants_payload(&self) -> bool {
+        present(&self.q).is_some()
     }
-    if write.is_some_and(|t| t.matches(presented)) {
-        return Ok("write-token");
+
+    /// The `filters` of the browser's request; `q` only when `with_q` (the caller may search
+    /// payloads). A tail refuses `from`, `to` and `cursor`. Values are the browser's to check.
+    fn filters(&self, tail: bool, with_q: bool) -> Result<Map<String, Value>, String> {
+        if tail {
+            for (name, v) in [
+                ("from", &self.from),
+                ("to", &self.to),
+                ("cursor", &self.cursor),
+            ] {
+                if present(v).is_some() {
+                    return Err(format!("a tail takes no {name}: it starts at the end"));
+                }
+            }
+        }
+        let mut filters = Map::new();
+        for (name, v) in [
+            ("from", &self.from),
+            ("to", &self.to),
+            ("type", &self.type_name),
+            ("key", &self.key),
+            ("source", &self.service),
+            ("correlationId", &self.correlation_id),
+            ("userId", &self.user_id),
+            ("eventId", &self.event_id),
+        ] {
+            if let Some(value) = present(v) {
+                let value = bounded(query_name(name), value, MAX_FILTER)?;
+                filters.insert(name.to_string(), Value::from(value));
+            }
+        }
+        if with_q && let Some(q) = present(&self.q) {
+            filters.insert("q".to_string(), bounded("q", q, MAX_FILTER)?.into());
+        }
+        Ok(filters)
     }
-    Err(Hidden::NotPresented)
+
+    fn source_into(&self, request: &mut Map<String, Value>) -> Result<(), String> {
+        if let Some(source) = present(&self.source) {
+            let source = bounded("source", source, MAX_FILTER)?;
+            request.insert("source".to_string(), Value::from(source));
+        }
+        Ok(())
+    }
+
+    /// `kraken.events.Search`: the source, the filters, the page size, the cursor and the time
+    /// budget the hub leaves the browser.
+    pub fn search_request(&self, with_q: bool, budget: Duration) -> Result<Value, String> {
+        let mut request = Map::new();
+        self.source_into(&mut request)?;
+        request.insert("filters".to_string(), self.filters(false, with_q)?.into());
+        if let Some(limit) = present(&self.limit) {
+            let limit = limit
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| "limit must be a positive number".to_string())?;
+            request.insert("limit".to_string(), limit.into());
+        }
+        if let Some(cursor) = present(&self.cursor) {
+            let cursor = bounded("cursor", cursor, MAX_CURSOR)?;
+            request.insert("cursor".to_string(), Value::from(cursor));
+        }
+        request.insert("timeoutMs".to_string(), ms(budget).into());
+        Ok(request.into())
+    }
+
+    /// `kraken.events.Tail`: the source, the filters, the heartbeat and the longest duration.
+    pub fn tail_request(
+        &self,
+        with_q: bool,
+        heartbeat: Duration,
+        duration: Duration,
+    ) -> Result<Value, String> {
+        let mut request = Map::new();
+        self.source_into(&mut request)?;
+        request.insert("filters".to_string(), self.filters(true, with_q)?.into());
+        request.insert("heartbeatMs".to_string(), ms(heartbeat).into());
+        request.insert("maxDurationMs".to_string(), ms(duration).into());
+        Ok(request.into())
+    }
+}
+
+/// The query-string name of a filter (the publishing service's filter is `service`).
+fn query_name(filter: &str) -> &str {
+    if filter == "source" {
+        "service"
+    } else {
+        filter
+    }
+}
+
+/// `kraken.events.Get`: one record, with its payload only when `payload`; `Err` with the reason
+/// for a 400 when a part of its place is longer than the browser takes.
+pub fn get_request(
+    source: &str,
+    segment: &str,
+    position: &str,
+    payload: bool,
+) -> Result<Value, String> {
+    let source = bounded("source", source, MAX_FILTER)?;
+    let segment = bounded("segment", segment, MAX_PLACE)?;
+    let position = bounded("position", position, MAX_PLACE)?;
+    Ok(json!({ "source": source, "segment": segment, "position": position, "payload": payload }))
+}
+
+/// `kraken.events.Lag` of `source` (the browser's default when absent); `Err` with the reason
+/// for a 400 when the source is longer than the browser takes.
+pub fn lag_request(source: Option<&str>) -> Result<Value, String> {
+    Ok(match source.filter(|s| !s.is_empty()) {
+        Some(source) => json!({ "source": bounded("source", source, MAX_FILTER)? }),
+        None => json!({}),
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Answers (the browser's JSON, ADR 0027): read into the hub's types and written back
+
+/// A record in a search result or the tail: where it is, its key, the library headers and the
+/// payload's size. Never the payload: a summary has no field for one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub source: String,
+    pub segment: String,
+    pub position: String,
+    #[serde(default)]
+    pub timestamp: Option<i64>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_truncated: bool,
+    /// Only the [`LIBRARY_HEADERS`] (see [`Summary::trimmed`]).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub size: u64,
+}
+
+impl Summary {
+    /// Keeps only the library headers: a summary never carries another header (the detail lists
+    /// them all).
+    fn trimmed(mut self) -> Self {
+        self.headers
+            .retain(|name, _| LIBRARY_HEADERS.contains(&name.as_str()));
+        self
+    }
+}
+
+/// `GET /api/v1/events`: one page of a search, newest first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+    pub results: Vec<Summary>,
+    #[serde(default)]
+    pub scanned: u64,
+    #[serde(default)]
+    pub exhausted: bool,
+    #[serde(default)]
+    pub stopped_by: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+impl SearchPage {
+    fn trimmed(mut self) -> Self {
+        self.results = self.results.into_iter().map(Summary::trimmed).collect();
+        self
+    }
+}
+
+/// One header of the detail view.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderView {
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// A JSON key that may be absent (`None`), `null` (`Some(None)`) or a value.
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// The browser's answer to `kraken.events.Get`.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordAnswer {
+    #[serde(flatten)]
+    pub summary: Summary,
+    #[serde(default)]
+    pub all_headers: Vec<HeaderView>,
+    #[serde(default)]
+    pub headers_omitted: u64,
+    #[serde(default, deserialize_with = "nullable")]
+    pub payload: Option<Option<String>>,
+    #[serde(default)]
+    pub payload_base64: Option<String>,
+    #[serde(default)]
+    pub payload_truncated: bool,
 }
 
 /// The payload field of the detail view.
@@ -237,20 +460,22 @@ pub enum PayloadView {
     },
 }
 
-/// The record detail: the summary, every header, and the payload when it may be served.
+/// `GET /api/v1/events/{source}/{segment}/{position}`: the summary, every header, and the payload
+/// or why it is hidden.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Detail {
     #[serde(flatten)]
     pub summary: Summary,
-    /// Every header in record order, at most [`MAX_HEADERS`].
     pub all_headers: Vec<HeaderView>,
-    /// Headers beyond [`MAX_HEADERS`], not listed.
     #[serde(skip_serializing_if = "is_zero")]
-    pub headers_omitted: usize,
-    /// The payload text, `null` for a record without a payload (a tombstone), or the reason it is
+    pub headers_omitted: u64,
+    /// The payload text, `null` for a record without one (a tombstone), or the reason it is
     /// hidden. Absent when the payload is served but is not UTF-8 (see `payload_base64`).
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "nullable")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "nullable_view"
+    )]
     pub payload: Option<Option<PayloadView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_base64: Option<String>,
@@ -258,11 +483,11 @@ pub struct Detail {
     pub payload_truncated: bool,
 }
 
-fn is_zero(n: &usize) -> bool {
+fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-fn nullable<S: serde::Serializer>(
+fn nullable_view<S: serde::Serializer>(
     value: &Option<Option<PayloadView>>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
@@ -273,941 +498,683 @@ fn nullable<S: serde::Serializer>(
 }
 
 impl Detail {
-    /// The detail of `r`; the payload is included only with `access` `Ok` (the caller audits it).
-    pub fn of(topic: &str, r: &RecordView<'_>, access: Result<(), Hidden>) -> Self {
-        let all_headers = r
-            .headers
-            .iter()
-            .take(MAX_HEADERS)
-            .map(|(name, value)| {
-                let name = escaped(name);
-                let (name, name_cut) = cut(&name, MAX_HEADER_NAME);
-                let (value, value_hex, value_cut) = match value {
-                    None => (None, None, false),
-                    Some(v) => match std::str::from_utf8(v) {
-                        Ok(text) => {
-                            let (shown, cut_off) = cut(text, MAX_HEADER_VALUE);
-                            (Some(shown.to_string()), None, cut_off)
-                        }
-                        Err(_) => {
-                            let shown = &v[..v.len().min(MAX_HEADER_VALUE)];
-                            (None, Some(hex(shown)), v.len() > MAX_HEADER_VALUE)
-                        }
-                    },
-                };
-                HeaderView {
-                    name: name.to_string(),
-                    value,
-                    value_hex,
-                    truncated: name_cut || value_cut,
-                }
-            })
-            .collect();
+    /// The detail of the browser's `answer`. With `access` `Ok` the hub asked for the payload and
+    /// shows what came (a record without `payload` or `payloadBase64` is a tombstone); otherwise
+    /// it says why the payload is hidden and drops whatever payload the browser sent anyway.
+    pub fn of(answer: RecordAnswer, access: Result<&str, Hidden>) -> Self {
         let mut detail = Self {
-            summary: Summary::of(topic, r),
-            all_headers,
-            headers_omitted: r.headers.len().saturating_sub(MAX_HEADERS),
+            summary: answer.summary.trimmed(),
+            all_headers: answer.all_headers,
+            headers_omitted: answer.headers_omitted,
             payload: None,
             payload_base64: None,
             payload_truncated: false,
         };
-        match (access, r.payload) {
-            (Err(why), _) => {
+        match access {
+            Err(why) => {
                 detail.payload = Some(Some(PayloadView::Hidden {
                     hidden: why.code(),
                     reason: why.reason(),
                 }));
             }
-            (Ok(()), None) => detail.payload = Some(None),
-            (Ok(()), Some(bytes)) => match std::str::from_utf8(bytes) {
-                Ok(text) => {
-                    let (shown, cut_off) = cut(text, MAX_PAYLOAD);
-                    detail.payload = Some(Some(PayloadView::Text(shown.to_string())));
-                    detail.payload_truncated = cut_off;
+            Ok(_) => {
+                detail.payload_truncated = answer.payload_truncated;
+                match (answer.payload_base64, answer.payload) {
+                    (Some(base64), _) => detail.payload_base64 = Some(base64),
+                    (None, Some(Some(text))) => {
+                        detail.payload = Some(Some(PayloadView::Text(text)));
+                    }
+                    (None, _) => {
+                        detail.payload = Some(None);
+                        detail.payload_truncated = false;
+                    }
                 }
-                Err(_) => {
-                    let shown = &bytes[..bytes.len().min(MAX_PAYLOAD)];
-                    detail.payload_base64 = Some(STANDARD.encode(shown));
-                    detail.payload_truncated = bytes.len() > MAX_PAYLOAD;
-                }
-            },
+            }
         }
         detail
     }
+
+    /// True when the detail carries a payload (text or base64), not a tombstone or a reason.
+    pub fn serves_payload(&self) -> bool {
+        self.payload_base64.is_some() || matches!(self.payload, Some(Some(PayloadView::Text(_))))
+    }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Filters
+/// `GET /api/v1/events/sources`: every source the browser reads, the default first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SourcesView {
+    pub sources: Vec<SourceView>,
+}
 
-/// The query of a search and of a tail, as sent. Empty values count as absent (a form sends
-/// every field).
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchQuery {
-    pub topic: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    #[serde(rename = "type")]
-    pub type_name: Option<String>,
-    pub key: Option<String>,
-    pub source: Option<String>,
-    pub correlation_id: Option<String>,
-    pub user_id: Option<String>,
-    pub event_id: Option<String>,
-    pub q: Option<String>,
-    pub limit: Option<String>,
-    pub cursor: Option<String>,
+pub struct SourceView {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+    #[serde(default)]
+    pub segments: Vec<SegmentBounds>,
 }
 
-/// The `type` filter: exact, or a prefix when it ends with `*`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeFilter {
-    Exact(String),
-    Prefix(String),
-}
-
-/// What a record must match; every set field must hold.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Filters {
-    /// The record timestamp is at least this (epoch ms)...
-    pub from: Option<i64>,
-    /// ...and at most this.
-    pub to: Option<i64>,
-    pub type_name: Option<TypeFilter>,
-    /// The key as [`escaped`] shows it, untruncated: the bytes for a UTF-8 key.
-    pub key: Option<String>,
-    /// Header `source`, `correlationId`, `userId`, `id`: the value as [`escaped`] shows it.
-    pub source: Option<String>,
-    pub correlation_id: Option<String>,
-    pub user_id: Option<String>,
-    pub event_id: Option<String>,
-    /// A substring of the payload bytes (case-sensitive).
-    pub q: Option<String>,
-}
-
-fn present(v: &Option<String>) -> Option<&str> {
-    v.as_deref().filter(|s| !s.is_empty())
-}
-
-impl Filters {
-    /// The filters of `query`; `Err` with the reason for a 400. `tail` refuses `from`, `to` and
-    /// `cursor`.
-    pub fn parse(query: &SearchQuery, tail: bool) -> Result<Self, String> {
-        if tail {
-            for (name, v) in [
-                ("from", &query.from),
-                ("to", &query.to),
-                ("cursor", &query.cursor),
-            ] {
-                if present(v).is_some() {
-                    return Err(format!("a tail takes no {name}: it starts at the end"));
-                }
-            }
-        }
-        let text = |name: &str, v: &Option<String>| -> Result<Option<String>, String> {
-            match present(v) {
-                Some(s) if s.len() > MAX_FILTER => {
-                    Err(format!("{name} is longer than {MAX_FILTER} bytes"))
-                }
-                other => Ok(other.map(str::to_string)),
-            }
-        };
-        let time = |name: &str, v: &Option<String>| -> Result<Option<i64>, String> {
-            present(v)
-                .map(|s| parse_time(s).map_err(|e| format!("{name}: {e}")))
-                .transpose()
-        };
-        let filters = Self {
-            from: time("from", &query.from)?,
-            to: time("to", &query.to)?,
-            type_name: text("type", &query.type_name)?.map(|t| match t.strip_suffix('*') {
-                Some(prefix) => TypeFilter::Prefix(prefix.to_string()),
-                None => TypeFilter::Exact(t),
-            }),
-            key: text("key", &query.key)?,
-            source: text("source", &query.source)?,
-            correlation_id: text("correlationId", &query.correlation_id)?,
-            user_id: text("userId", &query.user_id)?,
-            event_id: text("eventId", &query.event_id)?,
-            q: text("q", &query.q)?,
-        };
-        if let (Some(from), Some(to)) = (filters.from, filters.to)
-            && from > to
-        {
-            return Err("from is after to".to_string());
-        }
-        Ok(filters)
-    }
-
-    /// True when `r` matches every filter.
-    pub fn matches(&self, r: &RecordView<'_>) -> bool {
-        let ts = r.timestamp.unwrap_or(-1);
-        if self.from.is_some_and(|from| ts < from) || self.to.is_some_and(|to| ts > to) {
-            return false;
-        }
-        let equal = |want: &Option<String>, got: Option<&[u8]>| match want {
-            None => true,
-            Some(want) => got.is_some_and(|g| {
-                g == want.as_bytes() || (std::str::from_utf8(g).is_err() && escaped(g) == *want)
-            }),
-        };
-        if !equal(&self.key, r.key)
-            || !equal(&self.source, r.header("source"))
-            || !equal(&self.correlation_id, r.header("correlationId"))
-            || !equal(&self.user_id, r.header("userId"))
-            || !equal(&self.event_id, r.header("id"))
-        {
-            return false;
-        }
-        if let Some(t) = &self.type_name {
-            let Some(got) = r.header("type") else {
-                return false;
-            };
-            let ok = match t {
-                TypeFilter::Exact(want) => got == want.as_bytes(),
-                TypeFilter::Prefix(prefix) => got.starts_with(prefix.as_bytes()),
-            };
-            if !ok {
-                return false;
-            }
-        }
-        match &self.q {
-            None => true,
-            // Never empty: an empty `q` is no filter.
-            Some(q) => r
-                .payload
-                .is_some_and(|p| p.windows(q.len()).any(|w| w == q.as_bytes())),
-        }
-    }
-
-    /// A digest of the topic and the filters, which a cursor carries: a cursor only continues the
-    /// search it came from.
-    pub fn digest(&self, topic: &str) -> u64 {
-        let mut text = String::new();
-        let mut put = |name: &str, v: Option<&str>| {
-            text.push_str(name);
-            match v {
-                Some(v) => {
-                    text.push('=');
-                    text.push_str(v);
-                }
-                None => text.push('-'),
-            }
-            text.push('\u{0}');
-        };
-        put("topic", Some(topic));
-        put("from", self.from.map(|v| v.to_string()).as_deref());
-        put("to", self.to.map(|v| v.to_string()).as_deref());
-        let type_name = self.type_name.as_ref().map(|t| match t {
-            TypeFilter::Exact(t) => format!("exact:{t}"),
-            TypeFilter::Prefix(p) => format!("prefix:{p}"),
-        });
-        put("type", type_name.as_deref());
-        put("key", self.key.as_deref());
-        put("source", self.source.as_deref());
-        put("correlationId", self.correlation_id.as_deref());
-        put("userId", self.user_id.as_deref());
-        put("eventId", self.event_id.as_deref());
-        put("q", self.q.as_deref());
-        xxhash_rust::xxh64::xxh64(text.as_bytes(), 0)
-    }
-}
-
-/// Epoch milliseconds (digits only) or an RFC 3339 date-time (`2026-11-05T10:00:00Z`,
-/// `2026-11-05T10:00:00.250+01:00`).
-pub fn parse_time(s: &str) -> Result<i64, String> {
-    let s = s.trim();
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-        return s.parse::<i64>().map_err(|_| format!("{s:?} is too large"));
-    }
-    rfc3339(s).ok_or_else(|| format!("{s:?} is neither epoch milliseconds nor an RFC 3339 time"))
-}
-
-fn rfc3339(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    let digits = |from: usize, len: usize| -> Option<i64> {
-        let part = b.get(from..from + len)?;
-        part.iter()
-            .all(u8::is_ascii_digit)
-            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
-    };
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
-        return None;
-    }
-    if b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let (year, month, day) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
-    let (hour, minute, second) = (digits(11, 2)?, digits(14, 2)?, digits(17, 2)?);
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > month_days[(month - 1) as usize]
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let mut i = 19;
-    let mut millis = 0;
-    if b[i] == b'.' {
-        let start = i + 1;
-        i = start;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == start {
-            return None;
-        }
-        let frac = &s[start..i.min(start + 3)];
-        millis = frac.parse::<i64>().ok()? * 10i64.pow(3 - frac.len() as u32);
-    }
-    let offset_minutes = match &b[i..] {
-        [b'Z' | b'z'] => 0,
-        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
-            let (h, m) = (digits(i + 1, 2)?, digits(i + 4, 2)?);
-            if h > 23 || m > 59 {
-                return None;
-            }
-            let minutes = h * 60 + m;
-            if *sign == b'-' { -minutes } else { minutes }
-        }
-        _ => return None,
-    };
-    let days = days_from_civil(year, month, day);
-    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second.min(59) - offset_minutes * 60;
-    Some(seconds * 1000 + millis)
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// The `limit` of a search: [`DEFAULT_LIMIT`] when absent, else 1 to `max`.
-pub fn parse_limit(limit: Option<&str>, max: usize) -> Result<usize, String> {
-    match limit.filter(|s| !s.is_empty()) {
-        None => Ok(DEFAULT_LIMIT.min(max)),
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(n) if (1..=max).contains(&n) => Ok(n),
-            _ => Err(format!("limit must be a number from 1 to {max}")),
-        },
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Cursor
-
-/// Where a search goes on: for every partition, the offset below which the next page reads (the
-/// lowest examined so far), and the digest of the search ([`Filters::digest`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cursor {
-    #[serde(rename = "f")]
-    pub digest: String,
-    #[serde(rename = "p")]
-    pub positions: Vec<(i32, i64)>,
-}
-
-impl Cursor {
-    pub fn new(digest: u64, positions: Vec<(i32, i64)>) -> Self {
-        Self {
-            digest: format!("{digest:016x}"),
-            positions,
-        }
-    }
-
-    /// Opaque base64url (no padding) of its JSON.
-    pub fn encode(&self) -> String {
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("a cursor serializes"))
-    }
-
-    /// The cursor `s` of the search whose digest is `digest`; `Err` with the reason for a 400.
-    pub fn decode(s: &str, digest: u64) -> Result<Self, String> {
-        const MALFORMED: &str = "the cursor is malformed";
-        if s.len() > MAX_CURSOR {
-            return Err(MALFORMED.to_string());
-        }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(s.trim())
-            .map_err(|_| MALFORMED.to_string())?;
-        let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| MALFORMED.to_string())?;
-        if cursor
-            .positions
-            .iter()
-            .any(|(partition, offset)| *partition < 0 || *offset < 0)
-        {
-            return Err(MALFORMED.to_string());
-        }
-        if cursor.digest != format!("{digest:016x}") {
-            return Err(
-                "the cursor belongs to another search: send the topic and filters it came with"
-                    .to_string(),
-            );
-        }
-        Ok(cursor)
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Newest-first merge
-
-/// One partition's offsets to search: from `lower` (inclusive) up to `upper` (exclusive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Range {
-    pub partition: i32,
-    pub lower: i64,
-    pub upper: i64,
-}
-
-/// A record a search read: its place, its timestamp (-1 without one) and its summary when it
-/// matched the filters.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Examined {
-    pub offset: i64,
-    pub timestamp: i64,
-    pub hit: Option<Summary>,
-}
-
-/// A chunk a search reads: the records of `partition` from `start` up to (not including) `end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Want {
-    pub partition: i32,
-    pub start: i64,
-    pub end: i64,
-}
-
-/// Reads records for a search.
-pub trait Chunks {
-    type Error;
-    /// The records of every chunk of `wants`, read at once: per chunk, in its order, the
-    /// records in offset order, each examined against the filters (offsets with no record,
-    /// compacted or transaction markers, are simply absent), or `None` when `deadline` passed
-    /// before that chunk was complete.
-    fn read(
-        &mut self,
-        wants: &[Want],
-        deadline: Instant,
-    ) -> Result<Vec<Option<Vec<Examined>>>, Self::Error>;
-}
-
-/// Why a search page ended before every partition reached its lower bound.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub enum StoppedBy {
-    Limit,
-    ScanBudget,
-    TimeBudget,
+pub struct SegmentBounds {
+    pub segment: String,
+    pub first: String,
+    pub head: String,
 }
 
-/// The result of [`merge`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct Page {
-    /// The matching records, newest first.
-    pub results: Vec<Summary>,
-    /// Records read from Kafka.
-    pub scanned: u64,
-    /// Every partition reached its lower bound: there is no next page.
-    pub exhausted: bool,
-    /// Why the page ended early; `None` when exhausted.
-    pub stopped_by: Option<StoppedBy>,
-    /// Per partition, the offset below which the next page reads.
-    pub positions: Vec<(i32, i64)>,
+/// `GET /api/v1/events/lag`: every subscription with a committed position on the source, live
+/// or not, by lag.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LagView {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+    pub subscriptions: Vec<SubscriptionLag>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
-/// The bounds of one [`merge`].
-#[derive(Debug, Clone, Copy)]
-pub struct Budget {
-    pub limit: usize,
-    pub max_scanned: u64,
-    pub deadline: Instant,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionLag {
+    pub subscription: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub members: u64,
+    #[serde(default)]
+    pub segments: Vec<SegmentLag>,
+    #[serde(default)]
+    pub lag: u64,
 }
 
-struct Lane {
-    range: Range,
-    /// Every offset at or above it was examined and its match, if any, returned: the next
-    /// page's upper bound.
-    next: i64,
-    /// The start of the chunk in `buffer`.
-    loaded_from: i64,
-    /// The matches of the chunk not yet returned, oldest first (popped from the end).
-    buffer: Vec<Examined>,
-    /// Records the next chunk reads, at most.
-    size: i64,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentLag {
+    pub segment: String,
+    #[serde(default)]
+    pub committed: Option<String>,
+    pub head: String,
+    #[serde(default)]
+    pub lag: Option<u64>,
 }
 
-impl Lane {
-    fn done(&self) -> bool {
-        self.buffer.is_empty() && self.next <= self.range.lower
+/// The first part of a tail.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailStart {
+    pub source: String,
+    #[serde(default)]
+    pub segments: u64,
+    pub ends_at_ms: i64,
+}
+
+/// Why a tail ended, as the browser says it; any other reason reads as `failed`.
+pub const TAIL_END_REASONS: [&str; 4] = ["maxDuration", "slowReader", "shutdown", "failed"];
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct TailEnd {
+    pub reason: String,
+}
+
+/// A heartbeat part: the hub sends its own clock, so nothing of it is read.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct Beat {}
+
+/// One part of `kraken.events.Tail`.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum TailEvent {
+    Start(TailStart),
+    Record(Summary),
+    Heartbeat(Beat),
+    End(TailEnd),
+}
+
+/// A point query's answer: at most [`MAX_ANSWER`] bytes of JSON of the expected shape, else
+/// [`Refusal::Failed`].
+pub fn read<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Refusal> {
+    read_bounded(bytes, MAX_ANSWER)
+}
+
+fn read_bounded<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T, Refusal> {
+    if bytes.len() > max {
+        tracing::warn!(
+            size = bytes.len(),
+            max,
+            "event browser answer too large: dropped"
+        );
+        return Err(Refusal::Failed);
     }
-
-    /// Newest first; ties by partition, then offset, both descending.
-    fn head(&self) -> Option<(i64, i32, i64)> {
-        self.buffer
-            .last()
-            .map(|e| (e.timestamp, self.range.partition, e.offset))
-    }
-
-    /// Where the next page starts: just above the newest match not yet returned, else the
-    /// chunk's start (the offsets between were examined and match nothing).
-    fn settle(&mut self) {
-        self.next = self
-            .buffer
-            .last()
-            .map_or(self.loaded_from, |e| e.offset + 1);
-    }
-}
-
-/// Reads `ranges` backwards in chunks (of [`FIRST_CHUNK`] records first, then twice the last,
-/// up to [`CHUNK`]), every partition that needs one in the same read, and merges their matches
-/// newest first (record timestamp; ties by partition, then offset, descending) until
-/// `budget.limit` results, `budget.max_scanned` records read or `budget.deadline`, whichever
-/// comes first. A page that ends before it returns anything still moves on: a partition whose
-/// chunk arrived is positioned just above its newest match (below the chunk when it has none).
-pub fn merge<C: Chunks>(
-    reader: &mut C,
-    ranges: &[Range],
-    budget: Budget,
-) -> Result<Page, C::Error> {
-    // Enough per chunk that one round over the partitions fits the scan budget.
-    let chunk = (budget.max_scanned / (ranges.len().max(1) as u64)).clamp(1, CHUNK as u64) as i64;
-    let mut lanes: Vec<Lane> = ranges
-        .iter()
-        .map(|r| Lane {
-            range: *r,
-            next: r.upper.max(r.lower),
-            loaded_from: r.upper.max(r.lower),
-            buffer: Vec::new(),
-            size: chunk.min(FIRST_CHUNK as i64),
-        })
-        .collect();
-    let mut results = Vec::new();
-    let mut scanned = 0u64;
-    let mut stopped_by = None;
-    loop {
-        // Every partition that is not done needs a match in hand before the newest is known.
-        let needy: Vec<usize> = (0..lanes.len())
-            .filter(|i| lanes[*i].buffer.is_empty() && !lanes[*i].done())
-            .collect();
-        if !needy.is_empty() {
-            if scanned >= budget.max_scanned {
-                stopped_by = Some(StoppedBy::ScanBudget);
-                break;
-            }
-            if Instant::now() >= budget.deadline {
-                stopped_by = Some(StoppedBy::TimeBudget);
-                break;
-            }
-            // The scan budget left, shared by the partitions of this read (one record each
-            // at least, so fewer partitions when fewer records are left).
-            let left = budget.max_scanned - scanned;
-            let needy = &needy[..needy.len().min(left as usize)];
-            let share = (left / needy.len() as u64) as i64;
-            let wants: Vec<Want> = needy
-                .iter()
-                .map(|i| {
-                    let lane = &lanes[*i];
-                    Want {
-                        partition: lane.range.partition,
-                        start: (lane.next - lane.size.min(share)).max(lane.range.lower),
-                        end: lane.next,
-                    }
-                })
-                .collect();
-            let chunks = reader.read(&wants, budget.deadline)?;
-            let mut late = false;
-            for ((i, want), read) in needy.iter().zip(&wants).zip(chunks) {
-                let Some(read) = read else {
-                    late = true;
-                    continue;
-                };
-                scanned += read.len() as u64;
-                let lane = &mut lanes[*i];
-                lane.size = (lane.size * 2).min(chunk);
-                lane.loaded_from = want.start;
-                lane.buffer = read
-                    .into_iter()
-                    .filter(|e| e.hit.is_some() && (want.start..want.end).contains(&e.offset))
-                    .collect();
-                // This page returns at most `wanted` more results, so no partition needs a
-                // summary beyond its newest `wanted` matches: the older ones are let go (and
-                // read again by the next page), which bounds a page's memory by partitions x
-                // limit.
-                let wanted = budget.limit - results.len();
-                if lane.buffer.len() > wanted {
-                    let cut = lane.buffer.len() - wanted;
-                    lane.loaded_from = lane.buffer[cut].offset;
-                    lane.buffer.drain(..cut);
-                }
-                lane.settle();
-            }
-            if late {
-                stopped_by = Some(StoppedBy::TimeBudget);
-                break;
-            }
-            continue;
-        }
-        let Some(lane) = lanes
-            .iter_mut()
-            .filter(|l| !l.buffer.is_empty())
-            .max_by_key(|l| l.head())
-        else {
-            break;
-        };
-        let examined = lane.buffer.pop().expect("a lane with a head");
-        lane.settle();
-        results.push(examined.hit.expect("only matches are kept"));
-        if results.len() >= budget.limit {
-            stopped_by = Some(StoppedBy::Limit);
-            break;
-        }
-    }
-    let exhausted = lanes.iter().all(Lane::done);
-    Ok(Page {
-        results,
-        scanned,
-        exhausted,
-        stopped_by: if exhausted { None } else { stopped_by },
-        positions: lanes
-            .iter()
-            .map(|l| (l.range.partition, l.next.max(l.range.lower)))
-            .collect(),
+    serde_json::from_slice(bytes).map_err(|e| {
+        tracing::warn!(
+            error = %crate::auth::clip(&e.to_string()),
+            "event browser answer malformed: dropped"
+        );
+        Refusal::Failed
     })
 }
+
+/// [`read`] for a search page, its summaries trimmed to the library headers.
+pub fn read_page(bytes: &[u8]) -> Result<SearchPage, Refusal> {
+    read::<SearchPage>(bytes).map(SearchPage::trimmed)
+}
+
+/// One tail part: at most [`MAX_PART`] bytes; a record's summary trimmed to the library headers.
+pub fn read_part(bytes: &[u8]) -> Result<TailEvent, Refusal> {
+    read_bounded::<TailEvent>(bytes, MAX_PART).map(|event| match event {
+        TailEvent::Record(summary) => TailEvent::Record(summary.trimmed()),
+        TailEvent::End(end) if !TAIL_END_REASONS.contains(&end.reason.as_str()) => {
+            TailEvent::End(TailEnd {
+                reason: "failed".to_string(),
+            })
+        }
+        other => other,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+
+/// Why a call has no data: the hub's own refusal or the browser's, mapped to an HTTP status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// No browser is connected (404 [`NOT_INSTALLED`]).
+    NotInstalled,
+    /// 400: a parameter the hub or the browser cannot honour.
+    BadRequest(String),
+    /// 403: `q` without the payload rules.
+    Forbidden(Hidden),
+    /// 404: a record, segment or source that does not exist.
+    NotFound(String),
+    /// 429 with `Retry-After: 1`: too many searches or tails at once.
+    Busy(String),
+    /// 503: the event store did not answer the browser.
+    Unavailable(String),
+    /// 504: the browser did not answer in time.
+    Timeout,
+    /// 502: anything else (the browser left, broke the contract, answered garbage).
+    Failed,
+}
+
+/// The browser's error, as it puts it in `Error.details` (task E1-R).
+#[derive(Deserialize)]
+struct BrowseError {
+    error: String,
+    message: String,
+}
+
+/// The longest prefix of `s` of at most `max` bytes that ends at a character boundary.
+fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+impl Refusal {
+    /// What the router or the browser answered. Only the browser's `details` of a known kind
+    /// pass its message on; anything else gets a short message of the hub's.
+    pub fn from_route(e: RouteError) -> Self {
+        match e.code {
+            ErrorCode::NoHandler => return Refusal::NotInstalled,
+            ErrorCode::InvalidRequest => return Refusal::BadRequest(UNREADABLE.to_string()),
+            ErrorCode::Timeout => return Refusal::Timeout,
+            ErrorCode::ResourceExhausted => {
+                return Refusal::Busy(
+                    "the event browser has too many requests waiting; try again shortly"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        let Ok(browse) = serde_json::from_slice::<BrowseError>(&e.details) else {
+            return Refusal::Failed;
+        };
+        let message = cut(&browse.message, MAX_MESSAGE).to_string();
+        match browse.error.as_str() {
+            "invalid" => Refusal::BadRequest(message),
+            "not-found" => Refusal::NotFound(message),
+            "busy" => Refusal::Busy(message),
+            "unavailable" => Refusal::Unavailable(message),
+            _ => Refusal::Failed,
+        }
+    }
+
+    /// The `outcome` of `kraken_hub_event_browser_requests_total`.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Refusal::NotInstalled => "not_installed",
+            Refusal::BadRequest(_) => "bad_request",
+            Refusal::Forbidden(_) => "forbidden",
+            Refusal::NotFound(_) => "not_found",
+            Refusal::Busy(_) => "too_many",
+            Refusal::Unavailable(_) => "unavailable",
+            Refusal::Timeout => "timeout",
+            Refusal::Failed => "failed",
+        }
+    }
+}
+
+/// The message of a [`Refusal::Failed`]: never the browser's own words.
+pub const FAILED: &str = "the event browser failed to answer";
+/// The message of a 400 for a request the browser could not decode (`INVALID_REQUEST`).
+pub const UNREADABLE: &str = "the event browser could not read the request";
+/// The message of a [`Refusal::Timeout`].
+pub const TIMED_OUT: &str = "the event browser did not answer in time";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::Secret;
-    use std::time::Duration;
 
-    fn view<'a>(
-        partition: i32,
-        offset: i64,
-        key: Option<&'a [u8]>,
-        headers: &'a [(&'a [u8], Option<&'a [u8]>)],
-        payload: Option<&'a [u8]>,
-    ) -> RecordView<'a> {
-        RecordView {
-            partition,
-            offset,
-            timestamp: Some(1_000),
-            key,
-            headers,
-            payload,
-        }
-    }
-
-    #[test]
-    fn escaped_keeps_utf8_and_escapes_every_other_byte() {
-        assert_eq!(escaped(b"order-1"), "order-1");
-        assert_eq!(escaped("caf\u{e9}".as_bytes()), "caf\u{e9}");
-        assert_eq!(escaped(b"a\xff\xfeb"), "a\\xff\\xfeb");
-        assert_eq!(escaped(b"\xc3"), "\\xc3", "a truncated sequence");
-    }
-
-    #[test]
-    fn cut_stops_at_a_character_boundary() {
-        assert_eq!(cut("abc", 3), ("abc", false));
-        assert_eq!(cut("abcd", 3), ("abc", true));
-        // "é" is two bytes: a cut in its middle keeps it out.
-        assert_eq!(cut("a\u{e9}", 2), ("a", true));
-        assert_eq!(cut("", 0), ("", false));
-    }
-
-    #[test]
-    fn times_are_epoch_millis_or_rfc3339() {
-        assert_eq!(parse_time("1730000000000"), Ok(1_730_000_000_000));
-        assert_eq!(parse_time("1970-01-01T00:00:00Z"), Ok(0));
-        assert_eq!(parse_time("2026-11-05T10:00:00Z"), Ok(1_793_872_800_000));
-        assert_eq!(
-            parse_time("2026-11-05T11:00:00.25+01:00"),
-            Ok(1_793_872_800_250)
-        );
-        assert_eq!(
-            parse_time("2026-11-05t09:30:00.123456-00:30"),
-            Ok(1_793_872_800_123)
-        );
-        assert_eq!(parse_time("2024-02-29T00:00:00Z"), Ok(1_709_164_800_000));
-        for bad in [
-            "",
-            "yesterday",
-            "2026-11-05",
-            "2026-11-05T10:00:00",
-            "2026-13-01T00:00:00Z",
-            "2026-02-29T00:00:00Z",
-            "2026-11-05T24:00:00Z",
-            "2026-11-05T10:00:00.Z",
-            "2026-11-05T10:00:00+1:00",
-            "-5",
-            "99999999999999999999",
-        ] {
-            assert!(parse_time(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    fn query(pairs: &[(&str, &str)]) -> SearchQuery {
-        let encoded: String = pairs
+    /// The parameters of a query string with `pairs`.
+    fn params(pairs: &[(&str, &str)]) -> Params {
+        let map: Map<String, Value> = pairs
             .iter()
-            .map(|(k, v)| format!("{k}={v}&"))
-            .collect::<String>();
-        serde_urlencoded_like(&encoded)
-    }
-
-    /// The query as axum's `Query` would read it (the names are what the API documents).
-    fn serde_urlencoded_like(s: &str) -> SearchQuery {
-        let value: serde_json::Map<String, serde_json::Value> = s
-            .split('&')
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                let (k, v) = p.split_once('=').unwrap();
-                (k.to_string(), serde_json::Value::String(v.to_string()))
-            })
+            .map(|(k, v)| (k.to_string(), Value::from(*v)))
             .collect();
-        serde_json::from_value(serde_json::Value::Object(value)).unwrap()
+        serde_json::from_value(Value::Object(map)).unwrap()
     }
 
     #[test]
-    fn filters_parse_types_as_exact_or_prefix_and_refuse_what_they_cannot_honour() {
-        let f = Filters::parse(
-            &query(&[
-                ("type", "orders.*"),
-                ("key", "k-1"),
-                ("from", "1000"),
-                ("to", "1970-01-01T00:00:02Z"),
-                ("correlationId", ""),
-            ]),
-            false,
+    fn a_search_request_carries_the_filters_and_drops_empty_values() {
+        let p = params(&[
+            ("source", "kraken.events.dlt"),
+            ("from", "2026-11-05T10:00:00Z"),
+            ("to", "1730000000000"),
+            ("type", "orders.*"),
+            ("key", "order-42"),
+            ("service", "service-b"),
+            ("correlationId", "c-1"),
+            ("userId", "u-1"),
+            ("eventId", ""),
+            ("q", "\"total\":42"),
+            ("limit", "20"),
+            ("cursor", "eyJ"),
+        ]);
+        assert!(p.wants_payload());
+        let request = p.search_request(true, Duration::from_secs(8)).unwrap();
+        assert_eq!(
+            request,
+            json!({
+                "source": "kraken.events.dlt",
+                "filters": {
+                    "from": "2026-11-05T10:00:00Z", "to": "1730000000000", "type": "orders.*",
+                    "key": "order-42", "source": "service-b", "correlationId": "c-1",
+                    "userId": "u-1", "q": "\"total\":42",
+                },
+                "limit": 20,
+                "cursor": "eyJ",
+                "timeoutMs": 8000,
+            })
+        );
+        // `q` only under the payload rules.
+        let without = p.search_request(false, Duration::from_secs(8)).unwrap();
+        assert!(without["filters"].get("q").is_none(), "{without}");
+        // Nothing set: the browser's defaults.
+        assert_eq!(
+            Params::default()
+                .search_request(false, Duration::from_millis(1500))
+                .unwrap(),
+            json!({"filters": {}, "timeoutMs": 1500})
+        );
+        for limit in ["ten", "-1", "1.5", "0", " 0 "] {
+            let bad = params(&[("limit", limit)]).search_request(false, Duration::from_secs(1));
+            assert_eq!(
+                bad.unwrap_err(),
+                "limit must be a positive number",
+                "{limit}"
+            );
+        }
+        // A cursor holds a place per segment: up to the browser's 64 KiB, passed verbatim.
+        let cursor = "c".repeat(4096);
+        let request = params(&[("cursor", &cursor)])
+            .search_request(false, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(request["cursor"], cursor.as_str());
+        assert!(
+            params(&[("cursor", &"c".repeat(MAX_CURSOR))])
+                .search_request(false, Duration::from_secs(1))
+                .is_ok()
+        );
+        assert_eq!(
+            params(&[("cursor", &"c".repeat(MAX_CURSOR + 1))])
+                .search_request(false, Duration::from_secs(1))
+                .unwrap_err(),
+            format!("cursor is longer than {MAX_CURSOR} bytes")
+        );
+        // The browser's bounds, checked before asking: a filter value of at most 1 KiB.
+        let long = "x".repeat(MAX_FILTER + 1);
+        for name in ["from", "type", "service", "q", "source"] {
+            let err = params(&[(name, &long)])
+                .search_request(true, Duration::from_secs(1))
+                .unwrap_err();
+            assert_eq!(err, format!("{name} is longer than {MAX_FILTER} bytes"));
+        }
+        let longest = "x".repeat(MAX_FILTER);
+        assert!(
+            params(&[("key", &longest)])
+                .search_request(false, Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_record_request_bounds_its_place() {
+        assert_eq!(
+            get_request("kraken.events", "3", "42", true).unwrap(),
+            json!({"source": "kraken.events", "segment": "3", "position": "42", "payload": true})
+        );
+        let long = "1".repeat(MAX_PLACE + 1);
+        assert_eq!(
+            get_request("kraken.events", &long, "1", false).unwrap_err(),
+            format!("segment is longer than {MAX_PLACE} bytes")
+        );
+        assert_eq!(
+            get_request("kraken.events", "1", &long, false).unwrap_err(),
+            format!("position is longer than {MAX_PLACE} bytes")
+        );
+        assert!(get_request(&"s".repeat(MAX_FILTER + 1), "1", "1", false).is_err());
+    }
+
+    #[test]
+    fn a_lag_request_bounds_its_source() {
+        assert_eq!(lag_request(None).unwrap(), json!({}));
+        assert_eq!(lag_request(Some("")).unwrap(), json!({}));
+        assert_eq!(
+            lag_request(Some("kraken.events")).unwrap(),
+            json!({"source": "kraken.events"})
+        );
+        assert!(lag_request(Some(&"s".repeat(MAX_FILTER))).is_ok());
+        assert_eq!(
+            lag_request(Some(&"s".repeat(MAX_FILTER + 1))).unwrap_err(),
+            format!("source is longer than {MAX_FILTER} bytes")
+        );
+    }
+
+    /// serde's error text quotes what it could not read; the warning about a malformed answer
+    /// carries it cut, never a browser-chosen string of any length.
+    #[test]
+    fn a_malformed_answer_is_logged_cut() {
+        crate::telemetry::test_support::capture_logs();
+        let marker = "m".repeat(10);
+        let answer = format!("{{\"source\":\"{marker}{}\"}}", "y".repeat(10_000));
+        assert_eq!(read::<SearchPage>(answer.as_bytes()), Err(Refusal::Failed));
+        let answer = format!(
+            "{{\"source\":\"s\",\"results\":[],\"scanned\":\"{marker}{}\"}}",
+            "y".repeat(10_000)
+        );
+        assert_eq!(read::<SearchPage>(answer.as_bytes()), Err(Refusal::Failed));
+        let lines: Vec<_> = crate::telemetry::test_support::logged()
+            .into_iter()
+            .filter(|l| l.message.contains("malformed"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the malformed answers were not logged: {lines:?}"
+        );
+        for line in lines {
+            let error = line.field("error").unwrap_or_default();
+            assert!(
+                error.chars().count() <= crate::auth::MAX_LOGGED_CHARS,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tail_request_refuses_a_range_and_asks_a_heartbeat() {
+        for name in ["from", "to", "cursor"] {
+            let err = params(&[(name, "1")])
+                .tail_request(false, Duration::from_secs(1), Duration::from_secs(60))
+                .unwrap_err();
+            assert_eq!(err, format!("a tail takes no {name}: it starts at the end"));
+        }
+        let request = params(&[("type", "orders.*"), ("q", "x"), ("limit", "5")])
+            .tail_request(false, Duration::from_millis(2500), Duration::from_secs(598))
+            .unwrap();
+        assert_eq!(
+            request,
+            json!({"filters": {"type": "orders.*"}, "heartbeatMs": 2500, "maxDurationMs": 598000})
+        );
+    }
+
+    #[test]
+    fn the_hub_asks_budgets_within_its_own_bounds() {
+        assert_eq!(
+            search_budget(Duration::from_secs(30)),
+            Duration::from_secs(28)
+        );
+        assert_eq!(
+            search_budget(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        let config = Config::default();
+        // The internal stream idles out after the default timeout (5 s): 2 s, well below it.
+        assert_eq!(tail_heartbeat(&config), Duration::from_secs(2));
+        let slow = Config {
+            default_timeout: Duration::from_secs(60),
+            ..Config::default()
+        };
+        assert_eq!(tail_heartbeat(&slow), MAX_HEARTBEAT);
+        let overridden = Config {
+            timeout_overrides: [(TAIL.to_string(), Duration::from_millis(100))].into(),
+            ..Config::default()
+        };
+        assert_eq!(tail_heartbeat(&overridden), MIN_HEARTBEAT);
+        assert_eq!(tail_duration(&config), Duration::from_secs(598));
+    }
+
+    #[test]
+    fn a_correlation_id_is_taken_when_usable_else_made() {
+        assert_eq!(correlation_id(Some("c-7f1e")), "c-7f1e");
+        for bad in [None, Some(""), Some("has space"), Some("é")] {
+            let made = correlation_id(bad);
+            assert!(uuid::Uuid::parse_str(&made).is_ok(), "{bad:?}: {made}");
+        }
+        let long = "x".repeat(MAX_CORRELATION_ID + 1);
+        assert_ne!(correlation_id(Some(&long)), long);
+    }
+
+    #[test]
+    fn a_page_carries_a_long_cursor_back_intact() {
+        let cursor = "c".repeat(MAX_CURSOR);
+        let answer = format!(
+            "{{\"source\":\"kraken.events\",\"results\":[],\"scanned\":1,\"exhausted\":false,\"stoppedBy\":\"limit\",\"cursor\":\"{cursor}\"}}"
+        );
+        let page = read_page(answer.as_bytes()).unwrap();
+        assert_eq!(page.cursor.as_deref(), Some(cursor.as_str()));
+    }
+
+    #[test]
+    fn answers_keep_only_what_the_hub_knows() {
+        let page = read_page(
+            br#"{"source":"kraken.events","results":[{"source":"kraken.events","segment":"3",
+                "position":"42","timestamp":17,"key":"k","headers":{"type":"a.B","x-other":"y"},
+                "size":9,"payload":"secret","payloadBase64":"c2VjcmV0"}],"scanned":5,
+                "exhausted":true,"stoppedBy":null,"cursor":null,"extra":1}"#,
         )
         .unwrap();
-        assert_eq!(f.type_name, Some(TypeFilter::Prefix("orders.".into())));
-        assert_eq!((f.from, f.to), (Some(1000), Some(2000)));
-        assert_eq!(f.key.as_deref(), Some("k-1"));
-        assert_eq!(f.correlation_id, None, "an empty value is no filter");
-        let exact = Filters::parse(&query(&[("type", "orders.Placed")]), false).unwrap();
+        let out = serde_json::to_value(&page).unwrap();
         assert_eq!(
-            exact.type_name,
-            Some(TypeFilter::Exact("orders.Placed".into()))
+            out,
+            json!({"source": "kraken.events", "results": [{"source": "kraken.events",
+                "segment": "3", "position": "42", "timestamp": 17, "key": "k",
+                "headers": {"type": "a.B"}, "size": 9}], "scanned": 5, "exhausted": true,
+                "stoppedBy": null, "cursor": null})
         );
+        // Garbage, the wrong shape and an oversized answer are failures, never a panic.
+        for bad in [&b"not json"[..], b"[]", b"{\"source\":1}", b""] {
+            assert_eq!(read_page(bad), Err(Refusal::Failed), "{bad:?}");
+        }
+        let huge = format!(
+            "{{\"sources\":[{{\"source\":\"{}\"}}]}}",
+            "x".repeat(MAX_ANSWER)
+        );
+        assert_eq!(read::<SourcesView>(huge.as_bytes()), Err(Refusal::Failed));
+    }
 
-        let long = "x".repeat(MAX_FILTER + 1);
-        for bad in [
-            query(&[("from", "2000"), ("to", "1000")]),
-            query(&[("from", "soon")]),
-            query(&[("key", &long)]),
-            query(&[("q", &long)]),
-        ] {
-            assert!(Filters::parse(&bad, false).is_err(), "{bad:?}");
-        }
-        for name in ["from", "to", "cursor"] {
-            let err = Filters::parse(&query(&[(name, "1")]), true).unwrap_err();
-            assert!(err.contains(name), "{err}");
-        }
-        assert!(Filters::parse(&query(&[("type", "a.*")]), true).is_ok());
+    fn record(extra: &str) -> RecordAnswer {
+        let text = format!(
+            r#"{{"source":"kraken.events","segment":"0","position":"7","timestamp":1,"key":null,
+                "headers":{{"type":"a.B"}},"size":6,"allHeaders":[{{"name":"type","value":"a.B"}},
+                {{"name":"bin","value":null,"valueHex":"00ff","truncated":true}}]{extra}}}"#
+        );
+        serde_json::from_str(&text).unwrap()
     }
 
     #[test]
-    fn the_limit_defaults_to_fifty_and_stays_within_the_maximum() {
-        assert_eq!(parse_limit(None, 100), Ok(50));
-        assert_eq!(parse_limit(Some(""), 100), Ok(50));
-        assert_eq!(parse_limit(None, 20), Ok(20));
-        assert_eq!(parse_limit(Some("100"), 100), Ok(100));
-        for bad in ["0", "101", "ten", "-1"] {
-            assert!(parse_limit(Some(bad), 100).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn filters_match_the_key_and_the_library_headers_exactly_and_types_by_prefix() {
-        let headers: &[(&[u8], Option<&[u8]>)] = &[
-            (b"type", Some(b"orders.OrderPlaced")),
-            (b"id", Some(b"e-1")),
-            (b"correlationId", Some(b"c-old")),
-            (b"correlationId", Some(b"c-1")),
-            (b"source", Some(b"service-b")),
-            (b"userId", Some(b"u\xff")),
-            (b"traceparent", None),
-        ];
-        let r = view(0, 7, Some(b"k\xfe"), headers, Some(b"{\"total\":42}"));
-        let matches =
-            |pairs: &[(&str, &str)]| Filters::parse(&query(pairs), false).unwrap().matches(&r);
-        assert!(matches(&[]));
-        assert!(matches(&[("type", "orders.OrderPlaced")]));
-        assert!(matches(&[("type", "orders.*")]));
-        assert!(matches(&[("type", "*")]));
-        assert!(
-            !matches(&[("type", "orders")]),
-            "exact unless it ends with *"
-        );
-        assert!(!matches(&[("type", "orders.OrderPlaced.*")]));
-        assert!(matches(&[("eventId", "e-1")]));
-        assert!(matches(&[("correlationId", "c-1")]), "the last header wins");
-        assert!(!matches(&[("correlationId", "c-old")]));
-        assert!(matches(&[("source", "service-b")]));
-        assert!(!matches(&[("source", "service")]), "exact, not a substring");
-        assert!(
-            matches(&[("userId", "u\\xff")]),
-            "a value that is not UTF-8 matches as shown"
-        );
-        assert!(matches(&[("key", "k\\xfe")]));
-        assert!(!matches(&[("key", "k")]));
-        assert!(matches(&[("q", "\"total\":42")]));
-        assert!(!matches(&[("q", "TOTAL")]), "case-sensitive");
-        assert!(matches(&[("from", "1000"), ("to", "1000")]));
-        assert!(!matches(&[("from", "1001")]));
-        assert!(!matches(&[("to", "999")]));
-
-        // A header that is absent (or null) matches no value; a record without a key no key.
-        let bare = view(0, 8, None, &[], None);
-        let f = |pairs: &[(&str, &str)]| Filters::parse(&query(pairs), false).unwrap();
-        assert!(!f(&[("key", "k")]).matches(&bare));
-        assert!(!f(&[("type", "*")]).matches(&bare));
-        assert!(!f(&[("q", "x")]).matches(&bare));
-        let null_type: &[(&[u8], Option<&[u8]>)] = &[(b"type", None)];
-        assert!(!f(&[("type", "*")]).matches(&view(0, 9, None, null_type, None)));
-    }
-
-    #[test]
-    fn a_cursor_round_trips_and_only_continues_its_own_search() {
-        let f = Filters::parse(&query(&[("type", "a.*")]), false).unwrap();
-        let digest = f.digest("kraken.events");
-        let cursor = Cursor::new(digest, vec![(0, 120), (1, 0), (5, 9_000_000_000)]);
-        let text = cursor.encode();
-        assert!(
-            text.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "{text}"
-        );
-        assert_eq!(Cursor::decode(&text, digest), Ok(cursor));
-
-        let other = Filters::parse(&query(&[("type", "a.Placed")]), false).unwrap();
-        assert_ne!(other.digest("kraken.events"), digest);
-        assert_ne!(f.digest("kraken.events.dlt"), digest, "the topic counts");
-        let err = Cursor::decode(&text, other.digest("kraken.events")).unwrap_err();
-        assert!(err.contains("another search"), "{err}");
-        for bad in [
-            "%%%".to_string(),
-            URL_SAFE_NO_PAD.encode("{}"),
-            URL_SAFE_NO_PAD.encode(format!("{{\"f\":\"{digest:016x}\",\"p\":[[-1,5]]}}")),
-            URL_SAFE_NO_PAD.encode(format!("{{\"f\":\"{digest:016x}\",\"p\":[[0,-5]]}}")),
-            "A".repeat(MAX_CURSOR + 1),
-        ] {
-            assert!(Cursor::decode(&bad, digest).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_summary_cuts_the_key_and_headers_and_never_carries_the_payload() {
-        let long_type = "t".repeat(300);
-        let key = vec![b'k'; 200];
-        let headers: &[(&[u8], Option<&[u8]>)] = &[
-            (b"type", Some(long_type.as_bytes())),
-            (b"x-custom", Some(b"not listed")),
-            (b"source", Some(b"svc")),
-        ];
-        let s = Summary::of(
-            "kraken.events",
-            &view(3, 42, Some(&key), headers, Some(b"secret")),
-        );
-        assert_eq!(s.key.as_deref().map(str::len), Some(MAX_KEY));
-        assert!(s.key_truncated);
-        assert_eq!(s.headers["type"].len(), MAX_SUMMARY_HEADER);
-        assert_eq!(s.headers["source"], "svc");
-        assert!(!s.headers.contains_key("x-custom"));
-        assert_eq!(s.size, 6);
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(!json.contains("secret"), "{json}");
-        assert!(json.contains("\"keyTruncated\":true"), "{json}");
-        let short = Summary::of("t", &view(0, 0, Some(b"k"), &[], None));
-        let json = serde_json::to_string(&short).unwrap();
-        assert!(!json.contains("keyTruncated"), "{json}");
-        assert_eq!(short.size, 0);
-    }
-
-    #[test]
-    fn a_detail_bounds_every_header_and_serves_the_payload_only_when_allowed() {
-        let long_name = "n".repeat(200);
-        let long_value = "v".repeat(2000);
-        let mut headers: Vec<(&[u8], Option<&[u8]>)> = vec![
-            (b"type", Some(b"a.B")),
-            (long_name.as_bytes(), Some(long_value.as_bytes())),
-            (b"bin", Some(b"\x00\xff")),
-            (b"\xffname", None),
-        ];
-        for _ in 0..70 {
-            headers.push((b"filler", Some(b"x")));
-        }
-        let r = view(1, 2, None, &headers, Some(b"{\"a\":1}"));
-        let d = Detail::of("kraken.events", &r, Ok(()));
-        assert_eq!(d.all_headers.len(), MAX_HEADERS);
-        assert_eq!(d.headers_omitted, headers.len() - MAX_HEADERS);
-        let long = &d.all_headers[1];
+    fn a_detail_serves_the_payload_only_when_asked() {
+        // Asked: text, base64, a tombstone (null or nothing at all), and the cut marker.
+        let text = Detail::of(record(r#","payload":"{\"a\":1}""#), Ok("dashboard-token"));
         assert_eq!(
+            text.payload,
+            Some(Some(PayloadView::Text("{\"a\":1}".to_string())))
+        );
+        assert!(text.serves_payload());
+        let raw = Detail::of(
+            record(r#","payloadBase64":"/wA=","payloadTruncated":true"#),
+            Ok("write-token"),
+        );
+        let out = serde_json::to_value(&raw).unwrap();
+        assert_eq!(out["payloadBase64"], "/wA=");
+        assert_eq!(out["payloadTruncated"], true);
+        assert!(out.get("payload").is_none(), "{out}");
+        for tombstone in [r#","payload":null"#, ""] {
+            let d = Detail::of(record(tombstone), Ok("dashboard-token"));
+            let out = serde_json::to_value(&d).unwrap();
+            assert_eq!(out["payload"], Value::Null, "{tombstone}");
+            assert!(out.as_object().unwrap().contains_key("payload"));
+            assert!(!d.serves_payload());
+        }
+        // Not asked: the reason, whatever the browser sent.
+        let hidden = Detail::of(
+            record(r#","payload":"secret","payloadBase64":"c2VjcmV0","payloadTruncated":true"#),
+            Err(Hidden::NotPresented),
+        );
+        let out = serde_json::to_value(&hidden).unwrap();
+        assert_eq!(
+            out["payload"],
+            json!({"hidden": "no-token-presented", "reason": Hidden::NotPresented.reason()})
+        );
+        assert!(!out.to_string().contains("secret") && !out.to_string().contains("c2VjcmV0"));
+        assert!(out.get("payloadBase64").is_none() && out.get("payloadTruncated").is_none());
+        assert_eq!(out["allHeaders"][1]["valueHex"], "00ff");
+    }
+
+    #[test]
+    fn tail_parts_are_read_and_bounded() {
+        assert_eq!(
+            read_part(br#"{"start":{"source":"s","segments":6,"endsAtMs":9}}"#),
+            Ok(TailEvent::Start(TailStart {
+                source: "s".into(),
+                segments: 6,
+                ends_at_ms: 9
+            }))
+        );
+        assert!(matches!(
+            read_part(br#"{"heartbeat":{"nowMs":1}}"#),
+            Ok(TailEvent::Heartbeat(_))
+        ));
+        let Ok(TailEvent::Record(summary)) = read_part(
+            br#"{"record":{"source":"s","segment":"0","position":"1","headers":{"id":"e","p":"x"}}}"#,
+        ) else {
+            panic!("a record");
+        };
+        assert_eq!(summary.headers.keys().collect::<Vec<_>>(), ["id"]);
+        assert_eq!(
+            read_part(br#"{"end":{"reason":"maxDuration"}}"#),
+            Ok(TailEvent::End(TailEnd {
+                reason: "maxDuration".into()
+            }))
+        );
+        assert_eq!(
+            read_part(br#"{"end":{"reason":"<script>"}}"#),
+            Ok(TailEvent::End(TailEnd {
+                reason: "failed".into()
+            }))
+        );
+        assert_eq!(read_part(b"{\"nope\":1}"), Err(Refusal::Failed));
+        let big = format!(
+            r#"{{"record":{{"source":"{}","segment":"0","position":"1"}}}}"#,
+            "s".repeat(MAX_PART)
+        );
+        assert_eq!(read_part(big.as_bytes()), Err(Refusal::Failed));
+    }
+
+    fn route(code: ErrorCode, details: &str) -> RouteError {
+        RouteError {
+            code,
+            message: "raw handler message".to_string(),
+            details: details.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn browser_errors_map_to_refusals_and_nothing_else_leaks() {
+        let h = ErrorCode::HandlerError;
+        for (details, want) in [
             (
-                long.name.len(),
-                long.value.as_ref().unwrap().len(),
-                long.truncated
+                r#"{"error":"invalid","message":"bad cursor"}"#,
+                Refusal::BadRequest("bad cursor".into()),
             ),
-            (MAX_HEADER_NAME, MAX_HEADER_VALUE, true)
-        );
-        assert_eq!(
             (
-                &d.all_headers[2].value,
-                d.all_headers[2].value_hex.as_deref()
+                r#"{"error":"not-found","message":"no such position"}"#,
+                Refusal::NotFound("no such position".into()),
             ),
-            (&None, Some("00ff"))
-        );
-        assert_eq!(d.all_headers[3].name, "\\xffname");
-        assert_eq!(d.payload, Some(Some(PayloadView::Text("{\"a\":1}".into()))));
-        let json = serde_json::to_value(&d).unwrap();
-        assert_eq!(json["payload"], "{\"a\":1}");
-        assert_eq!(json["headers"]["type"], "a.B");
-
-        for why in [Hidden::Off, Hidden::NoToken, Hidden::NotPresented] {
-            let d = Detail::of("kraken.events", &r, Err(why));
-            let json = serde_json::to_value(&d).unwrap();
-            assert_eq!(json["payload"]["hidden"], why.code());
-            assert!(!json.to_string().contains("\\\"a\\\":1"), "{json}");
-            assert!(json.get("payloadBase64").is_none());
+            (
+                r#"{"error":"busy","message":"4 searches"}"#,
+                Refusal::Busy("4 searches".into()),
+            ),
+            (
+                r#"{"error":"unavailable","message":"store down"}"#,
+                Refusal::Unavailable("store down".into()),
+            ),
+            (r#"{"error":"other","message":"x"}"#, Refusal::Failed),
+            (r#"{"oops":true}"#, Refusal::Failed),
+            ("not json", Refusal::Failed),
+            ("", Refusal::Failed),
+        ] {
+            assert_eq!(Refusal::from_route(route(h, details)), want, "{details}");
         }
-
-        let big = "p".repeat(MAX_PAYLOAD + 10);
-        let d = Detail::of("t", &view(0, 0, None, &[], Some(big.as_bytes())), Ok(()));
-        assert!(d.payload_truncated);
         assert_eq!(
-            d.payload,
-            Some(Some(PayloadView::Text("p".repeat(MAX_PAYLOAD))))
+            Refusal::from_route(route(ErrorCode::NoHandler, "")),
+            Refusal::NotInstalled
         );
-        let d = Detail::of("t", &view(0, 0, None, &[], Some(b"\xff\x00")), Ok(()));
-        let json = serde_json::to_value(&d).unwrap();
-        assert!(json.get("payload").is_none(), "{json}");
-        assert_eq!(json["payloadBase64"], "/wA=");
-        let d = Detail::of("t", &view(0, 0, None, &[], None), Ok(()));
-        let json = serde_json::to_value(&d).unwrap();
-        assert!(
-            json["payload"].is_null() && json.get("payload").is_some(),
-            "{json}"
+        assert_eq!(
+            Refusal::from_route(route(ErrorCode::Timeout, "")),
+            Refusal::Timeout
         );
+        assert!(matches!(
+            Refusal::from_route(route(ErrorCode::ResourceExhausted, "")),
+            Refusal::Busy(_)
+        ));
+        // A request the browser could not decode: the hub's own fault, said neutrally.
+        assert_eq!(
+            Refusal::from_route(route(ErrorCode::InvalidRequest, "")),
+            Refusal::BadRequest(UNREADABLE.to_string())
+        );
+        for code in [ErrorCode::HandlerDisconnected, ErrorCode::Cancelled] {
+            assert_eq!(Refusal::from_route(route(code, "")), Refusal::Failed);
+        }
+        // A long message is cut at a character boundary.
+        let long = format!(
+            r#"{{"error":"invalid","message":"{}"}}"#,
+            "é".repeat(MAX_MESSAGE)
+        );
+        let Refusal::BadRequest(m) = Refusal::from_route(route(h, &long)) else {
+            panic!("invalid");
+        };
+        assert!(m.len() <= MAX_MESSAGE && m.chars().all(|c| c == 'é'));
     }
 
     #[test]
@@ -1247,354 +1214,11 @@ mod tests {
             payload_access(&config(true, None, Some(write)), Some(write)),
             Ok("write-token")
         );
-    }
-
-    // ---- merge ---------------------------------------------------------------------------
-
-    /// Records of one partition: `(offset, timestamp, matches)`; offsets may have gaps.
-    type Records = Vec<(i64, i64, bool)>;
-
-    /// Partitions in memory.
-    struct Fake {
-        partitions: BTreeMap<i32, Records>,
-        reads: usize,
-        slow_after: Option<usize>,
-        /// A slow link: records it delivers before the time budget runs out (`None`: no limit).
-        allowance: Option<usize>,
-    }
-
-    impl Fake {
-        fn new(partitions: &[(i32, Records)]) -> Self {
-            Self {
-                partitions: partitions.iter().cloned().collect(),
-                reads: 0,
-                slow_after: None,
-                allowance: None,
-            }
-        }
-
-        fn ranges(&self) -> Vec<Range> {
-            self.partitions
-                .iter()
-                .map(|(p, recs)| Range {
-                    partition: *p,
-                    lower: recs.first().map_or(0, |r| r.0),
-                    upper: recs.last().map_or(0, |r| r.0 + 1),
-                })
-                .collect()
-        }
-    }
-
-    impl Chunks for Fake {
-        type Error = ();
-        fn read(
-            &mut self,
-            wants: &[Want],
-            _deadline: Instant,
-        ) -> Result<Vec<Option<Vec<Examined>>>, ()> {
-            self.reads += 1;
-            if self.slow_after.is_some_and(|n| self.reads > n) {
-                return Ok(vec![None; wants.len()]);
-            }
-            // A slow link shares what it delivers between the chunks read at once.
-            let share = self.allowance.map(|a| a / wants.len());
-            let mut out = Vec::new();
-            for w in wants {
-                let records: Vec<&(i64, i64, bool)> = self.partitions[&w.partition]
-                    .iter()
-                    .filter(|(o, ..)| (w.start..w.end).contains(o))
-                    .collect();
-                if share.is_some_and(|share| records.len() > share) {
-                    out.push(None);
-                    continue;
-                }
-                if let Some(allowance) = &mut self.allowance {
-                    *allowance -= records.len();
-                }
-                out.push(Some(
-                    records
-                        .into_iter()
-                        .map(|(offset, ts, hit)| Examined {
-                            offset: *offset,
-                            timestamp: *ts,
-                            hit: hit.then(|| Summary {
-                                topic: "t".into(),
-                                partition: w.partition,
-                                offset: *offset,
-                                timestamp: Some(*ts),
-                                key: None,
-                                key_truncated: false,
-                                headers: BTreeMap::new(),
-                                size: 0,
-                            }),
-                        })
-                        .collect(),
-                ));
-            }
-            Ok(out)
-        }
-    }
-
-    /// One page over every record of `fake`.
-    fn run(fake: &mut Fake, budget: Budget) -> Page {
-        let ranges = fake.ranges();
-        merge(fake, &ranges, budget).unwrap()
-    }
-
-    fn budget(limit: usize, max_scanned: u64) -> Budget {
-        Budget {
-            limit,
-            max_scanned,
-            deadline: Instant::now() + Duration::from_secs(60),
-        }
-    }
-
-    fn places(page: &Page) -> Vec<(i32, i64)> {
-        page.results
-            .iter()
-            .map(|s| (s.partition, s.offset))
-            .collect()
-    }
-
-    #[test]
-    fn partitions_merge_newest_first_with_ties_by_partition_then_offset() {
-        // Partition 0 is busy and old, 1 sparse and new, 2 has gaps and ties with 0.
-        let mut fake = Fake::new(&[
-            (0, (0..5).map(|o| (o, 100 + o * 10, true)).collect()),
-            (1, vec![(0, 500, true), (1, 900, true)]),
-            (2, vec![(3, 120, true), (8, 140, true), (9, 140, true)]),
-        ]);
-        let page = run(&mut fake, budget(100, 1000));
+        // Who asked, whatever the switch.
         assert_eq!(
-            places(&page),
-            vec![
-                (1, 1),
-                (1, 0),
-                (2, 9),
-                (2, 8),
-                (0, 4),
-                (0, 3),
-                // Both at 120: the higher partition first.
-                (2, 3),
-                (0, 2),
-                (0, 1),
-                (0, 0)
-            ]
+            caller(&config(false, Some(read), Some(write)), Some(write)),
+            Some("write-token")
         );
-        let times: Vec<i64> = page.results.iter().map(|s| s.timestamp.unwrap()).collect();
-        assert!(times.windows(2).all(|w| w[0] >= w[1]), "{times:?}");
-        assert!(page.exhausted);
-        assert_eq!(page.stopped_by, None);
-        assert_eq!(page.scanned, 10);
-    }
-
-    #[test]
-    fn pages_continue_from_the_cursor_without_skipping_or_repeating_a_record() {
-        // Uneven partitions, gaps, non-matching records and timestamps that interleave.
-        let mut data = Vec::new();
-        for p in 0..4i32 {
-            let records: Vec<(i64, i64, bool)> = (0..(40 + p as i64 * 37))
-                .filter(|o| (o + p as i64) % 7 != 0)
-                .map(|o| {
-                    (
-                        o,
-                        (o * (p as i64 + 3) * 11) % 1500 + o * 5,
-                        (o + p as i64) % 3 != 0,
-                    )
-                })
-                .collect();
-            data.push((p, records));
-        }
-        let mut whole = Fake::new(&data);
-        let all = run(&mut whole, budget(10_000, 1_000_000));
-        assert!(all.exhausted);
-        let expected = places(&all);
-        assert!(expected.len() > 100);
-
-        for (limit, max_scanned) in [(7, 1_000_000), (100, 23), (3, 9), (50, 4)] {
-            let mut fake = Fake::new(&data);
-            let mut ranges = fake.ranges();
-            let mut got = Vec::new();
-            for _ in 0..10_000 {
-                let page = merge(&mut fake, &ranges, budget(limit, max_scanned)).unwrap();
-                assert!(page.results.len() <= limit);
-                got.extend(places(&page));
-                if page.exhausted {
-                    assert_eq!(page.stopped_by, None);
-                    break;
-                }
-                assert!(page.stopped_by.is_some());
-                // The next page: the same lower bounds, the cursor's upper bounds.
-                ranges = ranges
-                    .iter()
-                    .map(|r| Range {
-                        upper: page
-                            .positions
-                            .iter()
-                            .find(|(p, _)| *p == r.partition)
-                            .unwrap()
-                            .1,
-                        ..*r
-                    })
-                    .collect();
-            }
-            assert_eq!(got, expected, "limit {limit}, scan budget {max_scanned}");
-        }
-    }
-
-    /// Many partitions on a slow link: the time budget ends every page long before one chunk
-    /// of each partition arrives one by one. Every page still moves on, and the pages together
-    /// are the whole list, in order, nothing twice.
-    #[test]
-    fn many_partitions_on_a_slow_link_make_progress_page_by_page() {
-        let data: Vec<(i32, Records)> = (0..24)
-            .map(|p| {
-                let records = (0..300)
-                    .map(|o| (o, (o * 24 + p as i64) * 10, (o + p as i64) % 5 == 0))
-                    .collect();
-                (p, records)
-            })
-            .collect();
-        let expected = places(&run(&mut Fake::new(&data), budget(10_000, 10_000_000)));
-        assert_eq!(expected.len(), 24 * 60);
-
-        let mut fake = Fake::new(&data);
-        let mut ranges = fake.ranges();
-        let mut got = Vec::new();
-        for pages in 1.. {
-            assert!(pages < 1000, "{} of {} found", got.len(), expected.len());
-            fake.allowance = Some(2_000);
-            let page = merge(&mut fake, &ranges, budget(50, 50_000)).unwrap();
-            got.extend(places(&page));
-            if page.exhausted {
-                break;
-            }
-            let next: Vec<Range> = ranges
-                .iter()
-                .map(|r| Range {
-                    upper: page
-                        .positions
-                        .iter()
-                        .find(|(p, _)| *p == r.partition)
-                        .unwrap()
-                        .1,
-                    ..*r
-                })
-                .collect();
-            assert!(
-                !page.results.is_empty() || next != ranges,
-                "page {pages} made no progress: {:?}",
-                page.positions
-            );
-            ranges = next;
-        }
-        assert_eq!(got, expected);
-    }
-
-    /// A chunk full of matches keeps only the summaries the page can still return (here 3 of
-    /// 400 per partition); the rest is read again by the next page, so nothing is lost.
-    #[test]
-    fn a_chunk_full_of_matches_is_trimmed_without_losing_a_record() {
-        let mut fake = Fake::new(&[
-            (0, (0..400).map(|o| (o, o * 2, true)).collect()),
-            (1, (0..400).map(|o| (o, o * 2 + 1, true)).collect()),
-        ]);
-        let page = run(&mut fake, budget(3, 10_000));
-        assert_eq!(places(&page), vec![(1, 399), (0, 399), (1, 398)]);
-        assert_eq!(page.positions, vec![(0, 399), (1, 398)]);
-        let next = merge(
-            &mut fake,
-            &[
-                Range {
-                    partition: 0,
-                    lower: 0,
-                    upper: 399,
-                },
-                Range {
-                    partition: 1,
-                    lower: 0,
-                    upper: 398,
-                },
-            ],
-            budget(3, 10_000),
-        )
-        .unwrap();
-        assert_eq!(places(&next), vec![(0, 398), (1, 397), (0, 397)]);
-    }
-
-    #[test]
-    fn the_scan_budget_stops_a_search_and_counts_what_was_read() {
-        let mut fake = Fake::new(&[
-            (0, (0..300).map(|o| (o, o, false)).collect()),
-            (1, (0..300).map(|o| (o, o, false)).collect()),
-        ]);
-        let page = run(&mut fake, budget(10, 100));
-        assert_eq!(page.stopped_by, Some(StoppedBy::ScanBudget));
-        assert!(!page.exhausted);
-        assert_eq!(page.scanned, 100);
-        assert!(page.results.is_empty());
-        // Progress: the positions moved down from 300.
-        assert!(
-            page.positions.iter().all(|(_, o)| *o < 300),
-            "{:?}",
-            page.positions
-        );
-    }
-
-    #[test]
-    fn the_time_budget_stops_a_search_with_what_it_found() {
-        let mut fake = Fake::new(&[(0, (0..2000).map(|o| (o, o, true)).collect())]);
-        fake.slow_after = Some(1);
-        let page = run(&mut fake, budget(5000, 1_000_000));
-        assert_eq!(page.stopped_by, Some(StoppedBy::TimeBudget));
-        assert_eq!(page.results.len(), FIRST_CHUNK);
-        assert_eq!(page.positions, vec![(0, 2000 - FIRST_CHUNK as i64)]);
-
-        let mut fake = Fake::new(&[(0, vec![(0, 0, true)])]);
-        let past = Budget {
-            deadline: Instant::now(),
-            ..budget(10, 10)
-        };
-        let page = run(&mut fake, past);
-        assert_eq!(page.stopped_by, Some(StoppedBy::TimeBudget));
-        assert_eq!(
-            page.positions,
-            vec![(0, 1)],
-            "nothing read, nothing skipped"
-        );
-    }
-
-    #[test]
-    fn a_search_hitting_the_limit_on_its_last_record_is_exhausted() {
-        let mut fake = Fake::new(&[(0, vec![(0, 0, true), (1, 1, true)])]);
-        let page = run(&mut fake, budget(2, 100));
-        assert!(page.exhausted);
-        assert_eq!(page.stopped_by, None);
-        let mut fake = Fake::new(&[(0, vec![(0, 0, true), (1, 1, true), (2, 2, true)])]);
-        let page = run(&mut fake, budget(2, 100));
-        assert!(!page.exhausted);
-        assert_eq!(page.stopped_by, Some(StoppedBy::Limit));
-        assert_eq!(page.positions, vec![(0, 1)]);
-    }
-
-    #[test]
-    fn empty_ranges_are_exhausted_at_once() {
-        let mut fake = Fake::new(&[(0, vec![]), (1, vec![])]);
-        let page = run(&mut fake, budget(10, 10));
-        assert!(page.exhausted);
-        assert_eq!(page.scanned, 0);
-        assert_eq!(fake.reads, 0);
-        // A range that is empty because from/to resolved past the end.
-        let page = merge(
-            &mut fake,
-            &[Range {
-                partition: 0,
-                lower: 50,
-                upper: 10,
-            }],
-            budget(10, 10),
-        )
-        .unwrap();
-        assert!(page.exhausted);
+        assert_eq!(caller(&config(false, Some(read), None), None), None);
     }
 }

@@ -76,9 +76,35 @@ export function confirmDialog({ title, lines, extra = null, confirm }) {
   });
 }
 
-/** The reason a control call failed, from the hub's JSON (`error`) or the status. */
+/** One instance's answer (`{ result, code, message, instanceId }`) as text, or null. */
+function answerText(a) {
+  if (!a || typeof a !== 'object' || typeof a.result !== 'string') return null;
+  const what = typeof a.code === 'string' && a.code ? `refused ${a.code}` : a.result;
+  const message = typeof a.message === 'string' && a.message ? `: ${a.message}` : '';
+  const by = typeof a.instanceId === 'string' && a.instanceId ? ` (instance ${a.instanceId})` : '';
+  return `${what}${message}${by}`;
+}
+
+/**
+ * The reason a control call failed, from the hub's JSON or the status: the hub's `error` text
+ * (with the instance's refusal code when it names one), the answer that ended a reset (`error`
+ * as an object), or the first instance of a pause or resume that did not confirm.
+ */
+function reasonOf(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (typeof data.error === 'string') {
+    return typeof data.code === 'string' && data.code ? `${data.error} (${data.code})` : data.error;
+  }
+  const ended = answerText(data.error);
+  if (ended) return ended;
+  const instances = Array.isArray(data.instances) ? data.instances : [];
+  const failed = instances.find((i) => i && i.result !== 'ok');
+  return failed ? answerText(failed) : null;
+}
+
+/** The reason a control call failed, as the status line shows it. */
 export function failure(result) {
-  const reason = result.data && typeof result.data.error === 'string' ? result.data.error : null;
+  const reason = reasonOf(result.data);
   if (result.status === 401) return 'The hub did not accept the write token.';
   if (result.status === 403) return reason || 'This credential may not control processors.';
   return `HTTP ${result.status}${reason ? `: ${reason}` : ''}`;

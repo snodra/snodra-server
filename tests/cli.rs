@@ -44,7 +44,7 @@ async fn topology_probe_against_test_hub() {
 /// table shows them under their service.
 #[tokio::test]
 async fn topology_probe_shows_the_processors_an_instance_reports() {
-    use kraken_hub::proto::{PartitionStatus, ProcessorState, ProcessorStatus};
+    use kraken_hub::proto::{ProcessorState, ProcessorStatus, SegmentStatus};
     let addr = start_hub(Config {
         otlp_endpoint: None,
         ..Config::default()
@@ -55,16 +55,16 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
         &["hub"],
         vec![ProcessorStatus {
             name: "invoices".to_string(),
-            group_id: "billing.invoices".to_string(),
-            topic: "kraken.events".to_string(),
+            subscription: "billing.invoices".to_string(),
+            source: "kraken.events".to_string(),
             state: ProcessorState::ProcessorRunning as i32,
-            partitions: vec![PartitionStatus {
-                partition: 0,
-                position: 4,
-                committed: 4,
-                high_watermark: 6,
+            segments: vec![SegmentStatus {
+                segment: "0".to_string(),
+                position: "4".to_string(),
+                committed: "4".to_string(),
+                head: "6".to_string(),
                 lag: 2,
-                replay_until: 0,
+                replay_until: String::new(),
             }],
             dead_letter_mode: "collection".to_string(),
             ..Default::default()
@@ -89,7 +89,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
     assert!(text.contains("processor | instance"), "{text}");
     assert!(
         text.contains("invoices  | ")
-            && text.contains("| RUNNING | billing.invoices | kraken.events | 0          | 2 "),
+            && text.contains("| RUNNING | billing.invoices | kraken.events | 0        | 2 "),
         "{text}"
     );
 }

@@ -1,6 +1,6 @@
 // kraken-hub dashboard: hash routing, the header, live updates; the processor controls need a
-// write credential (ADR 0023); the event browser's pages (ADR 0025) show only where the hub reads
-// Kafka. No third-party code.
+// write credential (ADR 0023); the Events page (ADR 0025, ADR 0027) shows only while an event
+// browser add-on is connected to the hub. No third-party code.
 
 import * as api from './api.js';
 import { badge, fill, h } from './dom.js';
@@ -8,7 +8,6 @@ import * as fmt from './format.js';
 import { hideTip } from './graph.js';
 import deadLetters from './pages/deadletters.js';
 import events from './pages/events.js';
-import groups from './pages/groups.js';
 import * as hubs from './hubs.js';
 import { startLive } from './live.js';
 import { showLogin } from './login.js';
@@ -37,12 +36,11 @@ const PAGES = [
   processors,
   deadLetters,
   events,
-  groups,
   settings,
 ];
 
-/** False for an event browser page while this hub does not read Kafka (its nav entry hides). */
-const shown = (p) => !p.browser || Boolean(version?.eventBrowser?.enabled);
+/** False for an event browser page while no event browser is connected (its nav entry hides). */
+const shown = (p) => !p.browser || Boolean(version?.eventBrowser?.installed);
 
 const $ = (id) => document.getElementById(id);
 const main = $('main');

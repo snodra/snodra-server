@@ -48,6 +48,15 @@ pub type Digest = [u8; 32];
 /// The only context contexts-aware ACL files may name (contexts are deferred, roadmap P8).
 pub const DEFAULT_CONTEXT: &str = "default";
 
+/// The reserved namespace of the event browser's query types (ADR 0027): only a session whose
+/// ACL entry has `event-browser = true` may register a type in it, whatever its `handle` says.
+pub const EVENTS_NAMESPACE: &str = "kraken.events.";
+
+/// True when `type_name` is in [`EVENTS_NAMESPACE`] (the namespace itself is not a type).
+pub fn is_events_type(type_name: &str) -> bool {
+    type_name.len() > EVENTS_NAMESPACE.len() && type_name.starts_with(EVENTS_NAMESPACE)
+}
+
 /// Constant-time comparison, the only way this module (and the dashboard token check) compares
 /// secret-derived bytes.
 pub mod ct {
@@ -321,6 +330,46 @@ fn any_matches(patterns: &[Pattern], type_name: &str) -> bool {
     patterns.iter().any(|p| p.matches(type_name))
 }
 
+/// True when a `send` list grants `type_name`. A type of the event browser's namespace needs a
+/// pattern that names the namespace (`kraken.events.*`) or the type itself: `*` and broader
+/// prefixes such as `kraken.*` do not grant it, as `handle` never does.
+fn may_send(patterns: &[Pattern], type_name: &str) -> bool {
+    if !is_events_type(type_name) {
+        return any_matches(patterns, type_name);
+    }
+    patterns.iter().any(|p| match p {
+        Pattern::Any => false,
+        Pattern::Prefix(prefix) => prefix.starts_with(EVENTS_NAMESPACE) && p.matches(type_name),
+        Pattern::Exact(_) => p.matches(type_name),
+    })
+}
+
+/// True when `pattern` reaches for the event browser's namespace: a prefix of or within it, or
+/// one of its types. A bare `*` (an entry's "everything else") does not count.
+fn covers_events(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Any => false,
+        Pattern::Prefix(prefix) => {
+            EVENTS_NAMESPACE.starts_with(prefix.as_str()) || prefix.starts_with(EVENTS_NAMESPACE)
+        }
+        Pattern::Exact(e) => is_events_type(e),
+    }
+}
+
+/// Warns about each `handle` pattern of entry `at` that covers the event browser's types: it
+/// never grants them (only `event-browser = true` does), which the operator may not expect.
+fn warn_events_handle(at: &str, handle: &[Pattern], raw: &[String]) {
+    for (pattern, text) in handle.iter().zip(raw) {
+        if covers_events(pattern) {
+            warn!(
+                entry = %at,
+                pattern = %text,
+                "ACL handle pattern covers kraken.events.* types, which handle never grants: the event browser needs event-browser = true"
+            );
+        }
+    }
+}
+
 /// What one token may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclEntry {
@@ -333,6 +382,8 @@ pub struct AclEntry {
     pub send: Vec<Pattern>,
     /// The token may also call the hub's processor controls (ADR 0023).
     pub control: bool,
+    /// The token may register the event browser's `kraken.events.*` types (ADR 0027).
+    pub event_browser: bool,
     /// Free text for the operator ("rotation 2026-11"); never used for decisions.
     pub label: Option<String>,
 }
@@ -344,6 +395,7 @@ impl AclEntry {
             handle: &self.handle,
             send: &self.send,
             control: self.control,
+            event_browser: self.event_browser,
         }
     }
 }
@@ -357,6 +409,9 @@ pub struct Rights<'a> {
     pub send: &'a [Pattern],
     /// The processor controls of the HTTP API (ADR 0023).
     pub control: bool,
+    /// Registering the event browser's `kraken.events.*` types (ADR 0027); `handle` never
+    /// grants them.
+    pub event_browser: bool,
 }
 
 /// The ACL entry a credential resolves through.
@@ -466,6 +521,8 @@ pub struct ServiceEntry {
     pub send: Vec<Pattern>,
     /// The service's JWTs may also call the hub's processor controls (ADR 0023).
     pub control: bool,
+    /// The service may register the event browser's `kraken.events.*` types (ADR 0027).
+    pub event_browser: bool,
 }
 
 impl ServiceEntry {
@@ -475,6 +532,7 @@ impl ServiceEntry {
             handle: &self.handle,
             send: &self.send,
             control: self.control,
+            event_browser: self.event_browser,
         }
     }
 }
@@ -505,6 +563,8 @@ struct RawService {
     send: Vec<String>,
     #[serde(default)]
     control: bool,
+    #[serde(default, rename = "event-browser")]
+    event_browser: bool,
     contexts: Option<Vec<String>>,
 }
 
@@ -537,6 +597,8 @@ struct RawEntry {
     send: Vec<String>,
     #[serde(default)]
     control: bool,
+    #[serde(default, rename = "event-browser")]
+    event_browser: bool,
     contexts: Option<Vec<String>>,
     label: Option<String>,
 }
@@ -563,11 +625,14 @@ impl Acl {
                 anyhow::bail!("{at}: service must not be empty");
             }
             check_contexts(&at, e.contexts.as_ref())?;
+            let handle = parse_patterns(&at, "handle", &e.handle)?;
+            warn_events_handle(&at, &handle, &e.handle);
             entries.push(AclEntry {
                 digest,
-                handle: parse_patterns(&at, "handle", &e.handle)?,
+                handle,
                 send: parse_patterns(&at, "send", &e.send)?,
                 control: e.control,
+                event_browser: e.event_browser,
                 label: e.label,
                 service: e.service,
             });
@@ -583,10 +648,13 @@ impl Acl {
                 anyhow::bail!("{at}: duplicate [[service]] name");
             }
             check_contexts(&at, e.contexts.as_ref())?;
+            let handle = parse_patterns(&at, "handle", &e.handle)?;
+            warn_events_handle(&at, &handle, &e.handle);
             services.push(ServiceEntry {
-                handle: parse_patterns(&at, "handle", &e.handle)?,
+                handle,
                 send: parse_patterns(&at, "send", &e.send)?,
                 control: e.control,
+                event_browser: e.event_browser,
                 name: e.name,
             });
         }
@@ -1734,14 +1802,22 @@ impl Authorizer {
                     clip(sender_service)
                 ),
             )),
-            Some(rights) if !any_matches(rights.send, type_name) => Some(Denied::new(
+            Some(rights) if !may_send(rights.send, type_name) => Some(Denied::new(
                 "send_denied",
                 DeniedCode::PermissionDenied,
-                format!(
-                    "service {} is not allowed to send type {}",
-                    clip(sender_service),
-                    clip(type_name)
-                ),
+                if is_events_type(type_name) {
+                    format!(
+                        "service {} is not allowed to send type {}: {EVENTS_NAMESPACE}* types need a send pattern naming kraken.events",
+                        clip(sender_service),
+                        clip(type_name)
+                    )
+                } else {
+                    format!(
+                        "service {} is not allowed to send type {}",
+                        clip(sender_service),
+                        clip(type_name)
+                    )
+                },
             )),
             Some(_) => None,
         };
@@ -1794,7 +1870,24 @@ fn entry_gone(key: &AclKey) -> Denied {
     }
 }
 
-/// The checks of an entry that matched: the service name, then every handled type.
+/// `type A` or `types A, B` and, past [`MAX_LISTED_TYPES`], `and N more`: one denial names all
+/// the offending types of a `Register` (a client may offer thousands).
+fn listed(types: &[&String]) -> String {
+    let shown: Vec<String> = types
+        .iter()
+        .take(MAX_LISTED_TYPES)
+        .map(|t| clip(t))
+        .collect();
+    let more = match types.len().saturating_sub(MAX_LISTED_TYPES) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    let noun = if types.len() == 1 { "type" } else { "types" };
+    format!("{noun} {}{more}", shown.join(", "))
+}
+
+/// The checks of an entry that matched: the service name, every handled type against `handle`,
+/// then the event browser's types against the `event-browser` right.
 fn judge(
     rights: Rights<'_>,
     principal: &Principal,
@@ -1823,33 +1916,34 @@ fn judge(
             },
         ));
     }
-    let offending: Vec<&String> = handled
-        .iter()
+    // The event browser's namespace is the `event-browser` right's alone (ADR 0027): `handle`
+    // never grants it, so `handle = ["*"]` cannot register a browser by accident. Its denial
+    // comes first: a Register refused for both says why the reserved types were refused.
+    let (events, others): (Vec<&String>, Vec<&String>) =
+        handled.iter().partition(|t| is_events_type(t));
+    if !rights.event_browser && !events.is_empty() {
+        out.push(Denied::new(
+            "event_browser_denied",
+            DeniedCode::PermissionDenied,
+            format!(
+                "service {} may not handle {}: {EVENTS_NAMESPACE}* types need the event-browser right",
+                clip(service),
+                listed(&events)
+            ),
+        ));
+    }
+    let offending: Vec<&String> = others
+        .into_iter()
         .filter(|t| !any_matches(rights.handle, t))
         .collect();
     if !offending.is_empty() {
-        // One denial for all of them: a client may offer thousands of types.
-        let shown: Vec<String> = offending
-            .iter()
-            .take(MAX_LISTED_TYPES)
-            .map(|t| clip(t))
-            .collect();
-        let more = match offending.len().saturating_sub(MAX_LISTED_TYPES) {
-            0 => String::new(),
-            n => format!(" and {n} more"),
-        };
         out.push(Denied::new(
             "handle_denied",
             DeniedCode::PermissionDenied,
             format!(
-                "service {} is not allowed to handle {} {}{more}",
+                "service {} is not allowed to handle {}",
                 clip(service),
-                if offending.len() == 1 {
-                    "type"
-                } else {
-                    "types"
-                },
-                shown.join(", ")
+                listed(&offending)
             ),
         ));
     }
@@ -2682,6 +2776,292 @@ handle = ["*"]
         assert!(only.rights(&AclKey::Service("x".into())).is_some());
         // Two ACLs that differ only in a service table differ (a reload must notice).
         assert_ne!(Acl::parse(&acl_text()).unwrap(), acl);
+    }
+
+    // ---- the event-browser right (ADR 0027) ----
+
+    /// A browser token with the right, a token handling `*` without it, and the same pair as
+    /// `[[service]]` tables.
+    fn event_browser_acl_text() -> String {
+        format!(
+            r#"
+[[token]]
+token_sha256 = "{browser}"
+service = "kraken-event-browser"
+event-browser = true
+
+[[token]]
+token_sha256 = "{orders}"
+service = "orders"
+handle = ["*"]
+
+[[service]]
+name = "kraken-event-browser"
+event-browser = true
+
+[[service]]
+name = "orders"
+handle = ["*"]
+event-browser = false
+"#,
+            browser = hex("tok-browser"),
+            orders = hex("tok-orders")
+        )
+    }
+
+    #[test]
+    fn event_browser_right_parses_in_acl() {
+        let acl = Acl::parse(&event_browser_acl_text()).unwrap();
+        let browser = acl.lookup(&digest_of("tok-browser")).unwrap();
+        assert!(browser.event_browser);
+        assert!(!acl.lookup(&digest_of("tok-orders")).unwrap().event_browser);
+        assert!(
+            acl.rights(&tok("tok-browser", "kraken-event-browser").key)
+                .unwrap()
+                .event_browser
+        );
+        let service = |name: &str| {
+            acl.rights(&AclKey::Service(name.into()))
+                .unwrap()
+                .event_browser
+        };
+        assert!(service("kraken-event-browser"));
+        assert!(!service("orders"));
+        // Absent is false, in both tables.
+        let plain = Acl::parse(&service_acl_text()).unwrap();
+        assert!(
+            !plain
+                .lookup(&digest_of("tok-billing"))
+                .unwrap()
+                .event_browser
+        );
+        assert!(
+            !plain
+                .rights(&AclKey::Service("billing".into()))
+                .unwrap()
+                .event_browser
+        );
+        // A value that is not a boolean, or the right misspelt, is an error.
+        let with = |line: &str| {
+            format!(
+                "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"s\"\n{line}\n",
+                hex("t")
+            )
+        };
+        assert!(Acl::parse(&with("event-browser = \"yes\"")).is_err());
+        assert!(Acl::parse(&with("event_browser = true")).is_err());
+        assert!(Acl::parse("[[service]]\nname = \"s\"\nevent-browser = 1\n").is_err());
+        // Two ACLs that differ only in the right differ (a reload must notice).
+        let without = event_browser_acl_text().replace("event-browser = true", "");
+        assert_ne!(Acl::parse(&without).unwrap(), acl);
+    }
+
+    #[test]
+    fn events_types_need_the_event_browser_right() {
+        let m = test_metrics();
+        let acl = Acl::parse(&event_browser_acl_text()).unwrap();
+        let a = Authorizer::with_acl(AuthMode::Enforce, acl.clone(), m.metrics.clone());
+        let events = types(&["kraken.events.Search", "kraken.events.Tail"]);
+
+        // With the right: the reserved types register, and need no `handle` pattern.
+        let ok = a.admit(Some(&token("tok-browser")), "kraken-event-browser", &events);
+        assert_eq!(ok.refused, None);
+        // The right grants the reserved namespace only.
+        let other = a.admit(
+            Some(&token("tok-browser")),
+            "kraken-event-browser",
+            &types(&["kraken.events.Get", "orders.Get"]),
+        );
+        assert_eq!(other.refused.unwrap().reason, "handle_denied");
+
+        // Without it, even `handle = ["*"]` does not cover them: the whole Register is refused,
+        // naming the right and the type.
+        let refused = a
+            .admit(
+                Some(&token("tok-orders")),
+                "orders",
+                &types(&["orders.Get", "kraken.events.Search"]),
+            )
+            .refused
+            .expect("refused");
+        assert_eq!(refused.reason, "event_browser_denied");
+        assert_eq!(refused.code, DeniedCode::PermissionDenied);
+        assert_eq!(
+            refused.message,
+            "service orders may not handle type kraken.events.Search: kraken.events.* types need the event-browser right"
+        );
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "event_browser_denied"
+            ),
+            Some(1)
+        );
+        // Several are listed as `handle_denied` lists them.
+        let many = a.recheck(Some(&tok("tok-orders", "orders")), "orders", &events);
+        assert_eq!(many.len(), 1, "{many:?}");
+        assert!(
+            many[0]
+                .message
+                .contains("types kraken.events.Search, kraken.events.Tail"),
+            "{}",
+            many[0].message
+        );
+        // Only the namespace is reserved: neighbours are ordinary types.
+        assert!(
+            a.recheck(
+                Some(&tok("tok-orders", "orders")),
+                "orders",
+                &types(&["kraken.eventsX.Search", "kraken.Search"]),
+            )
+            .is_empty()
+        );
+
+        // JWT and certificate sessions resolve through `[[service]]` tables: the same rule.
+        let jwt =
+            |service: &str| Principal::jwt(service, SystemTime::now() + Duration::from_secs(3600));
+        assert!(
+            a.recheck(
+                Some(&jwt("kraken-event-browser")),
+                "kraken-event-browser",
+                &events
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            a.recheck(Some(&jwt("orders")), "orders", &events)[0].reason,
+            "event_browser_denied"
+        );
+
+        // A reload that takes the right away closes the browser's session.
+        let without = event_browser_acl_text().replace("event-browser = true", "");
+        let reloaded = Authorizer::with_acl(
+            AuthMode::Enforce,
+            Acl::parse(&without).unwrap(),
+            m.metrics.clone(),
+        );
+        let denials = reloaded.recheck(
+            Some(&tok("tok-browser", "kraken-event-browser")),
+            "kraken-event-browser",
+            &events,
+        );
+        assert_eq!(denials[0].reason, "event_browser_denied");
+
+        // Permissive counts and allows; off checks nothing.
+        let p = Authorizer::with_acl(AuthMode::Permissive, acl.clone(), m.metrics.clone());
+        assert_eq!(
+            p.admit(Some(&token("tok-orders")), "orders", &events)
+                .refused,
+            None
+        );
+        assert_eq!(
+            m.counter(
+                "kraken_hub_auth_violations_total",
+                "reason",
+                "event_browser_denied"
+            ),
+            Some(2)
+        );
+        let off = Authorizer::with_acl(AuthMode::Off, acl, m.metrics.clone());
+        assert_eq!(off.admit(None, "orders", &events).refused, None);
+    }
+
+    #[test]
+    fn a_mixed_register_reports_the_event_browser_denial_first() {
+        let (a, _m) = authorizer(AuthMode::Enforce);
+        // `billing` handles `billing.*` only: both the handle and the event-browser checks fail.
+        let refused = a
+            .admit(
+                Some(&token("tok-billing")),
+                "billing",
+                &types(&["admin.Wipe", "kraken.events.Search"]),
+            )
+            .refused
+            .expect("refused");
+        assert_eq!(refused.reason, "event_browser_denied");
+        let all = a.recheck(
+            Some(&tok("tok-billing", "billing")),
+            "billing",
+            &types(&["admin.Wipe", "kraken.events.Search"]),
+        );
+        let reasons: Vec<&str> = all.iter().map(|d| d.reason).collect();
+        assert_eq!(reasons, ["event_browser_denied", "handle_denied"]);
+    }
+
+    #[test]
+    fn sending_events_types_needs_a_send_pattern_naming_them() {
+        let entry = |t: &str, send: &str| {
+            format!(
+                "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"{t}\"\nsend = [\"{send}\"]\n",
+                hex(t)
+            )
+        };
+        let text = [
+            entry("any", "*"),
+            entry("kraken", "kraken.*"),
+            entry("events", "kraken.events.*"),
+            entry("search", "kraken.events.Search"),
+        ]
+        .join("\n");
+        let m = test_metrics();
+        let a = Authorizer::with_acl(AuthMode::Enforce, Acl::parse(&text).unwrap(), m.metrics);
+        let send = |t: &str, type_name: &str| a.check_send(Some(&tok(t, t)), t, type_name);
+        // `*` and `kraken.*` grant every other type, not the event browser's.
+        assert!(send("any", "orders.Place").is_ok());
+        assert!(send("kraken", "kraken.Other").is_ok());
+        for t in ["any", "kraken"] {
+            let denied = send(t, "kraken.events.Search").unwrap_err();
+            assert_eq!(denied.reason, "send_denied");
+            assert_eq!(
+                denied.message,
+                format!(
+                    "service {t} is not allowed to send type kraken.events.Search: kraken.events.* types need a send pattern naming kraken.events"
+                )
+            );
+        }
+        // A pattern that names the namespace, or the type, grants it.
+        assert!(send("events", "kraken.events.Search").is_ok());
+        assert!(send("events", "kraken.events.Tail").is_ok());
+        assert!(send("search", "kraken.events.Search").is_ok());
+        assert!(send("search", "kraken.events.Tail").is_err());
+    }
+
+    #[test]
+    fn a_handle_pattern_covering_the_events_namespace_warns_at_parse() {
+        crate::telemetry::test_support::capture_logs();
+        let entry = |t: &str, handle: &str| {
+            format!(
+                "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"{t}\"\nhandle = [\"{handle}\"]\n",
+                hex(t)
+            )
+        };
+        let text = [
+            entry("any", "*"),
+            entry("kraken", "kraken.*"),
+            entry("events", "kraken.events.*"),
+            entry("search", "kraken.events.Search"),
+            entry("orders", "orders.*"),
+            "[[service]]\nname = \"svc\"\nhandle = [\"kraken.events.Get\"]\n".to_string(),
+        ]
+        .join("\n");
+        Acl::parse(&text).unwrap();
+        let warned: Vec<String> = crate::telemetry::test_support::logged()
+            .into_iter()
+            .filter(|l| l.message.contains("never grants"))
+            .map(|l| l.field("pattern").unwrap_or_default().to_string())
+            .collect();
+        // A bare `*` is the usual "everything else" of an entry, not a reach for the namespace:
+        // no warning for it.
+        assert_eq!(
+            warned,
+            [
+                "kraken.*",
+                "kraken.events.*",
+                "kraken.events.Search",
+                "kraken.events.Get"
+            ]
+        );
     }
 
     #[test]

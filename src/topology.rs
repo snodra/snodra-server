@@ -680,16 +680,16 @@ mod tests {
             handlers_in_flight: 0,
             processors: vec![proto::ProcessorStatus {
                 name: "default".into(),
-                group_id: "svc".into(),
-                topic: "kraken.events".into(),
+                subscription: "svc".into(),
+                source: "kraken.events".into(),
                 state: proto::ProcessorState::ProcessorFailing as i32,
-                partitions: vec![proto::PartitionStatus {
-                    partition: 0,
-                    position: 7,
-                    committed: 5,
-                    high_watermark: 9,
+                segments: vec![proto::SegmentStatus {
+                    segment: "0".into(),
+                    position: "7".into(),
+                    committed: "5".into(),
+                    head: "9".into(),
                     lag: 4,
-                    replay_until: 8,
+                    replay_until: "8".into(),
                 }],
                 processed_total: 6,
                 failed_total: 1,
@@ -700,6 +700,8 @@ mod tests {
                 dead_letter_mode: "collection".into(),
                 replaying: true,
                 operation_id: "op-1".into(),
+                event_store: "kafka".into(),
+                capabilities: vec!["lag".into(), "replay".into()],
             }],
         };
         assert!(
@@ -738,14 +740,19 @@ mod tests {
         let reported = &json["services"][0]["instances"][0]["processors"][0];
         assert_eq!(reported["name"], "default");
         assert_eq!(reported["state"], "FAILING");
-        assert_eq!(reported["groupId"], "svc");
-        assert_eq!(reported["partitions"][0]["highWatermark"], 9);
+        assert_eq!(reported["subscription"], "svc");
+        assert_eq!(reported["eventStore"], "kafka");
+        assert_eq!(
+            reported["capabilities"],
+            serde_json::json!(["lag", "replay"])
+        );
+        assert_eq!(reported["segments"][0]["head"], "9");
         assert_eq!(reported["lastErrorAtMs"], 42);
         assert_eq!(reported["deadLetterMode"], "collection");
         // The control plane's fields (ADR 0023) ride along.
         assert_eq!(reported["replaying"], true);
         assert_eq!(reported["operationId"], "op-1");
-        assert_eq!(reported["partitions"][0]["replayUntil"], 8);
+        assert_eq!(reported["segments"][0]["replayUntil"], "8");
         assert_eq!(
             json["services"][0]["instances"][1]["processors"],
             serde_json::json!([])

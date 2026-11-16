@@ -35,6 +35,9 @@
 //! ending path removes both entries, sends the sender its `ReplyEnd` where one is due and every
 //! target still serving a `Cancel`.
 //!
+//! Hub-originated requests (ADR 0027, [`Router::query_internal`], [`Router::stream_internal`]):
+//! the hub is the sender, through a session of its own per request and the same paths.
+//!
 //! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
 //! A session is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
@@ -65,6 +68,12 @@ use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
 use crate::session::{SendError, SenderInfo, Sessions};
 use crate::telemetry::{
     FlowGauges, Metrics, OTHER_TYPE, Outcome, kind_label, set_parent_from_headers,
+};
+
+mod internal;
+
+pub use internal::{
+    HUB_SERVICE, INSTANCE_PREFIX as HUB_INSTANCE_PREFIX, MAX_INTERNAL_STREAM_CREDIT, RouteError,
 };
 
 /// How long a terminal message waits for room in a full sender buffer before it is given up.

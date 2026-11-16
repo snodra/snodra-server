@@ -164,7 +164,7 @@ pub struct Config {
     /// positive, at most [`Config::control_lease`] minus [`Config::control_lease_renew`].
     pub control_timeout: Duration,
     /// How long the instance that executes a reset may take (its reset handlers, the marker
-    /// deletion and the offset commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
+    /// deletion and the position commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
     pub reset_timeout: Duration,
     /// The lease a reset's prepare asks for: an instance that hears nothing more for this long
     /// releases the operation lock and consumes again. Not an environment variable: 30 s,
@@ -173,41 +173,17 @@ pub struct Config {
     /// How often a running reset renews the lease; below [`Config::control_lease`]. Not an
     /// environment variable: 10 s, shortened by tests.
     pub control_lease_renew: Duration,
-    /// The Kafka bootstrap servers the event browser reads (ADR 0025), plaintext like the
-    /// libraries. `KRAKEN_HUB_KAFKA_BOOTSTRAP`, default none: the event browser and the
-    /// consumer-group view are off (404). The hub never needs Kafka to start or to route.
-    pub kafka_bootstrap: Option<String>,
-    /// The only topics the event browser and the tail read; the first is the default.
-    /// `KRAKEN_HUB_EVENT_TOPICS`, comma-separated, default `kraken.events`. A dead-letter topic
-    /// (`<topic>.dlt`) is browsable when listed. A listed topic that does not exist is reported
-    /// as missing.
-    pub event_topics: Vec<String>,
     /// Payloads are served (the record detail and the `q` filter) only when this is on, a
-    /// dashboard or write token is configured and the request presents one (ADR 0025).
-    /// `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS`, default false.
+    /// dashboard or write token is configured and the request presents one (ADR 0025): the hub
+    /// asks the event browser for a payload only then. `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS`,
+    /// default false.
     pub event_payloads: bool,
-    /// Records one search reads from Kafka at most. `KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED`,
-    /// default 50 000, positive.
-    pub event_search_max_scanned: u64,
-    /// Results one search page returns at most (its `limit` is clamped to it).
-    /// `KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS`, default 100, 1 to 1000.
-    pub event_search_max_results: usize,
-    /// The time budget of one search, record read or consumer-group listing, Kafka calls
-    /// included. `KRAKEN_HUB_EVENT_SEARCH_TIMEOUT`, default 10 s, positive.
-    pub event_search_timeout: Duration,
-    /// Searches, record reads and consumer-group listings running at once on this hub; one more
-    /// is answered 429. `KRAKEN_HUB_EVENT_MAX_SEARCHES`, default 4, positive.
-    pub event_max_searches: usize,
-    /// Tails open at once on this hub; one more is answered 429. `KRAKEN_HUB_EVENT_MAX_TAILS`,
-    /// default 4, positive.
+    /// Event tails (`/api/v1/events/tail`) open at once on this hub; one more is answered 429.
+    /// `KRAKEN_HUB_EVENT_MAX_TAILS`, default 4, 1 to [`MAX_EVENT_TAILS`].
     pub event_max_tails: usize,
-    /// A tail ends (`event: end`) after this long. `KRAKEN_HUB_EVENT_TAIL_DURATION`, default
-    /// 15 m, at least 1 s.
-    pub event_tail_duration: Duration,
-    /// How often the consumer-group lag of the event topics is read for
-    /// `kraken_hub_consumer_group_lag` (ADR 0026), when `kafka_bootstrap` is set; zero turns it
-    /// off. `KRAKEN_HUB_GROUP_LAG_INTERVAL`, default 60 s, `0` or at least 1 s.
-    pub group_lag_interval: Duration,
+    /// The settings of [`REMOVED_SETTINGS`] the environment still sets: they are not read, and
+    /// each is a startup warning ([`Config::security_warnings`]).
+    pub removed_settings: Vec<&'static str>,
     /// At most one key-set fetch per this long is made because a token names an unknown `kid`.
     /// Not an environment variable: 30 s, shortened by tests.
     pub jwks_refetch_interval: Duration,
@@ -272,16 +248,9 @@ impl Default for Config {
             control_lease_renew: Duration::from_secs(10),
             jwks_refetch_interval: Duration::from_secs(30),
             jwks_fetch_timeout: Duration::from_secs(10),
-            kafka_bootstrap: None,
-            event_topics: vec!["kraken.events".to_string()],
             event_payloads: false,
-            event_search_max_scanned: 50_000,
-            event_search_max_results: 100,
-            event_search_timeout: Duration::from_secs(10),
-            event_max_searches: 4,
             event_max_tails: 4,
-            event_tail_duration: Duration::from_secs(900),
-            group_lag_interval: Duration::from_secs(60),
+            removed_settings: Vec::new(),
         }
     }
 }
@@ -453,43 +422,16 @@ impl Config {
         if let Some(v) = var("KRAKEN_HUB_JWKS_REFRESH") {
             c.jwks_refresh = parse_duration(&v).context("KRAKEN_HUB_JWKS_REFRESH")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_KAFKA_BOOTSTRAP") {
-            c.kafka_bootstrap = Some(v.trim().to_string()).filter(|s| !s.is_empty());
-        }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_TOPICS") {
-            c.event_topics = parse_topics(&v).context("KRAKEN_HUB_EVENT_TOPICS")?;
-        }
         if let Some(v) = var("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS") {
             c.event_payloads = parse_bool(&v).context("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED") {
-            c.event_search_max_scanned = v
-                .trim()
-                .parse()
-                .context("KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS") {
-            c.event_search_max_results = v
-                .trim()
-                .parse()
-                .context("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_SEARCH_TIMEOUT") {
-            c.event_search_timeout =
-                parse_duration(&v).context("KRAKEN_HUB_EVENT_SEARCH_TIMEOUT")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_MAX_SEARCHES") {
-            c.event_max_searches = v.trim().parse().context("KRAKEN_HUB_EVENT_MAX_SEARCHES")?;
         }
         if let Some(v) = var("KRAKEN_HUB_EVENT_MAX_TAILS") {
             c.event_max_tails = v.trim().parse().context("KRAKEN_HUB_EVENT_MAX_TAILS")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_TAIL_DURATION") {
-            c.event_tail_duration = parse_duration(&v).context("KRAKEN_HUB_EVENT_TAIL_DURATION")?;
-        }
-        if let Some(v) = var("KRAKEN_HUB_GROUP_LAG_INTERVAL") {
-            c.group_lag_interval = parse_duration(&v).context("KRAKEN_HUB_GROUP_LAG_INTERVAL")?;
-        }
+        c.removed_settings = REMOVED_SETTINGS
+            .into_iter()
+            .filter(|name| var(name).is_some())
+            .collect();
         c.resolve_jwt(explicit_uri)?;
         c.validate()?;
         Ok(c)
@@ -627,13 +569,6 @@ impl Config {
         changed
     }
 
-    /// How often the consumer-group lag task runs; `None` when it does not (no Kafka, or
-    /// `KRAKEN_HUB_GROUP_LAG_INTERVAL=0`).
-    pub fn group_lag(&self) -> Option<Duration> {
-        (self.kafka_bootstrap.is_some() && !self.group_lag_interval.is_zero())
-            .then_some(self.group_lag_interval)
-    }
-
     /// The bounds of the TLS handshakes of each listener.
     pub fn handshake_limits(&self) -> crate::tls::HandshakeLimits {
         crate::tls::HandshakeLimits {
@@ -768,38 +703,10 @@ impl Config {
         if let Some(url) = &self.grafana_url {
             check_link_url(url).context("KRAKEN_HUB_GRAFANA_URL")?;
         }
-        if let Some(bootstrap) = &self.kafka_bootstrap
-            && bootstrap.contains(char::is_whitespace)
-        {
+        if self.event_max_tails == 0 || self.event_max_tails > MAX_EVENT_TAILS {
             bail!(
-                "KRAKEN_HUB_KAFKA_BOOTSTRAP ({bootstrap:?}) is a comma-separated host:port list without blanks"
-            );
-        }
-        if self.event_search_max_scanned == 0 {
-            bail!("KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED must be positive");
-        }
-        if !(1..=MAX_EVENT_RESULTS).contains(&self.event_search_max_results) {
-            bail!("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS must be 1 to {MAX_EVENT_RESULTS}");
-        }
-        if self.event_search_timeout.is_zero() {
-            bail!("KRAKEN_HUB_EVENT_SEARCH_TIMEOUT must be positive");
-        }
-        if self.event_max_searches == 0 {
-            bail!("KRAKEN_HUB_EVENT_MAX_SEARCHES must be positive");
-        }
-        if self.event_max_tails == 0 {
-            bail!("KRAKEN_HUB_EVENT_MAX_TAILS must be positive");
-        }
-        if self.event_tail_duration < MIN_MAX_STREAM_DURATION {
-            bail!(
-                "KRAKEN_HUB_EVENT_TAIL_DURATION ({:?}) must be at least {MIN_MAX_STREAM_DURATION:?}",
-                self.event_tail_duration
-            );
-        }
-        if !self.group_lag_interval.is_zero() && self.group_lag_interval < Duration::from_secs(1) {
-            bail!(
-                "KRAKEN_HUB_GROUP_LAG_INTERVAL ({:?}) must be 0 (off) or at least 1s",
-                self.group_lag_interval
+                "KRAKEN_HUB_EVENT_MAX_TAILS ({}) must be 1 to {MAX_EVENT_TAILS}",
+                self.event_max_tails
             );
         }
         // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
@@ -885,18 +792,19 @@ impl Config {
             ));
         }
         // Payloads need a token to present (ADR 0025): without one the switch does nothing.
-        if self.event_payloads {
-            if self.kafka_bootstrap.is_none() {
-                out.push(
-                    "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS is on but KRAKEN_HUB_KAFKA_BOOTSTRAP is not set: the event browser is off"
-                        .to_string(),
-                );
-            } else if self.dashboard_token.is_none() && self.dashboard_write_token.is_none() {
-                out.push(
-                    "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS is on but neither KRAKEN_HUB_DASHBOARD_TOKEN nor KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is set: payloads stay hidden"
-                        .to_string(),
-                );
-            }
+        if self.event_payloads
+            && self.dashboard_token.is_none()
+            && self.dashboard_write_token.is_none()
+        {
+            out.push(
+                "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS is on but neither KRAKEN_HUB_DASHBOARD_TOKEN nor KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is set: payloads stay hidden"
+                    .to_string(),
+            );
+        }
+        for name in &self.removed_settings {
+            out.push(format!(
+                "{name} is set but is no longer read: the hub reads no event store; the event browser is the kraken-event-browser add-on, which takes its own settings (ADR 0027)"
+            ));
         }
         if self.tls_client_ca.is_some() && self.auth_mode == AuthMode::Off {
             out.push(
@@ -923,8 +831,18 @@ impl Config {
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
 
-/// The largest `KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS`.
-pub const MAX_EVENT_RESULTS: usize = 1000;
+/// Settings of the event browser the hub had (ADR 0025) and no longer reads (ADR 0027): the
+/// `kraken-event-browser` add-on reads the event store and takes its own settings.
+pub const REMOVED_SETTINGS: [&str; 8] = [
+    "KRAKEN_HUB_KAFKA_BOOTSTRAP",
+    "KRAKEN_HUB_EVENT_TOPICS",
+    "KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED",
+    "KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS",
+    "KRAKEN_HUB_EVENT_SEARCH_TIMEOUT",
+    "KRAKEN_HUB_EVENT_MAX_SEARCHES",
+    "KRAKEN_HUB_EVENT_TAIL_DURATION",
+    "KRAKEN_HUB_GROUP_LAG_INTERVAL",
+];
 
 /// Below a second a streaming query (or a subscription) could never deliver anything.
 const MIN_MAX_STREAM_DURATION: Duration = Duration::from_secs(1);
@@ -1017,6 +935,10 @@ fn check_dashboard_token(name: &str, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Event tails open at once on one hub at most (`KRAKEN_HUB_EVENT_MAX_TAILS`; the event
+/// browser's own bound on concurrent calls is the same).
+pub const MAX_EVENT_TAILS: usize = 1024;
+
 /// Peer hubs a dashboard merges at most (`KRAKEN_HUB_PEERS`).
 pub const MAX_PEERS: usize = 16;
 
@@ -1101,31 +1023,6 @@ pub fn peer_origin(url: &str) -> anyhow::Result<String> {
         Some(p) => format!("{scheme}://{host}:{p}"),
         None => format!("{scheme}://{host}"),
     })
-}
-
-/// A comma-separated list of Kafka topic names: trimmed, blanks skipped, duplicates dropped (the
-/// first occurrence keeps its place), at least one; each 1 to 249 of `[A-Za-z0-9._-]` as Kafka
-/// allows.
-fn parse_topics(s: &str) -> anyhow::Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    for topic in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        let valid = topic.len() <= 249
-            && topic != "."
-            && topic != ".."
-            && topic
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-        if !valid {
-            bail!("{topic:?} is not a Kafka topic name (1 to 249 of A-Z a-z 0-9 . _ -)");
-        }
-        if !out.iter().any(|t| t == topic) {
-            out.push(topic.to_string());
-        }
-    }
-    if out.is_empty() {
-        bail!("lists no topic");
-    }
-    Ok(out)
 }
 
 /// `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, any case.
@@ -2360,98 +2257,73 @@ mod tests {
     }
 
     #[test]
-    fn the_event_browser_is_off_without_a_bootstrap_and_its_limits_default_to_the_spec() {
+    fn the_event_settings_default_to_payloads_off_and_four_tails() {
         let c = with_env(&[]).unwrap();
-        assert_eq!(c.kafka_bootstrap, None);
-        assert_eq!(c.event_topics, vec!["kraken.events".to_string()]);
         assert!(!c.event_payloads);
-        assert_eq!(c.event_search_max_scanned, 50_000);
-        assert_eq!(c.event_search_max_results, 100);
-        assert_eq!(c.event_search_timeout, Duration::from_secs(10));
-        assert_eq!(c.event_max_searches, 4);
         assert_eq!(c.event_max_tails, 4);
-        assert_eq!(c.event_tail_duration, Duration::from_secs(900));
-        assert_eq!(c.group_lag_interval, Duration::from_secs(60));
-        assert_eq!(c.group_lag(), None, "no lag task without Kafka");
-    }
-
-    /// The consumer-group lag task (ADR 0026): every 60 s once Kafka is set, `0` turns it off.
-    #[test]
-    fn the_group_lag_interval_is_read_from_the_environment() {
-        let kafka = ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092");
-        let c = with_env(&[kafka]).unwrap();
-        assert_eq!(c.group_lag(), Some(Duration::from_secs(60)));
-        let c = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "15s")]).unwrap();
-        assert_eq!(c.group_lag(), Some(Duration::from_secs(15)));
-        let c = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "0")]).unwrap();
-        assert_eq!(c.group_lag(), None);
-        for bad in ["500ms", "soon"] {
-            let err = with_env(&[kafka, ("KRAKEN_HUB_GROUP_LAG_INTERVAL", bad)]).expect_err(bad);
-            assert!(
-                err.to_string().contains("KRAKEN_HUB_GROUP_LAG_INTERVAL"),
-                "{err:#}"
-            );
-        }
+        assert!(c.removed_settings.is_empty());
     }
 
     #[test]
-    fn the_event_browser_settings_are_read_from_the_environment() {
+    fn the_event_settings_are_read_from_the_environment() {
         let c = with_env(&[
-            ("KRAKEN_HUB_KAFKA_BOOTSTRAP", " kafka:19092 "),
-            (
-                "KRAKEN_HUB_EVENT_TOPICS",
-                " kraken.events , kraken.events.dlt,kraken.events,",
-            ),
             ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "true"),
-            ("KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED", "1000"),
-            ("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS", "20"),
-            ("KRAKEN_HUB_EVENT_SEARCH_TIMEOUT", "1500ms"),
-            ("KRAKEN_HUB_EVENT_MAX_SEARCHES", "2"),
             ("KRAKEN_HUB_EVENT_MAX_TAILS", "1"),
-            ("KRAKEN_HUB_EVENT_TAIL_DURATION", "2m"),
         ])
         .unwrap();
-        assert_eq!(c.kafka_bootstrap.as_deref(), Some("kafka:19092"));
-        assert_eq!(
-            c.event_topics,
-            vec!["kraken.events".to_string(), "kraken.events.dlt".to_string()],
-            "trimmed, in order, without duplicates"
-        );
         assert!(c.event_payloads);
-        assert_eq!(c.event_search_max_scanned, 1000);
-        assert_eq!(c.event_search_max_results, 20);
-        assert_eq!(c.event_search_timeout, Duration::from_millis(1500));
-        assert_eq!((c.event_max_searches, c.event_max_tails), (2, 1));
-        assert_eq!(c.event_tail_duration, Duration::from_secs(120));
-    }
-
-    #[test]
-    fn bad_event_browser_settings_are_startup_errors() {
+        assert_eq!(c.event_max_tails, 1);
+        let most = with_env(&[("KRAKEN_HUB_EVENT_MAX_TAILS", "1024")]).unwrap();
+        assert_eq!(most.event_max_tails, MAX_EVENT_TAILS);
         for (var, value) in [
-            ("KRAKEN_HUB_EVENT_TOPICS", ","),
-            ("KRAKEN_HUB_EVENT_TOPICS", "kraken events"),
-            ("KRAKEN_HUB_EVENT_TOPICS", "kraken/events"),
             ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "maybe"),
-            ("KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED", "0"),
-            ("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS", "0"),
-            ("KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS", "1001"),
-            ("KRAKEN_HUB_EVENT_SEARCH_TIMEOUT", "0"),
-            ("KRAKEN_HUB_EVENT_MAX_SEARCHES", "0"),
             ("KRAKEN_HUB_EVENT_MAX_TAILS", "0"),
-            ("KRAKEN_HUB_EVENT_TAIL_DURATION", "500ms"),
-            ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092 other:9092"),
+            ("KRAKEN_HUB_EVENT_MAX_TAILS", "many"),
+            ("KRAKEN_HUB_EVENT_MAX_TAILS", "1025"),
+            ("KRAKEN_HUB_EVENT_MAX_TAILS", "18446744073709551615"),
         ] {
-            // The first pair of a name wins: the one under test, then the bootstrap.
-            let err = with_env(&[(var, value), ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092")])
-                .expect_err(&format!("{var}={value:?}"));
+            let err = with_env(&[(var, value)]).expect_err(&format!("{var}={value:?}"));
             assert!(err.to_string().contains(var), "{var}: {err:#}");
         }
-        let topic = "t".repeat(250);
-        assert!(with_env(&[("KRAKEN_HUB_EVENT_TOPICS", &topic)]).is_err());
+    }
+
+    /// The hub reads no event store (ADR 0027): a setting of the event browser it had is no longer
+    /// read, and a hub that still sets one says so at startup, once per setting.
+    #[test]
+    fn removed_event_store_settings_are_startup_warnings() {
+        let c = with_env(&[
+            ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092"),
+            ("KRAKEN_HUB_EVENT_TOPICS", "kraken.events"),
+            ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "not even a duration"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.removed_settings,
+            [
+                "KRAKEN_HUB_KAFKA_BOOTSTRAP",
+                "KRAKEN_HUB_EVENT_TOPICS",
+                "KRAKEN_HUB_GROUP_LAG_INTERVAL"
+            ]
+        );
+        let warnings: Vec<String> = c
+            .security_warnings()
+            .into_iter()
+            .filter(|w| w.contains("is no longer read"))
+            .collect();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("KRAKEN_HUB_KAFKA_BOOTSTRAP is set but is no longer read"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("kraken-event-browser"), "{warnings:?}");
+        for removed in REMOVED_SETTINGS {
+            let c = with_env(&[(removed, "x")]).unwrap();
+            assert_eq!(c.removed_settings, [removed]);
+        }
     }
 
     #[test]
-    fn payloads_without_a_token_or_without_kafka_are_security_warnings() {
+    fn payloads_without_a_token_are_a_security_warning() {
         let warned = |vars: &[(&str, &str)]| {
             with_env(vars)
                 .unwrap()
@@ -2461,25 +2333,19 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let on = ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "true");
-        let kafka = ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092");
         let token = ("KRAKEN_HUB_DASHBOARD_TOKEN", "a-dashboard-token-0123456789");
         let write = (
             "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
             "a-write-token-0123456789",
         );
-        let w = warned(&[on, kafka]);
+        let w = warned(&[on]);
         assert!(
             w.len() == 1 && w[0].contains("payloads stay hidden"),
             "{w:?}"
         );
-        let w = warned(&[on]);
-        assert!(
-            w.len() == 1 && w[0].contains("KRAKEN_HUB_KAFKA_BOOTSTRAP"),
-            "{w:?}"
-        );
-        assert!(warned(&[on, kafka, token]).is_empty());
-        assert!(warned(&[on, kafka, write]).is_empty());
-        assert!(warned(&[kafka]).is_empty());
+        assert!(warned(&[on, token]).is_empty());
+        assert!(warned(&[on, write]).is_empty());
+        assert!(warned(&[]).is_empty());
     }
 
     #[test]

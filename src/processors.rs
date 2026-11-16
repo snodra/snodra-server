@@ -1,12 +1,16 @@
-//! Event processors (ADR 0022): what each instance reports about its Kafka event processors in
+//! Event processors (ADR 0022): what each instance reports about its event processors in
 //! `InstanceStatus.processors`, bounded as the hub keeps it, and the per-service view the
 //! dashboard and `GET /api/v1/processors` show. A report also says whether the processor replays
-//! and which reset holds its lock (ADR 0023).
+//! and which reset holds its lock (ADR 0023), and which event store it reads with which
+//! capabilities (ADR 0027).
 //!
-//! The hub only relays and aggregates what the libraries report: it reads no Kafka, keeps no
-//! history and stores nothing beyond the latest report of each live session (in the session's
+//! The hub only relays and aggregates what the libraries report: it reads no event store, keeps
+//! no history and stores nothing beyond the latest report of each live session (in the session's
 //! [`crate::session::StatusDetail`], dropped with the session). Never payloads, keys or headers.
+//! Segments and positions are opaque strings only the event-store add-on reads; the hub shows
+//! them as text and sorts segments in [`segment_order`].
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -16,23 +20,34 @@ use crate::topology::Topology;
 
 /// Processors kept from one report; further entries are dropped.
 pub const MAX_PROCESSORS: usize = 32;
-/// Partitions kept per processor.
-pub const MAX_PARTITIONS: usize = 1024;
+/// Segments kept per processor.
+pub const MAX_SEGMENTS: usize = 1024;
 /// Event types kept per processor.
 pub const MAX_EVENT_TYPES: usize = 256;
 /// Longest processor name kept, in bytes (longer names are cut at a UTF-8 boundary).
 pub const MAX_NAME_BYTES: usize = 64;
-/// Longest consumer group id and topic kept, in bytes.
-pub const MAX_GROUP_TOPIC_BYTES: usize = 256;
+/// Longest subscription and source kept, in bytes.
+pub const MAX_SUBSCRIPTION_SOURCE_BYTES: usize = 256;
+/// Longest event-store name kept, in bytes.
+pub const MAX_EVENT_STORE_BYTES: usize = 64;
+/// Capabilities kept per processor.
+pub const MAX_CAPABILITIES: usize = 16;
+/// Longest capability kept, in bytes.
+pub const MAX_CAPABILITY_BYTES: usize = 64;
+/// Longest segment name or position kept, in bytes. Never cut (a cut position is a wrong one):
+/// a longer segment is dropped, a longer position reads as unknown.
+pub const MAX_SEGMENT_BYTES: usize = 128;
 /// Longest last error kept, in bytes.
 pub const MAX_LAST_ERROR_BYTES: usize = 512;
 /// Longest event type kept, in bytes.
 pub const MAX_EVENT_TYPE_BYTES: usize = 256;
-/// Longest dead-letter mode kept, in bytes (the defined modes are at most 10).
+/// Longest dead-letter mode kept, in bytes (the defined modes are at most 11).
 pub const MAX_MODE_BYTES: usize = 32;
 /// Longest reset operation id kept, in bytes (the hub's are UUIDs, 36).
 pub const MAX_OPERATION_ID_BYTES: usize = 64;
 
+/// The capability that offers a reset (and so a replay) of a processor (ADR 0027).
+pub const CAPABILITY_REPLAY: &str = "replay";
 /// `ProcessorState` as the hub shows it (JSON: `"RUNNING"` and so on, without the
 /// `PROCESSOR_` prefix). A number this hub does not know reads as `Unspecified`.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,17 +133,41 @@ impl ProcessorStateName {
     }
 }
 
-/// One assigned partition as reported (`PartitionStatus`); -1 is unknown or none.
+/// The digits of a decimal segment name without its leading zeros (`""` for zero); `None` when
+/// the name is not decimal (empty, or anything but ASCII digits: a sign included).
+fn decimal_digits(name: &str) -> Option<&str> {
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| name.trim_start_matches('0'))
+}
+
+/// The order of segment names: decimal names (only ASCII digits) by value, of any length
+/// (`2` before `10`), before any other name; other names, and equal values (`007` and `7`), by
+/// their bytes. `ui/processors.js` `segmentOrder` is the same rule.
+pub fn segment_order(a: &str, b: &str) -> Ordering {
+    match (decimal_digits(a), decimal_digits(b)) {
+        (Some(x), Some(y)) => x
+            .len()
+            .cmp(&y.len())
+            .then_with(|| x.cmp(y))
+            .then_with(|| a.cmp(b)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// One assigned segment as reported (`SegmentStatus`): positions are opaque strings, empty when
+/// unknown or none; a lag of -1 is unknown.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct PartitionReport {
-    pub partition: i32,
-    pub position: i64,
-    pub committed: i64,
-    pub high_watermark: i64,
+pub struct SegmentReport {
+    pub segment: String,
+    pub position: String,
+    pub committed: String,
+    pub head: String,
     pub lag: i64,
-    /// The end (exclusive) of the partition's open replay range (ADR 0023); 0 when none.
-    pub replay_until: i64,
+    /// The end (exclusive) of the segment's open replay range (ADR 0023); empty when none.
+    pub replay_until: String,
 }
 
 /// One processor of one instance as the hub keeps it (`ProcessorStatus`, bounded).
@@ -136,11 +175,18 @@ pub struct PartitionReport {
 #[serde(rename_all = "camelCase", default)]
 pub struct ProcessorReport {
     pub name: String,
-    pub group_id: String,
-    pub topic: String,
+    /// The event store's name for the processor's subscription.
+    pub subscription: String,
+    /// The source the processor reads.
+    pub source: String,
+    /// The event store the processor reads (`kafka`, `rabbitmq-streams`, `memory`, ...).
+    pub event_store: String,
+    /// What the event store supports (`replay`, `browse`, `lag`, `native-dead-letter`, ...),
+    /// sorted, distinct.
+    pub capabilities: Vec<String>,
     pub state: ProcessorStateName,
-    /// Sorted by partition, distinct.
-    pub partitions: Vec<PartitionReport>,
+    /// Sorted in [`segment_order`], distinct.
+    pub segments: Vec<SegmentReport>,
     pub processed_total: u64,
     pub failed_total: u64,
     pub dead_letters: u64,
@@ -150,9 +196,9 @@ pub struct ProcessorReport {
     pub last_error_at_ms: i64,
     /// Sorted, distinct.
     pub event_types: Vec<String>,
-    /// `collection`, `topic` or `log` as reported.
+    /// `collection`, `event-store` or `log` as reported.
     pub dead_letter_mode: String,
-    /// A replay range is open on this instance's partitions (ADR 0023).
+    /// A replay range is open on this instance's segments (ADR 0023).
     pub replaying: bool,
     /// The reset operation holding the processor's lock; empty when none.
     pub operation_id: String,
@@ -170,78 +216,104 @@ pub fn truncate_utf8(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// An offset as kept: anything below -1 reads as -1 (unknown).
-fn offset(v: i64) -> i64 {
+/// A lag as kept: anything below -1 reads as -1 (unknown).
+fn lag(v: i64) -> i64 {
     v.max(-1)
 }
 
+/// A position (or a segment name where it is only shown) as kept: never cut, one longer than
+/// [`MAX_SEGMENT_BYTES`] reads as unknown (empty).
+pub fn kept_whole(p: &str) -> String {
+    if p.len() > MAX_SEGMENT_BYTES {
+        String::new()
+    } else {
+        p.to_string()
+    }
+}
+
+/// At most `max` distinct non-empty strings of `list`, each cut to `bytes`, sorted.
+fn distinct_bounded(list: &[String], max: usize, bytes: usize) -> Vec<String> {
+    let mut kept = BTreeSet::new();
+    for item in list {
+        if kept.len() == max {
+            break;
+        }
+        let item = truncate_utf8(item, bytes);
+        if !item.is_empty() {
+            kept.insert(item);
+        }
+    }
+    kept.into_iter().collect()
+}
+
 impl ProcessorReport {
-    /// Bounds one reported processor: strings cut, partitions and event types capped, offsets
-    /// below -1 and negative lags read as unknown (-1), an unknown state as `Unspecified`.
+    /// Bounds one reported processor: strings cut, segments, capabilities and event types
+    /// capped, an empty or too long segment dropped, a too long position and a lag below -1
+    /// read as unknown, an unknown state as `Unspecified`.
     fn bounded(p: &proto::ProcessorStatus, name: String) -> Self {
-        let mut partitions: Vec<PartitionReport> = Vec::new();
+        let mut segments: Vec<SegmentReport> = Vec::new();
         let mut seen = BTreeSet::new();
-        for part in &p.partitions {
-            if partitions.len() == MAX_PARTITIONS {
+        for seg in &p.segments {
+            if segments.len() == MAX_SEGMENTS {
                 break;
             }
-            if part.partition < 0 || !seen.insert(part.partition) {
+            if seg.segment.is_empty()
+                || seg.segment.len() > MAX_SEGMENT_BYTES
+                || !seen.insert(seg.segment.as_str())
+            {
                 continue;
             }
-            partitions.push(PartitionReport {
-                partition: part.partition,
-                position: offset(part.position),
-                committed: offset(part.committed),
-                high_watermark: offset(part.high_watermark),
-                lag: offset(part.lag),
-                replay_until: part.replay_until.max(0),
+            segments.push(SegmentReport {
+                segment: seg.segment.clone(),
+                position: kept_whole(&seg.position),
+                committed: kept_whole(&seg.committed),
+                head: kept_whole(&seg.head),
+                lag: lag(seg.lag),
+                replay_until: kept_whole(&seg.replay_until),
             });
         }
-        partitions.sort_by_key(|p| p.partition);
-        let mut event_types = BTreeSet::new();
-        for t in &p.event_types {
-            if event_types.len() == MAX_EVENT_TYPES {
-                break;
-            }
-            let t = truncate_utf8(t, MAX_EVENT_TYPE_BYTES);
-            if !t.is_empty() {
-                event_types.insert(t);
-            }
-        }
+        segments.sort_by(|a, b| segment_order(&a.segment, &b.segment));
         Self {
             name,
-            group_id: truncate_utf8(&p.group_id, MAX_GROUP_TOPIC_BYTES),
-            topic: truncate_utf8(&p.topic, MAX_GROUP_TOPIC_BYTES),
+            subscription: truncate_utf8(&p.subscription, MAX_SUBSCRIPTION_SOURCE_BYTES),
+            source: truncate_utf8(&p.source, MAX_SUBSCRIPTION_SOURCE_BYTES),
+            event_store: truncate_utf8(&p.event_store, MAX_EVENT_STORE_BYTES),
+            capabilities: distinct_bounded(&p.capabilities, MAX_CAPABILITIES, MAX_CAPABILITY_BYTES),
             state: ProcessorStateName::from_proto(p.state),
-            partitions,
+            segments,
             processed_total: p.processed_total,
             failed_total: p.failed_total,
             dead_letters: p.dead_letters,
             last_error: truncate_utf8(&p.last_error, MAX_LAST_ERROR_BYTES),
             last_error_at_ms: p.last_error_at_ms.max(0),
-            event_types: event_types.into_iter().collect(),
+            event_types: distinct_bounded(&p.event_types, MAX_EVENT_TYPES, MAX_EVENT_TYPE_BYTES),
             dead_letter_mode: truncate_utf8(&p.dead_letter_mode, MAX_MODE_BYTES),
             replaying: p.replaying,
             operation_id: truncate_utf8(&p.operation_id, MAX_OPERATION_ID_BYTES),
         }
     }
 
+    /// The event store declares `capability`.
+    pub fn can(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+
     pub fn to_proto(&self) -> proto::ProcessorStatus {
         proto::ProcessorStatus {
             name: self.name.clone(),
-            group_id: self.group_id.clone(),
-            topic: self.topic.clone(),
+            subscription: self.subscription.clone(),
+            source: self.source.clone(),
             state: self.state.to_proto() as i32,
-            partitions: self
-                .partitions
+            segments: self
+                .segments
                 .iter()
-                .map(|p| proto::PartitionStatus {
-                    partition: p.partition,
-                    position: p.position,
-                    committed: p.committed,
-                    high_watermark: p.high_watermark,
-                    lag: p.lag,
-                    replay_until: p.replay_until,
+                .map(|s| proto::SegmentStatus {
+                    segment: s.segment.clone(),
+                    position: s.position.clone(),
+                    committed: s.committed.clone(),
+                    head: s.head.clone(),
+                    lag: s.lag,
+                    replay_until: s.replay_until.clone(),
                 })
                 .collect(),
             processed_total: self.processed_total,
@@ -253,6 +325,8 @@ impl ProcessorReport {
             dead_letter_mode: self.dead_letter_mode.clone(),
             replaying: self.replaying,
             operation_id: self.operation_id.clone(),
+            event_store: self.event_store.clone(),
+            capabilities: self.capabilities.clone(),
         }
     }
 }
@@ -303,17 +377,20 @@ pub struct ServiceProcessors {
 #[serde(rename_all = "camelCase")]
 pub struct ProcessorAggregate {
     pub name: String,
-    /// Group id, topic and mode of the instance with the freshest report.
-    pub group_id: String,
-    pub topic: String,
+    /// Subscription, source, event store, capabilities and dead-letter mode of the instance with
+    /// the freshest report.
+    pub subscription: String,
+    pub source: String,
+    pub event_store: String,
+    pub capabilities: Vec<String>,
     pub dead_letter_mode: String,
     /// The worst state of its instances (FAILING, unknown, STARTING, PAUSED, STOPPED, RUNNING).
     pub state: ProcessorStateName,
     pub instances_reporting: u32,
-    /// Distinct partitions over the instances (a partition two instances report during a
-    /// rebalance counts once, as the freshest report has it).
-    pub assigned_partitions: u32,
-    /// The sum of the known lags of those partitions; `None` when no lag is known.
+    /// Distinct segments over the instances (a segment two instances report during a
+    /// reassignment counts once, as the freshest report has it).
+    pub assigned_segments: u32,
+    /// The sum of the known lags of those segments; `None` when no lag is known.
     pub lag: Option<i64>,
     /// The highest `deadLetters` of its instances (each samples the service-wide count).
     pub dead_letters: u64,
@@ -371,16 +448,16 @@ pub fn aggregate(name: &str, mut instances: Vec<ProcessorInstance>) -> Processor
         .map(|i| i.report.state)
         .max_by_key(|s| s.severity())
         .unwrap_or_default();
-    // Each partition as the freshest instance that reports it has it.
+    // Each segment as the freshest instance that reports it has it.
     let mut by_freshness: Vec<&ProcessorInstance> = instances.iter().collect();
     by_freshness.sort_by(|a, b| freshness(a).cmp(&freshness(b)));
-    let mut partitions: BTreeMap<i32, &PartitionReport> = BTreeMap::new();
+    let mut segments: BTreeMap<&str, &SegmentReport> = BTreeMap::new();
     for i in &by_freshness {
-        for p in &i.report.partitions {
-            partitions.entry(p.partition).or_insert(p);
+        for s in &i.report.segments {
+            segments.entry(s.segment.as_str()).or_insert(s);
         }
     }
-    let known: Vec<i64> = partitions
+    let known: Vec<i64> = segments
         .values()
         .map(|p| p.lag)
         .filter(|l| *l >= 0)
@@ -410,12 +487,14 @@ pub fn aggregate(name: &str, mut instances: Vec<ProcessorInstance>) -> Processor
         .unwrap_or_default();
     ProcessorAggregate {
         name: name.to_string(),
-        group_id: freshest.group_id,
-        topic: freshest.topic,
+        subscription: freshest.subscription,
+        source: freshest.source,
+        event_store: freshest.event_store,
+        capabilities: freshest.capabilities,
         dead_letter_mode: freshest.dead_letter_mode,
         state,
         instances_reporting: instances.len() as u32,
-        assigned_partitions: partitions.len() as u32,
+        assigned_segments: segments.len() as u32,
         lag,
         dead_letters: instances
             .iter()
@@ -496,28 +575,30 @@ pub fn by_service(
 mod tests {
     use super::*;
 
-    fn part(
-        partition: i32,
-        position: i64,
-        committed: i64,
-        hw: i64,
+    fn seg(
+        segment: &str,
+        position: &str,
+        committed: &str,
+        head: &str,
         lag: i64,
-    ) -> proto::PartitionStatus {
-        proto::PartitionStatus {
-            partition,
-            position,
-            committed,
-            high_watermark: hw,
+    ) -> proto::SegmentStatus {
+        proto::SegmentStatus {
+            segment: segment.to_string(),
+            position: position.to_string(),
+            committed: committed.to_string(),
+            head: head.to_string(),
             lag,
-            replay_until: 0,
+            replay_until: String::new(),
         }
     }
 
     fn status(name: &str, state: proto::ProcessorState) -> proto::ProcessorStatus {
         proto::ProcessorStatus {
             name: name.to_string(),
-            group_id: "svc".to_string(),
-            topic: "kraken.events".to_string(),
+            subscription: "svc".to_string(),
+            source: "kraken.events".to_string(),
+            event_store: "kafka".to_string(),
+            capabilities: vec!["lag".to_string(), "replay".to_string()],
             state: state as i32,
             dead_letter_mode: "collection".to_string(),
             ..Default::default()
@@ -536,6 +617,47 @@ mod tests {
     }
 
     #[test]
+    fn decimal_segments_sort_by_value_before_other_names() {
+        let mut names = vec!["b", "10", "a", "2", "02", "0", "kraken.events-1"];
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(names, ["0", "02", "2", "10", "a", "b", "kraken.events-1"]);
+        // Only ASCII digits are decimal (no sign); any length compares by value, no overflow;
+        // equal values by their bytes. ui/processors.js sorts this list the same way.
+        let mut names = vec![
+            "b",
+            "+5",
+            "7",
+            "99999999999999999999999",
+            "007",
+            "18446744073709551616",
+            "10",
+            "a",
+            "0",
+            "",
+            "00",
+            "5",
+        ];
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(
+            names,
+            [
+                "0",
+                "00",
+                "5",
+                "007",
+                "7",
+                "10",
+                "18446744073709551616",
+                "99999999999999999999999",
+                "",
+                "+5",
+                "a",
+                "b",
+            ]
+        );
+    }
+
+    #[test]
     fn a_report_is_bounded_and_never_refused() {
         let mut reported: Vec<proto::ProcessorStatus> = (0..40)
             .map(|i| status(&format!("p{i:02}"), proto::ProcessorState::ProcessorRunning))
@@ -551,65 +673,80 @@ mod tests {
         assert_eq!(kept[31].name, "p31");
 
         let mut big = status(&"n".repeat(100), proto::ProcessorState::ProcessorRunning);
-        big.group_id = "g".repeat(300);
-        big.topic = format!("{}é", "t".repeat(255));
+        big.subscription = "g".repeat(300);
+        big.source = format!("{}é", "t".repeat(255));
+        big.event_store = format!("{}é", "k".repeat(63));
+        big.capabilities = (0..20).map(|i| format!("cap-{i:02}")).collect();
+        big.capabilities.insert(0, "c".repeat(100));
         big.last_error = "e".repeat(600);
         big.dead_letter_mode = "m".repeat(40);
-        big.partitions = (0..2000).rev().map(|p| part(p, 1, 1, 1, 0)).collect();
+        big.segments = (0..2000)
+            .rev()
+            .map(|p| seg(&p.to_string(), "1", "1", "1", 0))
+            .collect();
         big.event_types = (0..300).map(|i| format!("ev.T{i:03}")).collect();
         big.event_types.push(format!("{}x", "x".repeat(300)));
         let kept = bound(&[big]);
         let p = &kept[0];
         assert_eq!(p.name.len(), MAX_NAME_BYTES);
-        assert_eq!(p.group_id.len(), MAX_GROUP_TOPIC_BYTES);
-        assert_eq!(p.topic, "t".repeat(255), "cut before the two-byte é");
+        assert_eq!(p.subscription.len(), MAX_SUBSCRIPTION_SOURCE_BYTES);
+        assert_eq!(p.source, "t".repeat(255), "cut before the two-byte é");
+        assert_eq!(p.event_store, "k".repeat(63), "cut before the two-byte é");
+        assert_eq!(p.capabilities.len(), MAX_CAPABILITIES);
+        // The first 16 reported (the long one, then cap-00 to cap-14), cut and sorted.
+        assert_eq!(p.capabilities[0], "cap-00");
+        assert_eq!(p.capabilities[14], "cap-14");
+        assert_eq!(p.capabilities[15], "c".repeat(MAX_CAPABILITY_BYTES));
         assert_eq!(p.last_error.len(), MAX_LAST_ERROR_BYTES);
         assert_eq!(p.dead_letter_mode.len(), MAX_MODE_BYTES);
-        assert_eq!(p.partitions.len(), MAX_PARTITIONS);
-        // The first 1024 reported (1999 down to 976), sorted.
-        assert_eq!(p.partitions[0].partition, 976);
-        assert_eq!(p.partitions[1023].partition, 1999);
+        assert_eq!(p.segments.len(), MAX_SEGMENTS);
+        // The first 1024 reported (1999 down to 976), sorted by value.
+        assert_eq!(p.segments[0].segment, "976");
+        assert_eq!(p.segments[1023].segment, "1999");
         assert_eq!(p.event_types.len(), MAX_EVENT_TYPES);
         assert_eq!(p.event_types[0], "ev.T000");
         assert_eq!(p.event_types[255], "ev.T255");
     }
 
     #[test]
-    fn offsets_states_and_partitions_are_normalised() {
+    fn positions_states_and_segments_are_normalised() {
         let mut p = status("default", proto::ProcessorState::ProcessorRunning);
-        p.partitions = vec![
-            part(2, 10, 8, 12, 4),
-            part(-1, 0, 0, 0, 0),
-            part(0, -7, -1, -9, -3),
-            part(2, 99, 99, 99, 99),
+        let long = "9".repeat(MAX_SEGMENT_BYTES + 1);
+        p.segments = vec![
+            seg("10", "10", "8", "12", 4),
+            seg("", "0", "0", "0", 0),
+            seg(&long, "0", "0", "0", 0),
+            seg("2", "", "", &long, -3),
+            seg("10", "99", "99", "99", 99),
+            seg("events-b", "7", "", "9", 2),
         ];
         p.last_error_at_ms = -5;
         p.event_types = vec!["b".into(), "".into(), "a".into(), "b".into()];
+        p.capabilities = vec!["replay".into(), "".into(), "lag".into(), "replay".into()];
         let kept = &bound(&[p])[0];
+        let report =
+            |segment: &str, position: &str, committed: &str, head: &str, lag: i64| SegmentReport {
+                segment: segment.into(),
+                position: position.into(),
+                committed: committed.into(),
+                head: head.into(),
+                lag,
+                replay_until: String::new(),
+            };
         assert_eq!(
-            kept.partitions,
+            kept.segments,
             [
-                PartitionReport {
-                    partition: 0,
-                    position: -1,
-                    committed: -1,
-                    high_watermark: -1,
-                    lag: -1,
-                    replay_until: 0,
-                },
-                PartitionReport {
-                    partition: 2,
-                    position: 10,
-                    committed: 8,
-                    high_watermark: 12,
-                    lag: 4,
-                    replay_until: 0,
-                },
+                report("2", "", "", "", -1),
+                report("10", "10", "8", "12", 4),
+                report("events-b", "7", "", "9", 2),
             ],
-            "a negative partition and a repeated one dropped, below -1 reads as unknown"
+            "an empty, a too long and a repeated segment dropped, a too long position and a lag \
+             below -1 read as unknown, decimal segments by value before other names"
         );
         assert_eq!(kept.last_error_at_ms, 0);
         assert_eq!(kept.event_types, ["a", "b"]);
+        assert_eq!(kept.capabilities, ["lag", "replay"]);
+        assert!(kept.can(CAPABILITY_REPLAY) && !kept.can("browse"));
 
         for (value, want) in [
             (0, ProcessorStateName::Unspecified),
@@ -631,23 +768,23 @@ mod tests {
         let mut p = status("audit", proto::ProcessorState::ProcessorStopped);
         p.replaying = true;
         p.operation_id = format!("{}é", "o".repeat(MAX_OPERATION_ID_BYTES - 1));
-        let mut replaying = part(0, 5, 4, 9, 5);
-        replaying.replay_until = 450;
-        let mut odd = part(1, 1, 1, 1, 0);
-        odd.replay_until = -3;
-        p.partitions = vec![replaying, odd];
+        let mut replaying = seg("0", "5", "4", "9", 5);
+        replaying.replay_until = "450".into();
+        let mut odd = seg("1", "1", "1", "1", 0);
+        odd.replay_until = "x".repeat(MAX_SEGMENT_BYTES + 1);
+        p.segments = vec![replaying, odd];
         let kept = &bound(&[p])[0];
         assert!(kept.replaying);
         assert_eq!(kept.operation_id, "o".repeat(MAX_OPERATION_ID_BYTES - 1));
-        assert_eq!(kept.partitions[0].replay_until, 450);
+        assert_eq!(kept.segments[0].replay_until, "450");
         assert_eq!(
-            kept.partitions[1].replay_until, 0,
-            "negative reads as not replaying"
+            kept.segments[1].replay_until, "",
+            "too long reads as not replaying"
         );
         let json = serde_json::to_value(kept).unwrap();
         assert_eq!(json["replaying"], true);
         assert_eq!(json["operationId"], kept.operation_id.as_str());
-        assert_eq!(json["partitions"][0]["replayUntil"], 450);
+        assert_eq!(json["segments"][0]["replayUntil"], "450");
     }
 
     #[test]
@@ -685,7 +822,7 @@ mod tests {
     #[test]
     fn proto_round_trip_keeps_a_bounded_report() {
         let mut p = status("orders", proto::ProcessorState::ProcessorFailing);
-        p.partitions = vec![part(0, 5, 4, 9, 5), part(1, -1, -1, -1, -1)];
+        p.segments = vec![seg("0", "5", "4", "9", 5), seg("1", "", "", "", -1)];
         p.processed_total = 10;
         p.failed_total = 2;
         p.dead_letters = 3;
@@ -694,7 +831,7 @@ mod tests {
         p.event_types = vec!["a.B".into()];
         p.replaying = true;
         p.operation_id = "op-1".into();
-        p.partitions[0].replay_until = 9;
+        p.segments[0].replay_until = "9".into();
         let kept = bound(std::slice::from_ref(&p));
         assert_eq!(kept[0].to_proto(), p);
         assert_eq!(bound(&[kept[0].to_proto()]), kept);
@@ -708,21 +845,23 @@ mod tests {
         }
     }
 
-    fn report(state: ProcessorStateName, partitions: &[(i32, i64)]) -> ProcessorReport {
+    fn report(state: ProcessorStateName, segments: &[(&str, i64)]) -> ProcessorReport {
         ProcessorReport {
             name: "default".into(),
-            group_id: "svc".into(),
-            topic: "kraken.events".into(),
+            subscription: "svc".into(),
+            source: "kraken.events".into(),
+            event_store: "kafka".into(),
+            capabilities: vec!["lag".into(), "replay".into()],
             state,
-            partitions: partitions
+            segments: segments
                 .iter()
-                .map(|(p, lag)| PartitionReport {
-                    partition: *p,
-                    position: 0,
-                    committed: 0,
-                    high_watermark: 0,
+                .map(|(s, lag)| SegmentReport {
+                    segment: s.to_string(),
+                    position: "0".into(),
+                    committed: "0".into(),
+                    head: "0".into(),
                     lag: *lag,
-                    replay_until: 0,
+                    replay_until: String::new(),
                 })
                 .collect(),
             dead_letter_mode: "collection".into(),
@@ -756,28 +895,28 @@ mod tests {
         let a = aggregate(
             "default",
             vec![
-                instance("i1", 0, report(Running, &[(0, 3), (1, -1)])),
-                instance("i2", 0, report(Running, &[(2, 4)])),
+                instance("i1", 0, report(Running, &[("0", 3), ("1", -1)])),
+                instance("i2", 0, report(Running, &[("2", 4)])),
             ],
         );
-        assert_eq!((a.assigned_partitions, a.lag), (3, Some(7)));
+        assert_eq!((a.assigned_segments, a.lag), (3, Some(7)));
         let unknown = aggregate(
             "default",
-            vec![instance("i1", 0, report(Running, &[(0, -1), (1, -1)]))],
+            vec![instance("i1", 0, report(Running, &[("0", -1), ("1", -1)]))],
         );
-        assert_eq!((unknown.assigned_partitions, unknown.lag), (2, None));
+        assert_eq!((unknown.assigned_segments, unknown.lag), (2, None));
         let none = aggregate("default", vec![instance("i1", 0, report(Running, &[]))]);
-        assert_eq!((none.assigned_partitions, none.lag), (0, None));
+        assert_eq!((none.assigned_segments, none.lag), (0, None));
     }
 
     #[test]
-    fn a_partition_two_instances_report_counts_once_as_the_freshest_has_it() {
+    fn a_segment_two_instances_report_counts_once_as_the_freshest_has_it() {
         use ProcessorStateName::Running;
-        let mut stale = report(Running, &[(0, 100), (1, 1)]);
-        stale.group_id = "old-group".into();
-        let mut fresh = report(Running, &[(0, 2)]);
-        fresh.group_id = "svc".into();
-        fresh.topic = "kraken.events".into();
+        let mut stale = report(Running, &[("0", 100), ("1", 1)]);
+        stale.subscription = "old-subscription".into();
+        let mut fresh = report(Running, &[("0", 2)]);
+        fresh.subscription = "svc".into();
+        fresh.source = "kraken.events".into();
         let a = aggregate(
             "default",
             vec![
@@ -785,13 +924,13 @@ mod tests {
                 instance("b-fresh", 200, fresh),
             ],
         );
-        assert_eq!(a.assigned_partitions, 2);
+        assert_eq!(a.assigned_segments, 2);
         assert_eq!(
             a.lag,
             Some(3),
-            "partition 0 from the fresh report (2), 1 from the other"
+            "segment 0 from the fresh report (2), 1 from the other"
         );
-        assert_eq!(a.group_id, "svc", "group of the freshest report");
+        assert_eq!(a.subscription, "svc", "subscription of the freshest report");
         assert_eq!(a.instances_reporting, 2);
         assert_eq!(
             a.instances
@@ -873,7 +1012,7 @@ mod tests {
         let named = |name: &str, dead: u64| ProcessorReport {
             name: name.into(),
             dead_letters: dead,
-            ..report(ProcessorStateName::Running, &[(0, 1)])
+            ..report(ProcessorStateName::Running, &[("0", 1)])
         };
         let t = Topology {
             hub_id: "hub-a".into(),
@@ -922,12 +1061,14 @@ mod tests {
         let p = &json["services"][0]["processors"][0];
         for key in [
             "name",
-            "groupId",
-            "topic",
+            "subscription",
+            "source",
+            "eventStore",
+            "capabilities",
             "deadLetterMode",
             "state",
             "instancesReporting",
-            "assignedPartitions",
+            "assignedSegments",
             "lag",
             "deadLetters",
             "processedTotal",
@@ -948,15 +1089,17 @@ mod tests {
             "instanceId",
             "statusAgeMs",
             "state",
-            "partitions",
+            "segments",
             "processedTotal",
             "failedTotal",
             "deadLetters",
             "lastError",
             "lastErrorAtMs",
             "eventTypes",
-            "groupId",
-            "topic",
+            "subscription",
+            "source",
+            "eventStore",
+            "capabilities",
             "deadLetterMode",
             "replaying",
             "operationId",
@@ -964,8 +1107,8 @@ mod tests {
             assert!(i.get(key).is_some(), "{key} missing in {i}");
         }
         assert_eq!(
-            i["partitions"][0],
-            serde_json::json!({"partition": 0, "position": 0, "committed": 0, "highWatermark": 0, "lag": 1, "replayUntil": 0})
+            i["segments"][0],
+            serde_json::json!({"segment": "0", "position": "0", "committed": "0", "head": "0", "lag": 1, "replayUntil": ""})
         );
         assert_eq!(serde_json::from_value::<ProcessorsView>(json).unwrap(), v);
     }

@@ -98,7 +98,8 @@ message ServerMessage {
 // are read from the first Register of a stream only; later Registers cannot change them. Field 11
 // is allocated to a later roadmap phase (contexts).
 message Register {
-  // Logical service name, for example "gym-notes-service". Also the Kafka consumer group name.
+  // Logical service name, for example "gym-notes-service"; each event-store add-on derives its
+  // own names from it.
   string service_name = 1;
   // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
   string instance_id = 2;
@@ -151,11 +152,13 @@ message InstanceStatus {
   repeated string connected_hub_ids = 1;
   // Handlers of this instance running now, over all its hubs.
   uint32 handlers_in_flight = 2;
-  // Event processors (ADR 0022): one entry per Kafka event processor this instance started, as
-  // of this report. The hub keeps the latest list per session, bounded: at most 32 processors,
-  // 1024 partitions and 256 event types each; longer strings are cut at a UTF-8 boundary (name 64
-  // bytes, group_id and topic 256, last_error 512, an event type 256, operation_id 64); the excess
-  // is dropped, never an error to the client.
+  // Event processors (ADR 0022): one entry per event processor this instance started, as of this
+  // report. The hub keeps the latest list per session, bounded: at most 32 processors, 1024
+  // segments, 16 capabilities and 256 event types each; longer strings are cut at a UTF-8
+  // boundary (name 64 bytes, subscription and source 256, event_store 64, a capability 64,
+  // last_error 512, an event type 256, operation_id 64). A segment name or a position is never
+  // cut: a segment named in more than 128 bytes is dropped, a longer position reads as unknown.
+  // The excess is dropped, never an error to the client.
   repeated ProcessorStatus processors = 3;
 }
 
@@ -165,43 +168,47 @@ message InstanceStatus {
 enum ProcessorState {
   // Never sent on purpose; a value this hub does not know reads as this.
   PROCESSOR_STATE_UNSPECIFIED = 0;
-  // Started, but no partition is assigned to it yet, or a rebalance is in progress.
+  // Started, but before its first assignment, or while a reassignment is in progress (a
+  // revocation not yet followed by an assignment). An instance whose assignment is empty is idle,
+  // RUNNING.
   PROCESSOR_STARTING = 1;
-  // Partitions assigned and records flowing (or none waiting).
+  // Assigned (possibly no segment: idle) and records flowing (or none waiting).
   PROCESSOR_RUNNING = 2;
-  // A record exhausted its attempts in the last 60 s, or the consumer reports an error.
+  // A record exhausted its attempts in the last 60 s, or the reader reports an error.
   PROCESSOR_FAILING = 3;
-  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of the consumer
-  // group while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
+  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of its subscription
+  // while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
   PROCESSOR_STOPPED = 4;
-  // Paused from the hub's control plane (ADR 0023): still in the consumer group, consuming
-  // nothing.
+  // Paused from the hub's control plane (ADR 0023): still in its subscription,
+  // consuming nothing.
   PROCESSOR_PAUSED = 5;
 }
 
-// One event processor of one instance (ADR 0022): a Kafka consumer with its own consumer group
-// on the events topic, running the handlers of one processing group. Counters are since the
+// One event processor of one instance (ADR 0022): a reader with its own subscription to
+// the event store's source, running the handlers of one processing group. Counters are since the
 // instance started; never payloads, keys or headers.
 message ProcessorStatus {
   // The processor's name: "default" for the handlers without a processing group, else the
   // group name ([a-z0-9][a-z0-9-]{0,47}).
   string name = 1;
-  // The Kafka consumer group: "<the service's group>.<name>", "default" included.
-  string group_id = 2;
-  // The Kafka topic the processor consumes.
-  string topic = 3;
+  // The event store's name for the processor's subscription (the name the add-on gives it),
+  // derived from the service name and the processor name.
+  string subscription = 2;
+  // The source the processor reads (the add-on's name for it).
+  string source = 3;
   // See ProcessorState.
   ProcessorState state = 4;
-  // The partitions assigned to this instance, sorted by partition; empty while none is.
-  repeated PartitionStatus partitions = 5;
+  // The segments assigned to this instance, in the hub's segment order: decimal names by value,
+  // then the rest by bytes; empty while none is.
+  repeated SegmentStatus segments = 5;
   // Records whose stage 1 (the processor's event handlers) completed, handled or found to be a
   // duplicate.
   uint64 processed_total = 6;
-  // Records that exhausted their attempts: parked as a dead letter, sent to the dead-letter
-  // topic or skipped (mode "log").
+  // Records that exhausted their attempts: parked as a dead letter, sent to the event
+  // store's dead-letter destination or skipped (mode "log").
   uint64 failed_total = 7;
-  // The processor's letters in the service's dead_letters collection, over all instances,
-  // sampled every 30 s; 0 when dead_letter_mode is not "collection".
+  // The processor's letters in the service's message store, over all instances, sampled every
+  // 30 s; 0 when dead_letter_mode is not "collection".
   uint64 dead_letters = 8;
   // The message of the latest failure (never a payload or a stack trace), at most 512 bytes
   // (cut at a UTF-8 boundary); empty when none.
@@ -211,33 +218,42 @@ message ProcessorStatus {
   // The event types the processor's handlers handle (stage 1), sorted; "default" also lists the
   // event types its sagas handle.
   repeated string event_types = 11;
-  // Where a record goes once its attempts are exhausted: "collection" (the dead_letters
-  // collection, the default), "topic" (<topic>.dlt) or "log" (logged and skipped).
+  // Where a record goes once its attempts are exhausted: "collection" (a dead letter in the
+  // service's message store, the default), "event-store" (the event store's own dead-letter
+  // destination) or "log" (logged and skipped).
   string dead_letter_mode = 12;
-  // A replay range is open on this instance's partitions (ADR 0023): records below a
-  // partition's replay_until are handled again.
+  // A replay range is open on this instance's segments (ADR 0023): records below a
+  // segment's replay_until are handled again.
   bool replaying = 13;
   // The reset operation holding the processor's lock (ADR 0023); empty when none.
   string operation_id = 14;
+  // The event store the processor reads: "kafka", "rabbitmq-streams", "memory" or the name of
+  // a third-party add-on.
+  string event_store = 15;
+  // What the event store supports: "replay", "browse", "lag", "native-dead-letter" or an
+  // add-on's own names.
+  repeated string capabilities = 16;
 }
 
-// One partition assigned to an event processor on one instance (ADR 0022). Offsets are Kafka
-// offsets; -1 means unknown or none.
-message PartitionStatus {
-  // The partition number.
-  int32 partition = 1;
-  // The next offset this instance will process; -1 when unknown.
-  int64 position = 2;
-  // The consumer group's committed offset; -1 when none.
-  int64 committed = 3;
-  // The partition's high watermark (the offset of the next record written); -1 when unknown.
-  int64 high_watermark = 4;
-  // high_watermark - committed (high_watermark - position when committed is -1); -1 when
-  // unknown; never negative otherwise.
+// One segment assigned to an event processor on one instance (ADR 0022). A segment is a unit of
+// the event store's order per key (a unit the add-on defines). Positions are
+// opaque strings that only the event-store add-on reads (a decimal counter for the first-wave
+// stores); an empty string means unknown or none.
+message SegmentStatus {
+  // The segment's name, unique within the source.
+  string segment = 1;
+  // The next position this instance will process; empty when unknown.
+  string position = 2;
+  // The subscription's committed position; empty when none.
+  string committed = 3;
+  // The segment's head (the position of the next record written); empty when unknown.
+  string head = 4;
+  // The number of records between the committed position and the head (between position and
+  // head when nothing is committed); -1 when unknown; never negative otherwise.
   int64 lag = 5;
-  // The end (exclusive) of the partition's open replay range (ADR 0023): its records below
-  // this offset are a replay; 0 when the partition is not replaying.
-  int64 replay_until = 6;
+  // The end (exclusive) of the segment's open replay range (ADR 0023): its records before this
+  // position are a replay; empty when the segment is not replaying.
+  string replay_until = 6;
 }
 
 // The hub asks this instance to act on one of its event processors (ADR 0023). Exactly one
@@ -262,24 +278,24 @@ message ControlRequest {
   }
 }
 
-// Persist "paused" in the service's processor_control collection and stop consuming without
-// leaving the consumer group. Answered with ok.
+// Persist "paused" in the service's message store (its processor control) and stop consuming
+// without leaving the subscription. Answered with ok.
 message ProcessorPause {}
 
 // Persist "not paused" and consume again. Answered with ok.
 message ProcessorResume {}
 
-// Stop consuming (leave the consumer group) and hold the operation lock until lease_ms from now.
+// Stop consuming (leave the subscription) and hold the operation lock until lease_ms from now.
 // Re-sent with the same operation_id to renew the lease. Answered with ok once the instance has
-// left the group; LOCKED when another operation holds the lock; NOT_PREPARED for an operation
-// that already ended on the instance, or a renewal whose lock is gone (a late renewal never takes
-// the lock again).
+// left the subscription; LOCKED when another operation holds the lock; NOT_PREPARED for an
+// operation that already ended on the instance, or a renewal whose lock is gone (a late renewal
+// never takes the lock again).
 message ResetPrepare {
   string operation_id = 1;
   int64 lease_ms = 2;
 }
 
-// Move the consumer group's committed offsets to the target; sent to one instance that holds
+// Move the subscription's committed positions to the target; sent to one instance that holds
 // operation_id. Answered with reset.
 message ResetExecute {
   string operation_id = 1;
@@ -293,29 +309,30 @@ message ResetFinish {
   bool aborted = 2;
 }
 
-// Where a reset moves the group's offsets. Anything but latest is a replay of the records between
-// the target and the committed offsets before the reset.
+// Where a reset moves the subscription's committed positions. Anything but latest is a replay of
+// the records between the target and the committed positions before the reset.
 message ResetTarget {
   oneof to {
-    // The partitions' low watermarks.
+    // The segments' first positions.
     bool earliest = 1;
-    // The partitions' high watermarks; never a replay.
+    // The segments' heads; never a replay.
     bool latest = 2;
-    // The first offset at or after this time, epoch milliseconds (the high watermark where no
-    // record is that late).
+    // The first position at or after this time, epoch milliseconds (the head where no record is
+    // that late).
     int64 timestamp_ms = 3;
-    // Explicit offsets; a partition not listed keeps its committed offset.
-    PartitionOffsets offsets = 4;
+    // Explicit positions; a segment not listed keeps its committed position.
+    SegmentPositions positions = 4;
   }
 }
 
-message PartitionOffsets {
-  repeated PartitionOffset offsets = 1;
+// The wrapper a oneof needs for a repeated field.
+message SegmentPositions {
+  repeated SegmentPosition positions = 1;
 }
 
-message PartitionOffset {
-  int32 partition = 1;
-  int64 offset = 2;
+message SegmentPosition {
+  string segment = 1;
+  string position = 2;
 }
 
 // List the processor's dead letters, oldest first, without payloads or headers.
@@ -344,7 +361,7 @@ message ControlReply {
     ControlOk ok = 10;
     // The instance would not or could not act. Nothing changed unless the message says what did:
     // a reset_execute refused after its reset handlers ran ends with "reset handlers ran (n), m
-    // markers deleted, offsets not moved: retry the reset".
+    // markers deleted, positions not moved: retry the reset".
     ControlRefused refused = 11;
     // reset_execute succeeded.
     ResetOutcome reset = 12;
@@ -378,34 +395,38 @@ enum ControlRefusal {
   // reset_execute or reset_finish for an operation this instance does not hold; reset_prepare
   // for an operation that ended on it, or a renewal whose lock is gone.
   CONTROL_REFUSAL_NOT_PREPARED = 3;
-  // Kafka refused: the consumer group still has members (the message lists their client ids).
-  CONTROL_REFUSAL_GROUP_NOT_EMPTY = 4;
+  // The event store refused: another instance still reads the processor's subscription (the
+  // message lists them).
+  CONTROL_REFUSAL_SUBSCRIBERS_ACTIVE = 4;
   // A reset handler threw (or panicked); the message says how many ran (their effects stay) and
-  // that no marker or offset changed.
+  // that no marker or position changed.
   CONTROL_REFUSAL_RESET_HANDLER_FAILED = 5;
   // A bad target, a bad letter id, a dead-letter mode other than "collection", a limit out of
   // range.
   CONTROL_REFUSAL_INVALID = 6;
-  // Anything else (a MongoDB or Kafka error, or "lease lost: ..." when the executor's lease was
-  // lost mid-execute); the message says what.
+  // Anything else (a message-store or event-store error, or "lease lost: ..." when the
+  // executor's lease was lost mid-execute); the message says what.
   CONTROL_REFUSAL_FAILED = 7;
   // A retry or discard of a letter that does not exist.
   CONTROL_REFUSAL_NOT_FOUND = 8;
+  // The event store lacks the capability the request needs (see ProcessorStatus.capabilities).
+  CONTROL_REFUSAL_UNSUPPORTED = 9;
 }
 
 message ResetOutcome {
-  // One per partition that replays; empty for "latest".
+  // One per segment that replays; empty for "latest".
   repeated ReplayRange ranges = 1;
   uint64 markers_deleted = 2;
   // How many @ResetHandler ran.
   uint32 reset_handlers = 3;
 }
 
-// Records of `partition` with from <= offset < until are a replay.
+// Records of `segment` at a position from <= position < until are a replay. Positions are the
+// opaque strings of SegmentStatus; empty means none.
 message ReplayRange {
-  int32 partition = 1;
-  int64 from = 2;
-  int64 until = 3;
+  string segment = 1;
+  string from = 2;
+  string until = 3;
 }
 
 message DeadLetterPage {
@@ -419,9 +440,12 @@ message DeadLetterPage {
 message DeadLetterSummary {
   string id = 1;
   string processor = 2;
-  string topic = 3;
-  int32 partition = 4;
-  int64 offset = 5;
+  // The source the letter's record came from.
+  string source = 3;
+  // The segment of the source the record came from.
+  string segment = 4;
+  // The record's position in its segment; empty when unknown.
+  string position = 5;
   string key = 6;
   string event_id = 7;
   string event_type = 8;
@@ -546,7 +570,8 @@ message Request {
   // Streaming and subscriptions: credits the sender grants before its first Flow.
   uint32 initial_credit = 11;
   // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
-  // remaining targets are dropped; the targets are not cancelled.
+  // remaining targets are dropped; a target already forwarded is sent a Cancel, one still queued
+  // leaves its queue.
   uint32 max_results = 12;
 }
 
@@ -618,7 +643,10 @@ message ReplyPart {
   // The service and instance that answered.
   string responder_service = 4;
   string responder_instance = 5;
-  // 0, 1, 2, ... in the order the hub sent the parts of this request.
+  // Scatter-gather: 0, 1, 2, ... in the order the hub sent the parts. Streaming: the handler's own
+  // number, 1, 2, 3, ... per request with no gap, relayed unchanged. Subscription: the hub's own,
+  // 1 for the initial result, then 2, 3, ... for the updates. A gap a sender sees in a stream or a
+  // subscription is a part the hub dropped.
   uint64 seq = 6;
 }
 
