@@ -1,5 +1,5 @@
 // Events (ADR 0025, ADR 0027): a read-only browser over the event store, through the event browser
-// add-on connected to this hub (kraken-event-browser); the page is hidden while none is. A search
+// add-on connected to this hub (snodra-event-browser); the page is hidden while none is. A search
 // runs newest first over every segment of a source and pages with the browser's cursor; a record
 // opens to its headers and, where this hub serves payloads to the token the tab holds, its
 // payload; the tail prepends new records as they come. This hub only: every hub's browser reads
@@ -46,7 +46,7 @@ const ENDED = {
   failed: 'the event browser stopped answering',
 };
 
-const NOT_INSTALLED = 'No event browser is connected to this hub: run the kraken-event-browser add-on (a service whose ACL entry has the event-browser right).';
+const NOT_INSTALLED = 'No event browser is connected to this hub: run the snodra-event-browser add-on (a service whose ACL entry has the event-browser right).';
 
 const str = (x) => (typeof x === 'string' ? x : '');
 const isObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
