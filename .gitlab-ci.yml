@@ -73,9 +73,9 @@ release:
             echo "No new commits since $CURRENT; no release."
             exit 0
           fi
-          if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
+          if grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:' <<< "$LOG"; then
             BUMP=major
-          elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+          elif grep -qE '^feat(\([^)]*\))?:' <<< "$LOG"; then
             BUMP=minor
           else
             BUMP=patch
