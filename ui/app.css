@@ -1,4 +1,4 @@
-/* kraken-hub dashboard. Plain CSS, no external fonts: the system UI stack. Light and dark come
+/* snodra-server dashboard. Plain CSS, no external fonts: the system UI stack. Light and dark come
    from prefers-color-scheme; every colour is a token below. Status colours (good, warning,
    critical) are fixed across themes and always paired with a shape and a label. */
 

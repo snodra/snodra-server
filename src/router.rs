@@ -31,7 +31,7 @@
 //! instance at open time) live inside the entry, not in the map: they are written
 //! `Request{mode = SUBSCRIPTION}` directly, outside flow control, and count nowhere. Their parts
 //! are relayed to the sender in arrival order under the sender's credit, buffered up to
-//! `KRAKEN_HUB_SUBSCRIPTION_BUFFER` while it owes credit (and behind the initial part); every
+//! `SNODRA_SERVER_SUBSCRIPTION_BUFFER` while it owes credit (and behind the initial part); every
 //! ending path removes both entries, sends the sender its `ReplyEnd` where one is due and every
 //! target still serving a `Cancel`.
 //!
@@ -254,7 +254,7 @@ struct Subscription {
     /// parts relayed.
     credit: u32,
     /// Updates waiting for credit, or for the initial part, in arrival order; at most
-    /// `KRAKEN_HUB_SUBSCRIPTION_BUFFER`.
+    /// `SNODRA_SERVER_SUBSCRIPTION_BUFFER`.
     buffered: VecDeque<Update>,
     /// Parts relayed to the sender (the initial part and the updates): the next one's `seq`.
     parts: u32,
@@ -262,7 +262,7 @@ struct Subscription {
     updates: u32,
     /// `Request.max_results`: end after this many updates (0 = no limit).
     max_results: u32,
-    /// The `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` timer, when set.
+    /// The `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION` timer, when set.
     max_duration: Option<AbortHandle>,
     span: tracing::Span,
     /// Ordered delivery of the parts and the end to the sender.
@@ -568,7 +568,7 @@ pub struct Router {
     sessions: Arc<Sessions>,
     pending: Mutex<HashMap<String, Pending>>,
     flows: Mutex<HashMap<InstanceId, Flow>>,
-    /// Bytes queued over all flows (`KRAKEN_HUB_QUEUE_BYTES_TOTAL`).
+    /// Bytes queued over all flows (`SNODRA_SERVER_QUEUE_BYTES_TOTAL`).
     queued_bytes: Arc<TotalBytes>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
@@ -614,7 +614,7 @@ fn outcome_of(code: ErrorCode) -> Outcome {
         ErrorCode::Timeout => Outcome::Timeout,
         ErrorCode::HandlerDisconnected => Outcome::HandlerDisconnected,
         ErrorCode::ResourceExhausted => Outcome::ResourceExhausted,
-        // The hub cancels a stream that outlived KRAKEN_HUB_MAX_STREAM_DURATION.
+        // The hub cancels a stream that outlived SNODRA_SERVER_MAX_STREAM_DURATION.
         ErrorCode::Cancelled => Outcome::Cancelled,
         ErrorCode::HandlerError | ErrorCode::Unauthenticated | ErrorCode::Unspecified => {
             Outcome::HandlerError
@@ -623,7 +623,7 @@ fn outcome_of(code: ErrorCode) -> Outcome {
 }
 
 fn record_outcome(span: &tracing::Span, outcome: Outcome) {
-    span.record("kraken.outcome", outcome.as_str());
+    span.record("snodra.outcome", outcome.as_str());
 }
 
 /// One structured line per error outcome: hub-produced errors at warn, a handler's own error
@@ -643,21 +643,21 @@ fn log_outcome(
     if relayed {
         tracing::info!(
             request_id,
-            kraken.type = type_name,
-            kraken.kind = kind,
-            kraken.sender = sender,
-            kraken.handler = handler,
-            kraken.outcome = outcome_label,
+            snodra.type = type_name,
+            snodra.kind = kind,
+            snodra.sender = sender,
+            snodra.handler = handler,
+            snodra.outcome = outcome_label,
             "request ended with error"
         );
     } else {
         tracing::warn!(
             request_id,
-            kraken.type = type_name,
-            kraken.kind = kind,
-            kraken.sender = sender,
-            kraken.handler = handler,
-            kraken.outcome = outcome_label,
+            snodra.type = type_name,
+            snodra.kind = kind,
+            snodra.sender = sender,
+            snodra.handler = handler,
+            snodra.outcome = outcome_label,
             "request ended with error"
         );
     }
@@ -1073,11 +1073,11 @@ impl Router {
         };
         let span = tracing::info_span!(
             "hub.route",
-            kraken.type = %req.r#type,
-            kraken.kind = req_kind.map_or("unspecified", kind_label),
-            kraken.sender = %sender,
-            kraken.handler = tracing::field::Empty,
-            kraken.outcome = tracing::field::Empty,
+            snodra.type = %req.r#type,
+            snodra.kind = req_kind.map_or("unspecified", kind_label),
+            snodra.sender = %sender,
+            snodra.handler = tracing::field::Empty,
+            snodra.outcome = tracing::field::Empty,
         );
         set_parent_from_headers(&span, &req.headers);
         let sender_info = self.sessions.sender_info(ctx, sender);
@@ -1202,7 +1202,7 @@ impl Router {
             }
         };
 
-        span.record("kraken.handler", handler.as_str());
+        span.record("snodra.handler", handler.as_str());
         let sender_token = sender_info.as_ref().map(|info| info.token);
         // `None`: the handler's session vanished since the pick; the send below reports it Gone.
         let handler_info = self.sessions.sender_info(ctx, &handler);
@@ -1345,7 +1345,7 @@ impl Router {
             };
             p.handler = handler.clone();
             p.handler_token = token;
-            p.span.record("kraken.handler", handler.as_str());
+            p.span.record("snodra.handler", handler.as_str());
         }
         tracing::debug!(request_id = %id, handler = %handler, "queued request routed again");
         self.dispatch(ctx, &id, &handler, token, req);
@@ -1619,12 +1619,12 @@ impl Router {
                     } else if entry.forwarded {
                         self.cancel_target(ctx, &id, &entry, "sender disconnected");
                     }
-                    entry.span.record("kraken.outcome", "sender_disconnected");
+                    entry.span.record("snodra.outcome", "sender_disconnected");
                 }
                 Pending::Scatter(gather) => {
                     gather.cancel.abort();
                     self.metrics.in_flight_add(gather.kind, -1);
-                    gather.span.record("kraken.outcome", "sender_disconnected");
+                    gather.span.record("snodra.outcome", "sender_disconnected");
                 }
                 Pending::Stream(stream) => {
                     stream.idle.abort();
@@ -1632,7 +1632,7 @@ impl Router {
                     self.metrics.in_flight_add(stream.kind, -1);
                     self.metrics
                         .stream_closed(&stream.handler_service, &stream.handler);
-                    stream.span.record("kraken.outcome", "sender_disconnected");
+                    stream.span.record("snodra.outcome", "sender_disconnected");
                 }
                 Pending::Subscription(sub) => {
                     if let Some(timer) = &sub.max_duration {
@@ -1642,7 +1642,7 @@ impl Router {
                         self.metrics.in_flight_add(sub.kind, -1);
                     }
                     self.cancel_subscription_targets(&sub, "sender disconnected");
-                    sub.span.record("kraken.outcome", "sender_disconnected");
+                    sub.span.record("snodra.outcome", "sender_disconnected");
                 }
             }
         }
@@ -1670,7 +1670,7 @@ impl Router {
         }
     }
 
-    /// Refreshes the `kraken_hub_connected_instances` and `kraken_hub_registered_types` gauges
+    /// Refreshes the `snodra_server_connected_instances` and `snodra_server_registered_types` gauges
     /// from the current session and registry state. Call after any change to either.
     pub fn refresh_gauges(&self) {
         self.metrics
@@ -1941,7 +1941,7 @@ impl Router {
             })
             .collect();
         span.record(
-            "kraken.handler",
+            "snodra.handler",
             format!("{} targets", targets.len()).as_str(),
         );
         {
@@ -2296,7 +2296,7 @@ impl Router {
         let i = choose(&candidates, &sender_tags, pool.rotation, |id| loads[id]);
         let handler = candidates.swap_remove(i).id;
         let handler_service = self.registry.service_of(ctx, &handler).unwrap_or_default();
-        span.record("kraken.handler", handler.as_str());
+        span.record("snodra.handler", handler.as_str());
         // The sender's own stream, weakly: the stream never keeps a closed stream open.
         let Some(out) = self
             .sessions
@@ -2748,7 +2748,7 @@ impl Router {
         self.end_stream(id, end);
     }
 
-    /// Stream `id` outlived `KRAKEN_HUB_MAX_STREAM_DURATION`.
+    /// Stream `id` outlived `SNODRA_SERVER_MAX_STREAM_DURATION`.
     fn on_stream_max_duration(&self, id: &str, max: Duration) {
         let message = format!(
             "max stream duration ({}) exceeded",
@@ -3003,7 +3003,7 @@ impl Router {
             })
             .collect();
         span.record(
-            "kraken.handler",
+            "snodra.handler",
             format!("{initial_handler} + {} targets", targets.len()).as_str(),
         );
         // The sender's own stream, weakly: the subscription never keeps a closed stream open.
@@ -3058,7 +3058,7 @@ impl Router {
             }
             if let Some((handler, _)) = open.iter().find(|(_, n)| **n >= max) {
                 let message = format!(
-                    "handler instance {handler} already serves {max} subscription{} (KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
+                    "handler instance {handler} already serves {max} subscription{} (SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
                     if max == 1 { "" } else { "s" }
                 );
                 drop(pending);
@@ -3572,7 +3572,7 @@ impl Router {
         }
     }
 
-    /// Subscription `id` outlived `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`.
+    /// Subscription `id` outlived `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION`.
     fn on_subscription_max_duration(&self, id: &str, max: Duration) {
         let message = format!(
             "max subscription duration ({}) exceeded",
@@ -4841,19 +4841,23 @@ mod tests {
         c.router.on_reply(&D, "h1", payload_reply("u1"));
         c.router.route(&D, "s1", request("x1", "t.Unknown", 0));
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "service", "orders"),
+            m.counter("snodra_server_requests_total", "service", "orders"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.histogram_count("kraken_hub_request_duration_seconds", "service", "orders"),
+            m.histogram_count(
+                "snodra_server_request_duration_seconds",
+                "service",
+                "orders"
+            ),
             Some(1)
         );
         assert_eq!(
-            m.counter_without("kraken_hub_requests_total", "service"),
+            m.counter_without("snodra_server_requests_total", "service"),
             Some(1),
             "the no_handler request"
         );
@@ -4873,25 +4877,25 @@ mod tests {
         c.router.route(&D, "s1", unkeyed("u1", 0, 0));
         c.router.on_reply(&D, "h1", payload_reply("u1"));
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "type", "other"),
+            m.counter("snodra_server_requests_total", "type", "other"),
             Some(2)
         );
         assert_eq!(
-            m.histogram_count("kraken_hub_request_duration_seconds", "type", "other"),
+            m.histogram_count("snodra_server_request_duration_seconds", "type", "other"),
             Some(2)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "type", "t.Unknown"),
+            m.counter("snodra_server_requests_total", "type", "t.Unknown"),
             None
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "type", "t.Cmd"),
+            m.counter("snodra_server_requests_total", "type", "t.Cmd"),
             Some(1)
         );
         // A registered type keeps its name when it is refused.
         c.router.route(&D, "s1", request("", "t.Cmd", 0));
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "type", "t.Cmd"),
+            m.counter("snodra_server_requests_total", "type", "t.Cmd"),
             Some(2)
         );
     }
@@ -4916,14 +4920,14 @@ mod tests {
         c.router.refresh_gauges();
         assert_eq!(
             m.gauge_where(
-                "kraken_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Cmd")]
             ),
             Some(2)
         );
         assert_eq!(
             m.gauge_where(
-                "kraken_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Qry")]
             ),
             Some(1)
@@ -4932,7 +4936,7 @@ mod tests {
         c.router.refresh_gauges();
         assert_eq!(
             m.gauge_where(
-                "kraken_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Cmd")]
             ),
             Some(0),
@@ -4949,8 +4953,8 @@ mod tests {
         c.join("h1", 1);
         let depth = |m: &crate::telemetry::test_support::TestMetrics| {
             (
-                m.gauge("kraken_hub_queue_depth", "orders"),
-                m.gauge("kraken_hub_permits_available", "orders"),
+                m.gauge("snodra_server_queue_depth", "orders"),
+                m.gauge("snodra_server_permits_available", "orders"),
             )
         };
         c.router.route(&D, "s1", unkeyed("busy", 0, 10_000));
@@ -5019,7 +5023,11 @@ mod tests {
         );
         assert_eq!(c.router.queued_total(), 1);
         assert_eq!(
-            m.counter("kraken_hub_rejected_total", "reason", "queue_bytes_total"),
+            m.counter(
+                "snodra_server_rejected_total",
+                "reason",
+                "queue_bytes_total"
+            ),
             Some(1)
         );
     }
@@ -5764,23 +5772,23 @@ mod tests {
         g.router.route(&D, "s1", scatter("cmd", "c.Do", 0, 0));
         g.messages("s1");
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "scatter_gather"),
+            m.counter("snodra_server_requests_total", "mode", "scatter_gather"),
             Some(2)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "invalid_request"),
+            m.counter("snodra_server_requests_total", "outcome", "invalid_request"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.histogram_sum("kraken_hub_scatter_targets"),
+            m.histogram_sum("snodra_server_scatter_targets"),
             Some((1, 3.0))
         );
         assert_eq!(
-            m.counter_without("kraken_hub_requests_total", "service"),
+            m.counter_without("snodra_server_requests_total", "service"),
             Some(2),
             "targets over A and B name no one service; the refused one had none"
         );
@@ -6782,15 +6790,15 @@ mod stream_tests {
         let (h, _) = f.target_of("st1");
         f.router.route(&D, "s1", stream("st2", "q.Own", 0, 0, 0));
         assert_eq!(
-            m.gauge_sum("kraken_hub_streams_open", "instance_id", h),
+            m.gauge_sum("snodra_server_streams_open", "instance_id", h),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("kraken_hub_streams_open", "instance_id", "x1"),
+            m.gauge_sum("snodra_server_streams_open", "instance_id", "x1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("kraken_hub_streams_open", "service", "X"),
+            m.gauge_sum("snodra_server_streams_open", "service", "X"),
             Some(1)
         );
         f.part(h, "st1#1", 0, b"a");
@@ -6799,36 +6807,36 @@ mod stream_tests {
         f.cancel("s1", "st2", "bye");
         f.router.route(&D, "s1", stream("p1", "q.Nope", 0, 0, 0));
         // Both instances' last stream closed: each reads 0 once (one export), then is gone.
-        let open = m.gauge_points("kraken_hub_streams_open");
+        let open = m.gauge_points("snodra_server_streams_open");
         assert_eq!(open.len(), 2, "{open:?}");
         assert!(open.iter().all(|(_, n)| *n == 0), "{open:?}");
-        assert_eq!(m.gauge_points("kraken_hub_streams_open"), []);
+        assert_eq!(m.gauge_points("snodra_server_streams_open"), []);
         assert_eq!(
-            m.counter("kraken_hub_stream_parts_total", "type", "q.Find"),
+            m.counter("snodra_server_stream_parts_total", "type", "q.Find"),
             Some(2)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "streaming"),
+            m.counter("snodra_server_requests_total", "mode", "streaming"),
             Some(3)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "cancelled"),
+            m.counter("snodra_server_requests_total", "outcome", "cancelled"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "ok"),
+            m.counter("snodra_server_requests_total", "outcome", "ok"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "service", "X"),
+            m.counter("snodra_server_requests_total", "service", "X"),
             Some(1),
             "the stream x1 served"
         );
@@ -8302,81 +8310,85 @@ mod subscription_tests {
         f.router.route(&D, "s1", subscribe("w2", "q.Own", 0, 0, 0));
         f.open("w2");
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "service", "X"),
+            m.gauge_sum("snodra_server_subscriptions_open", "service", "X"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             None,
             "nothing counted before the initial part"
         );
         f.reply(h, "w1#0", b"initial");
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "ok"),
+            m.counter("snodra_server_requests_total", "outcome", "ok"),
             Some(1)
         );
         f.part("a1", "w1#1", 1, b"u1");
         f.part("b1", "w1#2", 1, b"u2");
         f.end("a1", "w1#1", None);
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("kraken_hub_subscription_updates_total", "type", "q.Watch"),
+            m.counter(
+                "snodra_server_subscription_updates_total",
+                "type",
+                "q.Watch"
+            ),
             Some(2)
         );
         assert_eq!(
-            m.counter("kraken_hub_subscription_updates_total", "service", "B"),
+            m.counter("snodra_server_subscription_updates_total", "service", "B"),
             Some(1)
         );
         f.cancel("s1", "w1", "bye");
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "b1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(1),
             "a cancel after the initial part counts nothing more"
         );
         // Cancelled before the initial part: counted once, as cancelled.
         f.cancel("s1", "w2", "bye");
         assert_eq!(
-            m.gauge_sum("kraken_hub_subscriptions_open", "instance_id", "x1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "x1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "cancelled"),
+            m.counter("snodra_server_requests_total", "outcome", "cancelled"),
             Some(1)
         );
         f.router.route(&D, "s1", subscribe("p1", "q.Nope", 0, 0, 0));
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(3)
         );
         assert_eq!(
-            m.counter("kraken_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.histogram_sum("kraken_hub_request_duration_seconds")
+            m.histogram_sum("snodra_server_request_duration_seconds")
                 .map(|(n, _)| n),
             Some(3)
         );
@@ -8496,15 +8508,19 @@ mod auth_tests {
         }
         assert_eq!(f.router.in_flight(), 0);
         assert_eq!(
-            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(4)
         );
         assert_eq!(
-            f.m.counter("kraken_hub_auth_violations_total", "service", "web"),
+            f.m.counter("snodra_server_auth_violations_total", "service", "web"),
             Some(4)
         );
         assert_eq!(
-            f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+            f.m.counter("snodra_server_requests_total", "outcome", "denied"),
             Some(4)
         );
         // An allowed type is routed as usual.
@@ -8533,11 +8549,15 @@ mod auth_tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         assert_eq!(
-            f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+            f.m.counter("snodra_server_requests_total", "outcome", "denied"),
             None
         );
     }
@@ -8623,7 +8643,7 @@ mod auth_tests {
             assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
             assert_eq!(
                 m.counter(
-                    "kraken_hub_auth_violations_total",
+                    "snodra_server_auth_violations_total",
                     "reason",
                     "instance_takeover"
                 ),
@@ -8675,7 +8695,7 @@ mod auth_tests {
             assert!(f.handler.try_recv().is_err(), "{mode:?}: nothing is routed");
             assert_eq!(f.router.in_flight(), 0, "{mode:?}");
             assert_eq!(
-                f.m.counter("kraken_hub_requests_total", "outcome", "denied"),
+                f.m.counter("snodra_server_requests_total", "outcome", "denied"),
                 Some(1),
                 "{mode:?}"
             );
@@ -8700,7 +8720,11 @@ mod auth_tests {
         );
         assert!(f.handler.try_recv().is_ok());
         assert_eq!(
-            f.m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             None
         );
     }

@@ -12,17 +12,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{FakeClient, Spec, TempDir, acl_entry, auth_config};
 use keys::{JwksServer, Signer, claims, forge_hs256, forge_none, now};
-use kraken_hub::auth::AuthMode;
-use kraken_hub::config::Config;
-use kraken_hub::proto::{
+use serde_json::json;
+use snodra_server::auth::AuthMode;
+use snodra_server::config::Config;
+use snodra_server::proto::{
     ClientMessage, Credentials, ErrorCode, Request, RequestKind, RequestMode, client_message,
     credentials,
 };
-use serde_json::json;
 use tonic::{Code, Status};
 
 const ISS: &str = "https://sso.example/realms/kraken";
-const AUD: &str = "kraken-hub";
+const AUD: &str = "snodra-server";
 
 fn service_entry(name: &str, handle: &[&str], send: &[&str]) -> String {
     let list = |items: &[&str]| {
@@ -215,7 +215,7 @@ async fn works(c: &mut FakeClient) -> bool {
     loop {
         match c.next().await {
             Some(Ok(m)) => match m.message {
-                Some(kraken_hub::proto::server_message::Message::Error(e)) => {
+                Some(snodra_server::proto::server_message::Message::Error(e)) => {
                     return e.code == ErrorCode::NoHandler as i32;
                 }
                 _ => continue,
@@ -600,7 +600,7 @@ async fn a_refresh_naming_a_new_kid_never_stalls_the_stream_while_the_jwks_is_sl
             // The refresh may hold the loop for the hub's bound (1.5 s), not more.
             match c.next_within(Duration::from_secs(3)).await {
                 Some(Ok(m)) => {
-                    if let Some(kraken_hub::proto::server_message::Message::Heartbeat(h)) =
+                    if let Some(snodra_server::proto::server_message::Message::Heartbeat(h)) =
                         m.message
                         && h.sent_at_ms == sent
                     {
@@ -838,10 +838,10 @@ async fn the_topology_shows_nothing_about_authentication_when_it_is_off() {
 #[tokio::test]
 async fn the_topology_rpc_takes_a_jwt_whose_service_has_a_table() {
     let hub = Hub::start(Opts::default()).await;
-    let target = kraken_hub::client::Target::plain(hub.addr);
+    let target = snodra_server::client::Target::plain(hub.addr);
     let ok = hub.jwt("web", 300);
     assert!(
-        kraken_hub::topology_probe_target(&target, Some(&ok))
+        snodra_server::topology_probe_target(&target, Some(&ok))
             .await
             .is_ok()
     );
@@ -850,7 +850,7 @@ async fn the_topology_rpc_takes_a_jwt_whose_service_has_a_table() {
         ("expired", hub.jwt("web", -300)),
         ("garbage", "a.b.c".to_string()),
     ] {
-        let err = kraken_hub::topology_probe_target(&target, Some(&bad))
+        let err = snodra_server::topology_probe_target(&target, Some(&bad))
             .await
             .unwrap_err();
         let status = err.downcast_ref::<Status>().expect("a gRPC status");

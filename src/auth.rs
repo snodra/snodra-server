@@ -3,7 +3,7 @@
 //!
 //! Three pieces:
 //!
-//! * [`Acl`], parsed from the TOML file `KRAKEN_HUB_ACL_FILE`. Entries are keyed by the SHA-256
+//! * [`Acl`], parsed from the TOML file `SNODRA_SERVER_ACL_FILE`. Entries are keyed by the SHA-256
 //!   of a static token, so the file never holds a token. Lookups compare digests with
 //!   [`ct::eq`] against every entry, with no early exit.
 //! * [`Authorizer`]: the mode (`off`, `permissive`, `enforce`), the current ACL (swapped when the
@@ -50,7 +50,7 @@ pub const DEFAULT_CONTEXT: &str = "default";
 
 /// The reserved namespace of the event browser's query types (ADR 0027): only a session whose
 /// ACL entry has `event-browser = true` may register a type in it, whatever its `handle` says.
-pub const EVENTS_NAMESPACE: &str = "kraken.events.";
+pub const EVENTS_NAMESPACE: &str = "snodra.events.";
 
 /// True when `type_name` is in [`EVENTS_NAMESPACE`] (the namespace itself is not a type).
 pub fn is_events_type(type_name: &str) -> bool {
@@ -86,7 +86,7 @@ pub fn to_hex(digest: &Digest) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The hex digest `kraken-hub acl hash` prints.
+/// The hex digest `snodra-server acl hash` prints.
 pub fn hash_token(token: &str) -> String {
     to_hex(&digest_of(token))
 }
@@ -188,7 +188,7 @@ fn from_hex(s: &str) -> Option<Digest> {
 // ---------------------------------------------------------------------------------------------
 // Mode
 
-/// `KRAKEN_HUB_AUTH_MODE`.
+/// `SNODRA_SERVER_AUTH_MODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     /// No checks.
@@ -331,8 +331,8 @@ fn any_matches(patterns: &[Pattern], type_name: &str) -> bool {
 }
 
 /// True when a `send` list grants `type_name`. A type of the event browser's namespace needs a
-/// pattern that names the namespace (`kraken.events.*`) or the type itself: `*` and broader
-/// prefixes such as `kraken.*` do not grant it, as `handle` never does.
+/// pattern that names the namespace (`snodra.events.*`) or the type itself: `*` and broader
+/// prefixes such as `snodra.*` do not grant it, as `handle` never does.
 fn may_send(patterns: &[Pattern], type_name: &str) -> bool {
     if !is_events_type(type_name) {
         return any_matches(patterns, type_name);
@@ -364,7 +364,7 @@ fn warn_events_handle(at: &str, handle: &[Pattern], raw: &[String]) {
             warn!(
                 entry = %at,
                 pattern = %text,
-                "ACL handle pattern covers kraken.events.* types, which handle never grants: the event browser needs event-browser = true"
+                "ACL handle pattern covers snodra.events.* types, which handle never grants: the event browser needs event-browser = true"
             );
         }
     }
@@ -382,7 +382,7 @@ pub struct AclEntry {
     pub send: Vec<Pattern>,
     /// The token may also call the hub's processor controls (ADR 0023).
     pub control: bool,
-    /// The token may register the event browser's `kraken.events.*` types (ADR 0027).
+    /// The token may register the event browser's `snodra.events.*` types (ADR 0027).
     pub event_browser: bool,
     /// Free text for the operator ("rotation 2026-11"); never used for decisions.
     pub label: Option<String>,
@@ -409,7 +409,7 @@ pub struct Rights<'a> {
     pub send: &'a [Pattern],
     /// The processor controls of the HTTP API (ADR 0023).
     pub control: bool,
-    /// Registering the event browser's `kraken.events.*` types (ADR 0027); `handle` never
+    /// Registering the event browser's `snodra.events.*` types (ADR 0027); `handle` never
     /// grants them.
     pub event_browser: bool,
 }
@@ -521,7 +521,7 @@ pub struct ServiceEntry {
     pub send: Vec<Pattern>,
     /// The service's JWTs may also call the hub's processor controls (ADR 0023).
     pub control: bool,
-    /// The service may register the event browser's `kraken.events.*` types (ADR 0027).
+    /// The service may register the event browser's `snodra.events.*` types (ADR 0027).
     pub event_browser: bool,
 }
 
@@ -704,7 +704,7 @@ impl Acl {
 // ---------------------------------------------------------------------------------------------
 // Decisions
 
-/// Why a check failed; the `reason` label of `kraken_hub_auth_violations_total`.
+/// Why a check failed; the `reason` label of `snodra_server_auth_violations_total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denied {
     pub reason: &'static str,
@@ -912,7 +912,7 @@ pub struct Authorizer {
     path: Option<PathBuf>,
     metrics: Arc<Metrics>,
     limiter: LogLimiter,
-    /// Validates JWT credentials; `None` when `KRAKEN_HUB_JWT_ISSUER` is unset.
+    /// Validates JWT credentials; `None` when `SNODRA_SERVER_JWT_ISSUER` is unset.
     jwt: Option<Arc<Jwt>>,
 }
 
@@ -956,9 +956,9 @@ impl Authorizer {
             return Ok(Self::off(metrics));
         };
         let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read KRAKEN_HUB_ACL_FILE {}", path.display()))?;
-        let acl =
-            Acl::parse(&text).with_context(|| format!("KRAKEN_HUB_ACL_FILE {}", path.display()))?;
+            .with_context(|| format!("read SNODRA_SERVER_ACL_FILE {}", path.display()))?;
+        let acl = Acl::parse(&text)
+            .with_context(|| format!("SNODRA_SERVER_ACL_FILE {}", path.display()))?;
         info!(
             mode = config.auth_mode.as_str(),
             file = %path.display(),
@@ -1114,7 +1114,7 @@ impl Authorizer {
             Gate::Notice => {
                 warn!(
                     reason,
-                    "refusal log rate limit: more than {LOG_BURST} refusals in {LOG_WINDOW:?}; further lines for this reason are not logged until the window ends (kraken_hub_auth_violations_total still counts them)"
+                    "refusal log rate limit: more than {LOG_BURST} refusals in {LOG_WINDOW:?}; further lines for this reason are not logged until the window ends (snodra_server_auth_violations_total still counts them)"
                 );
                 false
             }
@@ -1807,7 +1807,7 @@ impl Authorizer {
                 DeniedCode::PermissionDenied,
                 if is_events_type(type_name) {
                     format!(
-                        "service {} is not allowed to send type {}: {EVENTS_NAMESPACE}* types need a send pattern naming kraken.events",
+                        "service {} is not allowed to send type {}: {EVENTS_NAMESPACE}* types need a send pattern naming snodra.events",
                         clip(sender_service),
                         clip(type_name)
                     )
@@ -2027,7 +2027,7 @@ contexts = ["default"]
         // Enforce refuses; it does not count a violation of its own.
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2042,7 +2042,7 @@ contexts = ["default"]
         assert!(a.check_topology(Some("nope"), None).is_ok());
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2052,7 +2052,7 @@ contexts = ["default"]
         assert!(a.check_topology(Some("tok-orders"), None).is_ok());
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2076,7 +2076,7 @@ contexts = ["default"]
             a.check_topology(Some("dash-token-0123456789"), Some(&dash))
                 .is_ok()
         );
-        assert_eq!(m.counter_total("kraken_hub_auth_violations_total"), None);
+        assert_eq!(m.counter_total("snodra_server_auth_violations_total"), None);
     }
 
     // ---- refusal logging (review finding 6) ----
@@ -2114,7 +2114,7 @@ contexts = ["default"]
         assert_eq!(lines[0].field("service").unwrap().chars().count(), 128);
         // The metric label is `unknown`: the ACL does not hold the name.
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
+            m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(1)
         );
         // A wrong-service denial quotes the name too, cut.
@@ -2144,7 +2144,7 @@ contexts = ["default"]
         // Every rule broken is still counted, once.
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "wrong_service"
             ),
@@ -2152,7 +2152,7 @@ contexts = ["default"]
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -2236,7 +2236,7 @@ contexts = ["default"]
         // Nothing is lost from the metric.
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "unknown_token"
             ),
@@ -2361,7 +2361,7 @@ contexts = ["default"]
         assert!(a.check_send(None, "whatever", "x.Y").is_ok());
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "no_credentials"
             ),
@@ -2469,7 +2469,7 @@ contexts = ["default"]
         assert_eq!(adm.status.label(), Some("authenticated"));
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "no_credentials"
             ),
@@ -2477,7 +2477,7 @@ contexts = ["default"]
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -2485,7 +2485,7 @@ contexts = ["default"]
         );
         // The service label of the first violation is a name the ACL knows.
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "service", "billing"),
+            m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(2)
         );
     }
@@ -2497,11 +2497,11 @@ contexts = ["default"]
             let _ = a.admit(None, &format!("random-{n}"), &[]);
         }
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
+            m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(5)
         );
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "service", "random-1"),
+            m.counter("snodra_server_auth_violations_total", "service", "random-1"),
             None
         );
     }
@@ -2518,7 +2518,11 @@ contexts = ["default"]
         );
         assert!(denied.message.contains("admin.Wipe"));
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         // A token the ACL no longer holds is unauthenticated; a changed service is denied.
@@ -2543,13 +2547,21 @@ contexts = ["default"]
         let d = tok("tok-billing", "billing");
         assert!(a.check_send(Some(&d), "billing", "admin.Wipe").is_ok());
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         // No principal: reported at Register, not per request.
         assert!(a.check_send(None, "billing", "admin.Wipe").is_ok());
         assert_eq!(
-            m.counter("kraken_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
     }
@@ -2628,7 +2640,7 @@ contexts = ["default"]
 
     #[test]
     fn reload_keeps_the_previous_acl_when_the_file_is_bad() {
-        let dir = std::env::temp_dir().join(format!("kraken-acl-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-acl-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("acl.toml");
         std::fs::write(&file, acl_text()).unwrap();
@@ -2655,7 +2667,7 @@ contexts = ["default"]
             "and the previous ACL"
         );
         assert_eq!(
-            m.counter_total("kraken_hub_acl_reload_errors_total"),
+            m.counter_total("snodra_server_acl_reload_errors_total"),
             Some(1)
         );
 
@@ -2663,7 +2675,7 @@ contexts = ["default"]
         assert!(a.reload());
         assert_eq!(a.generation(), 2);
         assert!(a.acl().lookup(&digest_of("tok-billing")).is_none());
-        assert_eq!(m.gauge_plain("kraken_hub_acl_generation"), Some(2));
+        assert_eq!(m.gauge_plain("snodra_server_acl_generation"), Some(2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2787,7 +2799,7 @@ handle = ["*"]
             r#"
 [[token]]
 token_sha256 = "{browser}"
-service = "kraken-event-browser"
+service = "snodra-event-browser"
 event-browser = true
 
 [[token]]
@@ -2796,7 +2808,7 @@ service = "orders"
 handle = ["*"]
 
 [[service]]
-name = "kraken-event-browser"
+name = "snodra-event-browser"
 event-browser = true
 
 [[service]]
@@ -2816,7 +2828,7 @@ event-browser = false
         assert!(browser.event_browser);
         assert!(!acl.lookup(&digest_of("tok-orders")).unwrap().event_browser);
         assert!(
-            acl.rights(&tok("tok-browser", "kraken-event-browser").key)
+            acl.rights(&tok("tok-browser", "snodra-event-browser").key)
                 .unwrap()
                 .event_browser
         );
@@ -2825,7 +2837,7 @@ event-browser = false
                 .unwrap()
                 .event_browser
         };
-        assert!(service("kraken-event-browser"));
+        assert!(service("snodra-event-browser"));
         assert!(!service("orders"));
         // Absent is false, in both tables.
         let plain = Acl::parse(&service_acl_text()).unwrap();
@@ -2861,16 +2873,16 @@ event-browser = false
         let m = test_metrics();
         let acl = Acl::parse(&event_browser_acl_text()).unwrap();
         let a = Authorizer::with_acl(AuthMode::Enforce, acl.clone(), m.metrics.clone());
-        let events = types(&["kraken.events.Search", "kraken.events.Tail"]);
+        let events = types(&["snodra.events.Search", "snodra.events.Tail"]);
 
         // With the right: the reserved types register, and need no `handle` pattern.
-        let ok = a.admit(Some(&token("tok-browser")), "kraken-event-browser", &events);
+        let ok = a.admit(Some(&token("tok-browser")), "snodra-event-browser", &events);
         assert_eq!(ok.refused, None);
         // The right grants the reserved namespace only.
         let other = a.admit(
             Some(&token("tok-browser")),
-            "kraken-event-browser",
-            &types(&["kraken.events.Get", "orders.Get"]),
+            "snodra-event-browser",
+            &types(&["snodra.events.Get", "orders.Get"]),
         );
         assert_eq!(other.refused.unwrap().reason, "handle_denied");
 
@@ -2880,7 +2892,7 @@ event-browser = false
             .admit(
                 Some(&token("tok-orders")),
                 "orders",
-                &types(&["orders.Get", "kraken.events.Search"]),
+                &types(&["orders.Get", "snodra.events.Search"]),
             )
             .refused
             .expect("refused");
@@ -2888,11 +2900,11 @@ event-browser = false
         assert_eq!(refused.code, DeniedCode::PermissionDenied);
         assert_eq!(
             refused.message,
-            "service orders may not handle type kraken.events.Search: kraken.events.* types need the event-browser right"
+            "service orders may not handle type snodra.events.Search: snodra.events.* types need the event-browser right"
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "event_browser_denied"
             ),
@@ -2904,7 +2916,7 @@ event-browser = false
         assert!(
             many[0]
                 .message
-                .contains("types kraken.events.Search, kraken.events.Tail"),
+                .contains("types snodra.events.Search, snodra.events.Tail"),
             "{}",
             many[0].message
         );
@@ -2913,7 +2925,7 @@ event-browser = false
             a.recheck(
                 Some(&tok("tok-orders", "orders")),
                 "orders",
-                &types(&["kraken.eventsX.Search", "kraken.Search"]),
+                &types(&["snodra.eventsX.Search", "snodra.Search"]),
             )
             .is_empty()
         );
@@ -2923,8 +2935,8 @@ event-browser = false
             |service: &str| Principal::jwt(service, SystemTime::now() + Duration::from_secs(3600));
         assert!(
             a.recheck(
-                Some(&jwt("kraken-event-browser")),
-                "kraken-event-browser",
+                Some(&jwt("snodra-event-browser")),
+                "snodra-event-browser",
                 &events
             )
             .is_empty()
@@ -2942,8 +2954,8 @@ event-browser = false
             m.metrics.clone(),
         );
         let denials = reloaded.recheck(
-            Some(&tok("tok-browser", "kraken-event-browser")),
-            "kraken-event-browser",
+            Some(&tok("tok-browser", "snodra-event-browser")),
+            "snodra-event-browser",
             &events,
         );
         assert_eq!(denials[0].reason, "event_browser_denied");
@@ -2957,7 +2969,7 @@ event-browser = false
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "event_browser_denied"
             ),
@@ -2975,7 +2987,7 @@ event-browser = false
             .admit(
                 Some(&token("tok-billing")),
                 "billing",
-                &types(&["admin.Wipe", "kraken.events.Search"]),
+                &types(&["admin.Wipe", "snodra.events.Search"]),
             )
             .refused
             .expect("refused");
@@ -2983,7 +2995,7 @@ event-browser = false
         let all = a.recheck(
             Some(&tok("tok-billing", "billing")),
             "billing",
-            &types(&["admin.Wipe", "kraken.events.Search"]),
+            &types(&["admin.Wipe", "snodra.events.Search"]),
         );
         let reasons: Vec<&str> = all.iter().map(|d| d.reason).collect();
         assert_eq!(reasons, ["event_browser_denied", "handle_denied"]);
@@ -2999,32 +3011,32 @@ event-browser = false
         };
         let text = [
             entry("any", "*"),
-            entry("kraken", "kraken.*"),
-            entry("events", "kraken.events.*"),
-            entry("search", "kraken.events.Search"),
+            entry("snodra", "snodra.*"),
+            entry("events", "snodra.events.*"),
+            entry("search", "snodra.events.Search"),
         ]
         .join("\n");
         let m = test_metrics();
         let a = Authorizer::with_acl(AuthMode::Enforce, Acl::parse(&text).unwrap(), m.metrics);
         let send = |t: &str, type_name: &str| a.check_send(Some(&tok(t, t)), t, type_name);
-        // `*` and `kraken.*` grant every other type, not the event browser's.
+        // `*` and `snodra.*` grant every other type, not the event browser's.
         assert!(send("any", "orders.Place").is_ok());
-        assert!(send("kraken", "kraken.Other").is_ok());
-        for t in ["any", "kraken"] {
-            let denied = send(t, "kraken.events.Search").unwrap_err();
+        assert!(send("snodra", "snodra.Other").is_ok());
+        for t in ["any", "snodra"] {
+            let denied = send(t, "snodra.events.Search").unwrap_err();
             assert_eq!(denied.reason, "send_denied");
             assert_eq!(
                 denied.message,
                 format!(
-                    "service {t} is not allowed to send type kraken.events.Search: kraken.events.* types need a send pattern naming kraken.events"
+                    "service {t} is not allowed to send type snodra.events.Search: snodra.events.* types need a send pattern naming snodra.events"
                 )
             );
         }
         // A pattern that names the namespace, or the type, grants it.
-        assert!(send("events", "kraken.events.Search").is_ok());
-        assert!(send("events", "kraken.events.Tail").is_ok());
-        assert!(send("search", "kraken.events.Search").is_ok());
-        assert!(send("search", "kraken.events.Tail").is_err());
+        assert!(send("events", "snodra.events.Search").is_ok());
+        assert!(send("events", "snodra.events.Tail").is_ok());
+        assert!(send("search", "snodra.events.Search").is_ok());
+        assert!(send("search", "snodra.events.Tail").is_err());
     }
 
     #[test]
@@ -3038,11 +3050,11 @@ event-browser = false
         };
         let text = [
             entry("any", "*"),
-            entry("kraken", "kraken.*"),
-            entry("events", "kraken.events.*"),
-            entry("search", "kraken.events.Search"),
+            entry("snodra", "snodra.*"),
+            entry("events", "snodra.events.*"),
+            entry("search", "snodra.events.Search"),
             entry("orders", "orders.*"),
-            "[[service]]\nname = \"svc\"\nhandle = [\"kraken.events.Get\"]\n".to_string(),
+            "[[service]]\nname = \"svc\"\nhandle = [\"snodra.events.Get\"]\n".to_string(),
         ]
         .join("\n");
         Acl::parse(&text).unwrap();
@@ -3056,10 +3068,10 @@ event-browser = false
         assert_eq!(
             warned,
             [
-                "kraken.*",
-                "kraken.events.*",
-                "kraken.events.Search",
-                "kraken.events.Get"
+                "snodra.*",
+                "snodra.events.*",
+                "snodra.events.Search",
+                "snodra.events.Get"
             ]
         );
     }
@@ -3301,12 +3313,16 @@ event-browser = false
         assert_eq!(d.message, "malformed token");
         assert_eq!(d.to_status().code(), tonic::Code::Unauthenticated);
         assert_eq!(
-            fx.m.counter("kraken_hub_jwt_validations_total", "result", "expired"),
+            fx.m.counter("snodra_server_jwt_validations_total", "result", "expired"),
             Some(1)
         );
         // Labels are fixed strings.
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(3)
         );
     }
@@ -3365,7 +3381,11 @@ event-browser = false
         assert_eq!(adm.principal, None);
         assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(1)
         );
         // A valid one for the right service is authenticated.
@@ -3429,12 +3449,12 @@ event-browser = false
             .auth
             .admit(Some(&fx.token("billing", 300)), "billing", &types(&["x.Y"]));
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(1)
         );
         let _ = fx.auth.admit(Some(&fx.token("ghost", 300)), "ghost", &[]);
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "service", "unknown"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(1)
         );
     }
@@ -3460,7 +3480,11 @@ event-browser = false
     }
 
     fn refreshes(fx: &JwtFx, result: &str) -> Option<u64> {
-        fx.m.counter("kraken_hub_credentials_refreshes_total", "result", result)
+        fx.m.counter(
+            "snodra_server_credentials_refreshes_total",
+            "result",
+            result,
+        )
     }
 
     #[tokio::test]
@@ -3495,7 +3519,10 @@ event-browser = false
         assert_eq!(refreshes(&fx, "unavailable"), Some(1));
         assert_eq!(refreshes(&fx, "refused"), None);
         // Not a violation: the credential is not bad, the hub just cannot judge it yet.
-        assert_eq!(fx.m.counter_total("kraken_hub_auth_violations_total"), None);
+        assert_eq!(
+            fx.m.counter_total("snodra_server_auth_violations_total"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3562,7 +3589,7 @@ event-browser = false
         assert_eq!(refreshes(&fx, "wrong_service"), Some(1));
         assert_eq!(
             fx.m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "wrong_service"
             ),
@@ -3608,7 +3635,11 @@ event-browser = false
         );
         assert_eq!(refreshes(&fx, "refused"), Some(1));
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(1)
         );
     }
@@ -3638,7 +3669,7 @@ event-browser = false
         );
         assert_eq!(
             fx.m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -3671,18 +3702,18 @@ event-browser = false
             )
         );
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "reason", "expired"),
+            fx.m.counter("snodra_server_auth_violations_total", "reason", "expired"),
             Some(1)
         );
         let fx = jwt_fx(AuthMode::Permissive).await;
         let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(31));
         assert_eq!(fx.auth.expired(&p, "billing"), Expiry::Keep);
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "reason", "expired"),
+            fx.m.counter("snodra_server_auth_violations_total", "reason", "expired"),
             Some(1)
         );
         assert_eq!(
-            fx.m.counter("kraken_hub_auth_violations_total", "service", "billing"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(1)
         );
     }
@@ -3700,7 +3731,7 @@ event-browser = false
             let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(10));
             assert_eq!(fx.auth.expired(&p, "billing"), Expiry::NotYet, "{mode:?}");
             assert_eq!(
-                fx.m.counter_total("kraken_hub_auth_violations_total"),
+                fx.m.counter_total("snodra_server_auth_violations_total"),
                 None,
                 "{mode:?}"
             );
@@ -3835,11 +3866,11 @@ handle = ["billing.*"]
     }
 
     fn results(m: &TestMetrics, result: &str) -> Option<u64> {
-        m.counter("kraken_hub_client_certificates_total", "result", result)
+        m.counter("snodra_server_client_certificates_total", "result", result)
     }
 
     fn violations(m: &TestMetrics, reason: &str) -> Option<u64> {
-        m.counter("kraken_hub_auth_violations_total", "reason", reason)
+        m.counter("snodra_server_auth_violations_total", "reason", reason)
     }
 
     #[test]
@@ -3876,7 +3907,7 @@ handle = ["billing.*"]
             ),
             (
                 ClientSpec {
-                    uris: vec!["kraken://service/a".into(), "kraken://service/b".into()],
+                    uris: vec!["snodra://service/a".into(), "snodra://service/b".into()],
                     ..ClientSpec::default()
                 },
                 "multiple_services",
@@ -4028,7 +4059,7 @@ handle = ["billing.*"]
         assert_eq!(adm.status, AuthStatus::Off);
         assert_eq!(adm.refused, None);
         assert_eq!(
-            m.counter_total("kraken_hub_client_certificates_total"),
+            m.counter_total("snodra_server_client_certificates_total"),
             None
         );
         assert_eq!(a.expiry_deadline(None), None);

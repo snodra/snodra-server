@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
-use kraken_hub::proto::{
+use snodra_server::config::Config;
+use snodra_server::proto::{
     ClientMessage, ErrorCode, Heartbeat, Register, RegisterAck, Request, RequestKind,
     client_message, reply, server_message,
 };
@@ -28,7 +28,7 @@ async fn expect_request(c: &mut FakeClient) -> Request {
     }
 }
 
-async fn expect_error(c: &mut FakeClient) -> kraken_hub::proto::Error {
+async fn expect_error(c: &mut FakeClient) -> snodra_server::proto::Error {
     match c.next_within(SHORT).await.unwrap().unwrap().message {
         Some(server_message::Message::Error(e)) => e,
         other => panic!("expected error, got {other:?}"),
@@ -64,43 +64,45 @@ async fn request_before_register_closes_with_failed_precondition() {
     assert_eq!(status.message(), "first message must be Register");
 }
 
-/// The hub's own request sessions use instance ids `kraken-hub/<uuid>` (ADR 0027): a client may
+/// The hub's own request sessions use instance ids `snodra-server/<uuid>` (ADR 0027): a client may
 /// not register one.
 #[tokio::test]
 async fn an_instance_id_with_the_hubs_reserved_prefix_is_refused() {
     let addr = start_hub(Config::default()).await;
     let mut client = FakeClient::connect(addr).await;
-    client.instance_id = "kraken-hub/1234".to_string();
+    client.instance_id = "snodra-server/1234".to_string();
     client.send_register("svc", &["svc.Do"], &[]).await;
     let status = client.expect_closed().await;
     assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(
         status.message(),
-        "Register.instance_id must not start with kraken-hub/: the hub's own requests use it"
+        "Register.instance_id must not start with snodra-server/: the hub's own requests use it"
     );
     // Anything else is an ordinary instance id.
     let mut other = FakeClient::connect(addr).await;
-    other.instance_id = "kraken-hubx/1".to_string();
+    other.instance_id = "snodra-serverx/1".to_string();
     other.send_register("svc", &["svc.Do"], &[]).await;
     other.expect_ack().await;
 }
 
-/// The hub's own requests are sent as service `kraken-hub`: no client may register as it.
+/// The hub's own requests are sent as service `snodra-server`: no client may register as it.
 #[tokio::test]
 async fn the_hubs_own_service_name_is_refused() {
     let addr = start_hub(Config::default()).await;
     let mut client = FakeClient::connect(addr).await;
-    client.send_register("kraken-hub", &["svc.Do"], &[]).await;
+    client
+        .send_register("snodra-server", &["svc.Do"], &[])
+        .await;
     let status = client.expect_closed().await;
     assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(
         status.message(),
-        "Register.service_name must not be kraken-hub: the hub's own requests use it"
+        "Register.service_name must not be snodra-server: the hub's own requests use it"
     );
     // Anything else is an ordinary service name.
     let mut other = FakeClient::connect(addr).await;
     other
-        .send_register("kraken-hub-tools", &["svc.Do"], &[])
+        .send_register("snodra-server-tools", &["svc.Do"], &[])
         .await;
     other.expect_ack().await;
 }
@@ -332,7 +334,7 @@ async fn health_service_reports_serving() {
     assert_eq!(resp.status, ServingStatus::Serving as i32);
     let resp = health
         .check(HealthCheckRequest {
-            service: "kraken.hub.v1.Hub".to_string(),
+            service: "snodra.hub.v1.Hub".to_string(),
         })
         .await
         .unwrap()
@@ -409,7 +411,7 @@ async fn every_accepted_register_is_acked_before_the_echo_and_the_client_version
     c.expect_ack().await;
     expect_echo(&mut c, 2).await;
 
-    let t = kraken_hub::topology_probe(addr).await.unwrap();
+    let t = snodra_server::topology_probe(addr).await.unwrap();
     let instance = &t.services[0].instances[0];
     assert_eq!(instance.client_version, "fake-client/1.0");
     assert_eq!(instance.command_types, ["a.One", "a.Two"]);
@@ -626,7 +628,7 @@ async fn empty_request_id_is_invalid_request() {
 #[tokio::test]
 async fn health_probe_reports_serving() {
     let addr = start_hub(Config::default()).await;
-    assert!(kraken_hub::health_probe(addr).await.unwrap());
+    assert!(snodra_server::health_probe(addr).await.unwrap());
 }
 
 async fn shutdown_returns_promptly(with_http: bool) {
@@ -639,7 +641,7 @@ async fn shutdown_returns_promptly(with_http: bool) {
     };
     let http_addr = http.as_ref().map(|l| l.local_addr().unwrap());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(kraken_hub::serve_with_shutdown(
+    let server = tokio::spawn(snodra_server::serve_with_shutdown(
         Config::default(),
         listener,
         http,

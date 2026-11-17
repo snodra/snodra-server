@@ -1,4 +1,4 @@
-// kraken-hub dashboard: hash routing, the header, live updates; the processor controls need a
+// snodra-server dashboard: hash routing, the header, live updates; the processor controls need a
 // write credential (ADR 0023); the Events page (ADR 0025, ADR 0027) shows only while an event
 // browser add-on is connected to the hub. No third-party code.
 
@@ -27,7 +27,7 @@ const MIN_REFRESH_MS = 1000;
 const PEER_CHECK_MS = 5000;
 
 /** Where the reader's choice of "all hubs" or "this hub" is remembered (this browser only). */
-const SCOPE_KEY = 'kraken-hub.scope';
+const SCOPE_KEY = 'snodra-server.scope';
 
 const PAGES = [
   overview,
@@ -152,7 +152,7 @@ function mount() {
   hideTip();
   fill(errorSlot);
   fill(content);
-  document.title = `${route.page.title} · kraken-hub`;
+  document.title = `${route.page.title} · Snodra Server`;
   renderNav();
   view = route.page.mount(content, ctx());
   refresh();
@@ -163,7 +163,7 @@ function renderHeader(summary) {
   const fact = (k, v) => h('div', null, h('dt', null, k), h('dd', null, v));
   const now = summary?.nowMs ?? version.nowMs;
   fill($('hub-meta'),
-    fact('hub', h('span', { class: 'mono', title: 'KRAKEN_HUB_ID' }, version.hubId)),
+    fact('hub', h('span', { class: 'mono', title: 'SNODRA_SERVER_ID' }, version.hubId)),
     fact('version', version.version),
     fact('up', fmt.span(now - version.startedAtMs)));
   const grafana = $('grafana');

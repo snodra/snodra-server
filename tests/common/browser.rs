@@ -1,5 +1,5 @@
 //! A fake event browser (ADR 0027) for the hub's tests: a client that registers as service
-//! `kraken-event-browser` with the five `kraken.events.*` query types and answers each request
+//! `snodra-event-browser` with the five `snodra.events.*` query types and answers each request
 //! as the test says (canned JSON, the browser's errors, garbage, nothing), records what it was
 //! asked (type, JSON, headers) and hands every tail to the test to stream by hand. Plus a reader
 //! for the tail's server-sent events and a capture of the hub's log lines.
@@ -10,20 +10,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::BodyExt;
-use kraken_hub::proto::{
+use serde_json::Value;
+use snodra_server::proto::{
     ClientMessage, Error, ErrorCode, Reply, ReplyEnd, client_message, reply, server_message,
 };
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::FakeClient;
 
-pub const SERVICE: &str = "kraken-event-browser";
-pub const SEARCH: &str = "kraken.events.Search";
-pub const GET: &str = "kraken.events.Get";
-pub const SOURCES: &str = "kraken.events.Sources";
-pub const LAG: &str = "kraken.events.Lag";
-pub const TAIL: &str = "kraken.events.Tail";
+pub const SERVICE: &str = "snodra-event-browser";
+pub const SEARCH: &str = "snodra.events.Search";
+pub const GET: &str = "snodra.events.Get";
+pub const SOURCES: &str = "snodra.events.Sources";
+pub const LAG: &str = "snodra.events.Lag";
+pub const TAIL: &str = "snodra.events.Tail";
 pub const TYPES: [&str; 5] = [SEARCH, GET, SOURCES, LAG, TAIL];
 
 /// How the fake answers one request.
@@ -219,7 +219,7 @@ impl FakeBrowser {
 fn permits(count: u32) -> ClientMessage {
     ClientMessage {
         message: Some(client_message::Message::Permits(
-            kraken_hub::proto::Permits { count, grant: 0 },
+            snodra_server::proto::Permits { count, grant: 0 },
         )),
     }
 }

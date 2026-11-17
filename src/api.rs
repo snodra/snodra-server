@@ -88,11 +88,11 @@ pub struct Version {
     pub now_ms: i64,
     /// Content hash of the embedded dashboard assets; a page whose own build differs is stale.
     pub build_id: String,
-    /// `KRAKEN_HUB_GRAFANA_URL`, `None` when unset.
+    /// `SNODRA_SERVER_GRAFANA_URL`, `None` when unset.
     pub grafana_url: Option<String>,
     /// The edge-statistics window.
     pub window_ms: i64,
-    /// `KRAKEN_HUB_PEERS` as origins (ADR 0016): the hubs whose APIs the page merges. May list
+    /// `SNODRA_SERVER_PEERS` as origins (ADR 0016): the hubs whose APIs the page merges. May list
     /// this hub; the page skips it by hub id. Empty: the page shows this hub only.
     pub peers: Vec<String>,
     /// Whether the event browser add-on is connected (ADR 0027); the page hides its Events
@@ -103,7 +103,7 @@ pub struct Version {
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventBrowser {
-    /// A `kraken-event-browser` instance is connected (it handles `kraken.events.Search`).
+    /// A `snodra-event-browser` instance is connected (it handles `snodra.events.Search`).
     pub installed: bool,
     /// A request that presents this hub's dashboard or write token sees payloads: a browser is
     /// installed, the switch is on and a token is configured.
@@ -226,7 +226,7 @@ pub fn types(t: &Topology, edges: &EdgeSnapshot) -> TypesView {
 pub struct Graph {
     pub now_ms: i64,
     pub window_ms: i64,
-    /// `KRAKEN_HUB_EDGE_STATS_MAX_EDGES`.
+    /// `SNODRA_SERVER_EDGE_STATS_MAX_EDGES`.
     pub max_edges: usize,
     /// Edges dropped at the cap since the hub started.
     pub evicted_edges: u64,
@@ -438,7 +438,7 @@ pub struct Setting {
     pub name: &'static str,
     /// The effective value in the variable's own syntax; `None` for a secret.
     pub value: Option<String>,
-    /// The built-in default; `None` for a secret or a generated default (`KRAKEN_HUB_ID`).
+    /// The built-in default; `None` for a secret or a generated default (`SNODRA_SERVER_ID`).
     pub default: Option<String>,
     pub secret: bool,
     pub description: &'static str,
@@ -539,7 +539,7 @@ fn overrides(c: &Config) -> String {
         .join(",")
 }
 
-/// Every `KRAKEN_HUB_*` setting with its effective value and default, in the order of the
+/// Every `SNODRA_SERVER_*` setting with its effective value and default, in the order of the
 /// configuration table in hub.md. Values use the variable's own syntax; an empty value means
 /// disabled or none.
 pub fn settings(c: &Config) -> SettingsView {
@@ -549,343 +549,343 @@ pub fn settings(c: &Config) -> SettingsView {
     let url = |u: &Option<String>| u.as_deref().map_or_else(String::new, strip_userinfo);
     let s = vec![
         setting(
-            "KRAKEN_HUB_ID",
+            "SNODRA_SERVER_ID",
             c.hub_id.clone(),
             None,
             Plain,
             "identifies this hub in RegisterAck and the topology (default: hostname and a random suffix)",
         ),
         setting(
-            "KRAKEN_HUB_LISTEN",
+            "SNODRA_SERVER_LISTEN",
             c.listen.to_string(),
             Some(d.listen.to_string()),
             Plain,
             "gRPC bind address",
         ),
         setting(
-            "KRAKEN_HUB_HTTP_LISTEN",
+            "SNODRA_SERVER_HTTP_LISTEN",
             addr(c.http_listen),
             Some(addr(d.http_listen)),
             Plain,
             "HTTP bind address (topology, dashboard, API); empty disables it",
         ),
         setting(
-            "KRAKEN_HUB_OTLP_ENDPOINT",
+            "SNODRA_SERVER_OTLP_ENDPOINT",
             url(&c.otlp_endpoint),
             Some(url(&d.otlp_endpoint)),
             Plain,
             "OTLP gRPC endpoint for traces and metrics; empty disables export",
         ),
         setting(
-            "KRAKEN_HUB_LOG",
+            "SNODRA_SERVER_LOG",
             c.log.clone(),
             Some(d.log.clone()),
             Plain,
             "tracing filter",
         ),
         setting(
-            "KRAKEN_HUB_DEFAULT_TIMEOUT_MS",
+            "SNODRA_SERVER_DEFAULT_TIMEOUT_MS",
             c.default_timeout.as_millis().to_string(),
             Some(d.default_timeout.as_millis().to_string()),
             Plain,
             "deadline for requests with timeout_ms 0 and no override",
         ),
         setting(
-            "KRAKEN_HUB_MAX_TIMEOUT_MS",
+            "SNODRA_SERVER_MAX_TIMEOUT_MS",
             c.max_timeout.as_millis().to_string(),
             Some(d.max_timeout.as_millis().to_string()),
             Plain,
             "upper clamp for timeout_ms on types without an override",
         ),
         setting(
-            "KRAKEN_HUB_TIMEOUT_OVERRIDES",
+            "SNODRA_SERVER_TIMEOUT_OVERRIDES",
             overrides(c),
             Some(overrides(&d)),
             Plain,
             "per-type timeouts (type=ms), replacing default and clamp",
         ),
         setting(
-            "KRAKEN_HUB_HEARTBEAT_INTERVAL",
+            "SNODRA_SERVER_HEARTBEAT_INTERVAL",
             fmt_duration(c.heartbeat_interval),
             Some(fmt_duration(d.heartbeat_interval)),
             Plain,
             "heartbeat period announced to clients",
         ),
         setting(
-            "KRAKEN_HUB_HEARTBEAT_TIMEOUT",
+            "SNODRA_SERVER_HEARTBEAT_TIMEOUT",
             fmt_duration(c.heartbeat_timeout),
             Some(fmt_duration(d.heartbeat_timeout)),
             Plain,
             "dead-instance threshold",
         ),
         setting(
-            "KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE",
+            "SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE",
             c.queue_capacity_per_instance.to_string(),
             Some(d.queue_capacity_per_instance.to_string()),
             Plain,
             "requests queued per instance",
         ),
         setting(
-            "KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE",
+            "SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE",
             fmt_size(c.queue_bytes_per_instance),
             Some(fmt_size(d.queue_bytes_per_instance)),
             Plain,
             "encoded bytes queued per instance",
         ),
         setting(
-            "KRAKEN_HUB_QUEUE_BYTES_TOTAL",
+            "SNODRA_SERVER_QUEUE_BYTES_TOTAL",
             fmt_size(c.queue_bytes_total),
             Some(fmt_size(d.queue_bytes_total)),
             Plain,
             "encoded bytes queued over all instances",
         ),
         setting(
-            "KRAKEN_HUB_OWNER_GRACE",
+            "SNODRA_SERVER_OWNER_GRACE",
             fmt_duration(c.owner_grace),
             Some(fmt_duration(d.owner_grace)),
             Plain,
             "type ownership kept after the last instance leaves",
         ),
         setting(
-            "KRAKEN_HUB_MAX_STREAM_DURATION",
+            "SNODRA_SERVER_MAX_STREAM_DURATION",
             fmt_duration(c.max_stream_duration),
             Some(fmt_duration(d.max_stream_duration)),
             Plain,
             "a streaming query open for longer ends with CANCELLED and its handler is cancelled",
         ),
         setting(
-            "KRAKEN_HUB_SUBSCRIPTION_BUFFER",
+            "SNODRA_SERVER_SUBSCRIPTION_BUFFER",
             c.subscription_buffer.to_string(),
             Some(d.subscription_buffer.to_string()),
             Plain,
             "updates held per subscription while its sender owes credit; one more ends it with RESOURCE_EXHAUSTED",
         ),
         setting(
-            "KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE",
+            "SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE",
             c.max_subscriptions_per_instance.to_string(),
             Some(d.max_subscriptions_per_instance.to_string()),
             Plain,
             "subscription targets one handler instance serves at once; beyond it a new subscription is refused",
         ),
         setting(
-            "KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION",
+            "SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION",
             optional_duration(c.max_subscription_duration),
             Some(optional_duration(d.max_subscription_duration)),
             Plain,
             "a subscription open for longer ends with CANCELLED and its targets are cancelled; 0: unlimited",
         ),
         setting(
-            "KRAKEN_HUB_SESSION_BUFFER",
+            "SNODRA_SERVER_SESSION_BUFFER",
             c.session_buffer.to_string(),
             Some(d.session_buffer.to_string()),
             Plain,
             "per-session outbound buffer, in messages",
         ),
         setting(
-            "KRAKEN_HUB_HANDSHAKE_TIMEOUT",
+            "SNODRA_SERVER_HANDSHAKE_TIMEOUT",
             fmt_duration(c.handshake_timeout),
             Some(fmt_duration(d.handshake_timeout)),
             Plain,
             "time allowed for the first Register on a new stream",
         ),
         setting(
-            "KRAKEN_HUB_DASHBOARD_ENABLED",
+            "SNODRA_SERVER_DASHBOARD_ENABLED",
             c.dashboard_enabled.to_string(),
             Some(d.dashboard_enabled.to_string()),
             Plain,
             "serve this dashboard and /api/v1 and keep edge statistics",
         ),
         setting(
-            "KRAKEN_HUB_GRAFANA_URL",
+            "SNODRA_SERVER_GRAFANA_URL",
             url(&c.grafana_url),
             Some(url(&d.grafana_url)),
             Plain,
             "Grafana base URL the dashboard links to; empty: no link",
         ),
         setting(
-            "KRAKEN_HUB_EDGE_STATS_MAX_EDGES",
+            "SNODRA_SERVER_EDGE_STATS_MAX_EDGES",
             c.edge_stats_max_edges.to_string(),
             Some(d.edge_stats_max_edges.to_string()),
             Plain,
             "cap on (sender service, type) edges; the least recently used go first",
         ),
         setting(
-            "KRAKEN_HUB_EDGE_STATS_WINDOW",
+            "SNODRA_SERVER_EDGE_STATS_WINDOW",
             fmt_duration(c.edge_stats_window),
             Some(fmt_duration(d.edge_stats_window)),
             Plain,
             "sliding window of the edge statistics",
         ),
         setting(
-            "KRAKEN_HUB_PEERS",
+            "SNODRA_SERVER_PEERS",
             c.peers.join(","),
             Some(d.peers.join(",")),
             Plain,
             "other hubs' dashboard URLs the page merges (CORS and CSP allow exactly these)",
         ),
         setting(
-            "KRAKEN_HUB_AUTH_MODE",
+            "SNODRA_SERVER_AUTH_MODE",
             c.auth_mode.as_str().to_string(),
             Some(d.auth_mode.as_str().to_string()),
             Plain,
             "access control for Connect: off, permissive (log and count violations) or enforce (refuse them)",
         ),
         setting(
-            "KRAKEN_HUB_ACL_FILE",
+            "SNODRA_SERVER_ACL_FILE",
             path(&c.acl_file),
             Some(path(&d.acl_file)),
             Plain,
             "ACL (token SHA-256 to service, handle and send patterns); reloaded when it changes",
         ),
         setting(
-            "KRAKEN_HUB_JWT_ISSUER",
+            "SNODRA_SERVER_JWT_ISSUER",
             url(&c.jwt_issuer),
             Some(url(&d.jwt_issuer)),
             Plain,
             "the iss a JWT credential must carry, exact match; unset: JWT credentials are refused",
         ),
         setting(
-            "KRAKEN_HUB_JWT_JWKS_URI",
+            "SNODRA_SERVER_JWT_JWKS_URI",
             url(&c.jwt_jwks_uri),
             Some(url(&d.jwt_jwks_uri)),
             Plain,
             "where the signing keys are fetched from (default: <issuer>/protocol/openid-connect/certs)",
         ),
         setting(
-            "KRAKEN_HUB_JWT_AUDIENCE",
+            "SNODRA_SERVER_JWT_AUDIENCE",
             c.jwt_audience.clone().unwrap_or_default(),
             Some(String::new()),
             Plain,
             "when set, a JWT's aud must contain it",
         ),
         setting(
-            "KRAKEN_HUB_JWT_LEEWAY",
+            "SNODRA_SERVER_JWT_LEEWAY",
             fmt_duration(c.jwt_leeway),
             Some(fmt_duration(d.jwt_leeway)),
             Plain,
             "clock skew tolerated on exp, nbf and iat",
         ),
         setting(
-            "KRAKEN_HUB_JWT_EXPIRY_GRACE",
+            "SNODRA_SERVER_JWT_EXPIRY_GRACE",
             fmt_duration(c.jwt_expiry_grace),
             Some(fmt_duration(d.jwt_expiry_grace)),
             Plain,
             "how long after exp a JWT session stays open without a refresh",
         ),
         setting(
-            "KRAKEN_HUB_JWKS_REFRESH",
+            "SNODRA_SERVER_JWKS_REFRESH",
             fmt_duration(c.jwks_refresh),
             Some(fmt_duration(d.jwks_refresh)),
             Plain,
             "how often the signing keys are fetched again",
         ),
         setting(
-            "KRAKEN_HUB_JWT_JWKS_CA",
+            "SNODRA_SERVER_JWT_JWKS_CA",
             path(&c.jwt_jwks_ca),
             Some(path(&d.jwt_jwks_ca)),
             Plain,
             "extra CA (PEM) trusted for the key fetch, on top of the platform roots",
         ),
         setting(
-            "KRAKEN_HUB_TLS_CERT",
+            "SNODRA_SERVER_TLS_CERT",
             path(&c.tls_cert),
             Some(path(&d.tls_cert)),
             Plain,
             "PEM certificate chain of the gRPC listener; with the key, the listener accepts TLS only",
         ),
         setting(
-            "KRAKEN_HUB_TLS_KEY",
+            "SNODRA_SERVER_TLS_KEY",
             path(&c.tls_key),
             Some(path(&d.tls_key)),
             Plain,
             "PEM private key of the gRPC listener (the file's path, never its content)",
         ),
         setting(
-            "KRAKEN_HUB_HTTP_TLS_CERT",
+            "SNODRA_SERVER_HTTP_TLS_CERT",
             path(&c.http_tls_cert),
             Some(path(&d.http_tls_cert)),
             Plain,
             "PEM certificate chain of the HTTP listener; default the gRPC pair",
         ),
         setting(
-            "KRAKEN_HUB_HTTP_TLS_KEY",
+            "SNODRA_SERVER_HTTP_TLS_KEY",
             path(&c.http_tls_key),
             Some(path(&d.http_tls_key)),
             Plain,
             "PEM private key of the HTTP listener; default the gRPC pair",
         ),
         setting(
-            "KRAKEN_HUB_RELOAD_INTERVAL",
+            "SNODRA_SERVER_RELOAD_INTERVAL",
             fmt_duration(c.reload_interval),
             Some(fmt_duration(d.reload_interval)),
             Plain,
             "how often the ACL and the certificates are checked for changes",
         ),
         setting(
-            "KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT",
+            "SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT",
             fmt_duration(c.tls_handshake_timeout),
             Some(fmt_duration(d.tls_handshake_timeout)),
             Plain,
             "a TLS handshake that takes longer is dropped",
         ),
         setting(
-            "KRAKEN_HUB_TLS_HANDSHAKES_PER_IP",
+            "SNODRA_SERVER_TLS_HANDSHAKES_PER_IP",
             c.tls_handshakes_per_ip.to_string(),
             Some(d.tls_handshakes_per_ip.to_string()),
             Plain,
             "TLS handshakes in progress at once from one peer IP; more are dropped at once; 0: no cap",
         ),
         setting(
-            "KRAKEN_HUB_DASHBOARD_TOKEN",
+            "SNODRA_SERVER_DASHBOARD_TOKEN",
             String::new(),
             None,
             Sensitivity::Secret,
             "bearer token the dashboard's API requires; unset: open",
         ),
         setting(
-            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            "SNODRA_SERVER_DASHBOARD_TOKEN_FILE",
             path(&c.dashboard_token_file),
             Some(path(&d.dashboard_token_file)),
             Plain,
-            "file holding the dashboard token (the path, never its content); wins over KRAKEN_HUB_DASHBOARD_TOKEN and is reloaded when it changes",
+            "file holding the dashboard token (the path, never its content); wins over SNODRA_SERVER_DASHBOARD_TOKEN and is reloaded when it changes",
         ),
         setting(
-            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+            "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE",
             path(&c.dashboard_write_token_file),
             Some(path(&d.dashboard_write_token_file)),
             Plain,
-            "file holding the write token (the path, never its content); wins over KRAKEN_HUB_DASHBOARD_WRITE_TOKEN and is reloaded when it changes",
+            "file holding the write token (the path, never its content); wins over SNODRA_SERVER_DASHBOARD_WRITE_TOKEN and is reloaded when it changes",
         ),
         setting(
-            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
+            "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN",
             String::new(),
             None,
             Sensitivity::Secret,
             "bearer token of the processor controls (pause, resume, reset, dead letters); also reads; unset with no ACL control entry: controls are disabled",
         ),
         setting(
-            "KRAKEN_HUB_CONTROL_TIMEOUT",
+            "SNODRA_SERVER_CONTROL_TIMEOUT",
             fmt_duration(c.control_timeout),
             Some(fmt_duration(d.control_timeout)),
             Plain,
             "how long a control call waits for an instance's answer",
         ),
         setting(
-            "KRAKEN_HUB_RESET_TIMEOUT",
+            "SNODRA_SERVER_RESET_TIMEOUT",
             fmt_duration(c.reset_timeout),
             Some(fmt_duration(d.reset_timeout)),
             Plain,
             "how long the instance that executes a reset may take",
         ),
         setting(
-            "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS",
+            "SNODRA_SERVER_EVENT_BROWSER_PAYLOADS",
             c.event_payloads.to_string(),
             Some(d.event_payloads.to_string()),
             Plain,
             "ask the event browser for event payloads (record detail, payload search) for a request that presents the dashboard or write token",
         ),
         setting(
-            "KRAKEN_HUB_EVENT_MAX_TAILS",
+            "SNODRA_SERVER_EVENT_MAX_TAILS",
             c.event_max_tails.to_string(),
             Some(d.event_max_tails.to_string()),
             Plain,
@@ -1265,13 +1265,16 @@ mod tests {
         for removed in crate::config::REMOVED_SETTINGS {
             assert!(v.settings.iter().all(|s| s.name != removed), "{removed}");
         }
-        assert_eq!(get("KRAKEN_HUB_ID").value.as_deref(), Some("hub-7"));
-        let control = get("KRAKEN_HUB_CONTROL_TIMEOUT");
+        assert_eq!(get("SNODRA_SERVER_ID").value.as_deref(), Some("hub-7"));
+        let control = get("SNODRA_SERVER_CONTROL_TIMEOUT");
         assert_eq!(
             (control.value.as_deref(), control.default.as_deref()),
             (Some("10s"), Some("10s"))
         );
-        assert_eq!(get("KRAKEN_HUB_RESET_TIMEOUT").value.as_deref(), Some("2m"));
+        assert_eq!(
+            get("SNODRA_SERVER_RESET_TIMEOUT").value.as_deref(),
+            Some("2m")
+        );
         assert!(
             v.settings
                 .iter()
@@ -1279,46 +1282,51 @@ mod tests {
             "the write token has an effect"
         );
         assert_eq!(
-            get("KRAKEN_HUB_MAX_STREAM_DURATION").value.as_deref(),
+            get("SNODRA_SERVER_MAX_STREAM_DURATION").value.as_deref(),
             Some("10m")
         );
         assert_eq!(
-            get("KRAKEN_HUB_SUBSCRIPTION_BUFFER").value.as_deref(),
+            get("SNODRA_SERVER_SUBSCRIPTION_BUFFER").value.as_deref(),
             Some("256")
         );
         assert_eq!(
-            get("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE")
+            get("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE")
                 .value
                 .as_deref(),
             Some("1024")
         );
-        let m = get("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION");
+        let m = get("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION");
         assert_eq!(
             (m.value.as_deref(), m.default.as_deref()),
             (Some("0"), Some("0")),
             "unlimited reads back as the value that unsets it"
         );
-        assert_eq!(get("KRAKEN_HUB_ID").default, None);
-        let t = get("KRAKEN_HUB_DEFAULT_TIMEOUT_MS");
+        assert_eq!(get("SNODRA_SERVER_ID").default, None);
+        let t = get("SNODRA_SERVER_DEFAULT_TIMEOUT_MS");
         assert_eq!(
             (t.value.as_deref(), t.default.as_deref()),
             (Some("2500"), Some("5000"))
         );
         assert_eq!(
-            get("KRAKEN_HUB_TIMEOUT_OVERRIDES").value.as_deref(),
+            get("SNODRA_SERVER_TIMEOUT_OVERRIDES").value.as_deref(),
             Some("files.Upload=120000")
         );
-        assert_eq!(get("KRAKEN_HUB_OTLP_ENDPOINT").value.as_deref(), Some(""));
         assert_eq!(
-            get("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE").value.as_deref(),
+            get("SNODRA_SERVER_OTLP_ENDPOINT").value.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            get("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE")
+                .value
+                .as_deref(),
             Some("64MiB")
         );
         assert_eq!(
-            get("KRAKEN_HUB_EDGE_STATS_WINDOW").value.as_deref(),
+            get("SNODRA_SERVER_EDGE_STATS_WINDOW").value.as_deref(),
             Some("5m")
         );
         assert_eq!(
-            get("KRAKEN_HUB_HEARTBEAT_INTERVAL").value.as_deref(),
+            get("SNODRA_SERVER_HEARTBEAT_INTERVAL").value.as_deref(),
             Some("3s")
         );
         let json = serde_json::to_string(&v).unwrap();
@@ -1334,8 +1342,8 @@ mod tests {
         assert_eq!(
             secrets,
             [
-                "KRAKEN_HUB_DASHBOARD_TOKEN",
-                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN"
+                "SNODRA_SERVER_DASHBOARD_TOKEN",
+                "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN"
             ]
         );
         assert!(
@@ -1344,7 +1352,7 @@ mod tests {
                 .filter(|s| s.secret)
                 .all(|s| s.value.is_none())
         );
-        assert_eq!(get("KRAKEN_HUB_AUTH_MODE").value.as_deref(), Some("off"));
+        assert_eq!(get("SNODRA_SERVER_AUTH_MODE").value.as_deref(), Some("off"));
     }
 
     #[test]
@@ -1352,42 +1360,45 @@ mod tests {
         let c = Config {
             jwt_issuer: Some("https://sso.example/realms/kraken".into()),
             jwt_jwks_uri: Some("http://keycloak:8080/certs".into()),
-            jwt_audience: Some("kraken-hub".into()),
+            jwt_audience: Some("snodra-server".into()),
             jwt_leeway: Duration::from_secs(5),
             ..Config::default()
         };
         let v = settings(&c);
         let get = |name: &str| v.settings.iter().find(|s| s.name == name).unwrap();
         assert_eq!(
-            get("KRAKEN_HUB_JWT_ISSUER").value.as_deref(),
+            get("SNODRA_SERVER_JWT_ISSUER").value.as_deref(),
             Some("https://sso.example/realms/kraken")
         );
         assert_eq!(
-            get("KRAKEN_HUB_JWT_JWKS_URI").value.as_deref(),
+            get("SNODRA_SERVER_JWT_JWKS_URI").value.as_deref(),
             Some("http://keycloak:8080/certs")
         );
         assert_eq!(
-            get("KRAKEN_HUB_JWT_AUDIENCE").value.as_deref(),
-            Some("kraken-hub")
+            get("SNODRA_SERVER_JWT_AUDIENCE").value.as_deref(),
+            Some("snodra-server")
         );
-        let leeway = get("KRAKEN_HUB_JWT_LEEWAY");
+        let leeway = get("SNODRA_SERVER_JWT_LEEWAY");
         assert_eq!(
             (leeway.value.as_deref(), leeway.default.as_deref()),
             (Some("5s"), Some("30s"))
         );
         assert_eq!(
-            get("KRAKEN_HUB_JWT_EXPIRY_GRACE").value.as_deref(),
+            get("SNODRA_SERVER_JWT_EXPIRY_GRACE").value.as_deref(),
             Some("30s")
         );
-        assert_eq!(get("KRAKEN_HUB_JWKS_REFRESH").value.as_deref(), Some("5m"));
-        assert_eq!(get("KRAKEN_HUB_JWT_JWKS_CA").value.as_deref(), Some(""));
-        assert!(!get("KRAKEN_HUB_JWT_ISSUER").secret);
+        assert_eq!(
+            get("SNODRA_SERVER_JWKS_REFRESH").value.as_deref(),
+            Some("5m")
+        );
+        assert_eq!(get("SNODRA_SERVER_JWT_JWKS_CA").value.as_deref(), Some(""));
+        assert!(!get("SNODRA_SERVER_JWT_ISSUER").secret);
     }
 
     #[test]
     fn a_secret_setting_never_carries_its_value() {
         let s = setting(
-            "KRAKEN_HUB_TOKEN",
+            "SNODRA_SERVER_TOKEN",
             "s3cret".into(),
             Some("default-s3cret".into()),
             Sensitivity::Secret,

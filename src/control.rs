@@ -52,9 +52,9 @@ const MAX_WORD_BYTES: usize = 32;
 /// How long the hub waits for the answers of one control call (ADR 0023).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
-    /// Every request but `reset_execute` (`KRAKEN_HUB_CONTROL_TIMEOUT`).
+    /// Every request but `reset_execute` (`SNODRA_SERVER_CONTROL_TIMEOUT`).
     pub request: Duration,
-    /// `reset_execute` (`KRAKEN_HUB_RESET_TIMEOUT`).
+    /// `reset_execute` (`SNODRA_SERVER_RESET_TIMEOUT`).
     pub reset: Duration,
     /// The lease a `reset_prepare` asks for.
     pub lease: Duration,
@@ -73,7 +73,7 @@ impl Timeouts {
     }
 }
 
-/// What an operator asked for; the `action` label of `kraken_hub_control_total` and the audit
+/// What an operator asked for; the `action` label of `snodra_server_control_total` and the audit
 /// line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -1289,7 +1289,7 @@ impl Control {
     }
 
     /// The audit line of one control call (ADR 0023) and its count in
-    /// `kraken_hub_control_total{action,outcome}`. `caller` is `write-token`, the ACL service
+    /// `snodra_server_control_total{action,outcome}`. `caller` is `write-token`, the ACL service
     /// name, or for a read the read credential (`dashboard-token`, `write-token`, `anonymous`).
     #[allow(clippy::too_many_arguments)] // the fields of the audit line
     pub fn audit(
@@ -1429,7 +1429,7 @@ mod tests {
         control.on_reply(&D, "other", token, ok(&req.control_id));
         control.on_reply(&D, "i1", token, ok("made-up"));
         assert_eq!(
-            m.counter_total("kraken_hub_control_unknown_replies_total"),
+            m.counter_total("snodra_server_control_unknown_replies_total"),
             Some(3)
         );
         assert_eq!(control.in_flight(), 1);
@@ -1439,7 +1439,7 @@ mod tests {
         // A second reply with that id is unknown now.
         control.on_reply(&D, "i1", token, ok(&req.control_id));
         assert_eq!(
-            m.counter_total("kraken_hub_control_unknown_replies_total"),
+            m.counter_total("snodra_server_control_unknown_replies_total"),
             Some(4)
         );
     }
@@ -1460,7 +1460,7 @@ mod tests {
         let req = request(&mut rx).await;
         control.on_reply(&D, "i1", token, ok(&req.control_id));
         assert_eq!(
-            m.counter_total("kraken_hub_control_unknown_replies_total"),
+            m.counter_total("snodra_server_control_unknown_replies_total"),
             Some(1)
         );
     }
@@ -1922,11 +1922,11 @@ mod tests {
         }
         assert!(line.field("duration_ms").is_some());
         assert_eq!(
-            m.counter("kraken_hub_control_total", "action", "reset"),
+            m.counter("snodra_server_control_total", "action", "reset"),
             Some(1)
         );
         assert_eq!(
-            m.counter("kraken_hub_control_total", "outcome", "unauthenticated"),
+            m.counter("snodra_server_control_total", "outcome", "unauthenticated"),
             Some(1)
         );
     }

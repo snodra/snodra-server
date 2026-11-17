@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{ClientSpec, FakeClient, Pki, Spec, TempDir, acl_entry, auth_config};
-use kraken_hub::auth::AuthMode;
-use kraken_hub::client::{ClientIdentity, Target, Trust};
-use kraken_hub::config::Config;
-use kraken_hub::tls::ClientAuthMode;
+use snodra_server::auth::AuthMode;
+use snodra_server::client::{ClientIdentity, Target, Trust};
+use snodra_server::config::Config;
+use snodra_server::tls::ClientAuthMode;
 
 /// A hub with TLS, a client CA and (optionally) an ACL, plus what a client needs to talk to it.
 struct Hub {
@@ -223,13 +223,13 @@ async fn the_health_probe_needs_a_client_certificate_on_a_required_hub() {
         tls: Some(Trust::Ca(hub.server_ca.clone())),
         identity: None,
     };
-    assert!(kraken_hub::health_probe_target(&plain).await.is_err());
+    assert!(snodra_server::health_probe_target(&plain).await.is_err());
     let id = hub.identity("probe", &ClientSpec::service("probe"));
     let with = Target {
         identity: Some(ClientIdentity::new(id.0.clone(), id.1.clone())),
         ..plain
     };
-    assert!(kraken_hub::health_probe_target(&with).await.unwrap());
+    assert!(snodra_server::health_probe_target(&with).await.unwrap());
 }
 
 #[tokio::test]
@@ -240,7 +240,9 @@ async fn an_unusable_client_certificate_is_an_error_not_a_silent_downgrade() {
         tls: Some(Trust::Ca(hub.server_ca.clone())),
         identity: Some(ClientIdentity::new("/nope.pem".into(), "/nope.key".into())),
     };
-    let e = kraken_hub::health_probe_target(&target).await.unwrap_err();
+    let e = snodra_server::health_probe_target(&target)
+        .await
+        .unwrap_err();
     assert!(format!("{e:#}").contains("/nope.pem"), "{e:#}");
 }
 
@@ -263,14 +265,14 @@ async fn the_binarys_own_health_check_works_against_a_required_hub() {
         ..auth_config(AuthMode::Off, &acl)
     })
     .await;
-    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let bin = env!("CARGO_BIN_EXE_snodra-server");
     let hub_env = |cmd: &mut tokio::process::Command| {
         cmd.env_clear()
-            .env("KRAKEN_HUB_LISTEN", format!("127.0.0.1:{}", addr.port()))
-            .env("KRAKEN_HUB_TLS_CERT", &cert)
-            .env("KRAKEN_HUB_TLS_KEY", &key)
-            .env("KRAKEN_HUB_TLS_CLIENT_CA", &client_ca)
-            .env("KRAKEN_HUB_TLS_CLIENT_AUTH", "required");
+            .env("SNODRA_SERVER_LISTEN", format!("127.0.0.1:{}", addr.port()))
+            .env("SNODRA_SERVER_TLS_CERT", &cert)
+            .env("SNODRA_SERVER_TLS_KEY", &key)
+            .env("SNODRA_SERVER_TLS_CLIENT_CA", &client_ca)
+            .env("SNODRA_SERVER_TLS_CLIENT_AUTH", "required");
     };
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--health-check");
@@ -311,8 +313,8 @@ async fn echoed(c: &mut FakeClient) -> bool {
     c.heartbeat(7).await;
     matches!(
         c.next_within(Duration::from_secs(2)).await,
-        Some(Ok(kraken_hub::proto::ServerMessage {
-            message: Some(kraken_hub::proto::server_message::Message::Heartbeat(_))
+        Some(Ok(snodra_server::proto::ServerMessage {
+            message: Some(snodra_server::proto::server_message::Message::Heartbeat(_))
         }))
     )
 }
@@ -392,8 +394,8 @@ async fn a_certificate_that_names_no_service_or_several_is_permission_denied_at_
         (
             ClientSpec {
                 uris: vec![
-                    "kraken://service/orders".into(),
-                    "kraken://service/billing".into(),
+                    "snodra://service/orders".into(),
+                    "snodra://service/billing".into(),
                 ],
                 ..ClientSpec::default()
             },
@@ -427,7 +429,7 @@ async fn the_service_is_read_from_the_leaf_of_a_chain_and_never_from_an_intermed
     // The leaf names orders, the intermediate names billing: the session is orders.
     let sub = hub
         .clients
-        .intermediate("sub CA", &["kraken://service/billing"]);
+        .intermediate("sub CA", &["snodra://service/billing"]);
     let id = chain_identity(&hub, "orders", &sub, &ClientSpec::service("orders"));
     let mut c = hub.register(&id, &orders()).await;
     c.expect_ack().await;
@@ -707,12 +709,12 @@ async fn a_credentials_refresh_on_a_certificate_session_changes_nothing() {
     let mut c = hub.register(&id, &orders()).await;
     c.expect_ack().await;
     for kind in [
-        kraken_hub::proto::credentials::Kind::Token("tok-orders".into()),
-        kraken_hub::proto::credentials::Kind::Token("junk".into()),
+        snodra_server::proto::credentials::Kind::Token("tok-orders".into()),
+        snodra_server::proto::credentials::Kind::Token("junk".into()),
     ] {
-        c.tx.send(kraken_hub::proto::ClientMessage {
-            message: Some(kraken_hub::proto::client_message::Message::Credentials(
-                kraken_hub::proto::Credentials { kind: Some(kind) },
+        c.tx.send(snodra_server::proto::ClientMessage {
+            message: Some(snodra_server::proto::client_message::Message::Credentials(
+                snodra_server::proto::Credentials { kind: Some(kind) },
             )),
         })
         .await
@@ -733,14 +735,14 @@ async fn the_topology_rpc_takes_a_certificate_whose_service_has_a_table() {
     };
     let good = hub.identity("orders", &ClientSpec::service("orders"));
     assert!(
-        kraken_hub::topology_probe_target(&probe(Some(&good)), None)
+        snodra_server::topology_probe_target(&probe(Some(&good)), None)
             .await
             .is_ok()
     );
     // A certificate whose service has no table, or names none: refused (UNAUTHENTICATED).
     for spec in [ClientSpec::service("nobody"), ClientSpec::default()] {
         let id = hub.identity("other", &spec);
-        let e = kraken_hub::topology_probe_target(&probe(Some(&id)), None)
+        let e = snodra_server::topology_probe_target(&probe(Some(&id)), None)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("unauthenticated"), "{e:#}");
@@ -760,12 +762,12 @@ async fn the_topology_rpc_without_a_certificate_still_needs_a_token_on_an_option
         identity: None,
     };
     assert!(
-        kraken_hub::topology_probe_target(&target, None)
+        snodra_server::topology_probe_target(&target, None)
             .await
             .is_err()
     );
     assert!(
-        kraken_hub::topology_probe_target(&target, Some("tok-orders"))
+        snodra_server::topology_probe_target(&target, Some("tok-orders"))
             .await
             .is_ok()
     );
@@ -777,7 +779,7 @@ async fn a_client_ca_without_the_server_pair_stops_the_hub_instead_of_serving_pl
     let dir = TempDir::new();
     let ca = dir.write("client-ca.pem", &Pki::new("client CA").ca_pem);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let result = kraken_hub::serve_with_shutdown(
+    let result = snodra_server::serve_with_shutdown(
         Config {
             otlp_endpoint: None,
             tls_client_ca: Some(ca),
@@ -790,7 +792,7 @@ async fn a_client_ca_without_the_server_pair_stops_the_hub_instead_of_serving_pl
     .await;
     let e = result.expect_err("the hub must not start");
     assert!(
-        format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"),
+        format!("{e:#}").contains("SNODRA_SERVER_TLS_CLIENT_CA"),
         "{e:#}"
     );
 }
@@ -800,7 +802,7 @@ async fn a_client_ca_that_does_not_load_stops_the_hub_at_startup() {
     let dir = TempDir::new();
     let (_, cert, key) = Pki::new("hub CA").write(&dir, "hub");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let result = kraken_hub::serve_with_shutdown(
+    let result = snodra_server::serve_with_shutdown(
         Config {
             otlp_endpoint: None,
             tls_cert: Some(cert),

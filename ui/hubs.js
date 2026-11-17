@@ -1,5 +1,5 @@
 // Multi-hub view (ADR 0016). Hubs never talk to each other: the page reads every peer listed in
-// KRAKEN_HUB_PEERS itself (CORS) and merges their topologies here, keyed by instance id, flagging
+// SNODRA_SERVER_PEERS itself (CORS) and merges their topologies here, keyed by instance id, flagging
 // where the reachable hubs disagree. An unreachable peer is shown as unreachable, never as a
 // disagreement. Everything a peer sends is data: it is checked for shape and rendered as text.
 
@@ -8,7 +8,7 @@ import { getFrom } from './api.js';
 /** Clients report InstanceStatus every 5 s; a report older than this is flagged. */
 export const STATUS_STALE_MS = 15000;
 
-/** KRAKEN_HUB_PEERS allows at most this many. */
+/** SNODRA_SERVER_PEERS allows at most this many. */
 const MAX_PEERS = 16;
 
 let own = null;

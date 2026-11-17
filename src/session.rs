@@ -679,25 +679,25 @@ mod tests {
     fn an_internal_session_is_a_sender_but_no_instance() {
         let sessions = Sessions::new();
         let (tx, _rx) = mpsc::channel(1);
-        let token = sessions.insert_internal(&D, "kraken-hub/1", "kraken-hub", tx);
+        let token = sessions.insert_internal(&D, "snodra-server/1", "snodra-server", tx);
         // The router finds it as the sender of its request.
-        assert_eq!(sessions.token_of(&D, "kraken-hub/1"), Some(token));
-        let info = sessions.sender_info(&D, "kraken-hub/1").unwrap();
+        assert_eq!(sessions.token_of(&D, "snodra-server/1"), Some(token));
+        let info = sessions.sender_info(&D, "snodra-server/1").unwrap();
         assert_eq!(
             (info.service.as_str(), info.principal),
-            ("kraken-hub", None)
+            ("snodra-server", None)
         );
-        assert!(sessions.sender(&D, "kraken-hub/1").is_some());
+        assert!(sessions.sender(&D, "snodra-server/1").is_some());
         // Nothing that lists instances sees it: no heartbeat to miss, no ACL entry to judge.
         assert!(sessions.details().is_empty());
         assert!(sessions.auth_views().is_empty());
         assert!(sessions.count_by_service().is_empty());
         let later = Instant::now() + Duration::from_secs(3600);
         assert!(sessions.stale(later, Duration::from_secs(1)).is_empty());
-        assert_eq!(sessions.processor_holders(&D, "kraken-hub", "p"), None);
+        assert_eq!(sessions.processor_holders(&D, "snodra-server", "p"), None);
         // The shutdown sweep ends it with the rest.
         assert_eq!(sessions.all_with_tokens().len(), 1);
-        assert!(sessions.remove_if(&D, "kraken-hub/1", token).is_some());
+        assert!(sessions.remove_if(&D, "snodra-server/1", token).is_some());
     }
 
     #[test]

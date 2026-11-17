@@ -31,7 +31,7 @@ function renderAllHubs(el, m) {
   const t = m.totals;
   const tiles = h('div', { class: 'tiles' },
     tile('Hubs', fmt.count(t.hubs),
-      t.unreachable ? badge('crit', `${t.unreachable} unreachable`, 'Listed in KRAKEN_HUB_PEERS but not answering; not counted as a disagreement') : 'all reachable'),
+      t.unreachable ? badge('crit', `${t.unreachable} unreachable`, 'Listed in SNODRA_SERVER_PEERS but not answering; not counted as a disagreement') : 'all reachable'),
     tile('Services', fmt.count(t.services), 'over all hubs'),
     tile('Instances', fmt.count(t.instances), 'distinct instance ids'),
     tile('Types', fmt.count(t.types), 'distinct type names'),

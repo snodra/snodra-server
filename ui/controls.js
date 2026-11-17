@@ -8,7 +8,7 @@ import * as api from './api.js';
 import { fill, h } from './dom.js';
 
 /** The help line under the write-token field. */
-const HELP = 'Pause, resume, reset and dead-letter actions need the write token (KRAKEN_HUB_DASHBOARD_WRITE_TOKEN) or an ACL credential with control = true. '
+const HELP = 'Pause, resume, reset and dead-letter actions need the write token (SNODRA_SERVER_DASHBOARD_WRITE_TOKEN) or an ACL credential with control = true. '
   + 'It is kept in this tab only and sent as an Authorization header to this hub, never in a URL. '
   + 'With several hubs, a control goes to the hub that served this page: every instance is connected to every hub, so it reaches them all.';
 

@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kraken_hub::config::Config;
-use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{
+use snodra_server::config::Config;
+use snodra_server::proto::hub_client::HubClient;
+use snodra_server::proto::{
     Cancel, ClientMessage, Credentials, Error, ErrorCode, Flow, Heartbeat, InstanceStatus, Permits,
     Register, Reply, ReplyEnd, ReplyPart, Request, RequestKind, ServerMessage, client_message,
     credentials, reply,
@@ -26,7 +26,7 @@ pub async fn start_hub(config: Config) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        kraken_hub::serve_with_shutdown(config, listener, None, std::future::pending())
+        snodra_server::serve_with_shutdown(config, listener, None, std::future::pending())
             .await
             .unwrap();
     });
@@ -44,7 +44,7 @@ pub async fn start_hub_with_http(config: Config) -> (SocketAddr, Option<SocketAd
     };
     let http_addr = http.as_ref().map(|l| l.local_addr().unwrap());
     tokio::spawn(async move {
-        kraken_hub::serve_with_shutdown(config, grpc, http, std::future::pending())
+        snodra_server::serve_with_shutdown(config, grpc, http, std::future::pending())
             .await
             .unwrap();
     });
@@ -300,7 +300,7 @@ impl FakeClient {
     pub async fn status_with_processors(
         &self,
         connected_hub_ids: &[&str],
-        processors: Vec<kraken_hub::proto::ProcessorStatus>,
+        processors: Vec<snodra_server::proto::ProcessorStatus>,
     ) {
         let msg = ClientMessage {
             message: Some(client_message::Message::Status(InstanceStatus {
@@ -480,7 +480,7 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("kraken-hub-test-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -513,14 +513,14 @@ pub fn acl_entry(token: &str, service: &str, handle: &[&str], send: &[&str]) -> 
     };
     format!(
         "[[token]]\ntoken_sha256 = \"{}\"\nservice = \"{service}\"\nhandle = [{}]\nsend = [{}]\n\n",
-        kraken_hub::auth::hash_token(token),
+        snodra_server::auth::hash_token(token),
         list(handle),
         list(send)
     )
 }
 
 /// A config with access control `mode` over the ACL file `acl`, polling for changes every 50 ms.
-pub fn auth_config(mode: kraken_hub::auth::AuthMode, acl: &std::path::Path) -> Config {
+pub fn auth_config(mode: snodra_server::auth::AuthMode, acl: &std::path::Path) -> Config {
     Config {
         otlp_endpoint: None,
         auth_mode: mode,
@@ -592,9 +592,9 @@ impl FakeClient {
 
     /// Like [`FakeClient::connect`] over TLS, trusting the CA in `ca_pem`.
     pub async fn connect_tls(addr: SocketAddr, ca_pem: &std::path::Path) -> Self {
-        let target = kraken_hub::client::Target {
+        let target = snodra_server::client::Target {
             address: addr.to_string(),
-            tls: Some(kraken_hub::client::Trust::Ca(ca_pem.to_path_buf())),
+            tls: Some(snodra_server::client::Trust::Ca(ca_pem.to_path_buf())),
             identity: None,
         };
         let channel = target.connect().await.unwrap();
@@ -620,11 +620,11 @@ impl FakeClient {
         ca_pem: &std::path::Path,
         identity: Option<(&std::path::Path, &std::path::Path)>,
     ) -> Result<Self, String> {
-        let target = kraken_hub::client::Target {
+        let target = snodra_server::client::Target {
             address: addr.to_string(),
-            tls: Some(kraken_hub::client::Trust::Ca(ca_pem.to_path_buf())),
+            tls: Some(snodra_server::client::Trust::Ca(ca_pem.to_path_buf())),
             identity: identity.map(|(cert, key)| {
-                kraken_hub::client::ClientIdentity::new(cert.to_path_buf(), key.to_path_buf())
+                snodra_server::client::ClientIdentity::new(cert.to_path_buf(), key.to_path_buf())
             }),
         };
         let channel = target.connect().await.map_err(|e| format!("{e:#}"))?;
@@ -643,10 +643,10 @@ impl FakeClient {
     }
 
     /// The next message, which must be a `RegisterAck` (the session was accepted).
-    pub async fn expect_ack(&mut self) -> kraken_hub::proto::RegisterAck {
+    pub async fn expect_ack(&mut self) -> snodra_server::proto::RegisterAck {
         match self.next().await {
             Some(Ok(ServerMessage {
-                message: Some(kraken_hub::proto::server_message::Message::RegisterAck(ack)),
+                message: Some(snodra_server::proto::server_message::Message::RegisterAck(ack)),
             })) => ack,
             other => panic!("expected a RegisterAck, got {other:?}"),
         }
@@ -668,10 +668,10 @@ impl FakeClient {
         loop {
             match self.next().await {
                 Some(Ok(ServerMessage {
-                    message: Some(kraken_hub::proto::server_message::Message::Error(e)),
+                    message: Some(snodra_server::proto::server_message::Message::Error(e)),
                 })) => return e,
                 Some(Ok(ServerMessage {
-                    message: Some(kraken_hub::proto::server_message::Message::Heartbeat(_)),
+                    message: Some(snodra_server::proto::server_message::Message::Heartbeat(_)),
                 })) => continue,
                 other => panic!("expected an Error, got {other:?}"),
             }
@@ -684,7 +684,7 @@ impl FakeClient {
             loop {
                 match self.rx.message().await {
                     Ok(Some(ServerMessage {
-                        message: Some(kraken_hub::proto::server_message::Message::Heartbeat(_)),
+                        message: Some(snodra_server::proto::server_message::Message::Heartbeat(_)),
                     })) => continue,
                     _ => return,
                 }
