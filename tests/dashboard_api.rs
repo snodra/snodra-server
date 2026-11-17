@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, http_get, http_get_full};
-use kraken_hub::config::Config;
-use kraken_hub::proto::{ErrorCode, RequestKind, ServerMessage, server_message};
-use kraken_hub::topology::Topology;
 use serde_json::Value;
+use snodra_server::config::Config;
+use snodra_server::proto::{ErrorCode, RequestKind, ServerMessage, server_message};
+use snodra_server::topology::Topology;
 
 const BOUND: Duration = Duration::from_secs(3);
 
@@ -256,10 +256,10 @@ async fn types_topology_settings_and_version_have_their_shape() {
 
     // settings: every variable, effective value and default, no secret values.
     let s = json(http, "/api/v1/settings").await;
-    let grafana = find(&s["settings"], "name", "KRAKEN_HUB_GRAFANA_URL");
+    let grafana = find(&s["settings"], "name", "SNODRA_SERVER_GRAFANA_URL");
     assert_eq!(grafana["value"], "http://grafana.local:3000");
     assert_eq!(grafana["default"], "");
-    let window = find(&s["settings"], "name", "KRAKEN_HUB_EDGE_STATS_WINDOW");
+    let window = find(&s["settings"], "name", "SNODRA_SERVER_EDGE_STATS_WINDOW");
     assert_eq!(window["value"], "5m");
     for entry in s["settings"].as_array().unwrap() {
         let secret = entry["name"].as_str().unwrap().ends_with("_TOKEN");
@@ -464,7 +464,7 @@ async fn ui_redirects_to_the_page_and_the_page_is_not_cached() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(build, kraken_hub::assets::build_id());
+    assert_eq!(build, snodra_server::assets::build_id());
     assert!(
         page.body
             .contains(&format!(r#"<script type="module" src="v/{build}/app.js">"#)),
@@ -486,7 +486,7 @@ async fn ui_redirects_to_the_page_and_the_page_is_not_cached() {
 #[tokio::test]
 async fn assets_have_their_content_types_and_are_immutable_per_build() {
     let (_grpc, http) = start(config()).await;
-    let build = kraken_hub::assets::build_id();
+    let build = snodra_server::assets::build_id();
     for (path, content_type) in [
         ("app.js", "text/javascript; charset=utf-8"),
         ("pages/overview.js", "text/javascript; charset=utf-8"),
@@ -526,7 +526,7 @@ async fn a_disabled_dashboard_serves_no_page() {
         ..config()
     })
     .await;
-    let build = kraken_hub::assets::build_id();
+    let build = snodra_server::assets::build_id();
     for path in ["/", "/ui", "/ui/", &format!("/ui/v/{build}/app.js")] {
         assert_eq!(http_get(http, path).await.0, 404, "{path}");
     }

@@ -15,8 +15,8 @@ mod common;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
-use kraken_hub::proto::{
+use snodra_server::config::Config;
+use snodra_server::proto::{
     ClientMessage, ErrorCode, Heartbeat, RequestKind, client_message, server_message,
 };
 

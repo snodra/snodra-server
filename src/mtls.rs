@@ -1,5 +1,5 @@
 //! The identity a client certificate carries (roadmap P5c, ADR 0020): exactly one URI SAN of the
-//! form `kraken://service/<name>` names the service the certificate authenticates.
+//! form `snodra://service/<name>` names the service the certificate authenticates.
 //!
 //! The TLS handshake has already verified the chain against the client CA and the validity
 //! period when this runs; this module only reads what the certificate says. Parsing is pure Rust
@@ -11,14 +11,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest as _, Sha256};
 
 /// The prefix of the URI SAN that names a service.
-pub const SERVICE_SAN_PREFIX: &str = "kraken://service/";
+pub const SERVICE_SAN_PREFIX: &str = "snodra://service/";
 
 /// The longest service name a certificate may carry (the hub clips names in logs at the same
 /// length).
 pub const MAX_SERVICE_NAME: usize = 128;
 
 /// Why a certificate names no service; the `result` label of
-/// `kraken_hub_client_certificates_total`.
+/// `snodra_server_client_certificates_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertError {
     /// No URI SAN of the form, a name outside the allowed characters, or a certificate that does
@@ -36,7 +36,7 @@ impl CertError {
         }
     }
 
-    /// The `reason` label of `kraken_hub_auth_violations_total`.
+    /// The `reason` label of `snodra_server_auth_violations_total`.
     pub fn reason(self) -> &'static str {
         match self {
             Self::NoService => "cert_no_service",
@@ -183,8 +183,8 @@ mod tests {
         for uri in [
             "spiffe://example.org/ns/prod/sa/billing",
             "https://billing.example/",
-            "kraken://other/billing",
-            "kraken://service",
+            "snodra://other/billing",
+            "snodra://service",
             "KRAKEN://service/billing",
         ] {
             let spec = ClientSpec {
@@ -196,7 +196,7 @@ mod tests {
         let one_among_others = ClientSpec {
             uris: vec![
                 "spiffe://example.org/billing".into(),
-                "kraken://service/billing".into(),
+                "snodra://service/billing".into(),
             ],
             ..ClientSpec::default()
         };
@@ -209,8 +209,8 @@ mod tests {
     #[test]
     fn two_service_uris_are_ambiguous_even_when_they_agree() {
         for uris in [
-            ["kraken://service/a", "kraken://service/b"],
-            ["kraken://service/a", "kraken://service/a"],
+            ["snodra://service/a", "snodra://service/b"],
+            ["snodra://service/a", "snodra://service/a"],
         ] {
             let spec = ClientSpec {
                 uris: uris.iter().map(|u| u.to_string()).collect(),
@@ -224,7 +224,7 @@ mod tests {
     fn a_name_outside_the_allowed_characters_names_no_service() {
         for name in ["", "a b", "a/b", "a?x=1", "a#f", "a%41", &"x".repeat(129)] {
             let spec = ClientSpec {
-                uris: vec![format!("kraken://service/{name}")],
+                uris: vec![format!("snodra://service/{name}")],
                 ..ClientSpec::default()
             };
             assert_eq!(identify(&der(&spec)), Err(CertError::NoService), "{name:?}");

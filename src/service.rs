@@ -423,7 +423,7 @@ async fn run_stream(
             .await;
         return;
     }
-    // The hub's own request sessions (ADR 0027) are `kraken-hub/<uuid>`: a client's id must not
+    // The hub's own request sessions (ADR 0027) are `snodra-server/<uuid>`: a client's id must not
     // be able to collide with one.
     if first
         .instance_id
@@ -438,7 +438,7 @@ async fn run_stream(
             .await;
         return;
     }
-    // ...and the hub sends them as service `kraken-hub`: no client may claim that name.
+    // ...and the hub sends them as service `snodra-server`: no client may claim that name.
     if first.service_name == crate::router::HUB_SERVICE {
         warn!(service = %crate::auth::clip(&first.service_name), instance = %crate::auth::clip(&first.instance_id), "register with the hub's own service name");
         let _ = tx
@@ -898,7 +898,7 @@ mod tests {
         assert!(status.message().contains("orders.Place"));
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -919,7 +919,7 @@ mod tests {
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "token_revoked"
             ),
@@ -950,7 +950,7 @@ mod tests {
     /// recorded yet), so it kept the session; the late judgement after `register` must close it.
     #[tokio::test]
     async fn a_re_register_that_a_reload_overtook_is_judged_again_once_recorded() {
-        let dir = std::env::temp_dir().join(format!("kraken-hub-race-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-race-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("acl.toml");
         let entry = |handle: &str| {
@@ -1037,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -1087,7 +1087,7 @@ mod tests {
             assert_eq!(sessions.auth_views().len(), 1);
             assert_eq!(
                 m.counter(
-                    "kraken_hub_auth_violations_total",
+                    "snodra_server_auth_violations_total",
                     "reason",
                     "token_revoked"
                 ),

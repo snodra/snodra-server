@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::topology::{InstanceTopology, Topology};
 
-pub const USAGE: &str = "usage:\n  kraken-hub                     run the hub\n  kraken-hub --health-check [REMOTE]      probe the hub's gRPC health service\n  kraken-hub --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  kraken-hub acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n  --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate (a hub with KRAKEN_HUB_TLS_CLIENT_AUTH=required)\n\nA hub with KRAKEN_HUB_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
+pub const USAGE: &str = "usage:\n  snodra-server                     run the hub\n  snodra-server --health-check [REMOTE]      probe the hub's gRPC health service\n  snodra-server --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  snodra-server acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n  --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate (a hub with SNODRA_SERVER_TLS_CLIENT_AUTH=required)\n\nA hub with SNODRA_SERVER_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
 
 /// Which hub a probe talks to; see [`crate::client::Target::resolve`].
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -54,7 +54,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
             [sub, token] if sub == "hash" => Ok(Mode::AclHash {
                 token: (token != "-").then(|| token.clone()),
             }),
-            _ => Err(UsageError("usage: kraken-hub acl hash <token|->".into())),
+            _ => Err(UsageError("usage: snodra-server acl hash <token|->".into())),
         };
     }
     let (mut health, mut topology, mut json) = (false, false, false);
@@ -546,7 +546,7 @@ mod tests {
             in_flight_as_sender: flight.1,
             command_types: commands.iter().map(|s| s.to_string()).collect(),
             query_types: queries.iter().map(|s| s.to_string()).collect(),
-            client_version: "kraken-messaging/0.1.0".into(),
+            client_version: "snodra-messaging/0.1.0".into(),
             permits_available: 0,
             queued: 0,
             load_factor: 100,

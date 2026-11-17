@@ -4,7 +4,7 @@
 // served the page, which reaches every instance. A reset is offered only when the processor's
 // event store declares the `replay` capability (ADR 0027). While an event browser add-on is
 // connected (ADR 0027), the page also lists the subscriptions no live instance reports, with the
-// lag the browser reads (kraken.events.Lag), so a stopped service's backlog stays visible.
+// lag the browser reads (snodra.events.Lag), so a stopped service's backlog stays visible.
 
 import * as controls from '../controls.js';
 import { MAX_ROWS, badge, capNote, fill, h, keepScroll, selectionIn, table } from '../dom.js';

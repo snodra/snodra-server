@@ -1,19 +1,19 @@
-//! kraken-hub binary: configuration, telemetry, then `kraken_hub::serve_with_shutdown`.
+//! snodra-server binary: configuration, telemetry, then `snodra_server::serve_with_shutdown`.
 //!
-//! `kraken-hub --health-check` instead probes the local hub's gRPC health service (for the
+//! `snodra-server --health-check` instead probes the local hub's gRPC health service (for the
 //! image's `HEALTHCHECK`; the distroless image has no shell or curl) and exits 0 when it is
-//! `SERVING`, 1 otherwise. `kraken-hub --topology [--json]` prints the local hub's topology; both
+//! `SERVING`, 1 otherwise. `snodra-server --topology [--json]` prints the local hub's topology; both
 //! take `--address` and `--tls-ca` to probe another hub or speak TLS (ADR 0018).
-//! `kraken-hub acl hash <token|->` prints the digest an ACL file holds for a token.
+//! `snodra-server acl hash <token|->` prints the digest an ACL file holds for a token.
 
 use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use kraken_hub::cli::{self, Mode, Remote};
-use kraken_hub::client::{ClientIdentity, Target};
-use kraken_hub::config::Config;
-use kraken_hub::tls::ClientAuthMode;
+use snodra_server::cli::{self, Mode, Remote};
+use snodra_server::client::{ClientIdentity, Target};
+use snodra_server::config::Config;
+use snodra_server::tls::ClientAuthMode;
 use tokio::net::TcpListener;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -36,14 +36,15 @@ async fn main() -> anyhow::Result<ExitCode> {
         Mode::Topology { json, remote } => return Ok(topology(&config, &remote, json).await),
         Mode::Serve | Mode::AclHash { .. } => {}
     }
-    let telemetry = kraken_hub::telemetry::init(&config)?;
+    let telemetry = snodra_server::telemetry::init(&config)?;
     for warning in config.security_warnings() {
         tracing::warn!("{warning}");
     }
-    kraken_hub::reload_on_sighup();
+    snodra_server::reload_on_sighup();
     let listener = TcpListener::bind(config.listen).await?;
-    let http = kraken_hub::bind_http(&config).await?;
-    kraken_hub::serve_with_shutdown(config, listener, http, kraken_hub::shutdown_signal()).await?;
+    let http = snodra_server::bind_http(&config).await?;
+    snodra_server::serve_with_shutdown(config, listener, http, snodra_server::shutdown_signal())
+        .await?;
     // Flushes pending spans and metrics.
     drop(telemetry);
     Ok(ExitCode::SUCCESS)
@@ -67,7 +68,7 @@ fn acl_hash(token: Option<String>) -> ExitCode {
         eprintln!("the token is empty");
         return ExitCode::from(2);
     }
-    println!("{}", kraken_hub::auth::hash_token(&token));
+    println!("{}", snodra_server::auth::hash_token(&token));
     ExitCode::SUCCESS
 }
 
@@ -95,21 +96,21 @@ fn target(config: &Config, remote: &Remote) -> Target {
 async fn health_check(config: &Config, remote: &Remote) -> ExitCode {
     let target = target(config, remote);
     let addr = &target.address;
-    match tokio::time::timeout(PROBE_TIMEOUT, kraken_hub::health_probe_target(&target)).await {
+    match tokio::time::timeout(PROBE_TIMEOUT, snodra_server::health_probe_target(&target)).await {
         Ok(Ok(true)) => {
-            println!("kraken-hub at {addr}: SERVING");
+            println!("snodra-server at {addr}: SERVING");
             ExitCode::SUCCESS
         }
         Ok(Ok(false)) => {
-            println!("kraken-hub at {addr}: NOT_SERVING");
+            println!("snodra-server at {addr}: NOT_SERVING");
             ExitCode::FAILURE
         }
         Ok(Err(e)) => {
-            println!("kraken-hub at {addr}: health check failed: {e:#}");
+            println!("snodra-server at {addr}: health check failed: {e:#}");
             ExitCode::FAILURE
         }
         Err(_) => {
-            println!("kraken-hub at {addr}: health check timed out after {PROBE_TIMEOUT:?}");
+            println!("snodra-server at {addr}: health check timed out after {PROBE_TIMEOUT:?}");
             ExitCode::FAILURE
         }
     }
@@ -119,11 +120,11 @@ async fn topology(config: &Config, remote: &Remote, json: bool) -> ExitCode {
     let target = target(config, remote);
     let addr = &target.address;
     // The dashboard token of the hub being probed; the same variable the hub reads.
-    let token = std::env::var("KRAKEN_HUB_DASHBOARD_TOKEN")
+    let token = std::env::var("SNODRA_SERVER_DASHBOARD_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    let probe = kraken_hub::topology_probe_target(&target, token.as_deref());
+    let probe = snodra_server::topology_probe_target(&target, token.as_deref());
     let result = match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
         Ok(result) => result.map_err(|e| format!("{e:#}")),
         Err(_) => Err(format!("timed out after {PROBE_TIMEOUT:?}")),
@@ -141,7 +142,7 @@ async fn topology(config: &Config, remote: &Remote, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("kraken-hub at {addr}: topology failed: {e}");
+            eprintln!("snodra-server at {addr}: topology failed: {e}");
             ExitCode::FAILURE
         }
     }

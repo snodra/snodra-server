@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
+use snodra_server::config::Config;
 
 const BOUND: Duration = Duration::from_secs(3);
 
@@ -20,7 +20,7 @@ async fn topology_probe_against_test_hub() {
 
     let topology = tokio::time::timeout(BOUND, async {
         loop {
-            let t = kraken_hub::topology_probe(addr).await.unwrap();
+            let t = snodra_server::topology_probe(addr).await.unwrap();
             if t.totals.instances == 1 {
                 return t;
             }
@@ -37,14 +37,14 @@ async fn topology_probe_against_test_hub() {
     assert_eq!(service.instances[0].command_types, ["Pay"]);
     assert_eq!(service.instances[0].query_types, ["GetInvoice"]);
     assert_eq!(topology.totals.instances, 1);
-    assert!(kraken_hub::cli::render_table(&topology).contains("service billing (1 instances)"));
+    assert!(snodra_server::cli::render_table(&topology).contains("service billing (1 instances)"));
 }
 
 /// The probe reads the processors over gRPC (`InstanceTopology.processors`, ADR 0022) and the
 /// table shows them under their service.
 #[tokio::test]
 async fn topology_probe_shows_the_processors_an_instance_reports() {
-    use kraken_hub::proto::{ProcessorState, ProcessorStatus, SegmentStatus};
+    use snodra_server::proto::{ProcessorState, ProcessorStatus, SegmentStatus};
     let addr = start_hub(Config {
         otlp_endpoint: None,
         ..Config::default()
@@ -73,7 +73,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
     .await;
     let topology = tokio::time::timeout(BOUND, async {
         loop {
-            let t = kraken_hub::topology_probe(addr).await.unwrap();
+            let t = snodra_server::topology_probe(addr).await.unwrap();
             if t.services
                 .first()
                 .is_some_and(|s| !s.instances[0].processors.is_empty())
@@ -85,7 +85,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
     })
     .await
     .expect("processors never appeared in topology");
-    let text = kraken_hub::cli::render_table(&topology);
+    let text = snodra_server::cli::render_table(&topology);
     assert!(text.contains("processor | instance"), "{text}");
     assert!(
         text.contains("invoices  | ")
@@ -97,7 +97,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
 #[tokio::test]
 async fn acl_hash_prints_the_digest_and_never_the_token() {
     use tokio::io::AsyncWriteExt;
-    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let bin = env!("CARGO_BIN_EXE_snodra-server");
     let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
 
     // From stdin (`-`): the token stays out of the process list.
@@ -153,17 +153,17 @@ async fn the_topology_mode_sends_the_dashboard_token_from_its_environment() {
     let token = "cli-0123456789abcdef0123";
     let addr = start_hub(Config {
         otlp_endpoint: None,
-        dashboard_token: Some(kraken_hub::auth::Secret::new(token)),
+        dashboard_token: Some(snodra_server::auth::Secret::new(token)),
         ..Config::default()
     })
     .await;
-    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let bin = env!("CARGO_BIN_EXE_snodra-server");
     let run = |env: Option<&str>| {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(["--topology", "--address", &addr.to_string()])
             .env_clear();
         if let Some(t) = env {
-            cmd.env("KRAKEN_HUB_DASHBOARD_TOKEN", t);
+            cmd.env("SNODRA_SERVER_DASHBOARD_TOKEN", t);
         }
         async move { cmd.output().await.unwrap() }
     };
@@ -185,7 +185,7 @@ async fn the_topology_mode_sends_the_dashboard_token_from_its_environment() {
 /// word, so a probe the operator believed authenticated ran unauthenticated.
 #[tokio::test]
 async fn a_client_certificate_for_a_plain_text_target_is_refused() {
-    use kraken_hub::client::{ClientIdentity, Target};
+    use snodra_server::client::{ClientIdentity, Target};
 
     let addr = start_hub(Config {
         otlp_endpoint: None,
@@ -194,11 +194,13 @@ async fn a_client_certificate_for_a_plain_text_target_is_refused() {
     .await;
     let identity = ClientIdentity::new("/nowhere/c.pem".into(), "/nowhere/k.pem".into());
     let target = Target::plain(addr).with_identity(Some(identity));
-    let e = kraken_hub::health_probe_target(&target).await.unwrap_err();
+    let e = snodra_server::health_probe_target(&target)
+        .await
+        .unwrap_err();
     assert!(format!("{e:#}").contains("needs TLS"), "{e:#}");
 
     // The same through the binary: a failed probe that says why, not a SERVING.
-    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let bin = env!("CARGO_BIN_EXE_snodra-server");
     for mode in ["--health-check", "--topology"] {
         let out = tokio::process::Command::new(bin)
             .args([mode, "--address", &format!("http://{addr}")])

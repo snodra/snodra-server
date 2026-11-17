@@ -1,7 +1,7 @@
-//! The HTTP port (`KRAKEN_HUB_HTTP_LISTEN`, default 7001): unless
-//! `KRAKEN_HUB_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see [`crate::assets`]) and its API
+//! The HTTP port (`SNODRA_SERVER_HTTP_LISTEN`, default 7001): unless
+//! `SNODRA_SERVER_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see [`crate::assets`]) and its API
 //! under `/api/v1/` (`processors`, ADR 0022; the processor controls under `/api/v1/services/`,
-//! ADR 0023); with the dashboard disabled every path is 404. With `KRAKEN_HUB_DASHBOARD_TOKEN`
+//! ADR 0023); with the dashboard disabled every path is 404. With `SNODRA_SERVER_DASHBOARD_TOKEN`
 //! set (ADR 0018), every read under `/api/v1/` (the event stream included) needs
 //! `Authorization: Bearer <token>` (the dashboard token, or the write token, which reads too);
 //! the page and its assets stay public, because the page is what asks for the token. The mutating control calls need the write token or an ACL credential whose
@@ -53,7 +53,7 @@ pub const STREAM_EVERY: Duration = Duration::from_secs(2);
 pub const MAX_STREAMS: usize = 64;
 
 /// `Content-Security-Policy` of every dashboard and API response: only the hub's own scripts,
-/// styles, images and API, plus the peer hubs' APIs (`KRAKEN_HUB_PEERS`, ADR 0016) for
+/// styles, images and API, plus the peer hubs' APIs (`SNODRA_SERVER_PEERS`, ADR 0016) for
 /// `connect-src`; no inline script or style, no framing, no plugins.
 pub fn csp(peers: &[String]) -> String {
     let mut connect = String::from("'self'");
@@ -90,7 +90,7 @@ pub struct HttpState {
     pub summaries: Arc<SummaryFeed>,
     /// The hub's instruments (the events API counts its calls, tails and payload views).
     pub metrics: Arc<Metrics>,
-    /// The slots of `KRAKEN_HUB_EVENT_MAX_TAILS`: event tails open on this hub.
+    /// The slots of `SNODRA_SERVER_EVENT_MAX_TAILS`: event tails open on this hub.
     pub tails: Arc<Semaphore>,
 }
 
@@ -516,7 +516,7 @@ impl<'a> EventCall<'a> {
     }
 }
 
-/// `GET /api/v1/events`: one page of a search, newest first (`kraken.events.Search`).
+/// `GET /api/v1/events`: one page of a search, newest first (`snodra.events.Search`).
 async fn api_events(
     State(s): State<HttpState>,
     Query(params): Query<events::Params>,
@@ -539,7 +539,7 @@ async fn api_events(
 }
 
 /// `GET /api/v1/events/{source}/{segment}/{position}`: one record, with every header and, under
-/// the payload rules (ADR 0025), its payload, each served payload audited (`kraken.events.Get`).
+/// the payload rules (ADR 0025), its payload, each served payload audited (`snodra.events.Get`).
 async fn api_event(
     State(s): State<HttpState>,
     Path((source, segment, position)): Path<(String, String, String)>,
@@ -574,7 +574,7 @@ async fn api_event(
 }
 
 /// `GET /api/v1/events/sources`: the sources the browser reads, the default first, with their
-/// segments' bounds (`kraken.events.Sources`).
+/// segments' bounds (`snodra.events.Sources`).
 async fn api_event_sources(State(s): State<HttpState>, headers: HeaderMap) -> Response {
     let call = EventCall::new(&s, "sources", &headers);
     let sources = async {
@@ -591,7 +591,7 @@ struct SourceQuery {
 }
 
 /// `GET /api/v1/events/lag?source=`: every subscription with a committed position on the
-/// source and its lag, live instances or not (`kraken.events.Lag`).
+/// source and its lag, live instances or not (`snodra.events.Lag`).
 async fn api_event_lag(
     State(s): State<HttpState>,
     Query(query): Query<SourceQuery>,
@@ -605,8 +605,8 @@ async fn api_event_lag(
     call.answer(lag.await)
 }
 
-/// Counts an open tail in `kraken_hub_event_tails` and holds its slot of
-/// `KRAKEN_HUB_EVENT_MAX_TAILS` until dropped.
+/// Counts an open tail in `snodra_server_event_tails` and holds its slot of
+/// `SNODRA_SERVER_EVENT_MAX_TAILS` until dropped.
 struct TailGuard {
     metrics: Arc<crate::telemetry::Metrics>,
     _slot: tokio::sync::OwnedSemaphorePermit,
@@ -623,11 +623,11 @@ fn sse_json(name: &'static str, value: &serde_json::Value) -> Event {
 }
 
 /// `GET /api/v1/events/tail`: server-sent events from the end of every segment, read through
-/// `kraken.events.Tail`: `start`, a `record` (a summary, never a payload) per matching record,
+/// `snodra.events.Tail`: `start`, a `record` (a summary, never a payload) per matching record,
 /// `heartbeat` while quiet (the browser's, asked below the hub's stream idle timeout) and `end`
 /// with the reason: the browser's (`maxDuration`, `slowReader`, `shutdown`), `failed` when the
 /// browser went away or broke the stream, `shutdown` when this hub stops. A reader that leaves
-/// cancels the browser's tail. At most `KRAKEN_HUB_EVENT_MAX_TAILS` are open on this hub.
+/// cancels the browser's tail. At most `SNODRA_SERVER_EVENT_MAX_TAILS` are open on this hub.
 async fn api_events_tail(
     State(s): State<HttpState>,
     Query(params): Query<events::Params>,
@@ -638,7 +638,7 @@ async fn api_events_tail(
         call.installed()?;
         let slot = Arc::clone(&s.tails).try_acquire_owned().map_err(|_| {
             Refusal::Busy(format!(
-                "{} event tails are open on this hub (KRAKEN_HUB_EVENT_MAX_TAILS); try again shortly",
+                "{} event tails are open on this hub (SNODRA_SERVER_EVENT_MAX_TAILS); try again shortly",
                 s.config.event_max_tails
             ))
         })?;
@@ -861,7 +861,7 @@ async fn admit_control(
                     control.refused(action, "forbidden");
                     return Err(Box::new(error_json(
                         StatusCode::FORBIDDEN,
-                        "the dashboard token is read-only; controls need KRAKEN_HUB_DASHBOARD_WRITE_TOKEN or an ACL credential with control = true",
+                        "the dashboard token is read-only; controls need SNODRA_SERVER_DASHBOARD_WRITE_TOKEN or an ACL credential with control = true",
                     )));
                 }
                 control.refused(action, "unauthenticated");
@@ -1600,14 +1600,14 @@ mod tests {
         assert!(StreamSlot::acquire(&open).is_some());
     }
 
-    /// An in-process event browser: a session of service `kraken-event-browser` that handles
+    /// An in-process event browser: a session of service `snodra-event-browser` that handles
     /// the five query types and answers each request with `answer(type, request)` (a tail gets
     /// its `start` and then nothing until it is cancelled).
     fn fake_browser(s: &HttpState, answer: fn(&str, &serde_json::Value) -> serde_json::Value) {
         use crate::proto::{Reply, ReplyPart, reply, server_message};
         let ctx = ContextId::default();
         let token = s.sessions.allocate_token();
-        let service = "kraken-event-browser";
+        let service = "snodra-event-browser";
         assert!(
             s.router
                 .open_session(&ctx, "b1", token, service, 64)
@@ -1734,24 +1734,24 @@ mod tests {
             .unwrap();
         assert_eq!(tail.status(), StatusCode::OK);
         assert_eq!(
-            metrics.up_down_total("kraken_hub_event_tails"),
+            metrics.up_down_total("snodra_server_event_tails"),
             Some(1),
             "a tail open"
         );
         drop(tail);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while metrics.up_down_total("kraken_hub_event_tails") != Some(0) {
+        while metrics.up_down_total("snodra_server_event_tails") != Some(0) {
             assert!(Instant::now() < deadline, "the tail did not end");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         let count = |kind: &str, outcome: &str| {
             let total = metrics
-                .counter("kraken_hub_event_browser_requests_total", "kind", kind)
+                .counter("snodra_server_event_browser_requests_total", "kind", kind)
                 .unwrap_or(0);
             let by_outcome = metrics
                 .counter(
-                    "kraken_hub_event_browser_requests_total",
+                    "snodra_server_event_browser_requests_total",
                     "outcome",
                     outcome,
                 )
@@ -1763,12 +1763,12 @@ mod tests {
         assert_eq!(count("record", "ok").0, 1);
         assert_eq!(count("tail", "ok").0, 1);
         assert_eq!(
-            metrics.histogram_sum("kraken_hub_event_browser_scanned_records"),
+            metrics.histogram_sum("snodra_server_event_browser_scanned_records"),
             Some((1, 3.0)),
             "one search that read three records"
         );
         assert_eq!(
-            metrics.counter_total("kraken_hub_event_payload_views_total"),
+            metrics.counter_total("snodra_server_event_payload_views_total"),
             Some(1)
         );
         let audits: Vec<_> = crate::telemetry::test_support::logged()

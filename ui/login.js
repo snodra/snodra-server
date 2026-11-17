@@ -1,4 +1,4 @@
-// The sign-in form of a hub that has a dashboard token (KRAKEN_HUB_DASHBOARD_TOKEN, ADR 0018).
+// The sign-in form of a hub that has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN, ADR 0018).
 // The token is typed into a password field, kept in sessionStorage by api.js and sent as a header;
 // the form never puts it in a URL.
 
@@ -35,7 +35,7 @@ export function showLogin(root, submit) {
   fill(root, h('section', { class: 'card login-card', 'aria-label': 'Sign in' },
     h('div', { class: 'card-head' }, h('h1', null, 'Sign in')),
     h('p', { class: 'note' },
-      'This hub requires a dashboard token (KRAKEN_HUB_DASHBOARD_TOKEN). It is kept in this tab only and sent as an Authorization header.'),
+      'This hub requires a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN). It is kept in this tab only and sent as an Authorization header.'),
     form));
   input.focus();
 }

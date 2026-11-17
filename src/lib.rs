@@ -1,4 +1,4 @@
-//! kraken-hub: routes commands and queries between kraken services over gRPC.
+//! snodra-server: routes commands and queries between Snodra services over gRPC.
 //! See kraken/docs/05-services/hub.md.
 
 pub mod api;
@@ -31,7 +31,7 @@ pub mod topology;
 mod pki_test_support;
 
 pub mod proto {
-    tonic::include_proto!("kraken.hub.v1");
+    tonic::include_proto!("snodra.hub.v1");
 }
 
 use std::future::Future;
@@ -66,7 +66,7 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// After the shutdown signal, connections get this long to drain before `serve` returns anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// gRPC health service name the hub reports (and `--health-check` probes).
-pub const HEALTH_SERVICE: &str = "kraken.hub.v1.Hub";
+pub const HEALTH_SERVICE: &str = "snodra.hub.v1.Hub";
 
 /// Runs the hub on `listener` until the server stops (no shutdown signal). The HTTP mirror is
 /// bound here from `config.http_listen`; failing to bind it is fatal.
@@ -103,7 +103,7 @@ pub async fn serve_with_shutdown(
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
-    let meter = opentelemetry::global::meter("kraken-hub");
+    let meter = opentelemetry::global::meter("snodra-server");
     let metrics = Metrics::new(meter.clone());
     // Read from the sessions when the metrics are exported; kept for the life of the hub.
     let _processor_gauges = telemetry::ProcessorGauges::register(&meter, Arc::clone(&sessions));
@@ -155,7 +155,7 @@ pub async fn serve_with_shutdown(
             tls::ClientAuth::from_store(cas)
         }
         (None, Some(_), _) => anyhow::bail!(
-            "KRAKEN_HUB_TLS_CLIENT_CA needs KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY"
+            "SNODRA_SERVER_TLS_CLIENT_CA needs SNODRA_SERVER_TLS_CERT and SNODRA_SERVER_TLS_KEY"
         ),
         _ => tls::ClientAuth::None,
     };
@@ -408,7 +408,7 @@ pub async fn shutdown_signal() {
 }
 
 /// Makes SIGHUP reload the ACL and the TLS certificates at once, instead of at the next poll
-/// (`KRAKEN_HUB_RELOAD_INTERVAL`). The binary calls it; in-process hubs (tests) do not, so they
+/// (`SNODRA_SERVER_RELOAD_INTERVAL`). The binary calls it; in-process hubs (tests) do not, so they
 /// never replace the process's SIGHUP disposition.
 pub fn reload_on_sighup() {
     #[cfg(unix)]

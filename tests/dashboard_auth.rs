@@ -1,5 +1,5 @@
 //! The dashboard token (roadmap P5a, ADR 0018): `/api/v1/*` and the event stream
-//! need `Authorization: Bearer <token>` when `KRAKEN_HUB_DASHBOARD_TOKEN` is set; the page and its
+//! need `Authorization: Bearer <token>` when `SNODRA_SERVER_DASHBOARD_TOKEN` is set; the page and its
 //! assets stay public.
 
 mod common;
@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{http_get_full, http_request, start_hub_with_http};
-use kraken_hub::auth::Secret;
-use kraken_hub::config::Config;
+use snodra_server::auth::Secret;
+use snodra_server::config::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOKEN: &str = "dash-0123456789abcdef0123456789";
@@ -104,7 +104,7 @@ async fn a_wrong_token_is_the_same_bare_401() {
 #[tokio::test]
 async fn the_page_and_its_assets_stay_public() {
     let http = start(config()).await;
-    let build = kraken_hub::assets::build_id();
+    let build = snodra_server::assets::build_id();
     for path in [
         "/".to_string(),
         "/ui".to_string(),
@@ -256,7 +256,7 @@ async fn without_a_token_configured_nothing_changes() {
     }
     // The settings view lists the token names, never a value.
     let r = http_get_full(http, "/api/v1/settings").await;
-    assert!(r.body.contains("KRAKEN_HUB_DASHBOARD_TOKEN"));
+    assert!(r.body.contains("SNODRA_SERVER_DASHBOARD_TOKEN"));
 }
 
 #[tokio::test]
@@ -276,7 +276,7 @@ async fn the_settings_view_never_shows_the_token() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["name"] == "KRAKEN_HUB_DASHBOARD_TOKEN")
+        .find(|s| s["name"] == "SNODRA_SERVER_DASHBOARD_TOKEN")
         .unwrap();
     assert_eq!(entry["secret"], true);
     assert!(entry["value"].is_null());
@@ -317,7 +317,7 @@ assert.equal(unauthorized, 1);
 
 api.setToken(`  ${token}\n`);
 assert.equal(api.hasToken(), true);
-assert.equal(store.get('kraken-hub.token'), token, 'kept in sessionStorage, trimmed');
+assert.equal(store.get('snodra-server.token'), token, 'kept in sessionStorage, trimmed');
 const version = await api.get('version');
 assert.ok(version.hubId);
 
@@ -347,7 +347,7 @@ await assert.rejects(api.readStream({ signal: new AbortController().signal, onOp
 
 api.clearToken();
 assert.equal(api.hasToken(), false);
-assert.equal(store.has('kraken-hub.token'), false);
+assert.equal(store.has('snodra-server.token'), false);
 
 for (const url of urls) assert.ok(!url.includes(token) && !url.includes('token='), `token in a URL: ${url}`);
 console.log('ok');
@@ -428,8 +428,8 @@ assert.match(r.data.error, /read-only/);
 // The write token: the call reaches the control plane (no instance here: 404, as JSON).
 api.setWriteToken(`  ${write}\n`);
 assert.equal(api.hasWriteToken(), true);
-assert.equal(store.get('kraken-hub.write-token'), write, 'its own key, trimmed');
-assert.equal(store.get('kraken-hub.token'), token, 'the dashboard token is kept apart');
+assert.equal(store.get('snodra-server.write-token'), write, 'its own key, trimmed');
+assert.equal(store.get('snodra-server.token'), token, 'the dashboard token is kept apart');
 r = await api.control('POST', 'services/svc/processors/audit/reset', { to: 'earliest' });
 assert.equal(r.status, 404);
 assert.match(r.data.error, /no instance of service svc/);
@@ -449,7 +449,7 @@ assert.equal(sent[before].init.headers.authorization, `Bearer ${token}`);
 
 api.clearWriteToken();
 assert.equal(api.hasWriteToken(), false);
-assert.equal(store.has('kraken-hub.write-token'), false);
+assert.equal(store.has('snodra-server.write-token'), false);
 for (const { url } of sent) {
   assert.ok(!url.includes(write) && !url.includes(token) && !url.includes('token='), `a token in a URL: ${url}`);
 }

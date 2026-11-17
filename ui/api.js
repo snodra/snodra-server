@@ -1,8 +1,8 @@
 // The hub's JSON API, relative to the page so the dashboard also works behind a proxy that
-// mounts the hub under a path. When the hub has a dashboard token (KRAKEN_HUB_DASHBOARD_TOKEN,
+// mounts the hub under a path. When the hub has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN,
 // ADR 0018) every call carries it as `Authorization: Bearer <token>`: the page asks for it once,
 // keeps it in sessionStorage (this tab only, gone when it closes) and never puts it in a URL, a
-// cookie or a log line. Peer hubs (KRAKEN_HUB_PEERS, ADR 0016) are read with `getFrom`,
+// cookie or a log line. Peer hubs (SNODRA_SERVER_PEERS, ADR 0016) are read with `getFrom`,
 // cross-origin, without cookies, with the same token (the hubs of one deployment share it).
 // The processor controls (ADR 0023) send a second credential, the write token, kept the same way
 // under its own key, only on `control` calls and only to this hub (it reaches every instance).
@@ -11,8 +11,8 @@
 // write token serves payloads to a request that presents it).
 
 const BASE = new URL('../api/v1/', document.baseURI);
-const TOKEN_KEY = 'kraken-hub.token';
-const WRITE_TOKEN_KEY = 'kraken-hub.write-token';
+const TOKEN_KEY = 'snodra-server.token';
+const WRITE_TOKEN_KEY = 'snodra-server.write-token';
 
 /** A peer that does not answer within this long counts as unreachable. */
 const PEER_TIMEOUT_MS = 3000;
@@ -115,7 +115,7 @@ export function get(name, { signal } = {}) {
 }
 
 /**
- * GET <origin>/api/v1/<name> on a peer hub; `origin` comes from this hub's KRAKEN_HUB_PEERS
+ * GET <origin>/api/v1/<name> on a peer hub; `origin` comes from this hub's SNODRA_SERVER_PEERS
  * (validated at its startup). Throws on an error answer (with its `status`), a network error or
  * a timeout.
  */

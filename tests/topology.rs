@@ -6,9 +6,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
-use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{Register, RequestKind, TopologyRequest, TopologyResponse, server_message};
+use snodra_server::config::Config;
+use snodra_server::proto::hub_client::HubClient;
+use snodra_server::proto::{
+    Register, RequestKind, TopologyRequest, TopologyResponse, server_message,
+};
 use tonic::transport::Endpoint;
 
 const BOUND: Duration = Duration::from_secs(3);
@@ -97,7 +99,7 @@ async fn topology_lists_two_services_with_instances_and_types() {
         (2, 3, 1, 1)
     );
     assert_eq!(totals.in_flight, 0);
-    // KRAKEN_HUB_HEARTBEAT_TIMEOUT.
+    // SNODRA_SERVER_HEARTBEAT_TIMEOUT.
     assert_eq!(t.heartbeat_timeout_ms, 10_000);
     assert!(!t.hub_id.is_empty());
     assert!(t.now_ms >= t.hub_started_at_ms && t.hub_started_at_ms > 0);
