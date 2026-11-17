@@ -350,7 +350,7 @@ in the hub.
 - **Builder call:** requests the hub answers without routing them (`NO_HANDLER`,
   `INVALID_REQUEST`, a duplicate id) count as errors but have no latency, so they do not drag
   the percentiles to zero. Requests whose sender disconnected are not counted (as in
-  `snodra_hub_requests_total`). The `handle` edge of a type merges all its requests, including
+  `snodra_server_requests_total`). The `handle` edge of a type merges all its requests, including
   `NO_HANDLER` answers while the owner had no instance.
 - **Builder call:** cap `SNODRA_SERVER_EDGE_STATS_MAX_EDGES` (10 000). At the cap a new edge drops
   the least recently used edges, 1 % of the cap at a time (at least one), counted in
@@ -492,7 +492,7 @@ waits for. The state lives in each service's store (`processor_control`), not in
   finish or may already have run reset handlers or deleted markers (its `error.message` says so). The finish goes out
   once the lease renewals in flight are answered, so a late renewal never re-takes the lock.
 - **Audit:** one `info` line `control` per call past the credential check (caller, service, processor, action,
-  outcome, duration, the reset's operation id) and `snodra_hub_control_total{action,outcome}`.
+  outcome, duration, the reset's operation id) and `snodra_server_control_total{action,outcome}`.
 - **Dashboard:** a second password field, "Write token" (`sessionStorage`, never a URL), shows the controls on the
   Processors and Dead letters pages; with peers a control goes to the hub that served the page, which reaches every
   instance.
@@ -555,7 +555,7 @@ service (the record header `source`). Empty parameters count as absent; times ar
   `q`. Otherwise `"payload": {"hidden": "payloads-off" | "no-token-configured" | "no-token-presented", "reason":
   "..."}` and `q` is 403 before the browser is asked. A payload the hub did not ask for is dropped, whatever the
   browser sends. Each payload served: one `info` line `event payload served` (caller, source, segment, position, size,
-  correlation id) and `snodra_hub_event_payload_views_total`; a payload search: one line `event payload search`
+  correlation id) and `snodra_server_event_payload_views_total`; a payload search: one line `event payload search`
   (caller, source, tail, correlation id; never the text). Never logged, cached, in a metric, a result, the tail or an
   error.
 - **Who asked:** each query carries the headers `userId` (the token presented, `dashboard-token` or `write-token`,
@@ -566,10 +566,10 @@ service (the record header `source`). Empty parameters count as absent; times ar
   any client allowed to send a `snodra.events.*` type can set them.
 - **Bounds** of the reads (records scanned, results, time per search, concurrent searches and tails, tail duration,
   buffer for a slow reader) are the add-on's settings.
-- **Metrics:** `snodra_hub_event_browser_requests_total{kind=search|record|sources|lag|tail,
+- **Metrics:** `snodra_server_event_browser_requests_total{kind=search|record|sources|lag|tail,
   outcome=ok|bad_request|forbidden|not_found|too_many|unavailable|not_installed|timeout|failed}`,
-  `snodra_hub_event_browser_scanned_records` (as the browser reports it), `snodra_hub_event_tails` (open on this hub),
-  `snodra_hub_event_payload_views_total`. The lag of subscriptions without a live instance is the add-on's metric.
+  `snodra_server_event_browser_scanned_records` (as the browser reports it), `snodra_server_event_tails` (open on this hub),
+  `snodra_server_event_payload_views_total`. The lag of subscriptions without a live instance is the add-on's metric.
 
 To install a browser under access control, give its credential the `event-browser` right; nothing else may handle a
 `snodra.events.*` type ([Security](#security)):
@@ -642,9 +642,9 @@ A reconnect of the **same** service takes over its instance id (also between two
 entries of one service, as in a token rotation). With `off` an instance id may change service.
 
 The ACL reloads when the file changes (5 s poll, or SIGHUP); a file that does not parse keeps the
-previous ACL (`snodra_hub_acl_generation`, `snodra_hub_acl_reload_errors_total`). Live sessions are
+previous ACL (`snodra_server_acl_generation`, `snodra_server_acl_reload_errors_total`). Live sessions are
 judged again on a change: a removed token or a registration the file no longer allows closes the
-session. Violations are counted in `snodra_hub_auth_violations_total{reason,service}`; logs show a
+session. Violations are counted in `snodra_server_auth_violations_total{reason,service}`; logs show a
 token only as the first 8 hex characters of its digest. Roll out with `permissive` first.
 
 Refusals are logged once per refused `Register` (the status sent back lists up to 10 forbidden types,
@@ -705,12 +705,12 @@ the certificate wins; nothing is merged). The session is closed at the certifica
 reloads its certificate and reconnects before `notAfter`; `permissive` counts the expiry once, `off`
 never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
 handshakes only. Logs and the topology show a certificate only by the first 8 hex characters of its
-SHA-256 fingerprint. Metrics: `snodra_hub_client_certificates_total{result}` (`ok`, `no_service`,
+SHA-256 fingerprint. Metrics: `snodra_server_client_certificates_total{result}` (`ok`, `no_service`,
 `multiple_services`, `mismatch`, `expired`; one per `Register` that carries a certificate, plus one
 `expired` per session that reaches `notAfter`, none in `off`; `ok` is a usable certificate, the ACL
-may still refuse the `Register`), `snodra_hub_tls_handshake_failures_total{listener,reason}`
+may still refuse the `Register`), `snodra_server_tls_handshake_failures_total{listener,reason}`
 (`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
-`snodra_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
+`snodra_server_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
 certificates and remove the service's table to cut it off. `--health-check` and `--topology` take
 `--tls-client-cert <pem>` and `--tls-client-key <pem>` (an error with a plain-text target). Give the
 healthcheck a dedicated probe pair, a client certificate from the client CA naming a service with no
@@ -725,7 +725,7 @@ TLS-only, and the HTTP listener too unless `SNODRA_SERVER_HTTP_TLS_*` gives it i
 reloads on change without dropping open connections. Handshakes are bounded: one that takes longer
 than `SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT` is dropped, and when every slot (512 per listener) or the
 peer IP's share (`SNODRA_SERVER_TLS_HANDSHAKES_PER_IP`) is busy a new connection is dropped at once
-and counted in `snodra_hub_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
+and counted in `snodra_server_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
 flood of half-open connections cannot stall the accept loop. At startup and on each reload
 the hub warns when the private key file is readable by its group or others (Unix: any of `0o077`
 set); `chmod 600` it. The dev sandbox's key is `0644` on purpose (see `dev-hub-pki.sh`) and warns. `--health-check` and `--topology` take
@@ -787,8 +787,8 @@ Error codes:
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
 `invalid_request`, `resource_exhausted`, `denied` and `cancelled` (a stream or subscription
-the sender cancelled, or one that outlived its max duration); `snodra_hub_requests_total` and
-`snodra_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
+the sender cancelled, or one that outlived its max duration); `snodra_server_requests_total` and
+`snodra_server_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
 `streaming`, `subscription`), so a gather's or stream's latency (to its `ReplyEnd`) and a
 subscription's (to its initial part) stay apart from the unary latency of the same type.
 **Builder call:** any handler `Reply{error}` counts as
@@ -893,8 +893,8 @@ umbrella `docs/05-services/hub.md` (Query modes).
   target that leaves, also while its request is still queued, is a failed part
   (`HANDLER_DISCONNECTED`).
 - **Accounting:** a scatter-gather is one request in flight, on its edge (latency to the
-  `ReplyEnd`, an error when no part succeeded) and in `snodra_hub_requests_total{mode="scatter_gather"}`;
-  `snodra_hub_scatter_targets{type}` records its targets.
+  `ReplyEnd`, an error when no part succeeded) and in `snodra_server_requests_total{mode="scatter_gather"}`;
+  `snodra_server_scatter_targets{type}` records its targets.
 - `tests/scatter_gather.rs` drives it over gRPC with raw clients.
 - **Streaming.** A sender sends a query with
   `Request.mode = STREAMING` (and `initial_credit`, `max_results`, `timeout_ms`). The hub picks
@@ -934,9 +934,9 @@ umbrella `docs/05-services/hub.md` (Query modes).
 - **Streaming accounting:** one request in flight (the sender's `inFlightAsSender`, the
   handler's `inFlightAsHandler`, one handler permit from the forward to the end, released on
   every ending path); one count on its edge with the latency to the end (an error when the end
-  carries one); `snodra_hub_requests_total{mode="streaming"}` and the duration histogram;
-  `snodra_hub_streams_open{service,instance_id}` (the handler's) and
-  `snodra_hub_stream_parts_total{service,type}`.
+  carries one); `snodra_server_requests_total{mode="streaming"}` and the duration histogram;
+  `snodra_server_streams_open{service,instance_id}` (the handler's) and
+  `snodra_server_stream_parts_total{service,type}`.
 - `tests/streaming.rs` drives it over gRPC with raw clients. The client APIs are in the
   libraries' READMEs: [snodra-messaging, Streaming queries](../snodra-messaging/README.md#streaming-queries)
   (Kotlin) and [snodra-messaging-rs, Streaming queries](../snodra-messaging-rs/README.md#streaming-queries)
@@ -1000,11 +1000,11 @@ umbrella `docs/05-services/hub.md` (Query modes).
 - **Subscription accounting:** one request in flight (`inFlight`, the sender's
   `inFlightAsSender`; the initial request in its handler's `inFlightAsHandler`) until the initial
   part is delivered, then the subscription counts nowhere but in
-  `snodra_hub_subscriptions_open{service,instance_id}` (targets per handler instance); one count on
+  `snodra_server_subscriptions_open{service,instance_id}` (targets per handler instance); one count on
   its edge at the initial reply (an error when the initial failed, or when the subscription ended
-  before it other than by the sender's cancel), `snodra_hub_requests_total{mode="subscription"}`
+  before it other than by the sender's cancel), `snodra_server_requests_total{mode="subscription"}`
   and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
-  the max duration before the initial part; `snodra_hub_subscription_updates_total{service,type}`
+  the max duration before the initial part; `snodra_server_subscription_updates_total{service,type}`
   per update relayed. A subscription that ends after its initial part counts nothing more.
 - `tests/subscription.rs` drives it over gRPC with raw clients. The client libraries implement
   the sender and handler sides; their READMEs:
@@ -1054,7 +1054,7 @@ any client change.
   request arrived on), requests it sent are dropped; the new session's requests are untouched.
 - **Builder call:** when a sender's buffer is full, a terminal `Reply` or `Error` is retried in
   the background for up to 5 s before it is dropped (logged at `warn`, counted in
-  `snodra_hub_session_buffer_full_total{service}`).
+  `snodra_server_session_buffer_full_total{service}`).
 - Graceful shutdown on SIGTERM or Ctrl-C: health turns `NOT_SERVING`, every stream is closed with
   `UNAVAILABLE` `hub shutting down` (in-flight requests fail as on a disconnect), connections get
   at most 5 s to drain, then telemetry is flushed and the process exits.
@@ -1070,33 +1070,33 @@ any client change.
   `job="snodra-server"` and `instance="<hub id>"`; no data point carries a hub id. Exported every 60 s
   (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it). Every metric with its labels and meaning is in
   `../kraken/docs/05-services/hub.md` (Observability); in short:
-  - routing: `snodra_hub_requests_total{kind,type,mode,service,outcome}` and
-    `snodra_hub_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
+  - routing: `snodra_server_requests_total{kind,type,mode,service,outcome}` and
+    `snodra_server_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
     there was none or a gather's targets span services; outcome `denied` for a refused request; a request answered
     before routing whose type has no owner is counted as type `other`, so senders cannot grow the series),
-    `snodra_hub_in_flight{kind}` (queued requests included), `snodra_hub_connected_instances{service}`,
-    `snodra_hub_registered_types{service,kind}`, `snodra_hub_session_buffer_full_total{service}`;
-  - flow control: `snodra_hub_queue_depth{service,type}`, `snodra_hub_permits_available{service}`,
-    `snodra_hub_queue_wait_seconds{service,type}`, `snodra_hub_rejected_total{service,reason}` (`queue_full`,
+    `snodra_server_in_flight{kind}` (queued requests included), `snodra_server_connected_instances{service}`,
+    `snodra_server_registered_types{service,kind}`, `snodra_server_session_buffer_full_total{service}`;
+  - flow control: `snodra_server_queue_depth{service,type}`, `snodra_server_permits_available{service}`,
+    `snodra_server_queue_wait_seconds{service,type}`, `snodra_server_rejected_total{service,reason}` (`queue_full`,
     `queue_bytes`, `queue_bytes_total`, `buffer_full`), refreshed by the watchdog every tick (at most a second);
-  - query modes: `snodra_hub_scatter_targets{type}`, `snodra_hub_streams_open{service,instance_id}` and
-    `snodra_hub_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
+  - query modes: `snodra_server_scatter_targets{type}`, `snodra_server_streams_open{service,instance_id}` and
+    `snodra_server_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
     with an instance label, named `instance_id` because Prometheus overwrites `instance`; an instance whose last one
-    closed reads 0 once, then is not exported), `snodra_hub_stream_parts_total{service,type}`,
-    `snodra_hub_subscription_updates_total{service,type}`;
-  - event processors, from the instances' status (no event-store read): `snodra_hub_processor_lag{service,processor}`,
-    `snodra_hub_processor_dead_letters{service,processor}`, `snodra_hub_processor_state{service,processor,state}`
-    (1 for the current state, 0 for the others), `snodra_hub_processor_processed{service,processor}` and
-    `snodra_hub_processor_failed{service,processor}` (since-start totals summed over the live instances: gauges, not
-    counters); `snodra_hub_control_total{action,outcome}`, `snodra_hub_control_unknown_replies_total`;
-  - the events API ([Event browser](#event-browser)): `snodra_hub_event_browser_requests_total{kind,outcome}`,
-    `snodra_hub_event_browser_scanned_records`, `snodra_hub_event_tails`, `snodra_hub_event_payload_views_total`
+    closed reads 0 once, then is not exported), `snodra_server_stream_parts_total{service,type}`,
+    `snodra_server_subscription_updates_total{service,type}`;
+  - event processors, from the instances' status (no event-store read): `snodra_server_processor_lag{service,processor}`,
+    `snodra_server_processor_dead_letters{service,processor}`, `snodra_server_processor_state{service,processor,state}`
+    (1 for the current state, 0 for the others), `snodra_server_processor_processed{service,processor}` and
+    `snodra_server_processor_failed{service,processor}` (since-start totals summed over the live instances: gauges, not
+    counters); `snodra_server_control_total{action,outcome}`, `snodra_server_control_unknown_replies_total`;
+  - the events API ([Event browser](#event-browser)): `snodra_server_event_browser_requests_total{kind,outcome}`,
+    `snodra_server_event_browser_scanned_records`, `snodra_server_event_tails`, `snodra_server_event_payload_views_total`
     (the lag of subscriptions without a live instance is the `snodra-event-browser` add-on's metric);
-  - security: `snodra_hub_auth_violations_total{reason,service}`, `snodra_hub_acl_generation`,
-    `snodra_hub_acl_reload_errors_total`, `snodra_hub_jwt_validations_total{result}`,
-    `snodra_hub_jwks_fetches_total{result}`, `snodra_hub_jwks_keys`, `snodra_hub_credentials_refreshes_total{result}`,
-    `snodra_hub_client_certificates_total{result}`, `snodra_hub_tls_handshake_failures_total{listener,reason}`,
-    `snodra_hub_tls_handshakes_shed_total{listener,reason}`, `snodra_hub_tls_client_ca_reload_errors_total`.
+  - security: `snodra_server_auth_violations_total{reason,service}`, `snodra_server_acl_generation`,
+    `snodra_server_acl_reload_errors_total`, `snodra_server_jwt_validations_total{result}`,
+    `snodra_server_jwks_fetches_total{result}`, `snodra_server_jwks_keys`, `snodra_server_credentials_refreshes_total{result}`,
+    `snodra_server_client_certificates_total{result}`, `snodra_server_tls_handshake_failures_total{listener,reason}`,
+    `snodra_server_tls_handshakes_shed_total{listener,reason}`, `snodra_server_tls_client_ca_reload_errors_total`.
 
   Over several hubs, counters, histograms and the hub-local gauges add up (`sum`); connected instances, registered
   types and the processor gauges are the same on every hub (`max`).

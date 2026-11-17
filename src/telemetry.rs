@@ -255,24 +255,24 @@ impl Metrics {
         let open_gauges = [
             OpenCounts::observe(
                 &meter,
-                "snodra_hub_streams_open",
+                "snodra_server_streams_open",
                 "Streaming queries open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
                 Arc::clone(&streams_open),
             ),
             OpenCounts::observe(
                 &meter,
-                "snodra_hub_subscriptions_open",
+                "snodra_server_subscriptions_open",
                 "Subscription query targets open, per handler service and instance (an instance whose last one closed reads 0 once, then is not exported)",
                 Arc::clone(&subscriptions_open),
             ),
         ];
         Arc::new(Self {
             requests: meter
-                .u64_counter("snodra_hub_requests_total")
+                .u64_counter("snodra_server_requests_total")
                 .with_description("Requests routed by the hub")
                 .build(),
             duration: meter
-                .f64_histogram("snodra_hub_request_duration_seconds")
+                .f64_histogram("snodra_server_request_duration_seconds")
                 .with_unit("s")
                 .with_boundaries(vec![
                     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -281,31 +281,31 @@ impl Metrics {
                 .with_description("Time from request receipt to terminal message")
                 .build(),
             in_flight: meter
-                .i64_up_down_counter("snodra_hub_in_flight")
+                .i64_up_down_counter("snodra_server_in_flight")
                 .with_description("Requests awaiting a reply")
                 .build(),
             connected_instances: meter
-                .u64_gauge("snodra_hub_connected_instances")
+                .u64_gauge("snodra_server_connected_instances")
                 .with_description("Instances with a stream to this hub, per service")
                 .build(),
             registered_types: meter
-                .u64_gauge("snodra_hub_registered_types")
+                .u64_gauge("snodra_server_registered_types")
                 .with_description("Registered message types per service and kind")
                 .build(),
             buffer_full: meter
-                .u64_counter("snodra_hub_session_buffer_full_total")
+                .u64_counter("snodra_server_session_buffer_full_total")
                 .with_description("Messages not delivered because a session buffer was full (busy handler, or a terminal message the sender did not read in time)")
                 .build(),
             queue_depth: meter
-                .u64_gauge("snodra_hub_queue_depth")
+                .u64_gauge("snodra_server_queue_depth")
                 .with_description("Requests queued for instances, per service and type")
                 .build(),
             permits_available: meter
-                .u64_gauge("snodra_hub_permits_available")
+                .u64_gauge("snodra_server_permits_available")
                 .with_description("Permits instances have left, per service")
                 .build(),
             queue_wait: meter
-                .f64_histogram("snodra_hub_queue_wait_seconds")
+                .f64_histogram("snodra_server_queue_wait_seconds")
                 .with_unit("s")
                 .with_boundaries(vec![
                     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -314,11 +314,11 @@ impl Metrics {
                 .with_description("Time a request waited in a queue before it was forwarded")
                 .build(),
             rejected: meter
-                .u64_counter("snodra_hub_rejected_total")
+                .u64_counter("snodra_server_rejected_total")
                 .with_description("Requests rejected for capacity (queue_full, queue_bytes, queue_bytes_total, buffer_full)")
                 .build(),
             scatter_targets: meter
-                .u64_histogram("snodra_hub_scatter_targets")
+                .u64_histogram("snodra_server_scatter_targets")
                 .with_boundaries(vec![
                     1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
                 ])
@@ -326,83 +326,83 @@ impl Metrics {
                 .build(),
             streams_open,
             stream_parts: meter
-                .u64_counter("snodra_hub_stream_parts_total")
+                .u64_counter("snodra_server_stream_parts_total")
                 .with_description("Parts of streaming queries relayed, per handler service and type")
                 .build(),
             subscriptions_open,
             subscription_updates: meter
-                .u64_counter("snodra_hub_subscription_updates_total")
+                .u64_counter("snodra_server_subscription_updates_total")
                 .with_description("Updates of subscription queries relayed, per handler service and type")
                 .build(),
             auth_violations: meter
-                .u64_counter("snodra_hub_auth_violations_total")
+                .u64_counter("snodra_server_auth_violations_total")
                 .with_description("Access-control violations (ADR 0018), refused in enforce mode and allowed in permissive mode, per reason and service (`unknown` for a service name the ACL does not hold)")
                 .build(),
             acl_generation: meter
-                .u64_gauge("snodra_hub_acl_generation")
+                .u64_gauge("snodra_server_acl_generation")
                 .with_description("Generation of the loaded ACL: 1 at startup, plus one per reload that changed it")
                 .build(),
             acl_reload_errors: meter
-                .u64_counter("snodra_hub_acl_reload_errors_total")
+                .u64_counter("snodra_server_acl_reload_errors_total")
                 .with_description("ACL reloads that failed to read or parse; the previous ACL stays in force")
                 .build(),
             tls_handshakes_shed: meter
-                .u64_counter("snodra_hub_tls_handshakes_shed_total")
+                .u64_counter("snodra_server_tls_handshakes_shed_total")
                 .with_description("TCP connections dropped before their TLS handshake because every handshake slot was busy (reason `slots`) or the peer IP already held its share (reason `per_ip`), per listener")
                 .build(),
             tls_handshake_failures: meter
-                .u64_counter("snodra_hub_tls_handshake_failures_total")
+                .u64_counter("snodra_server_tls_handshake_failures_total")
                 .with_description("TLS handshakes that failed, per listener and reason: client_cert_missing (a required client certificate was not presented), client_cert_invalid (it did not verify against the client CA or was expired), timeout, other (plain text, scans, protocol errors)")
                 .build(),
             tls_client_ca_reload_errors: meter
-                .u64_counter("snodra_hub_tls_client_ca_reload_errors_total")
+                .u64_counter("snodra_server_tls_client_ca_reload_errors_total")
                 .with_description("Client CA bundle reloads that failed to read or parse; the previous CAs stay in force")
                 .build(),
             client_certificates: meter
-                .u64_counter("snodra_hub_client_certificates_total")
+                .u64_counter("snodra_server_client_certificates_total")
                 .with_description("Client certificates judged (ADR 0020; not in off): one per Register that carries one, per result: ok (it names one service and has not ended; the Register may still be refused by the ACL), no_service, multiple_services, mismatch (credentials name another service), expired (it had ended at Register); plus one expired when a session reaches notAfter (closed, or in permissive kept)")
                 .build(),
             jwt_validations: meter
-                .u64_counter("snodra_hub_jwt_validations_total")
+                .u64_counter("snodra_server_jwt_validations_total")
                 .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, key_pending, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
                 .build(),
             jwks_fetches: meter
-                .u64_counter("snodra_hub_jwks_fetches_total")
+                .u64_counter("snodra_server_jwks_fetches_total")
                 .with_description("Signing-key set fetches, per result: ok, network, tls, timeout, status, too_large, invalid (a failed fetch keeps the last good key set)")
                 .build(),
             jwks_keys: meter
-                .u64_gauge("snodra_hub_jwks_keys")
+                .u64_gauge("snodra_server_jwks_keys")
                 .with_description("Signing keys in the loaded key set; absent until the first successful fetch")
                 .build(),
             credentials_refreshes: meter
-                .u64_counter("snodra_hub_credentials_refreshes_total")
+                .u64_counter("snodra_server_credentials_refreshes_total")
                 .with_description("ClientMessage.credentials refreshes (not in off), per result: ok, refused (in permissive a refresh refused only for a handled type is still adopted), wrong_service, throttled, unavailable (not judgeable yet; the session keeps its credentials), ignored_certificate_session")
                 .build(),
             control: meter
-                .u64_counter("snodra_hub_control_total")
+                .u64_counter("snodra_server_control_total")
                 .with_description("Processor control calls of the HTTP API (ADR 0023), per action (pause, resume, reset, dead_letter_list, dead_letter_retry, dead_letter_retry_all, dead_letter_discard) and outcome (ok, bad_request, not_found, conflict, failed, unavailable, timeout, unauthenticated, forbidden, disabled)")
                 .build(),
             control_unknown_replies: meter
-                .u64_counter("snodra_hub_control_unknown_replies_total")
+                .u64_counter("snodra_server_control_unknown_replies_total")
                 .with_description("ControlReply messages dropped because no request waits for them (unknown id, a reply after the timeout, or from another session than the one asked)")
                 .build(),
             event_browser_requests: meter
-                .u64_counter("snodra_hub_event_browser_requests_total")
+                .u64_counter("snodra_server_event_browser_requests_total")
                 .with_description("Calls of the events API (ADR 0027), per kind (search, record, sources, lag, tail) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, not_installed, timeout, failed)")
                 .build(),
             event_browser_scanned: meter
-                .u64_histogram("snodra_hub_event_browser_scanned_records")
+                .u64_histogram("snodra_server_event_browser_scanned_records")
                 .with_boundaries(vec![
                     0.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 25000.0, 50000.0, 100000.0,
                 ])
                 .with_description("Records one event search read, as the event browser reports it")
                 .build(),
             event_tails: meter
-                .i64_up_down_counter("snodra_hub_event_tails")
+                .i64_up_down_counter("snodra_server_event_tails")
                 .with_description("Event tails open on this hub now")
                 .build(),
             event_payload_views: meter
-                .u64_counter("snodra_hub_event_payload_views_total")
+                .u64_counter("snodra_server_event_payload_views_total")
                 .with_description("Event payloads served by the record detail (each also writes an audit line)")
                 .build(),
             seen: Mutex::new(Seen::default()),
@@ -932,28 +932,28 @@ impl ProcessorGauges {
         };
         Self {
             _lag: meter
-                .i64_observable_gauge("snodra_hub_processor_lag")
+                .i64_observable_gauge("snodra_server_processor_lag")
                 .with_description("Records behind per service and processor: the sum over its distinct segments as the freshest report has them; absent while no lag is known")
                 .with_callback(per_processor(&rows, |r| r.lag))
                 .build(),
             _dead_letters: meter
-                .u64_observable_gauge("snodra_hub_processor_dead_letters")
+                .u64_observable_gauge("snodra_server_processor_dead_letters")
                 .with_description("Dead letters per service and processor: the highest count its instances report")
                 .with_callback(per_processor(&rows, |r| Some(r.dead_letters)))
                 .build(),
             _state: meter
-                .u64_observable_gauge("snodra_hub_processor_state")
+                .u64_observable_gauge("snodra_server_processor_state")
                 .with_description("1 for the state of the processor (the worst over its instances), 0 for the other states")
                 .with_callback(state)
                 .build(),
             _processed: meter
-                .u64_observable_gauge("snodra_hub_processor_processed")
+                .u64_observable_gauge("snodra_server_processor_processed")
                 .with_description("Records processed, summed over the instances reporting the processor, each since its own start (a gauge: it drops when an instance restarts; rates come from snodra_events_consumed_total)")
                 .with_callback(per_processor(&rows, |r| Some(r.processed)))
                 .build(),
             _failed: meter
-                .u64_observable_gauge("snodra_hub_processor_failed")
-                .with_description("Records whose handling failed, summed over the instances reporting the processor, each since its own start (a gauge, as snodra_hub_processor_processed)")
+                .u64_observable_gauge("snodra_server_processor_failed")
+                .with_description("Records whose handling failed, summed over the instances reporting the processor, each since its own start (a gauge, as snodra_server_processor_processed)")
                 .with_callback(per_processor(&rows, |r| Some(r.failed)))
                 .build(),
         }
@@ -1345,7 +1345,7 @@ mod tests {
             .iter()
             .flat_map(|rm| rm.scope_metrics())
             .flat_map(|sm| sm.metrics())
-            .find(|m| m.name() == "snodra_hub_requests_total")
+            .find(|m| m.name() == "snodra_server_requests_total")
             .expect("counter exported");
         let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
             panic!("expected u64 sum");
@@ -1381,19 +1381,23 @@ mod tests {
         m.metrics.subscription_update("A", "q.Watch");
         m.metrics.subscription_update("B", "q.Watch");
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_subscription_updates_total", "service", "A"),
+            m.counter("snodra_server_subscription_updates_total", "service", "A"),
             Some(2)
         );
         assert_eq!(
-            m.counter("snodra_hub_subscription_updates_total", "type", "q.Watch"),
+            m.counter(
+                "snodra_server_subscription_updates_total",
+                "type",
+                "q.Watch"
+            ),
             Some(3)
         );
     }
@@ -1434,7 +1438,7 @@ mod tests {
             .iter()
             .flat_map(|rm| rm.scope_metrics())
             .flat_map(|sm| sm.metrics())
-            .find(|m| m.name() == "snodra_hub_request_duration_seconds")
+            .find(|m| m.name() == "snodra_server_request_duration_seconds")
             .expect("histogram exported");
         let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data() else {
             panic!("expected f64 histogram");
@@ -1484,7 +1488,7 @@ mod tests {
             .iter()
             .flat_map(|rm| rm.scope_metrics())
             .flat_map(|sm| sm.metrics())
-            .find(|m| m.name() == "snodra_hub_in_flight")
+            .find(|m| m.name() == "snodra_server_in_flight")
             .expect("up-down counter exported");
         let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
             panic!("expected i64 sum");
@@ -1518,12 +1522,12 @@ mod tests {
         let m = test_support::test_metrics();
         m.metrics
             .connected_instances_set(HashMap::from([("A".to_string(), 2), ("B".to_string(), 1)]));
-        assert_eq!(m.gauge("snodra_hub_connected_instances", "A"), Some(2));
-        assert_eq!(m.gauge("snodra_hub_connected_instances", "B"), Some(1));
+        assert_eq!(m.gauge("snodra_server_connected_instances", "A"), Some(2));
+        assert_eq!(m.gauge("snodra_server_connected_instances", "B"), Some(1));
         m.metrics
             .connected_instances_set(HashMap::from([("A".to_string(), 1)]));
-        assert_eq!(m.gauge("snodra_hub_connected_instances", "A"), Some(1));
-        assert_eq!(m.gauge("snodra_hub_connected_instances", "B"), Some(0));
+        assert_eq!(m.gauge("snodra_server_connected_instances", "A"), Some(1));
+        assert_eq!(m.gauge("snodra_server_connected_instances", "B"), Some(0));
     }
 
     /// The open streams and subscription targets are gauges of the live counts per handler
@@ -1534,7 +1538,11 @@ mod tests {
         let m = test_support::test_metrics();
         let open = |m: &test_support::TestMetrics| {
             let export = m.all_gauge_points();
-            ["snodra_hub_streams_open", "snodra_hub_subscriptions_open"].map(|name| {
+            [
+                "snodra_server_streams_open",
+                "snodra_server_subscriptions_open",
+            ]
+            .map(|name| {
                 export
                     .get(name)
                     .cloned()
@@ -1573,15 +1581,15 @@ mod tests {
         m.metrics.stream_opened("A", "a1");
         m.metrics.subscription_opened("A", "a2");
         assert_eq!(
-            m.gauge_sum("snodra_hub_streams_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_streams_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "a2"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a2"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_streams_open", "instance", "a1"),
+            m.gauge_sum("snodra_server_streams_open", "instance", "a1"),
             None
         );
     }
@@ -1687,23 +1695,23 @@ mod tests {
         };
         // Segment 1 as a2 (the freshest) has it: 5 + 3 + 4; audit's lag is unknown.
         assert_eq!(
-            m.gauge_points("snodra_hub_processor_lag"),
+            m.gauge_points("snodra_server_processor_lag"),
             [(labels("default"), 12)]
         );
         assert_eq!(
-            m.gauge_points("snodra_hub_processor_dead_letters"),
+            m.gauge_points("snodra_server_processor_dead_letters"),
             [(labels("audit"), 0), (labels("default"), 3)]
         );
         assert_eq!(
-            m.gauge_points("snodra_hub_processor_processed"),
+            m.gauge_points("snodra_server_processor_processed"),
             [(labels("audit"), 0), (labels("default"), 150)]
         );
         assert_eq!(
-            m.gauge_points("snodra_hub_processor_failed"),
+            m.gauge_points("snodra_server_processor_failed"),
             [(labels("audit"), 0), (labels("default"), 3)]
         );
         let states: Vec<(String, i64)> = m
-            .gauge_points("snodra_hub_processor_state")
+            .gauge_points("snodra_server_processor_state")
             .into_iter()
             .filter(|(attrs, _)| attrs.contains(&("processor".into(), "default".into())))
             .map(|(attrs, v)| {
@@ -1746,21 +1754,21 @@ mod tests {
             )],
             std::time::Instant::now(),
         );
-        assert_eq!(m.gauge_points("snodra_hub_processor_lag").len(), 1);
-        assert_eq!(m.gauge_points("snodra_hub_processor_state").len(), 6);
+        assert_eq!(m.gauge_points("snodra_server_processor_lag").len(), 1);
+        assert_eq!(m.gauge_points("snodra_server_processor_state").len(), 6);
         sessions.remove_if(&crate::context::ContextId::default(), "a1", token);
         // One export: every gauge of the processor once more, at 0.
         let export = m.all_gauge_points();
         for name in [
-            "snodra_hub_processor_lag",
-            "snodra_hub_processor_dead_letters",
-            "snodra_hub_processor_processed",
-            "snodra_hub_processor_failed",
+            "snodra_server_processor_lag",
+            "snodra_server_processor_dead_letters",
+            "snodra_server_processor_processed",
+            "snodra_server_processor_failed",
         ] {
             assert_eq!(export[name].len(), 1, "{name}");
             assert_eq!(export[name][0].1, 0, "{name}");
         }
-        let state = &export["snodra_hub_processor_state"];
+        let state = &export["snodra_server_processor_state"];
         assert_eq!(state.len(), 6);
         assert!(state.iter().all(|(_, v)| *v == 0), "{state:?}");
         // The next export has none of them.
@@ -1768,7 +1776,7 @@ mod tests {
         assert!(
             export
                 .keys()
-                .all(|name| !name.starts_with("snodra_hub_processor_")),
+                .all(|name| !name.starts_with("snodra_server_processor_")),
             "{export:?}"
         );
     }
@@ -1792,15 +1800,15 @@ mod tests {
             )]
         };
         report(&sessions, "a1", "svc", p(9), std::time::Instant::now());
-        assert_eq!(m.gauge_points("snodra_hub_processor_lag").len(), 1);
+        assert_eq!(m.gauge_points("snodra_server_processor_lag").len(), 1);
         report(&sessions, "a1", "svc", p(-1), std::time::Instant::now());
         for _ in 0..2 {
             let export = m.all_gauge_points();
             assert!(
-                !export.contains_key("snodra_hub_processor_lag"),
+                !export.contains_key("snodra_server_processor_lag"),
                 "{export:?}"
             );
-            assert_eq!(export["snodra_hub_processor_state"].len(), 6);
+            assert_eq!(export["snodra_server_processor_state"].len(), 6);
         }
     }
 
@@ -1854,7 +1862,7 @@ mod tests {
                 .map(|m| m.description().to_string())
                 .expect(name)
         };
-        let certificates = description("snodra_hub_client_certificates_total");
+        let certificates = description("snodra_server_client_certificates_total");
         for words in [
             "ok",
             "no_service",
@@ -1867,7 +1875,7 @@ mod tests {
         ] {
             assert!(certificates.contains(words), "{words}: {certificates}");
         }
-        let refreshes = description("snodra_hub_credentials_refreshes_total");
+        let refreshes = description("snodra_server_credentials_refreshes_total");
         for result in [
             "ok",
             "refused",

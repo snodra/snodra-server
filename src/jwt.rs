@@ -70,7 +70,7 @@ pub struct Verified {
 }
 
 /// Why a token was refused. [`JwtError::label`] is the `result` label of
-/// `snodra_hub_jwt_validations_total`.
+/// `snodra_server_jwt_validations_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JwtError {
     /// The first fetch of the key set has not succeeded yet.
@@ -287,7 +287,7 @@ enum FetchError {
 }
 
 impl FetchError {
-    /// The `result` label of `snodra_hub_jwks_fetches_total`: fixed strings.
+    /// The `result` label of `snodra_server_jwks_fetches_total`: fixed strings.
     fn label(&self) -> &'static str {
         match self {
             Self::Network(_) => "network",
@@ -835,12 +835,12 @@ mod tests {
 
         fn validations(&self, result: &str) -> Option<u64> {
             self.m
-                .counter("snodra_hub_jwt_validations_total", "result", result)
+                .counter("snodra_server_jwt_validations_total", "result", result)
         }
 
         fn fetches(&self, result: &str) -> Option<u64> {
             self.m
-                .counter("snodra_hub_jwks_fetches_total", "result", result)
+                .counter("snodra_server_jwks_fetches_total", "result", result)
         }
     }
 
@@ -1161,7 +1161,7 @@ mod tests {
         assert_eq!(fx.validations("malformed"), Some(7));
         // No label is made of anything the client sent.
         assert_eq!(
-            fx.m.counter_total("snodra_hub_jwt_validations_total"),
+            fx.m.counter_total("snodra_server_jwt_validations_total"),
             Some(7)
         );
     }
@@ -1299,7 +1299,7 @@ mod tests {
             fx.jwt.key_count() == 2
         })
         .await;
-        assert_eq!(fx.m.gauge_plain("snodra_hub_jwks_keys"), Some(2));
+        assert_eq!(fx.m.gauge_plain("snodra_server_jwks_keys"), Some(2));
     }
 
     #[tokio::test]

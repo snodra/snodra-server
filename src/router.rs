@@ -1670,7 +1670,7 @@ impl Router {
         }
     }
 
-    /// Refreshes the `snodra_hub_connected_instances` and `snodra_hub_registered_types` gauges
+    /// Refreshes the `snodra_server_connected_instances` and `snodra_server_registered_types` gauges
     /// from the current session and registry state. Call after any change to either.
     pub fn refresh_gauges(&self) {
         self.metrics
@@ -4841,19 +4841,23 @@ mod tests {
         c.router.on_reply(&D, "h1", payload_reply("u1"));
         c.router.route(&D, "s1", request("x1", "t.Unknown", 0));
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "service", "orders"),
+            m.counter("snodra_server_requests_total", "service", "orders"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.histogram_count("snodra_hub_request_duration_seconds", "service", "orders"),
+            m.histogram_count(
+                "snodra_server_request_duration_seconds",
+                "service",
+                "orders"
+            ),
             Some(1)
         );
         assert_eq!(
-            m.counter_without("snodra_hub_requests_total", "service"),
+            m.counter_without("snodra_server_requests_total", "service"),
             Some(1),
             "the no_handler request"
         );
@@ -4873,25 +4877,25 @@ mod tests {
         c.router.route(&D, "s1", unkeyed("u1", 0, 0));
         c.router.on_reply(&D, "h1", payload_reply("u1"));
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "type", "other"),
+            m.counter("snodra_server_requests_total", "type", "other"),
             Some(2)
         );
         assert_eq!(
-            m.histogram_count("snodra_hub_request_duration_seconds", "type", "other"),
+            m.histogram_count("snodra_server_request_duration_seconds", "type", "other"),
             Some(2)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "type", "t.Unknown"),
+            m.counter("snodra_server_requests_total", "type", "t.Unknown"),
             None
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "type", "t.Cmd"),
+            m.counter("snodra_server_requests_total", "type", "t.Cmd"),
             Some(1)
         );
         // A registered type keeps its name when it is refused.
         c.router.route(&D, "s1", request("", "t.Cmd", 0));
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "type", "t.Cmd"),
+            m.counter("snodra_server_requests_total", "type", "t.Cmd"),
             Some(2)
         );
     }
@@ -4916,14 +4920,14 @@ mod tests {
         c.router.refresh_gauges();
         assert_eq!(
             m.gauge_where(
-                "snodra_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Cmd")]
             ),
             Some(2)
         );
         assert_eq!(
             m.gauge_where(
-                "snodra_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Qry")]
             ),
             Some(1)
@@ -4932,7 +4936,7 @@ mod tests {
         c.router.refresh_gauges();
         assert_eq!(
             m.gauge_where(
-                "snodra_hub_queue_depth",
+                "snodra_server_queue_depth",
                 &[("service", "orders"), ("type", "t.Cmd")]
             ),
             Some(0),
@@ -4949,8 +4953,8 @@ mod tests {
         c.join("h1", 1);
         let depth = |m: &crate::telemetry::test_support::TestMetrics| {
             (
-                m.gauge("snodra_hub_queue_depth", "orders"),
-                m.gauge("snodra_hub_permits_available", "orders"),
+                m.gauge("snodra_server_queue_depth", "orders"),
+                m.gauge("snodra_server_permits_available", "orders"),
             )
         };
         c.router.route(&D, "s1", unkeyed("busy", 0, 10_000));
@@ -5019,7 +5023,11 @@ mod tests {
         );
         assert_eq!(c.router.queued_total(), 1);
         assert_eq!(
-            m.counter("snodra_hub_rejected_total", "reason", "queue_bytes_total"),
+            m.counter(
+                "snodra_server_rejected_total",
+                "reason",
+                "queue_bytes_total"
+            ),
             Some(1)
         );
     }
@@ -5764,23 +5772,23 @@ mod tests {
         g.router.route(&D, "s1", scatter("cmd", "c.Do", 0, 0));
         g.messages("s1");
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "scatter_gather"),
+            m.counter("snodra_server_requests_total", "mode", "scatter_gather"),
             Some(2)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "invalid_request"),
+            m.counter("snodra_server_requests_total", "outcome", "invalid_request"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.histogram_sum("snodra_hub_scatter_targets"),
+            m.histogram_sum("snodra_server_scatter_targets"),
             Some((1, 3.0))
         );
         assert_eq!(
-            m.counter_without("snodra_hub_requests_total", "service"),
+            m.counter_without("snodra_server_requests_total", "service"),
             Some(2),
             "targets over A and B name no one service; the refused one had none"
         );
@@ -6782,15 +6790,15 @@ mod stream_tests {
         let (h, _) = f.target_of("st1");
         f.router.route(&D, "s1", stream("st2", "q.Own", 0, 0, 0));
         assert_eq!(
-            m.gauge_sum("snodra_hub_streams_open", "instance_id", h),
+            m.gauge_sum("snodra_server_streams_open", "instance_id", h),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_streams_open", "instance_id", "x1"),
+            m.gauge_sum("snodra_server_streams_open", "instance_id", "x1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_streams_open", "service", "X"),
+            m.gauge_sum("snodra_server_streams_open", "service", "X"),
             Some(1)
         );
         f.part(h, "st1#1", 0, b"a");
@@ -6799,36 +6807,36 @@ mod stream_tests {
         f.cancel("s1", "st2", "bye");
         f.router.route(&D, "s1", stream("p1", "q.Nope", 0, 0, 0));
         // Both instances' last stream closed: each reads 0 once (one export), then is gone.
-        let open = m.gauge_points("snodra_hub_streams_open");
+        let open = m.gauge_points("snodra_server_streams_open");
         assert_eq!(open.len(), 2, "{open:?}");
         assert!(open.iter().all(|(_, n)| *n == 0), "{open:?}");
-        assert_eq!(m.gauge_points("snodra_hub_streams_open"), []);
+        assert_eq!(m.gauge_points("snodra_server_streams_open"), []);
         assert_eq!(
-            m.counter("snodra_hub_stream_parts_total", "type", "q.Find"),
+            m.counter("snodra_server_stream_parts_total", "type", "q.Find"),
             Some(2)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "streaming"),
+            m.counter("snodra_server_requests_total", "mode", "streaming"),
             Some(3)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "cancelled"),
+            m.counter("snodra_server_requests_total", "outcome", "cancelled"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "ok"),
+            m.counter("snodra_server_requests_total", "outcome", "ok"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "service", "X"),
+            m.counter("snodra_server_requests_total", "service", "X"),
             Some(1),
             "the stream x1 served"
         );
@@ -8302,81 +8310,85 @@ mod subscription_tests {
         f.router.route(&D, "s1", subscribe("w2", "q.Own", 0, 0, 0));
         f.open("w2");
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "b1"),
             Some(1)
         );
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "service", "X"),
+            m.gauge_sum("snodra_server_subscriptions_open", "service", "X"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             None,
             "nothing counted before the initial part"
         );
         f.reply(h, "w1#0", b"initial");
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "ok"),
+            m.counter("snodra_server_requests_total", "outcome", "ok"),
             Some(1)
         );
         f.part("a1", "w1#1", 1, b"u1");
         f.part("b1", "w1#2", 1, b"u2");
         f.end("a1", "w1#1", None);
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "a1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "a1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("snodra_hub_subscription_updates_total", "type", "q.Watch"),
+            m.counter(
+                "snodra_server_subscription_updates_total",
+                "type",
+                "q.Watch"
+            ),
             Some(2)
         );
         assert_eq!(
-            m.counter("snodra_hub_subscription_updates_total", "service", "B"),
+            m.counter("snodra_server_subscription_updates_total", "service", "B"),
             Some(1)
         );
         f.cancel("s1", "w1", "bye");
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "b1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "b1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(1),
             "a cancel after the initial part counts nothing more"
         );
         // Cancelled before the initial part: counted once, as cancelled.
         f.cancel("s1", "w2", "bye");
         assert_eq!(
-            m.gauge_sum("snodra_hub_subscriptions_open", "instance_id", "x1"),
+            m.gauge_sum("snodra_server_subscriptions_open", "instance_id", "x1"),
             Some(0)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "cancelled"),
+            m.counter("snodra_server_requests_total", "outcome", "cancelled"),
             Some(1)
         );
         f.router.route(&D, "s1", subscribe("p1", "q.Nope", 0, 0, 0));
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "outcome", "no_handler"),
+            m.counter("snodra_server_requests_total", "outcome", "no_handler"),
             Some(1)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "subscription"),
+            m.counter("snodra_server_requests_total", "mode", "subscription"),
             Some(3)
         );
         assert_eq!(
-            m.counter("snodra_hub_requests_total", "mode", "unary"),
+            m.counter("snodra_server_requests_total", "mode", "unary"),
             None
         );
         assert_eq!(
-            m.histogram_sum("snodra_hub_request_duration_seconds")
+            m.histogram_sum("snodra_server_request_duration_seconds")
                 .map(|(n, _)| n),
             Some(3)
         );
@@ -8496,15 +8508,19 @@ mod auth_tests {
         }
         assert_eq!(f.router.in_flight(), 0);
         assert_eq!(
-            f.m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(4)
         );
         assert_eq!(
-            f.m.counter("snodra_hub_auth_violations_total", "service", "web"),
+            f.m.counter("snodra_server_auth_violations_total", "service", "web"),
             Some(4)
         );
         assert_eq!(
-            f.m.counter("snodra_hub_requests_total", "outcome", "denied"),
+            f.m.counter("snodra_server_requests_total", "outcome", "denied"),
             Some(4)
         );
         // An allowed type is routed as usual.
@@ -8533,11 +8549,15 @@ mod auth_tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            f.m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         assert_eq!(
-            f.m.counter("snodra_hub_requests_total", "outcome", "denied"),
+            f.m.counter("snodra_server_requests_total", "outcome", "denied"),
             None
         );
     }
@@ -8623,7 +8643,7 @@ mod auth_tests {
             assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
             assert_eq!(
                 m.counter(
-                    "snodra_hub_auth_violations_total",
+                    "snodra_server_auth_violations_total",
                     "reason",
                     "instance_takeover"
                 ),
@@ -8675,7 +8695,7 @@ mod auth_tests {
             assert!(f.handler.try_recv().is_err(), "{mode:?}: nothing is routed");
             assert_eq!(f.router.in_flight(), 0, "{mode:?}");
             assert_eq!(
-                f.m.counter("snodra_hub_requests_total", "outcome", "denied"),
+                f.m.counter("snodra_server_requests_total", "outcome", "denied"),
                 Some(1),
                 "{mode:?}"
             );
@@ -8700,7 +8720,11 @@ mod auth_tests {
         );
         assert!(f.handler.try_recv().is_ok());
         assert_eq!(
-            f.m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            f.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             None
         );
     }

@@ -748,7 +748,7 @@ impl Refusal {
         }
     }
 
-    /// The `outcome` of `snodra_hub_event_browser_requests_total`.
+    /// The `outcome` of `snodra_server_event_browser_requests_total`.
     pub fn outcome(&self) -> &'static str {
         match self {
             Refusal::NotInstalled => "not_installed",

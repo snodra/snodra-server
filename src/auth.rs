@@ -704,7 +704,7 @@ impl Acl {
 // ---------------------------------------------------------------------------------------------
 // Decisions
 
-/// Why a check failed; the `reason` label of `snodra_hub_auth_violations_total`.
+/// Why a check failed; the `reason` label of `snodra_server_auth_violations_total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denied {
     pub reason: &'static str,
@@ -1114,7 +1114,7 @@ impl Authorizer {
             Gate::Notice => {
                 warn!(
                     reason,
-                    "refusal log rate limit: more than {LOG_BURST} refusals in {LOG_WINDOW:?}; further lines for this reason are not logged until the window ends (snodra_hub_auth_violations_total still counts them)"
+                    "refusal log rate limit: more than {LOG_BURST} refusals in {LOG_WINDOW:?}; further lines for this reason are not logged until the window ends (snodra_server_auth_violations_total still counts them)"
                 );
                 false
             }
@@ -2027,7 +2027,7 @@ contexts = ["default"]
         // Enforce refuses; it does not count a violation of its own.
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2042,7 +2042,7 @@ contexts = ["default"]
         assert!(a.check_topology(Some("nope"), None).is_ok());
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2052,7 +2052,7 @@ contexts = ["default"]
         assert!(a.check_topology(Some("tok-orders"), None).is_ok());
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "topology_unauthenticated"
             ),
@@ -2076,7 +2076,7 @@ contexts = ["default"]
             a.check_topology(Some("dash-token-0123456789"), Some(&dash))
                 .is_ok()
         );
-        assert_eq!(m.counter_total("snodra_hub_auth_violations_total"), None);
+        assert_eq!(m.counter_total("snodra_server_auth_violations_total"), None);
     }
 
     // ---- refusal logging (review finding 6) ----
@@ -2114,7 +2114,7 @@ contexts = ["default"]
         assert_eq!(lines[0].field("service").unwrap().chars().count(), 128);
         // The metric label is `unknown`: the ACL does not hold the name.
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "service", "unknown"),
+            m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(1)
         );
         // A wrong-service denial quotes the name too, cut.
@@ -2144,7 +2144,7 @@ contexts = ["default"]
         // Every rule broken is still counted, once.
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "wrong_service"
             ),
@@ -2152,7 +2152,7 @@ contexts = ["default"]
         );
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -2236,7 +2236,7 @@ contexts = ["default"]
         // Nothing is lost from the metric.
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "unknown_token"
             ),
@@ -2361,7 +2361,7 @@ contexts = ["default"]
         assert!(a.check_send(None, "whatever", "x.Y").is_ok());
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "no_credentials"
             ),
@@ -2469,7 +2469,7 @@ contexts = ["default"]
         assert_eq!(adm.status.label(), Some("authenticated"));
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "no_credentials"
             ),
@@ -2477,7 +2477,7 @@ contexts = ["default"]
         );
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -2485,7 +2485,7 @@ contexts = ["default"]
         );
         // The service label of the first violation is a name the ACL knows.
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "service", "billing"),
+            m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(2)
         );
     }
@@ -2497,11 +2497,11 @@ contexts = ["default"]
             let _ = a.admit(None, &format!("random-{n}"), &[]);
         }
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "service", "unknown"),
+            m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(5)
         );
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "service", "random-1"),
+            m.counter("snodra_server_auth_violations_total", "service", "random-1"),
             None
         );
     }
@@ -2518,7 +2518,11 @@ contexts = ["default"]
         );
         assert!(denied.message.contains("admin.Wipe"));
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         // A token the ACL no longer holds is unauthenticated; a changed service is denied.
@@ -2543,13 +2547,21 @@ contexts = ["default"]
         let d = tok("tok-billing", "billing");
         assert!(a.check_send(Some(&d), "billing", "admin.Wipe").is_ok());
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
         // No principal: reported at Register, not per request.
         assert!(a.check_send(None, "billing", "admin.Wipe").is_ok());
         assert_eq!(
-            m.counter("snodra_hub_auth_violations_total", "reason", "send_denied"),
+            m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "send_denied"
+            ),
             Some(1)
         );
     }
@@ -2655,7 +2667,7 @@ contexts = ["default"]
             "and the previous ACL"
         );
         assert_eq!(
-            m.counter_total("snodra_hub_acl_reload_errors_total"),
+            m.counter_total("snodra_server_acl_reload_errors_total"),
             Some(1)
         );
 
@@ -2663,7 +2675,7 @@ contexts = ["default"]
         assert!(a.reload());
         assert_eq!(a.generation(), 2);
         assert!(a.acl().lookup(&digest_of("tok-billing")).is_none());
-        assert_eq!(m.gauge_plain("snodra_hub_acl_generation"), Some(2));
+        assert_eq!(m.gauge_plain("snodra_server_acl_generation"), Some(2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2892,7 +2904,7 @@ event-browser = false
         );
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "event_browser_denied"
             ),
@@ -2957,7 +2969,7 @@ event-browser = false
         );
         assert_eq!(
             m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "event_browser_denied"
             ),
@@ -3301,12 +3313,16 @@ event-browser = false
         assert_eq!(d.message, "malformed token");
         assert_eq!(d.to_status().code(), tonic::Code::Unauthenticated);
         assert_eq!(
-            fx.m.counter("snodra_hub_jwt_validations_total", "result", "expired"),
+            fx.m.counter("snodra_server_jwt_validations_total", "result", "expired"),
             Some(1)
         );
         // Labels are fixed strings.
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(3)
         );
     }
@@ -3365,7 +3381,11 @@ event-browser = false
         assert_eq!(adm.principal, None);
         assert_eq!(adm.status, AuthStatus::UnauthenticatedPermissive);
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(1)
         );
         // A valid one for the right service is authenticated.
@@ -3429,12 +3449,12 @@ event-browser = false
             .auth
             .admit(Some(&fx.token("billing", 300)), "billing", &types(&["x.Y"]));
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "service", "billing"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(1)
         );
         let _ = fx.auth.admit(Some(&fx.token("ghost", 300)), "ghost", &[]);
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "service", "unknown"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "unknown"),
             Some(1)
         );
     }
@@ -3460,7 +3480,11 @@ event-browser = false
     }
 
     fn refreshes(fx: &JwtFx, result: &str) -> Option<u64> {
-        fx.m.counter("snodra_hub_credentials_refreshes_total", "result", result)
+        fx.m.counter(
+            "snodra_server_credentials_refreshes_total",
+            "result",
+            result,
+        )
     }
 
     #[tokio::test]
@@ -3495,7 +3519,10 @@ event-browser = false
         assert_eq!(refreshes(&fx, "unavailable"), Some(1));
         assert_eq!(refreshes(&fx, "refused"), None);
         // Not a violation: the credential is not bad, the hub just cannot judge it yet.
-        assert_eq!(fx.m.counter_total("snodra_hub_auth_violations_total"), None);
+        assert_eq!(
+            fx.m.counter_total("snodra_server_auth_violations_total"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3562,7 +3589,7 @@ event-browser = false
         assert_eq!(refreshes(&fx, "wrong_service"), Some(1));
         assert_eq!(
             fx.m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "wrong_service"
             ),
@@ -3608,7 +3635,11 @@ event-browser = false
         );
         assert_eq!(refreshes(&fx, "refused"), Some(1));
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "reason", "jwt_invalid"),
+            fx.m.counter(
+                "snodra_server_auth_violations_total",
+                "reason",
+                "jwt_invalid"
+            ),
             Some(1)
         );
     }
@@ -3638,7 +3669,7 @@ event-browser = false
         );
         assert_eq!(
             fx.m.counter(
-                "snodra_hub_auth_violations_total",
+                "snodra_server_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -3671,18 +3702,18 @@ event-browser = false
             )
         );
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "reason", "expired"),
+            fx.m.counter("snodra_server_auth_violations_total", "reason", "expired"),
             Some(1)
         );
         let fx = jwt_fx(AuthMode::Permissive).await;
         let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(31));
         assert_eq!(fx.auth.expired(&p, "billing"), Expiry::Keep);
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "reason", "expired"),
+            fx.m.counter("snodra_server_auth_violations_total", "reason", "expired"),
             Some(1)
         );
         assert_eq!(
-            fx.m.counter("snodra_hub_auth_violations_total", "service", "billing"),
+            fx.m.counter("snodra_server_auth_violations_total", "service", "billing"),
             Some(1)
         );
     }
@@ -3700,7 +3731,7 @@ event-browser = false
             let p = Principal::jwt("billing", SystemTime::now() - Duration::from_secs(10));
             assert_eq!(fx.auth.expired(&p, "billing"), Expiry::NotYet, "{mode:?}");
             assert_eq!(
-                fx.m.counter_total("snodra_hub_auth_violations_total"),
+                fx.m.counter_total("snodra_server_auth_violations_total"),
                 None,
                 "{mode:?}"
             );
@@ -3835,11 +3866,11 @@ handle = ["billing.*"]
     }
 
     fn results(m: &TestMetrics, result: &str) -> Option<u64> {
-        m.counter("snodra_hub_client_certificates_total", "result", result)
+        m.counter("snodra_server_client_certificates_total", "result", result)
     }
 
     fn violations(m: &TestMetrics, reason: &str) -> Option<u64> {
-        m.counter("snodra_hub_auth_violations_total", "reason", reason)
+        m.counter("snodra_server_auth_violations_total", "reason", reason)
     }
 
     #[test]
@@ -4028,7 +4059,7 @@ handle = ["billing.*"]
         assert_eq!(adm.status, AuthStatus::Off);
         assert_eq!(adm.refused, None);
         assert_eq!(
-            m.counter_total("snodra_hub_client_certificates_total"),
+            m.counter_total("snodra_server_client_certificates_total"),
             None
         );
         assert_eq!(a.expiry_deadline(None), None);

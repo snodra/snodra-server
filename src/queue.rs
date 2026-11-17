@@ -36,7 +36,7 @@ pub enum Full {
 }
 
 impl Full {
-    /// Label of the `reason` attribute of `snodra_hub_rejected_total`.
+    /// Label of the `reason` attribute of `snodra_server_rejected_total`.
     pub fn reason(self) -> &'static str {
         match self {
             Full::Count => "queue_full",

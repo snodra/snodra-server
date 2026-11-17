@@ -18,7 +18,7 @@ pub const SERVICE_SAN_PREFIX: &str = "snodra://service/";
 pub const MAX_SERVICE_NAME: usize = 128;
 
 /// Why a certificate names no service; the `result` label of
-/// `snodra_hub_client_certificates_total`.
+/// `snodra_server_client_certificates_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertError {
     /// No URI SAN of the form, a name outside the allowed characters, or a certificate that does
@@ -36,7 +36,7 @@ impl CertError {
         }
     }
 
-    /// The `reason` label of `snodra_hub_auth_violations_total`.
+    /// The `reason` label of `snodra_server_auth_violations_total`.
     pub fn reason(self) -> &'static str {
         match self {
             Self::NoService => "cert_no_service",

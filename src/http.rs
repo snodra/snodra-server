@@ -605,7 +605,7 @@ async fn api_event_lag(
     call.answer(lag.await)
 }
 
-/// Counts an open tail in `snodra_hub_event_tails` and holds its slot of
+/// Counts an open tail in `snodra_server_event_tails` and holds its slot of
 /// `SNODRA_SERVER_EVENT_MAX_TAILS` until dropped.
 struct TailGuard {
     metrics: Arc<crate::telemetry::Metrics>,
@@ -1734,24 +1734,24 @@ mod tests {
             .unwrap();
         assert_eq!(tail.status(), StatusCode::OK);
         assert_eq!(
-            metrics.up_down_total("snodra_hub_event_tails"),
+            metrics.up_down_total("snodra_server_event_tails"),
             Some(1),
             "a tail open"
         );
         drop(tail);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while metrics.up_down_total("snodra_hub_event_tails") != Some(0) {
+        while metrics.up_down_total("snodra_server_event_tails") != Some(0) {
             assert!(Instant::now() < deadline, "the tail did not end");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         let count = |kind: &str, outcome: &str| {
             let total = metrics
-                .counter("snodra_hub_event_browser_requests_total", "kind", kind)
+                .counter("snodra_server_event_browser_requests_total", "kind", kind)
                 .unwrap_or(0);
             let by_outcome = metrics
                 .counter(
-                    "snodra_hub_event_browser_requests_total",
+                    "snodra_server_event_browser_requests_total",
                     "outcome",
                     outcome,
                 )
@@ -1763,12 +1763,12 @@ mod tests {
         assert_eq!(count("record", "ok").0, 1);
         assert_eq!(count("tail", "ok").0, 1);
         assert_eq!(
-            metrics.histogram_sum("snodra_hub_event_browser_scanned_records"),
+            metrics.histogram_sum("snodra_server_event_browser_scanned_records"),
             Some((1, 3.0)),
             "one search that read three records"
         );
         assert_eq!(
-            metrics.counter_total("snodra_hub_event_payload_views_total"),
+            metrics.counter_total("snodra_server_event_payload_views_total"),
             Some(1)
         );
         let audits: Vec<_> = crate::telemetry::test_support::logged()
