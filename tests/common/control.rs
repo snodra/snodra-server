@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_hub::proto::{
+use snodra_server::proto::{
     ClientMessage, ControlRefusal, ControlReply, ControlRequest, Credentials, Heartbeat,
     InstanceStatus, ProcessorState, ProcessorStatus, Register, ServerMessage, client_message,
     control_reply, control_request, credentials, server_message,
@@ -39,8 +39,8 @@ pub fn default_result(req: &ControlRequest) -> control_reply::Result {
     use control_reply::Result as R;
     use control_request::Action as A;
     match &req.action {
-        Some(A::ResetExecute(_)) => R::Reset(kraken_hub::proto::ResetOutcome {
-            ranges: vec![kraken_hub::proto::ReplayRange {
+        Some(A::ResetExecute(_)) => R::Reset(snodra_server::proto::ResetOutcome {
+            ranges: vec![snodra_server::proto::ReplayRange {
                 segment: "0".into(),
                 from: "0".into(),
                 until: "42".into(),
@@ -48,29 +48,29 @@ pub fn default_result(req: &ControlRequest) -> control_reply::Result {
             markers_deleted: 3,
             reset_handlers: 1,
         }),
-        Some(A::DeadLetterList(_)) => R::DeadLetters(kraken_hub::proto::DeadLetterPage {
+        Some(A::DeadLetterList(_)) => R::DeadLetters(snodra_server::proto::DeadLetterPage {
             letters: vec![],
             total: 0,
         }),
-        Some(A::DeadLetterRetry(_)) => R::Retry(kraken_hub::proto::DeadLetterRetryOutcome {
+        Some(A::DeadLetterRetry(_)) => R::Retry(snodra_server::proto::DeadLetterRetryOutcome {
             result: "Retried".into(),
             detail: String::new(),
         }),
         Some(A::DeadLetterRetryAll(_)) => {
-            R::RetryAll(kraken_hub::proto::DeadLetterRetryAllOutcome::default())
+            R::RetryAll(snodra_server::proto::DeadLetterRetryAllOutcome::default())
         }
         _ => ok(),
     }
 }
 
 pub fn ok() -> control_reply::Result {
-    control_reply::Result::Ok(kraken_hub::proto::ControlOk {
+    control_reply::Result::Ok(snodra_server::proto::ControlOk {
         detail: String::new(),
     })
 }
 
 pub fn refused(code: ControlRefusal, message: &str) -> control_reply::Result {
-    control_reply::Result::Refused(kraken_hub::proto::ControlRefused {
+    control_reply::Result::Refused(snodra_server::proto::ControlRefused {
         code: code as i32,
         message: message.to_string(),
     })

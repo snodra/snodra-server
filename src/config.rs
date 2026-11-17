@@ -1054,7 +1054,7 @@ fn default_hub_id(host: Option<&str>) -> String {
     );
     hasher.write_u32(std::process::id());
     let suffix = hasher.finish() as u32;
-    format!("{}-{suffix:08x}", host.unwrap_or("kraken-hub"))
+    format!("{}-{suffix:08x}", host.unwrap_or("snodra-server"))
 }
 
 /// `type=ms,type=ms`; blanks around entries are ignored, a trailing comma is allowed. Every value
@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(suffix.len(), 8);
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
         assert_ne!(a, b, "two hub processes must not share an id");
-        assert!(default_hub_id(None).starts_with("kraken-hub-"));
+        assert!(default_hub_id(None).starts_with("snodra-server-"));
     }
 
     #[test]
@@ -1628,7 +1628,7 @@ mod tests {
                 "KRAKEN_HUB_JWT_JWKS_URI",
                 "http://keycloak:8080/realms/kraken/certs",
             ),
-            ("KRAKEN_HUB_JWT_AUDIENCE", "kraken-hub"),
+            ("KRAKEN_HUB_JWT_AUDIENCE", "snodra-server"),
             ("KRAKEN_HUB_JWT_LEEWAY", "5s"),
             ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "0"),
             ("KRAKEN_HUB_JWKS_REFRESH", "10m"),
@@ -1639,7 +1639,7 @@ mod tests {
             c.jwt_jwks_uri.as_deref(),
             Some("http://keycloak:8080/realms/kraken/certs")
         );
-        assert_eq!(c.jwt_audience.as_deref(), Some("kraken-hub"));
+        assert_eq!(c.jwt_audience.as_deref(), Some("snodra-server"));
         assert_eq!(c.jwt_leeway, Duration::from_secs(5));
         assert_eq!(c.jwt_expiry_grace, Duration::ZERO);
         assert_eq!(c.jwks_refresh, Duration::from_secs(600));
@@ -1650,7 +1650,7 @@ mod tests {
     fn jwt_settings_without_an_issuer_are_a_startup_error() {
         for (name, value) in [
             ("KRAKEN_HUB_JWT_JWKS_URI", "https://sso.example/certs"),
-            ("KRAKEN_HUB_JWT_AUDIENCE", "kraken-hub"),
+            ("KRAKEN_HUB_JWT_AUDIENCE", "snodra-server"),
             ("KRAKEN_HUB_JWT_JWKS_CA", "/etc/hub/ca.pem"),
         ] {
             let err = with_env(&[(name, value)]).unwrap_err();

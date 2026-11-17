@@ -12,10 +12,10 @@ use common::browser::{
     self, Answer, FakeBrowser, GET, LAG, SEARCH, SOURCES, TAIL, defaults, page, refusal, summary,
 };
 use common::{FakeClient, http_send};
-use kraken_hub::auth::Secret;
-use kraken_hub::config::Config;
-use kraken_hub::proto::{ErrorCode, RequestKind, server_message};
 use serde_json::{Value, json};
+use snodra_server::auth::Secret;
+use snodra_server::config::Config;
+use snodra_server::proto::{ErrorCode, RequestKind, server_message};
 
 const READ: &str = "a-dashboard-token-0123456789";
 const WRITE: &str = "a-write-token-0123456789";
@@ -871,7 +871,7 @@ async fn a_hub_that_stops_ends_its_tails_with_shutdown() {
     );
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        kraken_hub::serve_with_shutdown(config(), grpc_listener, Some(http_listener), async {
+        snodra_server::serve_with_shutdown(config(), grpc_listener, Some(http_listener), async {
             let _ = stopped.await;
         })
         .await

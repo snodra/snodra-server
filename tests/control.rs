@@ -12,10 +12,10 @@ use common::control::{
     ControlClient, Reaction, action_of, actions, default_result, ok, ok_to_everything, refused,
 };
 use common::{HttpResponse, TempDir, http_send, start_hub_with_http};
-use kraken_hub::auth::{AuthMode, Secret, hash_token};
-use kraken_hub::config::Config;
-use kraken_hub::proto::{ControlRefusal, ControlRequest, control_reply, control_request};
 use serde_json::{Value, json};
+use snodra_server::auth::{AuthMode, Secret, hash_token};
+use snodra_server::config::Config;
+use snodra_server::proto::{ControlRefusal, ControlRequest, control_reply, control_request};
 
 const WRITE: &str = "write-token-0123456789abcdef";
 const READ: &str = "read-token-0123456789abcdef";
@@ -306,33 +306,35 @@ async fn a_reset_prepares_every_instance_executes_on_the_freshest_and_finishes_a
     };
     assert_eq!(
         execute.target.as_ref().unwrap().to,
-        Some(kraken_hub::proto::reset_target::To::Earliest(true))
+        Some(snodra_server::proto::reset_target::To::Earliest(true))
     );
 
     // The other targets reach the instance as given.
     for (body, want) in [
         (
             r#"{"to":"latest"}"#,
-            kraken_hub::proto::reset_target::To::Latest(true),
+            snodra_server::proto::reset_target::To::Latest(true),
         ),
         (
             r#"{"to":{"timestampMs":1762250000000}}"#,
-            kraken_hub::proto::reset_target::To::TimestampMs(1_762_250_000_000),
+            snodra_server::proto::reset_target::To::TimestampMs(1_762_250_000_000),
         ),
         (
             r#"{"to":{"positions":[{"segment":"1","position":"7"},{"segment":"0","position":"12"}]}}"#,
-            kraken_hub::proto::reset_target::To::Positions(kraken_hub::proto::SegmentPositions {
-                positions: vec![
-                    kraken_hub::proto::SegmentPosition {
-                        segment: "0".into(),
-                        position: "12".into(),
-                    },
-                    kraken_hub::proto::SegmentPosition {
-                        segment: "1".into(),
-                        position: "7".into(),
-                    },
-                ],
-            }),
+            snodra_server::proto::reset_target::To::Positions(
+                snodra_server::proto::SegmentPositions {
+                    positions: vec![
+                        snodra_server::proto::SegmentPosition {
+                            segment: "0".into(),
+                            position: "12".into(),
+                        },
+                        snodra_server::proto::SegmentPosition {
+                            segment: "1".into(),
+                            position: "7".into(),
+                        },
+                    ],
+                },
+            ),
         ),
     ] {
         let r = post(http, RESET, body).await;
@@ -688,9 +690,9 @@ async fn an_instance_that_leaves_mid_call_fails_it_at_once() {
 }
 
 /// A letter with every field set, `n`-th of its page.
-fn letter(n: usize, long: bool) -> kraken_hub::proto::DeadLetterSummary {
+fn letter(n: usize, long: bool) -> snodra_server::proto::DeadLetterSummary {
     let text = |s: &str, len: usize| if long { s.repeat(len) } else { s.to_string() };
-    kraken_hub::proto::DeadLetterSummary {
+    snodra_server::proto::DeadLetterSummary {
         id: if long {
             "i".repeat(300)
         } else {
@@ -729,24 +731,26 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
             use control_reply::Result as R;
             use control_request::Action as A;
             Some(Reaction::Reply(match &req.action {
-                Some(A::DeadLetterList(l)) => R::DeadLetters(kraken_hub::proto::DeadLetterPage {
-                    letters: (0..150).map(|n| letter(n, l.limit == 100)).collect(),
-                    total: 150,
-                }),
+                Some(A::DeadLetterList(l)) => {
+                    R::DeadLetters(snodra_server::proto::DeadLetterPage {
+                        letters: (0..150).map(|n| letter(n, l.limit == 100)).collect(),
+                        total: 150,
+                    })
+                }
                 Some(A::DeadLetterRetry(r)) if r.letter_id == "blocked" => {
-                    R::Retry(kraken_hub::proto::DeadLetterRetryOutcome {
+                    R::Retry(snodra_server::proto::DeadLetterRetryOutcome {
                         result: "Blocked".into(),
                         detail: "letter-0".into(),
                     })
                 }
                 Some(A::DeadLetterRetry(_)) => {
-                    R::Retry(kraken_hub::proto::DeadLetterRetryOutcome {
+                    R::Retry(snodra_server::proto::DeadLetterRetryOutcome {
                         result: "Retried".into(),
                         detail: String::new(),
                     })
                 }
                 Some(A::DeadLetterRetryAll(_)) => {
-                    R::RetryAll(kraken_hub::proto::DeadLetterRetryAllOutcome {
+                    R::RetryAll(snodra_server::proto::DeadLetterRetryAllOutcome {
                         retried: 2,
                         failed: 1,
                         blocked: 4,

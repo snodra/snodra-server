@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, Spec, TempDir, acl_entry, auth_config, start_hub, start_hub_with_http};
-use kraken_hub::auth::AuthMode;
-use kraken_hub::config::Config;
-use kraken_hub::proto::{
+use snodra_server::auth::AuthMode;
+use snodra_server::config::Config;
+use snodra_server::proto::{
     ClientMessage, ErrorCode, Request, RequestKind, RequestMode, ServerMessage, client_message,
     server_message,
 };
@@ -384,7 +384,7 @@ async fn startup_fails_on_a_missing_or_malformed_acl_file() {
         dir.write("bad.toml", "[[token]]\nservice = 3"),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let result = kraken_hub::serve_with_shutdown(
+        let result = snodra_server::serve_with_shutdown(
             auth_config(AuthMode::Enforce, &file),
             listener,
             None,
@@ -714,12 +714,12 @@ async fn the_topology_rpc_needs_the_dashboard_token_when_one_is_set() {
     let token = "0123456789abcdef0123";
     let addr = start_hub(Config {
         otlp_endpoint: None,
-        dashboard_token: Some(kraken_hub::auth::Secret::new(token)),
+        dashboard_token: Some(snodra_server::auth::Secret::new(token)),
         ..Config::default()
     })
     .await;
-    let target = kraken_hub::client::Target::plain(addr);
-    let denied = kraken_hub::topology_probe_target(&target, None)
+    let target = snodra_server::client::Target::plain(addr);
+    let denied = snodra_server::topology_probe_target(&target, None)
         .await
         .unwrap_err();
     assert!(
@@ -728,14 +728,14 @@ async fn the_topology_rpc_needs_the_dashboard_token_when_one_is_set() {
             .contains("unauthenticated"),
         "{denied:#}"
     );
-    let wrong = kraken_hub::topology_probe_target(&target, Some("not-the-token-at-all")).await;
+    let wrong = snodra_server::topology_probe_target(&target, Some("not-the-token-at-all")).await;
     assert!(wrong.is_err());
-    let t = kraken_hub::topology_probe_target(&target, Some(token))
+    let t = snodra_server::topology_probe_target(&target, Some(token))
         .await
         .unwrap();
     assert_eq!(t.totals.instances, 0);
     // The health service stays public.
-    assert!(kraken_hub::health_probe(addr).await.unwrap());
+    assert!(snodra_server::health_probe(addr).await.unwrap());
 }
 
 // ---- instance id takeover (review finding 1) ----------------------------------------------
@@ -769,7 +769,7 @@ async fn expect_reply_payload(c: &mut FakeClient) -> Vec<u8> {
             Some(Ok(ServerMessage {
                 message: Some(server_message::Message::Reply(r)),
             })) => match r.result {
-                Some(kraken_hub::proto::reply::Result::Payload(p)) => return p,
+                Some(snodra_server::proto::reply::Result::Payload(p)) => return p,
                 other => panic!("expected a payload, got {other:?}"),
             },
             Some(Ok(ServerMessage {
@@ -913,9 +913,9 @@ async fn a_reconnect_with_the_rotated_token_of_the_same_service_is_allowed() {
 #[tokio::test]
 async fn enforce_refuses_the_topology_rpc_without_a_dashboard_token_or_an_acl_token() {
     let h = hub(AuthMode::Enforce).await;
-    let target = kraken_hub::client::Target::plain(h.addr);
+    let target = snodra_server::client::Target::plain(h.addr);
     for presented in [None, Some("not-a-token")] {
-        let denied = kraken_hub::topology_probe_target(&target, presented)
+        let denied = snodra_server::topology_probe_target(&target, presented)
             .await
             .unwrap_err();
         let status = denied
@@ -924,11 +924,11 @@ async fn enforce_refuses_the_topology_rpc_without_a_dashboard_token_or_an_acl_to
         assert_eq!(status.code(), Code::Unauthenticated, "{presented:?}");
     }
     // Any ACL token reads it.
-    let t = kraken_hub::topology_probe_target(&target, Some("tok-web"))
+    let t = snodra_server::topology_probe_target(&target, Some("tok-web"))
         .await
         .unwrap();
     assert_eq!(t.totals.instances, 0);
-    assert!(kraken_hub::health_probe(h.addr).await.unwrap());
+    assert!(snodra_server::health_probe(h.addr).await.unwrap());
 }
 
 #[tokio::test]
@@ -937,19 +937,19 @@ async fn enforce_with_a_dashboard_token_accepts_it_and_acl_tokens() {
     let file = dir.write("acl.toml", &acl());
     let dash = "0123456789abcdef0123";
     let addr = start_hub(Config {
-        dashboard_token: Some(kraken_hub::auth::Secret::new(dash)),
+        dashboard_token: Some(snodra_server::auth::Secret::new(dash)),
         ..auth_config(AuthMode::Enforce, &file)
     })
     .await;
-    let target = kraken_hub::client::Target::plain(addr);
+    let target = snodra_server::client::Target::plain(addr);
     assert!(
-        kraken_hub::topology_probe_target(&target, None)
+        snodra_server::topology_probe_target(&target, None)
             .await
             .is_err()
     );
     for token in [dash, "tok-ops"] {
         assert!(
-            kraken_hub::topology_probe_target(&target, Some(token))
+            snodra_server::topology_probe_target(&target, Some(token))
                 .await
                 .is_ok(),
             "{token}"
@@ -961,9 +961,9 @@ async fn enforce_with_a_dashboard_token_accepts_it_and_acl_tokens() {
 async fn permissive_and_off_leave_the_topology_rpc_open_without_a_dashboard_token() {
     for mode in [AuthMode::Permissive, AuthMode::Off] {
         let h = hub(mode).await;
-        let target = kraken_hub::client::Target::plain(h.addr);
+        let target = snodra_server::client::Target::plain(h.addr);
         assert!(
-            kraken_hub::topology_probe_target(&target, None)
+            snodra_server::topology_probe_target(&target, None)
                 .await
                 .is_ok(),
             "{mode:?}"
@@ -983,11 +983,11 @@ async fn a_rotated_dashboard_token_file_applies_without_a_restart() {
     };
     config.load_token_files().unwrap();
     let addr = start_hub(config).await;
-    let target = kraken_hub::client::Target::plain(addr);
+    let target = snodra_server::client::Target::plain(addr);
     let works = |token: &'static str| {
         let target = target.clone();
         async move {
-            kraken_hub::topology_probe_target(&target, Some(token))
+            snodra_server::topology_probe_target(&target, Some(token))
                 .await
                 .is_ok()
         }

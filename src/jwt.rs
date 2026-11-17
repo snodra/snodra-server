@@ -1030,10 +1030,10 @@ mod tests {
         c["aud"] = json!("someone-else");
         assert!(fx.check(&key.sign(&c)).await.is_ok(), "no audience set");
 
-        let fx = loaded_with(&[&key], |c| c.jwt_audience = Some("kraken-hub".into())).await;
+        let fx = loaded_with(&[&key], |c| c.jwt_audience = Some("snodra-server".into())).await;
         for (aud, ok) in [
-            (json!("kraken-hub"), true),
-            (json!(["account", "kraken-hub"]), true),
+            (json!("snodra-server"), true),
+            (json!(["account", "snodra-server"]), true),
             (json!("someone-else"), false),
             (json!(["account", "other"]), false),
             (json!([]), false),

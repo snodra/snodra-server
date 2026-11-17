@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{FakeClient, http_get, http_get_full};
-use kraken_hub::config::Config;
-use kraken_hub::proto::{RequestKind, ServerMessage, server_message};
+use snodra_server::config::Config;
+use snodra_server::proto::{RequestKind, ServerMessage, server_message};
 
 /// The fake instances never send a heartbeat: a long timeout keeps them registered however long
 /// the headless loads take on a busy machine (ten pages load at once).
@@ -165,13 +165,13 @@ async fn every_referenced_asset_and_import_is_served() {
     }
 
     // Every embedded module is reachable (no dead or forgotten file), and only those exist.
-    let build = kraken_hub::assets::build_id();
+    let build = snodra_server::assets::build_id();
     let prefix = format!("/ui/v/{build}/");
     let reached: BTreeSet<String> = reached
         .iter()
         .map(|p| p.strip_prefix(&prefix).unwrap_or(p).to_string())
         .collect();
-    let embedded: BTreeSet<String> = kraken_hub::assets::names()
+    let embedded: BTreeSet<String> = snodra_server::assets::names()
         .into_iter()
         .filter(|n| n.ends_with(".js"))
         .collect();
@@ -290,7 +290,8 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
         server_message::Message::Reply(_)
     ));
 
-    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-test-{}", std::process::id()));
+    let profiles =
+        std::env::temp_dir().join(format!("snodra-server-ui-test-{}", std::process::id()));
     let pages = [
         ("overview", "aria-label=\"Traffic graph"),
         ("services", "Instances of service-b"),
@@ -340,7 +341,7 @@ async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
     for service in ["service-a", "service-b"] {
         let client = FakeClient::connect(grpc).await;
         client
-            .send_raw_register(kraken_hub::proto::Register {
+            .send_raw_register(snodra_server::proto::Register {
                 shared_query_types: vec!["search.FindAnything".to_string()],
                 ..client.register_message(service, &[], &[])
             })
@@ -349,7 +350,7 @@ async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-shared-{}", std::process::id()));
+        std::env::temp_dir().join(format!("snodra-server-ui-shared-{}", std::process::id()));
     // Without a live stream the page keeps no connection open, so the virtual-time load ends.
     let _slots = take_stream_slots(http).await;
     let (dom, _) = rendered(&browser, http, "types", &profiles.join("types")).await;
@@ -378,7 +379,7 @@ async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
 async fn take_stream_slots(http: SocketAddr) -> Vec<tokio::net::TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut open = Vec::new();
-    for _ in 0..kraken_hub::http::MAX_STREAMS {
+    for _ in 0..snodra_server::http::MAX_STREAMS {
         let mut stream = tokio::net::TcpStream::connect(http).await.unwrap();
         let request = format!("GET /api/v1/stream HTTP/1.1\r\nHost: {http}\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -477,7 +478,8 @@ async fn a_flood_of_types_and_edges_renders_bounded_and_in_time() {
     // stream slot taken the page falls back to polling (also covered here), so a virtual-time
     // budget lets the large first fetch finish before the DOM is dumped.
     let _slots = take_stream_slots(http).await;
-    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-flood-{}", std::process::id()));
+    let profiles =
+        std::env::temp_dir().join(format!("snodra-server-ui-flood-{}", std::process::id()));
     let (dom, took) = rendered(&browser, http, "overview", &profiles.join("overview")).await;
     assert!(took < Duration::from_secs(15), "overview took {took:?}");
     assert!(
@@ -555,7 +557,7 @@ async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
             ..config()
         };
         tokio::spawn(async move {
-            kraken_hub::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
+            snodra_server::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
                 .await
                 .unwrap();
         });
@@ -572,7 +574,8 @@ async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
     // The live stream stops Chrome's virtual time; with every slot taken the page polls (see
     // the flood test), and a virtual-time budget lets the chained fetches finish.
     let _slots = take_stream_slots(ha).await;
-    let profiles = std::env::temp_dir().join(format!("kraken-hub-ui-peers-{}", std::process::id()));
+    let profiles =
+        std::env::temp_dir().join(format!("snodra-server-ui-peers-{}", std::process::id()));
     let dead_port = dead.port().to_string();
     // The browser logs the refused connection to the dead peer; nothing else may be logged.
     let refused = |l: &str| l.contains("ERR_CONNECTION_REFUSED") || l.contains(&dead_port);
@@ -624,8 +627,8 @@ fn segment(
     position: i64,
     committed: i64,
     head: i64,
-) -> kraken_hub::proto::SegmentStatus {
-    kraken_hub::proto::SegmentStatus {
+) -> snodra_server::proto::SegmentStatus {
+    snodra_server::proto::SegmentStatus {
         segment: segment.to_string(),
         position: position.to_string(),
         committed: committed.to_string(),
@@ -637,10 +640,10 @@ fn segment(
 
 fn processor(
     name: &str,
-    state: kraken_hub::proto::ProcessorState,
-    segments: Vec<kraken_hub::proto::SegmentStatus>,
-) -> kraken_hub::proto::ProcessorStatus {
-    kraken_hub::proto::ProcessorStatus {
+    state: snodra_server::proto::ProcessorState,
+    segments: Vec<snodra_server::proto::SegmentStatus>,
+) -> snodra_server::proto::ProcessorStatus {
+    snodra_server::proto::ProcessorStatus {
         name: name.to_string(),
         subscription: if name == "default" {
             "service-b".to_string()
@@ -673,7 +676,7 @@ async fn register_as(grpc: SocketAddr, service: &str, instance_id: &str) -> Fake
 /// the dead letters.
 #[tokio::test]
 async fn the_processors_page_aggregates_and_expands_to_segments() {
-    use kraken_hub::proto::ProcessorState;
+    use snodra_server::proto::ProcessorState;
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
@@ -718,8 +721,10 @@ async fn the_processors_page_aggregates_and_expands_to_segments() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _slots = take_stream_slots(http).await;
-    let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-processors-{}", std::process::id()));
+    let profiles = std::env::temp_dir().join(format!(
+        "snodra-server-ui-processors-{}",
+        std::process::id()
+    ));
     let (dom, _) = rendered(
         &browser,
         http,
@@ -779,7 +784,7 @@ async fn the_processors_page_aggregates_and_expands_to_segments() {
 /// report wins; a second instance only hub-b knows is added.
 #[tokio::test]
 async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
-    use kraken_hub::proto::ProcessorState;
+    use snodra_server::proto::ProcessorState;
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
@@ -805,7 +810,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
             ..config()
         };
         tokio::spawn(async move {
-            kraken_hub::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
+            snodra_server::serve_with_shutdown(config, grpc, Some(http), std::future::pending())
                 .await
                 .unwrap();
         });
@@ -844,8 +849,10 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _slots = take_stream_slots(ha).await;
-    let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-proc-peers-{}", std::process::id()));
+    let profiles = std::env::temp_dir().join(format!(
+        "snodra-server-ui-proc-peers-{}",
+        std::process::id()
+    ));
     let (dom, _) = rendered(
         &browser,
         ha,
@@ -883,7 +890,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
 /// credential it offers the write-token field and no control buttons.
 #[tokio::test]
 async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the_write_token() {
-    use kraken_hub::proto::ProcessorState;
+    use snodra_server::proto::ProcessorState;
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
@@ -912,7 +919,7 @@ async fn the_processors_page_shows_paused_stopped_and_replaying_and_asks_for_the
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _slots = take_stream_slots(http).await;
     let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-controls-{}", std::process::id()));
+        std::env::temp_dir().join(format!("snodra-server-ui-controls-{}", std::process::id()));
     let (dom, _) = rendered(
         &browser,
         http,
@@ -981,7 +988,7 @@ fn processor_rows(devtools: &mut Devtools) -> Vec<(String, String)> {
 /// event store shows in its column, with its capabilities in the title.
 #[tokio::test]
 async fn reset_offered_only_with_replay_capability() {
-    use kraken_hub::proto::ProcessorState;
+    use snodra_server::proto::ProcessorState;
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
@@ -1006,8 +1013,10 @@ async fn reset_offered_only_with_replay_capability() {
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _slots = take_stream_slots(http).await;
-    let profile =
-        std::env::temp_dir().join(format!("kraken-hub-ui-replay-cap-{}", std::process::id()));
+    let profile = std::env::temp_dir().join(format!(
+        "snodra-server-ui-replay-cap-{}",
+        std::process::id()
+    ));
     let page = format!("http://{http}/ui/#/processors");
     let dir = profile.clone();
     let rows = tokio::task::spawn_blocking(move || {
@@ -1053,11 +1062,11 @@ async fn reset_offered_only_with_replay_capability() {
 #[tokio::test]
 async fn unsupported_refusal_reaches_the_dashboard() {
     use common::control::{ControlClient, Reaction, default_result, refused};
-    use kraken_hub::proto::{ControlRefusal, control_request};
+    use snodra_server::proto::{ControlRefusal, control_request};
     const WRITE: &str = "write-token-0123456789abcdef";
     const WHY: &str = "this event store cannot seek by time";
     let (grpc, http) = common::start_hub_with_http(Config {
-        dashboard_write_token: Some(kraken_hub::auth::Secret::new(WRITE)),
+        dashboard_write_token: Some(snodra_server::auth::Secret::new(WRITE)),
         ..config()
     })
     .await;
@@ -1068,7 +1077,7 @@ async fn unsupported_refusal_reaches_the_dashboard() {
         "b-1",
         &["audit"],
         std::sync::Arc::new(
-            |req: &kraken_hub::proto::ControlRequest| match &req.action {
+            |req: &snodra_server::proto::ControlRequest| match &req.action {
                 Some(control_request::Action::ResetExecute(_)) => {
                     Reaction::Reply(refused(ControlRefusal::Unsupported, WHY))
                 }
@@ -1107,8 +1116,10 @@ async fn unsupported_refusal_reaches_the_dashboard() {
         return;
     };
     let _slots = take_stream_slots(http).await;
-    let profile =
-        std::env::temp_dir().join(format!("kraken-hub-ui-unsupported-{}", std::process::id()));
+    let profile = std::env::temp_dir().join(format!(
+        "snodra-server-ui-unsupported-{}",
+        std::process::id()
+    ));
     let page = format!("http://{http}/ui/#/processors");
     let dir = profile.clone();
     let line = tokio::task::spawn_blocking(move || {
@@ -1146,14 +1157,14 @@ async fn unsupported_refusal_reaches_the_dashboard() {
 #[tokio::test]
 async fn reset_dialog_takes_one_opaque_position_per_line() {
     use common::control::{ControlClient, ok_to_everything};
-    use kraken_hub::proto::{SegmentPosition, control_request, reset_target};
+    use snodra_server::proto::{SegmentPosition, control_request, reset_target};
     const WRITE: &str = "write-token-0123456789abcdef";
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
     };
     let (grpc, http) = common::start_hub_with_http(Config {
-        dashboard_write_token: Some(kraken_hub::auth::Secret::new(WRITE)),
+        dashboard_write_token: Some(snodra_server::auth::Secret::new(WRITE)),
         ..config()
     })
     .await;
@@ -1161,7 +1172,7 @@ async fn reset_dialog_takes_one_opaque_position_per_line() {
     let b1 = ControlClient::new(grpc, "service-b", "b-1", &["audit"], ok_to_everything()).await;
     let _slots = take_stream_slots(http).await;
     let profile =
-        std::env::temp_dir().join(format!("kraken-hub-ui-positions-{}", std::process::id()));
+        std::env::temp_dir().join(format!("snodra-server-ui-positions-{}", std::process::id()));
     let page = format!("http://{http}/ui/#/processors");
     let dir = profile.clone();
     let (placeholder, refusal) = tokio::task::spawn_blocking(move || {
@@ -1225,7 +1236,7 @@ async fn reset_dialog_takes_one_opaque_position_per_line() {
     assert_eq!(
         target.to,
         Some(reset_target::To::Positions(
-            kraken_hub::proto::SegmentPositions {
+            snodra_server::proto::SegmentPositions {
                 positions: vec![
                     position("0", "12,5"),
                     position("1", "a=b,c"),
@@ -1244,7 +1255,7 @@ async fn reset_dialog_takes_one_opaque_position_per_line() {
 #[tokio::test]
 async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
     use common::control::{ControlClient, Reaction};
-    use kraken_hub::proto::{DeadLetterPage, DeadLetterSummary, control_reply, control_request};
+    use snodra_server::proto::{DeadLetterPage, DeadLetterSummary, control_reply, control_request};
     let Some(browser) = browser() else {
         eprintln!("no Chrome or Chromium found: headless check skipped");
         return;
@@ -1274,7 +1285,7 @@ async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
         "b-1",
         &["audit"],
         std::sync::Arc::new(
-            move |req: &kraken_hub::proto::ControlRequest| match &req.action {
+            move |req: &snodra_server::proto::ControlRequest| match &req.action {
                 Some(control_request::Action::DeadLetterList(_)) => {
                     Reaction::Reply(control_reply::Result::DeadLetters(DeadLetterPage {
                         letters: vec![
@@ -1291,7 +1302,7 @@ async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
     .await;
     let _slots = take_stream_slots(http).await;
     let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-letters-{}", std::process::id()));
+        std::env::temp_dir().join(format!("snodra-server-ui-letters-{}", std::process::id()));
     let (dom, _) = rendered(
         &browser,
         http,
@@ -1356,12 +1367,15 @@ async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
         return;
     };
     let (_grpc, http) = common::start_hub_with_http(Config {
-        dashboard_token: Some(kraken_hub::auth::Secret::new("dash-0123456789abcdef0123")),
+        dashboard_token: Some(snodra_server::auth::Secret::new(
+            "dash-0123456789abcdef0123",
+        )),
         ..config()
     })
     .await;
     let http: SocketAddr = http.unwrap();
-    let profile = std::env::temp_dir().join(format!("kraken-hub-ui-login-{}", std::process::id()));
+    let profile =
+        std::env::temp_dir().join(format!("snodra-server-ui-login-{}", std::process::id()));
     let url = format!("http://{http}/ui/");
     let mut last = String::new();
     for _ in 0..8 {
@@ -1436,7 +1450,7 @@ async fn the_events_page_renders_the_browsers_answers_as_text_and_hides_without_
     .await;
     let _slots = take_stream_slots(http).await;
     let profiles =
-        std::env::temp_dir().join(format!("kraken-hub-ui-events-{}", std::process::id()));
+        std::env::temp_dir().join(format!("snodra-server-ui-events-{}", std::process::id()));
 
     let (dom, _) = rendered(
         &chrome,

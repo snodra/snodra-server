@@ -86,7 +86,7 @@ pub fn to_hex(digest: &Digest) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The hex digest `kraken-hub acl hash` prints.
+/// The hex digest `snodra-server acl hash` prints.
 pub fn hash_token(token: &str) -> String {
     to_hex(&digest_of(token))
 }

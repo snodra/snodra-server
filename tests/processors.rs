@@ -9,13 +9,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, http_get, start_hub_with_http};
-use kraken_hub::config::Config;
-use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{
+use serde_json::{Value, json};
+use snodra_server::config::Config;
+use snodra_server::proto::hub_client::HubClient;
+use snodra_server::proto::{
     ProcessorState, ProcessorStatus, RegisterAck, SegmentStatus, TopologyRequest, server_message,
 };
-use kraken_hub::topology::Topology;
-use serde_json::{Value, json};
+use snodra_server::topology::Topology;
 use tonic::transport::Endpoint;
 
 const SHORT: Duration = Duration::from_millis(1500);

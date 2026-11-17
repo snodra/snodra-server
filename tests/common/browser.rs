@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::BodyExt;
-use kraken_hub::proto::{
+use serde_json::Value;
+use snodra_server::proto::{
     ClientMessage, Error, ErrorCode, Reply, ReplyEnd, client_message, reply, server_message,
 };
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::FakeClient;
@@ -219,7 +219,7 @@ impl FakeBrowser {
 fn permits(count: u32) -> ClientMessage {
     ClientMessage {
         message: Some(client_message::Message::Permits(
-            kraken_hub::proto::Permits { count, grant: 0 },
+            snodra_server::proto::Permits { count, grant: 0 },
         )),
     }
 }

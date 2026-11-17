@@ -1352,7 +1352,7 @@ mod tests {
         let c = Config {
             jwt_issuer: Some("https://sso.example/realms/kraken".into()),
             jwt_jwks_uri: Some("http://keycloak:8080/certs".into()),
-            jwt_audience: Some("kraken-hub".into()),
+            jwt_audience: Some("snodra-server".into()),
             jwt_leeway: Duration::from_secs(5),
             ..Config::default()
         };
@@ -1368,7 +1368,7 @@ mod tests {
         );
         assert_eq!(
             get("KRAKEN_HUB_JWT_AUDIENCE").value.as_deref(),
-            Some("kraken-hub")
+            Some("snodra-server")
         );
         let leeway = get("KRAKEN_HUB_JWT_LEEWAY");
         assert_eq!(

@@ -692,7 +692,7 @@ mod tests {
     /// An `accept` loop over a loopback listener, with a throwaway self-signed certificate.
     async fn fixture(limits: HandshakeLimits) -> Fx {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir().join(format!("kraken-hub-tls-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-tls-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert_path, key.cert.pem()).unwrap();
@@ -756,7 +756,7 @@ mod tests {
 
     fn scratch_pair() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir().join(format!("kraken-hub-key-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-key-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let (cert, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert, key.cert.pem()).unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
     async fn mx(mode: ClientAuthMode) -> Mx {
         let server_pki = Pki::new("server CA");
         let (cert, key) = server_pki.server();
-        let dir = std::env::temp_dir().join(format!("kraken-hub-mtls-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-mtls-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert_path, cert).unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
     #[test]
     fn a_client_ca_that_does_not_load_is_a_startup_error() {
         let m = test_metrics();
-        let dir = std::env::temp_dir().join(format!("kraken-hub-ca-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-server-ca-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("nope.pem");
         assert!(

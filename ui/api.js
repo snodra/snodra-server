@@ -11,8 +11,8 @@
 // write token serves payloads to a request that presents it).
 
 const BASE = new URL('../api/v1/', document.baseURI);
-const TOKEN_KEY = 'kraken-hub.token';
-const WRITE_TOKEN_KEY = 'kraken-hub.write-token';
+const TOKEN_KEY = 'snodra-server.token';
+const WRITE_TOKEN_KEY = 'snodra-server.write-token';
 
 /** A peer that does not answer within this long counts as unreachable. */
 const PEER_TIMEOUT_MS = 3000;

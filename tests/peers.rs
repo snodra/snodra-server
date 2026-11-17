@@ -7,8 +7,8 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{HttpResponse, http_request, start_hub_with_http};
-use kraken_hub::config::Config;
 use serde_json::Value;
+use snodra_server::config::Config;
 
 const PEER: &str = "http://localhost:7011";
 const OTHER_PEER: &str = "http://127.0.0.1:9";

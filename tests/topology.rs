@@ -6,9 +6,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
-use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{Register, RequestKind, TopologyRequest, TopologyResponse, server_message};
+use snodra_server::config::Config;
+use snodra_server::proto::hub_client::HubClient;
+use snodra_server::proto::{
+    Register, RequestKind, TopologyRequest, TopologyResponse, server_message,
+};
 use tonic::transport::Endpoint;
 
 const BOUND: Duration = Duration::from_secs(3);

@@ -30,11 +30,11 @@ use crate::proto::{
 use crate::registry::InstanceId;
 
 /// The service the hub sends its own requests as.
-pub const HUB_SERVICE: &str = "kraken-hub";
+pub const HUB_SERVICE: &str = "snodra-server";
 
-/// The instance id prefix of the hub's request sessions (`kraken-hub/<uuid>`); a client may not
+/// The instance id prefix of the hub's request sessions (`snodra-server/<uuid>`); a client may not
 /// register an instance id that starts with it.
-pub const INSTANCE_PREFIX: &str = "kraken-hub/";
+pub const INSTANCE_PREFIX: &str = "snodra-server/";
 
 /// The most credit an internal stream holds: the receiver's buffer is that large.
 pub const MAX_INTERNAL_STREAM_CREDIT: u32 = 1024;

@@ -8,8 +8,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{FakeClient, Pki, TempDir, https_request, start_hub_with_http};
-use kraken_hub::client::{Target, Trust};
-use kraken_hub::config::Config;
+use snodra_server::client::{Target, Trust};
+use snodra_server::config::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config(cert: &Path, key: &Path) -> Config {
@@ -34,7 +34,7 @@ async fn probe(addr: SocketAddr, ca: &Path) -> anyhow::Result<bool> {
     let target = ca_target(addr, ca);
     tokio::time::timeout(
         Duration::from_secs(3),
-        kraken_hub::health_probe_target(&target),
+        snodra_server::health_probe_target(&target),
     )
     .await
     .map_err(|_| anyhow::anyhow!("timed out"))?
@@ -86,7 +86,8 @@ async fn grpc_serves_tls_only_and_verifies_against_the_ca() {
     assert!(probe(grpc, &ca).await.unwrap());
 
     // Plain text is refused: the health probe never connects.
-    let plain = tokio::time::timeout(Duration::from_secs(3), kraken_hub::health_probe(grpc)).await;
+    let plain =
+        tokio::time::timeout(Duration::from_secs(3), snodra_server::health_probe(grpc)).await;
     assert!(
         !matches!(plain, Ok(Ok(true))),
         "plain text must not work: {plain:?}"
@@ -241,7 +242,7 @@ async fn startup_fails_on_a_certificate_that_does_not_load() {
     let (_, cert, _key) = pki.write(&dir, "hub");
     let (_, _, other_key) = Pki::new("other").write(&dir, "other");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let result = kraken_hub::serve_with_shutdown(
+    let result = snodra_server::serve_with_shutdown(
         config(&cert, &other_key),
         listener,
         None,
@@ -269,8 +270,8 @@ async fn the_probes_of_the_hubs_own_container_work_with_tls() {
     // pinned (127.0.0.1 is not in a typical certificate).
     let local = Target::resolve(None, None, grpc.port(), Some(&cert));
     assert!(matches!(local.tls, Some(Trust::Pinned(_))));
-    assert!(kraken_hub::health_probe_target(&local).await.unwrap());
-    let t = kraken_hub::topology_probe_target(&local, None)
+    assert!(snodra_server::health_probe_target(&local).await.unwrap());
+    let t = snodra_server::topology_probe_target(&local, None)
         .await
         .unwrap();
     assert_eq!(t.services[0].service_name, "billing");
@@ -282,7 +283,7 @@ async fn the_probes_of_the_hubs_own_container_work_with_tls() {
         1,
         None,
     );
-    let t = kraken_hub::topology_probe_target(&by_ca, None)
+    let t = snodra_server::topology_probe_target(&by_ca, None)
         .await
         .unwrap();
     assert_eq!(t.totals.instances, 1);
@@ -295,12 +296,12 @@ async fn the_probes_of_the_hubs_own_container_work_with_tls() {
         None,
     );
     assert_eq!(system.tls, Some(Trust::System));
-    assert!(kraken_hub::health_probe_target(&system).await.is_err());
+    assert!(snodra_server::health_probe_target(&system).await.is_err());
 
     // Pinning a different certificate refuses this hub.
     let (_, other_cert, _) = Pki::new("other").write(&dir, "pin");
     let wrong = Target::resolve(None, None, grpc.port(), Some(&other_cert));
-    assert!(kraken_hub::health_probe_target(&wrong).await.is_err());
+    assert!(snodra_server::health_probe_target(&wrong).await.is_err());
 }
 
 #[tokio::test]
@@ -316,7 +317,7 @@ async fn the_binary_speaks_tls_with_tls_ca_and_in_its_own_container() {
     let mut client = FakeClient::connect_tls(grpc, &ca).await;
     client.send_register("billing", &["billing.Pay"], &[]).await;
     client.expect_ack().await;
-    let bin = env!("CARGO_BIN_EXE_kraken-hub");
+    let bin = env!("CARGO_BIN_EXE_snodra-server");
     let address = format!("https://localhost:{}", grpc.port());
 
     let out = tokio::process::Command::new(bin)

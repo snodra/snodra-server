@@ -1,17 +1,17 @@
 [package]
-name = "kraken-hub"
+name = "snodra-server"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "gRPC router for kraken commands and queries"
+description = "gRPC router for snodra commands and queries"
 license = "MIT"
 publish = false
 
 [lib]
-name = "kraken_hub"
+name = "snodra_server"
 
 [[bin]]
-name = "kraken-hub"
+name = "snodra-server"
 path = "src/main.rs"
 
 [dependencies]

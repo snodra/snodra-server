@@ -25,7 +25,7 @@ use crate::processors::{self, ProcessorStateName};
 use crate::registry::{Kind, RegistrySnapshot};
 use crate::session::Sessions;
 
-const SERVICE_NAME: &str = "kraken-hub";
+const SERVICE_NAME: &str = "snodra-server";
 
 /// Owns the OTLP providers; dropping it flushes and shuts them down.
 pub struct TelemetryGuard {
@@ -105,7 +105,7 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
     Ok(guard)
 }
 
-/// The OTLP resource of every span and metric: `service.name` `kraken-hub` and
+/// The OTLP resource of every span and metric: `service.name` `snodra-server` and
 /// `service.instance.id` the hub id, which Prometheus turns into the `job` and `instance` labels
 /// dashboards select hubs by (ADR 0026); no `service.namespace`, which would change `job`.
 pub fn resource(config: &Config) -> Resource {
@@ -1507,7 +1507,7 @@ mod tests {
                 .get(&opentelemetry::Key::from_static_str(key))
                 .map(|v| v.to_string())
         };
-        assert_eq!(get("service.name").as_deref(), Some("kraken-hub"));
+        assert_eq!(get("service.name").as_deref(), Some("snodra-server"));
         assert_eq!(get("service.instance.id").as_deref(), Some("hub-7"));
         assert_eq!(get("service.namespace"), None, "it would change `job`");
     }

@@ -1,4 +1,4 @@
-//! kraken-hub: routes commands and queries between kraken services over gRPC.
+//! snodra-server: routes commands and queries between Snodra services over gRPC.
 //! See kraken/docs/05-services/hub.md.
 
 pub mod api;
@@ -103,7 +103,7 @@ pub async fn serve_with_shutdown(
     let config = Arc::new(config);
     let registry = Arc::new(Registry::new(config.owner_grace));
     let sessions = Arc::new(Sessions::new());
-    let meter = opentelemetry::global::meter("kraken-hub");
+    let meter = opentelemetry::global::meter("snodra-server");
     let metrics = Metrics::new(meter.clone());
     // Read from the sessions when the metrics are exported; kept for the life of the hub.
     let _processor_gauges = telemetry::ProcessorGauges::register(&meter, Arc::clone(&sessions));

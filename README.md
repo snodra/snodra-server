@@ -1,26 +1,26 @@
 <p align="center">
-  <img alt="kraken hub mascot" src="https://gitlab.damoreira.ml/kraken-org/kraken/-/raw/main/docs/assets/brand/svg/kraken-hub.svg" width="160">
+  <img alt="Snodra Server mascot" src="docs/assets/brand/svg/snodra.svg" width="160">
 </p>
 
-<h1 align="center">kraken-hub</h1>
+<h1 align="center">Snodra Server</h1>
 
 <p align="center">
-  A stateless gRPC router for commands and queries between kraken services.
+  A stateless gRPC router for commands and queries between Snodra services.
 </p>
 
 <p align="center">
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/kraken-org/kraken-hub/badges/main/pipeline.svg"></a>
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/kraken-org/kraken-hub/-/badges/release.svg"></a>
+  <a href="https://gitlab.damoreira.ml/snodra/snodra-server/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/snodra/snodra-server/badges/main/pipeline.svg"></a>
+  <a href="https://gitlab.damoreira.ml/snodra/snodra-server/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/snodra/snodra-server/-/badges/release.svg"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
   <img alt="image" src="https://img.shields.io/badge/image-distroless-blue?logo=docker&logoColor=white">
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken/-/tree/main/docs"><img alt="kraken docs" src="https://img.shields.io/badge/kraken-umbrella%20docs-0B5FFF"></a>
+  <a href="https://snodra.damoreira.com/"><img alt="Snodra docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-green"></a>
 </p>
 
 ---
 
-gRPC router for kraken. Services open one bidirectional stream (`Hub.Connect`),
+gRPC router for Snodra. Services open one bidirectional stream (`Hub.Connect`),
 register the command and query types they handle, and the hub forwards each request to a live
 instance of the owning service and relays the reply. Events never pass through here; they go
 straight to the event store.
@@ -132,7 +132,7 @@ read: a hub that still sets one logs a startup warning naming it and starts as u
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 
-The topology view (`GET /api/v1/topology`, `kraken-hub --topology`) is described in [Topology view](#topology-view),
+The topology view (`GET /api/v1/topology`, `snodra-server --topology`) is described in [Topology view](#topology-view),
 the dashboard in [Dashboard](#dashboard).
 
 - **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
@@ -160,12 +160,12 @@ three ways:
 ```sh
 grpcurl -plaintext -import-path proto -proto hub.proto localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
 curl localhost:7001/api/v1/topology                            # HTTP JSON (the dashboard API)
-kraken-hub --topology [--json]                                 # CLI inside the container
+snodra-server --topology [--json]                                 # CLI inside the container
 ```
 
 ```sh
-docker exec kraken-hub /app/kraken-hub --topology
-docker exec kraken-hub /app/kraken-hub --topology --json
+docker exec snodra-server /app/snodra-server --topology
+docker exec snodra-server /app/snodra-server --topology --json
 ```
 
 - `GET /api/v1/topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as
@@ -174,7 +174,7 @@ docker exec kraken-hub /app/kraken-hub --topology --json
   `KRAKEN_HUB_DASHBOARD_ENABLED=false` every path is: the gRPC call and the CLI remain.
   **Builder call:** the HTTP endpoint is a second port (7001), because the gRPC port speaks only
   HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
-- `kraken-hub --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
+- `snodra-server --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
   port of `KRAKEN_HUB_LISTEN` (or `--address host:port|https://host:port`) with a 3 s timeout, over
   TLS as `--tls-ca <pem>`, an `https://` address or the environment's TLS setting say, with
   `KRAKEN_HUB_DASHBOARD_TOKEN` from its environment when the hub has one. Exit codes: 0 success, 1 failure (hub
@@ -431,7 +431,7 @@ per session and shows it.
   lags below -1 read as -1; an unknown state number reads as `UNSPECIFIED`. Never an error to the client. Segments
   are sorted with decimal names by value (`2` before `10`), then other names.
 - **Topology.** `InstanceTopology.processors` (field 19) over gRPC, `processors` in `GET /api/v1/topology`, and
-  under each service in `kraken-hub --topology` a table with one row per (processor,
+  under each service in `snodra-server --topology` a table with one row per (processor,
   instance): state, subscription, source, segments (runs of decimal names as ranges, `0-2,5`), the known lag,
   processed, failed, dead letters (or `(event-store)` / `(log)`), the last error with its age, cut at 60 characters. Every cell and service header of the
   `--topology` table is shown on one line (control characters such as newlines and escapes become spaces, runs of
@@ -561,7 +561,7 @@ service (the record header `source`). Empty parameters count as absent; times ar
 - **Who asked:** each query carries the headers `userId` (the token presented, `dashboard-token` or `write-token`,
   when one was) and `correlationId` (the request's `X-Correlation-Id` when it is 1 to 128 visible ASCII characters,
   else a fresh one); every answer carries `X-Correlation-Id` back, and the audit lines the same id. The sender is the
-  hub itself (service `kraken-hub`, instance `kraken-hub/<uuid>`: no client may register that service name or that
+  hub itself (service `snodra-server`, instance `snodra-server/<uuid>`: no client may register that service name or that
   instance prefix). The browser treats `userId` and `correlationId` as information for its logs, not as an identity:
   any client allowed to send a `kraken.events.*` type can set them.
 - **Bounds** of the reads (records scanned, results, time per search, concurrent searches and tails, tail duration,
@@ -605,7 +605,7 @@ table per token, keyed by the token's SHA-256 (never the token):
 
 ```toml
 [[token]]
-token_sha256 = "<64 hex characters from `kraken-hub acl hash -`>"
+token_sha256 = "<64 hex characters from `snodra-server acl hash -`>"
 service = "billing-service"          # the only service name this token may register as
 handle  = ["billing.*"]              # types it may handle: commands, queries, shared queries
 send    = ["orders.*"]               # types it may send, in every request mode
@@ -619,7 +619,7 @@ the file is read; a bare `*` does not). Sending a
 `kraken.events.*` type likewise needs a `send` pattern that names it, `kraken.events.*` or the type itself (`*` and
 `kraken.*` do not grant it): an operator who grants one lets that service read events directly from the browser,
 without the hub's payload rules. `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
-`printf %s "$TOKEN" | kraken-hub acl hash -` (or `kraken-hub acl hash <token>`).
+`printf %s "$TOKEN" | snodra-server acl hash -` (or `snodra-server acl hash <token>`).
 
 | Violation | `enforce` | `permissive` |
 |---|---|---|
@@ -634,7 +634,7 @@ without the hub's payload rules. `contexts` only accepts `["default"]`. Generate
 | a handled `kraken.events.*` type without `event-browser = true` | stream closed with `PERMISSION_DENIED` "service `<s>` may not handle type `<t>`: kraken.events.* types need the event-browser right" | logged, counted (`event_browser_denied`), allowed |
 | a handled `kraken.events.*` type and another type outside `handle` | as above: the event-browser denial is the one reported | as above |
 | a request for a type outside `send` (unary, scatter-gather, streaming, subscription); for a `kraken.events.*` type, a `send` without a pattern naming `kraken.events` | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
-| a `Register` whose instance id starts with `kraken-hub/` or whose service name is `kraken-hub` (reserved for the hub's own requests) | stream closed with `INVALID_ARGUMENT`, in every mode | the same |
+| a `Register` whose instance id starts with `snodra-server/` or whose service name is `snodra-server` (reserved for the hub's own requests) | stream closed with `INVALID_ARGUMENT`, in every mode | the same |
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
 | the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
 
@@ -1066,8 +1066,8 @@ any client change.
 - Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
   [Dashboard](#dashboard)); Grafana for history.
 - Metrics (OTLP, ADR 0026, `../kraken/docs/adr/0026-metrics-and-dashboards.md`): the resource is
-  `service.name=kraken-hub`, `service.instance.id=<KRAKEN_HUB_ID>`, so in Prometheus every series carries
-  `job="kraken-hub"` and `instance="<hub id>"`; no data point carries a hub id. Exported every 60 s
+  `service.name=snodra-server`, `service.instance.id=<KRAKEN_HUB_ID>`, so in Prometheus every series carries
+  `job="snodra-server"` and `instance="<hub id>"`; no data point carries a hub id. Exported every 60 s
   (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it). Every metric with its labels and meaning is in
   `../kraken/docs/05-services/hub.md` (Observability); in short:
   - routing: `kraken_hub_requests_total{kind,type,mode,service,outcome}` and
@@ -1101,7 +1101,7 @@ any client change.
   Over several hubs, counters, histograms and the hub-local gauges add up (`sum`); connected instances, registered
   types and the processor gauges are the same on every hub (`max`).
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
-  `kraken.hub.v1.Hub`, and `""` for the whole server). `kraken-hub --health-check` probes it on
+  `kraken.hub.v1.Hub`, and `""` for the whole server). `snodra-server --health-check` probes it on
   `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
   `SERVING`, 1 otherwise.
 - Logs: JSON on stdout, filtered by `KRAKEN_HUB_LOG`.
@@ -1109,37 +1109,37 @@ any client change.
 ## Image
 
 ```sh
-docker build -t kraken-hub:dev .
-docker run --rm -p 7000:7000 -p 7001:7001 -e KRAKEN_HUB_OTLP_ENDPOINT= kraken-hub:dev
+docker build -t snodra-server:dev .
+docker run --rm -p 7000:7000 -p 7001:7001 -e KRAKEN_HUB_OTLP_ENDPOINT= snodra-server:dev
 ```
 
 The builder installs `protobuf-compiler` only; the hub links no event-store client (`tests/dependencies.rs` checks
 `Cargo.lock` and the Dockerfile), so the runtime stays distroless (no shell, no curl, no extra library). Its `HEALTHCHECK` runs the binary's own probe:
-`HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/kraken-hub", "--health-check"]`.
+`HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/snodra-server", "--health-check"]`.
 In compose, `depends_on` can wait for it:
 
 ```yaml
 services:
-  kraken-hub:
-    image: kraken-hub:dev
+  snodra-server:
+    image: snodra-server:dev
     environment:
       KRAKEN_HUB_OTLP_ENDPOINT: http://otel-lgtm:4317
     # The image already declares this healthcheck; repeat it only to change the timings.
     healthcheck:
-      test: ["CMD", "/app/kraken-hub", "--health-check"]
+      test: ["CMD", "/app/snodra-server", "--health-check"]
       interval: 10s
       timeout: 3s
       retries: 3
   orders:
     depends_on:
-      kraken-hub:
+      snodra-server:
         condition: service_healthy
 ```
 
 `docker stop` sends SIGTERM to the hub (PID 1), which shuts down gracefully (see above).
 
-`kraken-hub:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
-releases (`vX.Y.Z`) to `harbor.damoreira.ml/kraken-org/kraken-hub:<tag>` and `:latest`.
+`snodra-server:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
+releases (`vX.Y.Z`) to `harbor.damoreira.ml/kraken-org/snodra-server:<tag>` and `:latest`.
 
 ## Layout
 
@@ -1211,11 +1211,11 @@ flowchart LR
 `release` computes the semantic-version bump from the commits since the latest `v*` tag: `BREAKING CHANGE` or a
 `type!:` subject is major, a `feat` subject minor, anything else patch (`SEMVER_BUMP` or `RELEASE_VERSION` override
 it; nothing to do when `HEAD` is already tagged or no commit is new; `DRY_RUN=true` stops before publishing). It
-then tags `vX.Y.Z` and pushes the tag, builds the `Dockerfile` and pushes `<harbor>/<project>/kraken-hub:X.Y.Z` and
+then tags `vX.Y.Z` and pushes the tag, builds the `Dockerfile` and pushes `<harbor>/<project>/snodra-server:X.Y.Z` and
 `:latest`, sets the GitLab group variable `KRAKEN_HUB_IMAGE` to the new image (creating it when missing) so the
 libraries' end-to-end jobs use it, and creates the GitLab release.
 
-The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `kraken-hub:dev`).
+The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `snodra-server:dev`).
 
 ## Contributing
 

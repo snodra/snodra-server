@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{FakeClient, start_hub};
-use kraken_hub::config::Config;
-use kraken_hub::proto::hub_client::HubClient;
-use kraken_hub::proto::{
+use snodra_server::config::Config;
+use snodra_server::proto::hub_client::HubClient;
+use snodra_server::proto::{
     ClientMessage, ErrorCode, Register, ReplyEnd, ReplyPart, Request, RequestKind, RequestMode,
     ServerMessage, TopologyRequest, client_message, server_message,
 };
@@ -67,7 +67,7 @@ fn scatter(id: &str, type_name: &str, timeout_ms: u32, max_results: u32) -> Clie
     if let Some(client_message::Message::Request(r)) = m.message.as_mut() {
         r.mode = RequestMode::ScatterGather as i32;
         r.max_results = max_results;
-        r.payload = b"{\"q\":\"kraken\"}".to_vec();
+        r.payload = b"{\"q\":\"Snodra\"}".to_vec();
     }
     m
 }
@@ -128,7 +128,7 @@ async fn a_scatter_gather_over_three_instances_of_two_owners_gets_three_parts_an
             RequestMode::Unary as i32,
             "handlers see a unary request"
         );
-        assert_eq!(r.payload, b"{\"q\":\"kraken\"}");
+        assert_eq!(r.payload, b"{\"q\":\"Snodra\"}");
         h.tx.send(FakeClient::reply_ok(&r.id, name.as_bytes()))
             .await
             .unwrap();
