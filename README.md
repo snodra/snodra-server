@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://gitlab.damoreira.ml/snodra/snodra-server/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/snodra/snodra-server/badges/main/pipeline.svg"></a>
-  <a href="https://gitlab.damoreira.ml/snodra/snodra-server/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/snodra/snodra-server/-/badges/release.svg"></a>
+  <a href="https://github.com/snodra/snodra-server/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/snodra/snodra-server/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/snodra/snodra-server/releases"><img alt="release" src="https://img.shields.io/github/v/release/snodra/snodra-server?label=release"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
   <img alt="image" src="https://img.shields.io/badge/image-distroless-blue?logo=docker&logoColor=white">
@@ -1138,8 +1138,8 @@ services:
 
 `docker stop` sends SIGTERM to the hub (PID 1), which shuts down gracefully (see above).
 
-`snodra-server:dev` is the image name the Kotlin starter's integration tests use. CI publishes tagged
-releases (`vX.Y.Z`) to `harbor.damoreira.ml/kraken-org/snodra-server:<tag>` and `:latest`.
+`snodra-server:dev` is the image name the Kotlin starter's integration tests use. A release publishes
+`docker.io/snodra/snodra-server:X.Y.Z` and `:latest` (`linux/amd64` and `linux/arm64`).
 
 ## Layout
 
@@ -1186,41 +1186,44 @@ proto/hub.proto   protocol, synced from the umbrella repo
 
 ## CI/CD pipeline
 
-Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml); a pipeline runs for every merge request and for every push to
-`main`, nothing else. The runners use the shell executor (Rust, `protoc`, Docker and buildx installed on the host):
-no job image, no services.
+Defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (pushes to `main` and pull requests) and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) (tags `v*`). Both run on GitHub-hosted Ubuntu
+runners with the Rust 1.99 toolchain and `protoc` 29.
 
 ```mermaid
 flowchart LR
-    subgraph check
-      fmt["fmt<br/>cargo fmt --check"]
-      sync["proto-sync"]
-      clippy["clippy<br/>--all-targets --all-features -D warnings"]
+    subgraph ci [ci]
+      fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets --all-features -D warnings"] --> test["test<br/>cargo test --all-features"]
     end
-    check --> test["test<br/>cargo test --all-features"] --> release["release · main only<br/>tag vX.Y.Z, image → Harbor"]
+    ci --> rel["release · tag v* only<br/>image → Docker Hub + GitHub release"]
 ```
 
-| Stage | Job | Runs | Produces |
+| Workflow | Job | Runs | Produces |
 |---|---|---|---|
-| check | `fmt` | always | `cargo fmt --all -- --check` |
-| check | `proto-sync` | always | `scripts/check-proto-sync.sh` against a fresh clone of the umbrella repo: `proto/hub.proto` must match `kraken/protocol/hub.proto` byte for byte |
-| check | `clippy` | always | `cargo clippy --all-targets --all-features -- -D warnings` |
-| test | `test` | always | `cargo test --all-features`: unit and in-process integration tests |
-| release | `release` | pushes to `main` only, one at a time | the next version and its release (below) |
+| `ci` | `fmt` | every push and pull request | `cargo fmt --all -- --check` |
+| `ci` | `clippy` | every push and pull request | `cargo clippy --all-targets --all-features -- -D warnings` |
+| `ci` | `test` | every push and pull request | `cargo test --all-features`: unit and in-process integration tests (the headless-browser load is skipped, as it was on the old runners) |
+| `release` | `image` | tags `v*` only | `docker.io/snodra/snodra-server:X.Y.Z` and `:latest`, then a GitHub release with generated notes |
 
-`release` computes the semantic-version bump from the commits since the latest `v*` tag: `BREAKING CHANGE` or a
-`type!:` subject is major, a `feat` subject minor, anything else patch (`SEMVER_BUMP` or `RELEASE_VERSION` override
-it; nothing to do when `HEAD` is already tagged or no commit is new; `DRY_RUN=true` stops before publishing). It
-then tags `vX.Y.Z` and pushes the tag, builds the `Dockerfile` and pushes `<harbor>/<project>/snodra-server:X.Y.Z` and
-`:latest`, sets the GitLab group variable `SNODRA_SERVER_IMAGE` to the new image (creating it when missing) so the
-libraries' end-to-end jobs use it, and creates the GitLab release.
+`proto/hub.proto` here is the protocol's source of truth; the umbrella repository and the two libraries follow the
+server release, and the libraries' own `proto-sync` job compares against this repository.
+
+Releases are cut deliberately, not by every merge:
+
+```sh
+git switch main && git pull
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+The tag workflow builds the multi-arch image, pushes it and creates the GitHub release. The umbrella's
+`SNODRA_SERVER_VERSION` and the GitLab group variable `SNODRA_SERVER_IMAGE` are then set to the exact version.
 
 The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `snodra-server:dev`).
 
 ## Contributing
 
-Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by merge request with a
-green pipeline; conventional commit messages. Design changes go to the umbrella repo first.
+Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by pull request with a
+green workflow; conventional commit messages. Design changes go to the umbrella repo first.
 Conventions: [`../kraken/docs/04-repositories.md`](../kraken/docs/04-repositories.md).
 
 ## License
