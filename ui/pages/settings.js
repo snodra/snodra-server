@@ -39,7 +39,7 @@ export default {
           fact('Version', v.version),
           fact('Started', `${fmt.time(v.startedAtMs)} (up ${fmt.span(v.nowMs - v.startedAtMs)})`),
           fact('Dashboard build', h('span', { class: 'mono' }, v.buildId)),
-          fact('Grafana', v.grafanaUrl ? h('a', { href: v.grafanaUrl, target: '_blank', rel: 'noopener noreferrer' }, v.grafanaUrl) : h('span', { class: 'dim' }, 'not configured (KRAKEN_HUB_GRAFANA_URL)')));
+          fact('Grafana', v.grafanaUrl ? h('a', { href: v.grafanaUrl, target: '_blank', rel: 'noopener noreferrer' }, v.grafanaUrl) : h('span', { class: 'dim' }, 'not configured (SNODRA_SERVER_GRAFANA_URL)')));
         fill(body, table('Configuration', ['Variable', 'Value', 'Default', ''], settings.map((s) => {
           const changed = !s.secret && s.default !== null && s.value !== s.default;
           return [

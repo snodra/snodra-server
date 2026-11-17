@@ -120,7 +120,7 @@ async fn topology(config: &Config, remote: &Remote, json: bool) -> ExitCode {
     let target = target(config, remote);
     let addr = &target.address;
     // The dashboard token of the hub being probed; the same variable the hub reads.
-    let token = std::env::var("KRAKEN_HUB_DASHBOARD_TOKEN")
+    let token = std::env::var("SNODRA_SERVER_DASHBOARD_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());

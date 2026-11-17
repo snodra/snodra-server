@@ -12,7 +12,7 @@ RUN cargo build --release --locked
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 COPY --from=builder /app/target/release/snodra-server /app/snodra-server
-ENV KRAKEN_HUB_LISTEN=0.0.0.0:7000
+ENV SNODRA_SERVER_LISTEN=0.0.0.0:7000
 EXPOSE 7000 7001
 USER nonroot
 # Distroless has no shell or curl: the binary probes its own gRPC health service.

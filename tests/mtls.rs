@@ -268,11 +268,11 @@ async fn the_binarys_own_health_check_works_against_a_required_hub() {
     let bin = env!("CARGO_BIN_EXE_snodra-server");
     let hub_env = |cmd: &mut tokio::process::Command| {
         cmd.env_clear()
-            .env("KRAKEN_HUB_LISTEN", format!("127.0.0.1:{}", addr.port()))
-            .env("KRAKEN_HUB_TLS_CERT", &cert)
-            .env("KRAKEN_HUB_TLS_KEY", &key)
-            .env("KRAKEN_HUB_TLS_CLIENT_CA", &client_ca)
-            .env("KRAKEN_HUB_TLS_CLIENT_AUTH", "required");
+            .env("SNODRA_SERVER_LISTEN", format!("127.0.0.1:{}", addr.port()))
+            .env("SNODRA_SERVER_TLS_CERT", &cert)
+            .env("SNODRA_SERVER_TLS_KEY", &key)
+            .env("SNODRA_SERVER_TLS_CLIENT_CA", &client_ca)
+            .env("SNODRA_SERVER_TLS_CLIENT_AUTH", "required");
     };
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--health-check");
@@ -394,8 +394,8 @@ async fn a_certificate_that_names_no_service_or_several_is_permission_denied_at_
         (
             ClientSpec {
                 uris: vec![
-                    "kraken://service/orders".into(),
-                    "kraken://service/billing".into(),
+                    "snodra://service/orders".into(),
+                    "snodra://service/billing".into(),
                 ],
                 ..ClientSpec::default()
             },
@@ -429,7 +429,7 @@ async fn the_service_is_read_from_the_leaf_of_a_chain_and_never_from_an_intermed
     // The leaf names orders, the intermediate names billing: the session is orders.
     let sub = hub
         .clients
-        .intermediate("sub CA", &["kraken://service/billing"]);
+        .intermediate("sub CA", &["snodra://service/billing"]);
     let id = chain_identity(&hub, "orders", &sub, &ClientSpec::service("orders"));
     let mut c = hub.register(&id, &orders()).await;
     c.expect_ack().await;
@@ -792,7 +792,7 @@ async fn a_client_ca_without_the_server_pair_stops_the_hub_instead_of_serving_pl
     .await;
     let e = result.expect_err("the hub must not start");
     assert!(
-        format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"),
+        format!("{e:#}").contains("SNODRA_SERVER_TLS_CLIENT_CA"),
         "{e:#}"
     );
 }

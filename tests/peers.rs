@@ -1,4 +1,4 @@
-//! Dashboard peers (ADR 0016): `KRAKEN_HUB_PEERS` reaches the page through `/api/v1/version` and
+//! Dashboard peers (ADR 0016): `SNODRA_SERVER_PEERS` reaches the page through `/api/v1/version` and
 //! `/api/v1/settings`, the CSP's `connect-src` gains exactly the peer origins, and the API answers
 //! CORS for those origins only (GET and its preflight, `/api/v1/*` only, never credentials).
 
@@ -173,8 +173,8 @@ async fn the_page_learns_the_peers_from_version_and_settings() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "KRAKEN_HUB_PEERS")
-        .expect("KRAKEN_HUB_PEERS listed");
+        .find(|e| e["name"] == "SNODRA_SERVER_PEERS")
+        .expect("SNODRA_SERVER_PEERS listed");
     assert_eq!(peers["value"], format!("{PEER},{OTHER_PEER}"));
     assert_eq!(peers["default"], "");
 }

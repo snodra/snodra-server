@@ -191,7 +191,7 @@ async fn enforce_refuses_kraken_events_types_without_the_event_browser_right() {
     let dir = TempDir::new();
     let browser = format!(
         "{}event-browser = true\n\n",
-        acl_entry("tok-browser", "kraken-event-browser", &[], &[])
+        acl_entry("tok-browser", "snodra-event-browser", &[], &[])
     );
     let file = dir.write("acl.toml", &[acl(), browser].concat());
     let addr = start_hub(auth_config(AuthMode::Enforce, &file)).await;
@@ -199,22 +199,22 @@ async fn enforce_refuses_kraken_events_types_without_the_event_browser_right() {
     // refused, naming the type and the right.
     let s = Spec {
         commands: vec!["ops.Run"],
-        queries: vec!["kraken.events.Search"],
+        queries: vec!["snodra.events.Search"],
         ..spec("ops", Some("tok-ops"))
     };
     let mut c = FakeClient::register_spec(addr, &s).await;
     let status = c.expect_closed().await;
     assert_eq!(status.code(), Code::PermissionDenied);
     assert!(
-        status.message().contains("kraken.events.Search")
+        status.message().contains("snodra.events.Search")
             && status.message().contains("event-browser right"),
         "{}",
         status.message()
     );
     // The entry with the right registers the browser's queries.
     let s = Spec {
-        queries: vec!["kraken.events.Search", "kraken.events.Tail"],
-        ..spec("kraken-event-browser", Some("tok-browser"))
+        queries: vec!["snodra.events.Search", "snodra.events.Tail"],
+        ..spec("snodra-event-browser", Some("tok-browser"))
     };
     let mut c = FakeClient::register_spec(addr, &s).await;
     c.expect_ack().await;
@@ -393,7 +393,7 @@ async fn startup_fails_on_a_missing_or_malformed_acl_file() {
         .await;
         let err = format!("{:#}", result.unwrap_err());
         assert!(
-            err.contains("KRAKEN_HUB_ACL_FILE") || err.contains("ACL"),
+            err.contains("SNODRA_SERVER_ACL_FILE") || err.contains("ACL"),
             "{err}"
         );
     }

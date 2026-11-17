@@ -898,7 +898,7 @@ mod tests {
         assert!(status.message().contains("orders.Place"));
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_hub_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -919,7 +919,7 @@ mod tests {
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_hub_auth_violations_total",
                 "reason",
                 "token_revoked"
             ),
@@ -1037,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             m.counter(
-                "kraken_hub_auth_violations_total",
+                "snodra_hub_auth_violations_total",
                 "reason",
                 "handle_denied"
             ),
@@ -1087,7 +1087,7 @@ mod tests {
             assert_eq!(sessions.auth_views().len(), 1);
             assert_eq!(
                 m.counter(
-                    "kraken_hub_auth_violations_total",
+                    "snodra_hub_auth_violations_total",
                     "reason",
                     "token_revoked"
                 ),

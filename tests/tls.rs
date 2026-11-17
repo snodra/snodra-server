@@ -357,9 +357,9 @@ async fn the_binary_speaks_tls_with_tls_ca_and_in_its_own_container() {
     let out = tokio::process::Command::new(bin)
         .arg("--health-check")
         .env_clear()
-        .env("KRAKEN_HUB_LISTEN", format!("127.0.0.1:{}", grpc.port()))
-        .env("KRAKEN_HUB_TLS_CERT", &cert)
-        .env("KRAKEN_HUB_TLS_KEY", &key)
+        .env("SNODRA_SERVER_LISTEN", format!("127.0.0.1:{}", grpc.port()))
+        .env("SNODRA_SERVER_TLS_CERT", &cert)
+        .env("SNODRA_SERVER_TLS_KEY", &key)
         .output()
         .await
         .unwrap();

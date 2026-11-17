@@ -99,7 +99,7 @@ async fn topology_lists_two_services_with_instances_and_types() {
         (2, 3, 1, 1)
     );
     assert_eq!(totals.in_flight, 0);
-    // KRAKEN_HUB_HEARTBEAT_TIMEOUT.
+    // SNODRA_SERVER_HEARTBEAT_TIMEOUT.
     assert_eq!(t.heartbeat_timeout_ms, 10_000);
     assert!(!t.hub_id.is_empty());
     assert!(t.now_ms >= t.hub_started_at_ms && t.hub_started_at_ms > 0);

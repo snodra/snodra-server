@@ -1,7 +1,7 @@
 //! Change detection for the files the hub reloads without a restart: the ACL
-//! (`KRAKEN_HUB_ACL_FILE`) and the TLS certificate and key (ADR 0018).
+//! (`SNODRA_SERVER_ACL_FILE`) and the TLS certificate and key (ADR 0018).
 //!
-//! A watcher polls the files' modification time and size every `KRAKEN_HUB_RELOAD_INTERVAL`
+//! A watcher polls the files' modification time and size every `SNODRA_SERVER_RELOAD_INTERVAL`
 //! (5 s); [`request_reload`] (the binary calls it on SIGHUP) makes every watcher reload at once.
 //! Symlinks are followed, so the atomic-rename swap Kubernetes does for mounted secrets is seen.
 

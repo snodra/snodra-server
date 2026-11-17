@@ -38,10 +38,10 @@ pub struct ClientSpec {
 }
 
 impl ClientSpec {
-    /// A certificate whose only SAN is `kraken://service/<name>`.
+    /// A certificate whose only SAN is `snodra://service/<name>`.
     pub fn service(name: &str) -> Self {
         Self {
-            uris: vec![format!("kraken://service/{name}")],
+            uris: vec![format!("snodra://service/{name}")],
             ..Self::default()
         }
     }

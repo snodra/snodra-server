@@ -118,8 +118,8 @@ async fn events_api_404_without_browser() {
         .iter()
         .map(|s| s["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"KRAKEN_HUB_EVENT_BROWSER_PAYLOADS"));
-    assert!(names.contains(&"KRAKEN_HUB_EVENT_MAX_TAILS"));
+    assert!(names.contains(&"SNODRA_SERVER_EVENT_BROWSER_PAYLOADS"));
+    assert!(names.contains(&"SNODRA_SERVER_EVENT_MAX_TAILS"));
     assert!(names.iter().all(|n| !n.contains("KAFKA")), "{names:?}");
 
     // A browser connects: the routes answer; it leaves: 404 again.
@@ -828,7 +828,7 @@ async fn the_hub_bounds_its_open_tails() {
         body["error"]
             .as_str()
             .unwrap()
-            .contains("KRAKEN_HUB_EVENT_MAX_TAILS")
+            .contains("SNODRA_SERVER_EVENT_MAX_TAILS")
     );
     assert_eq!(
         fake.seen().iter().filter(|s| s.type_name == TAIL).count(),

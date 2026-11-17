@@ -31,12 +31,12 @@ pub struct Queued {
 pub enum Full {
     Count,
     Bytes,
-    /// The hub-wide cap (`KRAKEN_HUB_QUEUE_BYTES_TOTAL`).
+    /// The hub-wide cap (`SNODRA_SERVER_QUEUE_BYTES_TOTAL`).
     TotalBytes,
 }
 
 impl Full {
-    /// Label of the `reason` attribute of `kraken_hub_rejected_total`.
+    /// Label of the `reason` attribute of `snodra_hub_rejected_total`.
     pub fn reason(self) -> &'static str {
         match self {
             Full::Count => "queue_full",

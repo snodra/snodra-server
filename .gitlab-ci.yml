@@ -24,10 +24,10 @@ fmt:
 proto-sync:
   stage: check
   script:
-    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
+    - git config --global url."https://${SNODRA_UMBRELLA_DEPLOY_USER}:${SNODRA_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
     - rm -rf "$CI_PROJECT_DIR/../kraken"
-    - git -c url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
-    - KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
+    - git -c url."https://${SNODRA_UMBRELLA_DEPLOY_USER}:${SNODRA_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
+    - SNODRA_PROTO_SYNC_REQUIRED=true SNODRA_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
   stage: check
@@ -114,28 +114,28 @@ release:
       docker push "$IMAGE:$VERSION"
       docker push "$IMAGE:latest"
       NEW_HUB_IMAGE="$IMAGE:$VERSION"
-      echo "Updating GitLab group variable KRAKEN_HUB_IMAGE to $NEW_HUB_IMAGE..."
+      echo "Updating GitLab group variable SNODRA_SERVER_IMAGE to $NEW_HUB_IMAGE..."
       if [ -z "${GITLAB_GROUP_TOKEN:-}" ]; then
-        echo "ERROR: GITLAB_GROUP_TOKEN is not set. Cannot update KRAKEN_HUB_IMAGE."
+        echo "ERROR: GITLAB_GROUP_TOKEN is not set. Cannot update SNODRA_SERVER_IMAGE."
         exit 1
       fi
       STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
         --request PUT \
         --header "PRIVATE-TOKEN: $GITLAB_GROUP_TOKEN" \
         --form "value=$NEW_HUB_IMAGE" \
-        "$CI_API_V4_URL/groups/$CI_PROJECT_ROOT_NAMESPACE/variables/KRAKEN_HUB_IMAGE")
+        "$CI_API_V4_URL/groups/$CI_PROJECT_ROOT_NAMESPACE/variables/SNODRA_SERVER_IMAGE")
       if [ "$STATUS" = "404" ]; then
-        echo "Variable KRAKEN_HUB_IMAGE not found, creating it via POST..."
+        echo "Variable SNODRA_SERVER_IMAGE not found, creating it via POST..."
         STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
           --request POST \
           --header "PRIVATE-TOKEN: $GITLAB_GROUP_TOKEN" \
-          --form "key=KRAKEN_HUB_IMAGE" \
+          --form "key=SNODRA_SERVER_IMAGE" \
           --form "value=$NEW_HUB_IMAGE" \
           "$CI_API_V4_URL/groups/$CI_PROJECT_ROOT_NAMESPACE/variables")
       fi
       case "$STATUS" in
-        200|201) echo "Successfully updated group variable KRAKEN_HUB_IMAGE to $NEW_HUB_IMAGE." ;;
-        *) echo "Failed to update group variable KRAKEN_HUB_IMAGE (HTTP $STATUS)"; exit 1 ;;
+        200|201) echo "Successfully updated group variable SNODRA_SERVER_IMAGE to $NEW_HUB_IMAGE." ;;
+        *) echo "Failed to update group variable SNODRA_SERVER_IMAGE (HTTP $STATUS)"; exit 1 ;;
       esac
       RELEASE=$(jq -n \
         --arg name "$CI_PROJECT_NAME $NEXT" \

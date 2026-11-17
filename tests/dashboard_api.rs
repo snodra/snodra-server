@@ -256,10 +256,10 @@ async fn types_topology_settings_and_version_have_their_shape() {
 
     // settings: every variable, effective value and default, no secret values.
     let s = json(http, "/api/v1/settings").await;
-    let grafana = find(&s["settings"], "name", "KRAKEN_HUB_GRAFANA_URL");
+    let grafana = find(&s["settings"], "name", "SNODRA_SERVER_GRAFANA_URL");
     assert_eq!(grafana["value"], "http://grafana.local:3000");
     assert_eq!(grafana["default"], "");
-    let window = find(&s["settings"], "name", "KRAKEN_HUB_EDGE_STATS_WINDOW");
+    let window = find(&s["settings"], "name", "SNODRA_SERVER_EDGE_STATS_WINDOW");
     assert_eq!(window["value"], "5m");
     for entry in s["settings"].as_array().unwrap() {
         let secret = entry["name"].as_str().unwrap().ends_with("_TOKEN");

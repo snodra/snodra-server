@@ -2,7 +2,7 @@
 //! every `import` in every module resolves to a served module, no module is unreachable, and
 //! no module uses HTML-string sinks or third-party code. When a Chrome or Chromium binary is
 //! available, each page is also loaded headless and must render without a console message
-//! (`KRAKEN_HUB_TEST_BROWSER` points at a binary, or `none` to skip).
+//! (`SNODRA_SERVER_TEST_BROWSER` points at a binary, or `none` to skip).
 
 mod common;
 
@@ -181,7 +181,7 @@ async fn every_referenced_asset_and_import_is_served() {
 // ---- headless browser --------------------------------------------------------------------
 
 fn browser() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("KRAKEN_HUB_TEST_BROWSER") {
+    if let Ok(path) = std::env::var("SNODRA_SERVER_TEST_BROWSER") {
         return (!path.is_empty() && path != "none").then(|| path.into());
     }
     let mac = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -296,7 +296,7 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
         ("overview", "aria-label=\"Traffic graph"),
         ("services", "Instances of service-b"),
         ("types", "examples.CountGreetings"),
-        ("settings", "KRAKEN_HUB_EDGE_STATS_WINDOW"),
+        ("settings", "SNODRA_SERVER_EDGE_STATS_WINDOW"),
         ("processors", "No service reports event processors"),
         ("dead-letters", "No processor keeps dead letters"),
     ];
@@ -521,7 +521,7 @@ async fn register_reporting(
     client
 }
 
-/// Two in-process hubs list each other (and a third URL nobody answers) in KRAKEN_HUB_PEERS.
+/// Two in-process hubs list each other (and a third URL nobody answers) in SNODRA_SERVER_PEERS.
 /// Hub A's page merges both: the instance registered on A only, the type owned by different
 /// services on A and B and the instance that reports no connection to B are flagged; the dead
 /// peer is shown as unreachable, not as a disagreement.

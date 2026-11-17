@@ -1,5 +1,5 @@
 //! The dashboard token (roadmap P5a, ADR 0018): `/api/v1/*` and the event stream
-//! need `Authorization: Bearer <token>` when `KRAKEN_HUB_DASHBOARD_TOKEN` is set; the page and its
+//! need `Authorization: Bearer <token>` when `SNODRA_SERVER_DASHBOARD_TOKEN` is set; the page and its
 //! assets stay public.
 
 mod common;
@@ -256,7 +256,7 @@ async fn without_a_token_configured_nothing_changes() {
     }
     // The settings view lists the token names, never a value.
     let r = http_get_full(http, "/api/v1/settings").await;
-    assert!(r.body.contains("KRAKEN_HUB_DASHBOARD_TOKEN"));
+    assert!(r.body.contains("SNODRA_SERVER_DASHBOARD_TOKEN"));
 }
 
 #[tokio::test]
@@ -276,7 +276,7 @@ async fn the_settings_view_never_shows_the_token() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["name"] == "KRAKEN_HUB_DASHBOARD_TOKEN")
+        .find(|s| s["name"] == "SNODRA_SERVER_DASHBOARD_TOKEN")
         .unwrap();
     assert_eq!(entry["secret"], true);
     assert!(entry["value"].is_null());

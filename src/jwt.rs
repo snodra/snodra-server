@@ -2,7 +2,7 @@
 //! token against the issuer's signing keys, and the cache of those keys.
 //!
 //! * [`Jwt`] holds the settings and the key cache. The keys are fetched in the background
-//!   ([`Jwt::spawn`]) at startup and every `KRAKEN_HUB_JWKS_REFRESH`, and when a token names a
+//!   ([`Jwt::spawn`]) at startup and every `SNODRA_SERVER_JWKS_REFRESH`, and when a token names a
 //!   `kid` the cache lacks ([`Jwt::ensure_key`], at most once per `jwks_refetch_interval`). A
 //!   failed fetch keeps the last good set.
 //! * [`Jwt::verify`] is synchronous over the cache: signature, algorithm, `iss`, `aud`, `exp`,
@@ -70,7 +70,7 @@ pub struct Verified {
 }
 
 /// Why a token was refused. [`JwtError::label`] is the `result` label of
-/// `kraken_hub_jwt_validations_total`.
+/// `snodra_hub_jwt_validations_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JwtError {
     /// The first fetch of the key set has not succeeded yet.
@@ -287,7 +287,7 @@ enum FetchError {
 }
 
 impl FetchError {
-    /// The `result` label of `kraken_hub_jwks_fetches_total`: fixed strings.
+    /// The `result` label of `snodra_hub_jwks_fetches_total`: fixed strings.
     fn label(&self) -> &'static str {
         match self {
             Self::Network(_) => "network",
@@ -324,13 +324,13 @@ struct Fetcher {
 
 impl Fetcher {
     fn new(uri: &str, ca: Option<&Path>, timeout: Duration) -> anyhow::Result<Self> {
-        let uri: Uri = uri.parse().context("KRAKEN_HUB_JWT_JWKS_URI")?;
+        let uri: Uri = uri.parse().context("SNODRA_SERVER_JWT_JWKS_URI")?;
         let https = uri.scheme_str() == Some("https");
         // `Uri::host` keeps the brackets of an IPv6 literal; neither connecting nor a TLS server
         // name takes them.
         let host = uri
             .host()
-            .context("KRAKEN_HUB_JWT_JWKS_URI has no host")?
+            .context("SNODRA_SERVER_JWT_JWKS_URI has no host")?
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_string();
@@ -344,7 +344,9 @@ impl Fetcher {
             // Unused, but still checked: a CA that cannot be read is a mistake the operator
             // must hear about now, not when the URI later becomes https.
             tls_config(ca)?;
-            warn!("KRAKEN_HUB_JWT_JWKS_CA is set but the JWKS URI is plain http: the CA is unused");
+            warn!(
+                "SNODRA_SERVER_JWT_JWKS_CA is set but the JWKS URI is plain http: the CA is unused"
+            );
         }
         Ok(Self {
             uri,
@@ -444,16 +446,16 @@ fn tls_config(ca: Option<&Path>) -> anyhow::Result<rustls::ClientConfig> {
     if let Some(path) = ca {
         let mut added = 0;
         for cert in CertificateDer::pem_file_iter(path)
-            .with_context(|| format!("KRAKEN_HUB_JWT_JWKS_CA: read {}", path.display()))?
+            .with_context(|| format!("SNODRA_SERVER_JWT_JWKS_CA: read {}", path.display()))?
         {
-            let cert =
-                cert.with_context(|| format!("KRAKEN_HUB_JWT_JWKS_CA: parse {}", path.display()))?;
-            roots.add(cert).context("KRAKEN_HUB_JWT_JWKS_CA")?;
+            let cert = cert
+                .with_context(|| format!("SNODRA_SERVER_JWT_JWKS_CA: parse {}", path.display()))?;
+            roots.add(cert).context("SNODRA_SERVER_JWT_JWKS_CA")?;
             added += 1;
         }
         anyhow::ensure!(
             added > 0,
-            "KRAKEN_HUB_JWT_JWKS_CA: no certificate in {}",
+            "SNODRA_SERVER_JWT_JWKS_CA: no certificate in {}",
             path.display()
         );
     }
@@ -544,7 +546,7 @@ impl Jwt {
         })))
     }
 
-    /// Fetches the key set now and then every `KRAKEN_HUB_JWKS_REFRESH`, until `stopping`. It
+    /// Fetches the key set now and then every `SNODRA_SERVER_JWKS_REFRESH`, until `stopping`. It
     /// never blocks or fails the hub's startup: while the keys are not loaded a JWT is refused
     /// with `UNAVAILABLE` and the fetch is retried with a growing delay (1 s, 2 s, ... capped at
     /// 30 s and at the refetch interval); a failed refresh keeps the last good keys and retries
@@ -833,12 +835,12 @@ mod tests {
 
         fn validations(&self, result: &str) -> Option<u64> {
             self.m
-                .counter("kraken_hub_jwt_validations_total", "result", result)
+                .counter("snodra_hub_jwt_validations_total", "result", result)
         }
 
         fn fetches(&self, result: &str) -> Option<u64> {
             self.m
-                .counter("kraken_hub_jwks_fetches_total", "result", result)
+                .counter("snodra_hub_jwks_fetches_total", "result", result)
         }
     }
 
@@ -1159,7 +1161,7 @@ mod tests {
         assert_eq!(fx.validations("malformed"), Some(7));
         // No label is made of anything the client sent.
         assert_eq!(
-            fx.m.counter_total("kraken_hub_jwt_validations_total"),
+            fx.m.counter_total("snodra_hub_jwt_validations_total"),
             Some(7)
         );
     }
@@ -1297,7 +1299,7 @@ mod tests {
             fx.jwt.key_count() == 2
         })
         .await;
-        assert_eq!(fx.m.gauge_plain("kraken_hub_jwks_keys"), Some(2));
+        assert_eq!(fx.m.gauge_plain("snodra_hub_jwks_keys"), Some(2));
     }
 
     #[tokio::test]
@@ -1476,7 +1478,7 @@ mod tests {
             .err()
             .expect("an error");
         assert!(
-            format!("{err:#}").contains("KRAKEN_HUB_JWT_JWKS_CA"),
+            format!("{err:#}").contains("SNODRA_SERVER_JWT_JWKS_CA"),
             "{err:#}"
         );
     }
@@ -1493,7 +1495,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{ca}: an unusable CA over http is accepted"));
             assert!(
-                format!("{err:#}").contains("KRAKEN_HUB_JWT_JWKS_CA"),
+                format!("{err:#}").contains("SNODRA_SERVER_JWT_JWKS_CA"),
                 "{err:#}"
             );
         }

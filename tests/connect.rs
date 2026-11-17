@@ -334,7 +334,7 @@ async fn health_service_reports_serving() {
     assert_eq!(resp.status, ServingStatus::Serving as i32);
     let resp = health
         .check(HealthCheckRequest {
-            service: "kraken.hub.v1.Hub".to_string(),
+            service: "snodra.hub.v1.Hub".to_string(),
         })
         .await
         .unwrap()

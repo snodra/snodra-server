@@ -9,7 +9,7 @@
 //! covers the current slot and the nine before it, so it reaches between 9/10 of the window and
 //! the whole window back. An edge without a request in the window is dropped.
 //!
-//! Bound: at most `max_edges` edges (`KRAKEN_HUB_EDGE_STATS_MAX_EDGES`, default 10 000).
+//! Bound: at most `max_edges` edges (`SNODRA_SERVER_EDGE_STATS_MAX_EDGES`, default 10 000).
 //! Expired edges are swept once per slot; a new edge at the cap then drops the least recently
 //! used edges, 1 % of the cap at a time (at least one), and counts them in
 //! [`EdgeSnapshot::evicted`]. Sender and type names longer than [`MAX_NAME_BYTES`] are cut.

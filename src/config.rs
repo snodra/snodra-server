@@ -1,4 +1,4 @@
-//! Environment-based configuration. Every variable is prefixed `KRAKEN_HUB_`.
+//! Environment-based configuration. Every variable is prefixed `SNODRA_SERVER_`.
 
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
@@ -13,158 +13,158 @@ use crate::tls::ClientAuthMode;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Identifies this hub process in `RegisterAck.hub_id` and the topology. `KRAKEN_HUB_ID`,
+    /// Identifies this hub process in `RegisterAck.hub_id` and the topology. `SNODRA_SERVER_ID`,
     /// default the hostname plus a random 8-hex-digit suffix (unique per process start).
     pub hub_id: String,
-    /// Address the gRPC server binds to. `KRAKEN_HUB_LISTEN`, default `0.0.0.0:7000`.
+    /// Address the gRPC server binds to. `SNODRA_SERVER_LISTEN`, default `0.0.0.0:7000`.
     pub listen: SocketAddr,
-    /// Address of the dashboard and its API (`/ui/`, `/api/v1/`). `KRAKEN_HUB_HTTP_LISTEN`, default
+    /// Address of the dashboard and its API (`/ui/`, `/api/v1/`). `SNODRA_SERVER_HTTP_LISTEN`, default
     /// `0.0.0.0:7001`; an explicitly empty value disables the HTTP listener.
     pub http_listen: Option<SocketAddr>,
-    /// OTLP gRPC endpoint for traces and metrics. `KRAKEN_HUB_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
+    /// OTLP gRPC endpoint for traces and metrics. `SNODRA_SERVER_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
     pub otlp_endpoint: Option<String>,
-    /// `tracing` filter. `KRAKEN_HUB_LOG`, default `info`.
+    /// `tracing` filter. `SNODRA_SERVER_LOG`, default `info`.
     pub log: String,
-    /// Used when `Request.timeout_ms` is zero. `KRAKEN_HUB_DEFAULT_TIMEOUT_MS`, default 5000.
+    /// Used when `Request.timeout_ms` is zero. `SNODRA_SERVER_DEFAULT_TIMEOUT_MS`, default 5000.
     pub default_timeout: Duration,
     /// Upper bound for `Request.timeout_ms`; larger hints are clamped.
-    /// `KRAKEN_HUB_MAX_TIMEOUT_MS`, default 60000.
+    /// `SNODRA_SERVER_MAX_TIMEOUT_MS`, default 60000.
     pub max_timeout: Duration,
     /// Heartbeat period announced to every session in `RegisterAck`.
-    /// `KRAKEN_HUB_HEARTBEAT_INTERVAL`, default 3 s. `heartbeat_timeout` must be at least twice it.
+    /// `SNODRA_SERVER_HEARTBEAT_INTERVAL`, default 3 s. `heartbeat_timeout` must be at least twice it.
     pub heartbeat_interval: Duration,
     /// A session is dropped after this long without a heartbeat.
-    /// `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, default 10 s.
+    /// `SNODRA_SERVER_HEARTBEAT_TIMEOUT`, default 10 s.
     pub heartbeat_timeout: Duration,
     /// Per-type request timeouts. For a listed type the override replaces the default (requests
-    /// with `timeout_ms == 0`) and the clamp (`max_timeout`). `KRAKEN_HUB_TIMEOUT_OVERRIDES`,
+    /// with `timeout_ms == 0`) and the clamp (`max_timeout`). `SNODRA_SERVER_TIMEOUT_OVERRIDES`,
     /// `type=ms,type=ms`, default none.
     pub timeout_overrides: BTreeMap<String, Duration>,
     /// Requests the hub queues for one instance before rejecting new ones.
-    /// `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE`, default 10 000.
+    /// `SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE`, default 10 000.
     pub queue_capacity_per_instance: usize,
-    /// Encoded bytes the hub queues for one instance before rejecting new requests. `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
+    /// Encoded bytes the hub queues for one instance before rejecting new requests. `SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE`, default 64 MiB (`B`, `KiB`, `MiB`, `GiB`).
     pub queue_bytes_per_instance: usize,
     /// Encoded bytes the hub queues over all instances together before
-    /// rejecting new requests (reason `queue_bytes_total`). `KRAKEN_HUB_QUEUE_BYTES_TOTAL`,
+    /// rejecting new requests (reason `queue_bytes_total`). `SNODRA_SERVER_QUEUE_BYTES_TOTAL`,
     /// default 512 MiB.
     pub queue_bytes_total: usize,
     /// Type ownership is kept this long after the last instance leaves.
-    /// `KRAKEN_HUB_OWNER_GRACE`, default 60 s.
+    /// `SNODRA_SERVER_OWNER_GRACE`, default 60 s.
     pub owner_grace: Duration,
     /// A streaming query (ADR 0017, P4b) open for longer than this ends with
     /// `ReplyEnd{error = CANCELLED}` and a `Cancel` to its handler, however active it is.
-    /// `KRAKEN_HUB_MAX_STREAM_DURATION`, default 10 minutes, at least 1 s.
+    /// `SNODRA_SERVER_MAX_STREAM_DURATION`, default 10 minutes, at least 1 s.
     pub max_stream_duration: Duration,
     /// Updates of a subscription query (ADR 0017, P4c) the hub holds for a sender whose credit
     /// is exhausted; one more ends the subscription with `RESOURCE_EXHAUSTED`.
-    /// `KRAKEN_HUB_SUBSCRIPTION_BUFFER`, default 256, positive.
+    /// `SNODRA_SERVER_SUBSCRIPTION_BUFFER`, default 256, positive.
     pub subscription_buffer: usize,
     /// Subscription targets one handler instance serves at once; a subscription that would
     /// exceed it on any of its targets is refused with `RESOURCE_EXHAUSTED`.
-    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, default 1024, positive.
+    /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE`, default 1024, positive.
     pub max_subscriptions_per_instance: u32,
     /// A subscription open for longer than this ends with `ReplyEnd{error = CANCELLED}` and a
-    /// `Cancel` to every target. `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`, default `0` (`None`:
+    /// `Cancel` to every target. `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION`, default `0` (`None`:
     /// unlimited); when set, at least 1 s.
     pub max_subscription_duration: Option<Duration>,
-    /// Per-session outbound buffer, in messages. `KRAKEN_HUB_SESSION_BUFFER`, default 1024.
+    /// Per-session outbound buffer, in messages. `SNODRA_SERVER_SESSION_BUFFER`, default 1024.
     pub session_buffer: usize,
     /// A new `Connect` stream must send `Register` within this long or it is closed with
-    /// `DEADLINE_EXCEEDED`. `KRAKEN_HUB_HANDSHAKE_TIMEOUT`, default 10 s.
+    /// `DEADLINE_EXCEEDED`. `SNODRA_SERVER_HANDSHAKE_TIMEOUT`, default 10 s.
     pub handshake_timeout: Duration,
     /// Serve the read-only dashboard (`/ui/`) and its JSON API (`/api/v1/`) on the HTTP port and
-    /// keep the edge statistics they show. `KRAKEN_HUB_DASHBOARD_ENABLED`, default true. When
+    /// keep the edge statistics they show. `SNODRA_SERVER_DASHBOARD_ENABLED`, default true. When
     /// false the HTTP port serves nothing (every path is 404); the gRPC `Topology` stays.
     pub dashboard_enabled: bool,
     /// Grafana base URL the dashboard links to (`http://` or `https://`).
-    /// `KRAKEN_HUB_GRAFANA_URL`, default none (no link).
+    /// `SNODRA_SERVER_GRAFANA_URL`, default none (no link).
     pub grafana_url: Option<String>,
     /// Cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least
-    /// recently used edges are dropped. `KRAKEN_HUB_EDGE_STATS_MAX_EDGES`, default 10 000.
+    /// recently used edges are dropped. `SNODRA_SERVER_EDGE_STATS_MAX_EDGES`, default 10 000.
     pub edge_stats_max_edges: usize,
-    /// Sliding window of the edge statistics. `KRAKEN_HUB_EDGE_STATS_WINDOW`, default 5 minutes,
+    /// Sliding window of the edge statistics. `SNODRA_SERVER_EDGE_STATS_WINDOW`, default 5 minutes,
     /// at least 10 s.
     pub edge_stats_window: Duration,
     /// The other hubs' dashboards, as their HTTP base URLs reachable from the operator's browser
-    /// (ADR 0016). `KRAKEN_HUB_PEERS`, comma-separated, default none. Normalised to origins
+    /// (ADR 0016). `SNODRA_SERVER_PEERS`, comma-separated, default none. Normalised to origins
     /// (`scheme://host[:port]`, lowercase, default port dropped), deduplicated, at most
     /// [`MAX_PEERS`]. The list may include this hub (the page skips it by hub id). The dashboard
     /// merges the peers in the browser; each peer answers CORS for these origins only.
     pub peers: Vec<String>,
     /// Access control for `Connect` (ADR 0018): `off` (default, no checks), `permissive`
     /// (evaluate, log and count violations, allow everything) or `enforce` (refuse violations).
-    /// `KRAKEN_HUB_AUTH_MODE`.
+    /// `SNODRA_SERVER_AUTH_MODE`.
     pub auth_mode: AuthMode,
     /// The ACL (TOML, token SHA-256 -> service, handle and send patterns); required unless the
-    /// mode is `off`. Reloaded when it changes. `KRAKEN_HUB_ACL_FILE`.
+    /// mode is `off`. Reloaded when it changes. `SNODRA_SERVER_ACL_FILE`.
     pub acl_file: Option<PathBuf>,
     /// PEM certificate chain and private key of the gRPC listener; when set it only accepts TLS.
-    /// `KRAKEN_HUB_TLS_CERT` and `KRAKEN_HUB_TLS_KEY`, both or neither. Reloaded when they change.
+    /// `SNODRA_SERVER_TLS_CERT` and `SNODRA_SERVER_TLS_KEY`, both or neither. Reloaded when they change.
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
-    /// The HTTP listener's own pair; default the gRPC pair. `KRAKEN_HUB_HTTP_TLS_CERT` and
-    /// `KRAKEN_HUB_HTTP_TLS_KEY`, both or neither.
+    /// The HTTP listener's own pair; default the gRPC pair. `SNODRA_SERVER_HTTP_TLS_CERT` and
+    /// `SNODRA_SERVER_HTTP_TLS_KEY`, both or neither.
     pub http_tls_cert: Option<PathBuf>,
     pub http_tls_key: Option<PathBuf>,
     /// PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS,
     /// ADR 0020); needs the gRPC pair. Reloaded when it changes. The HTTP listener never asks for
-    /// a client certificate. `KRAKEN_HUB_TLS_CLIENT_CA`.
+    /// a client certificate. `SNODRA_SERVER_TLS_CLIENT_CA`.
     pub tls_client_ca: Option<PathBuf>,
     /// Whether a client must present a certificate: `optional` (default when the CA is set) or
-    /// `required`. `None` when `KRAKEN_HUB_TLS_CLIENT_AUTH` is unset; setting it without the CA is
+    /// `required`. `None` when `SNODRA_SERVER_TLS_CLIENT_AUTH` is unset; setting it without the CA is
     /// an error. Read it through [`Config::client_auth`].
     pub tls_client_auth: Option<ClientAuthMode>,
     /// When set, `/api/*`, the event stream and the gRPC `Topology` call need
-    /// `Authorization: Bearer <token>`. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_TOKEN`,
+    /// `Authorization: Bearer <token>`. Only its digest is kept. `SNODRA_SERVER_DASHBOARD_TOKEN`,
     /// at least 16 characters. Unrelated to the ACL tokens.
     pub dashboard_token: Option<Secret>,
     /// The processor controls' token (ADR 0023): the mutating calls under `/api/v1/services/`
     /// accept it, or an ACL credential whose entry has `control = true`; it also reads everything
-    /// the dashboard token reads. Only its digest is kept. `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, at
+    /// the dashboard token reads. Only its digest is kept. `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN`, at
     /// least 16 characters.
     pub dashboard_write_token: Option<Secret>,
     /// The files the two tokens above are read from; each is read at startup and again on the
     /// reload poll, and wins over the variable when both are set (like the client libraries'
-    /// `*_TOKEN_FILE`). `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`,
-    /// `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE`.
+    /// `*_TOKEN_FILE`). `SNODRA_SERVER_DASHBOARD_TOKEN_FILE`,
+    /// `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE`.
     pub dashboard_token_file: Option<PathBuf>,
     pub dashboard_write_token_file: Option<PathBuf>,
     /// How often the ACL and the certificates are checked for changes.
-    /// `KRAKEN_HUB_RELOAD_INTERVAL`, default 5 s.
+    /// `SNODRA_SERVER_RELOAD_INTERVAL`, default 5 s.
     pub reload_interval: Duration,
-    /// A TLS handshake that takes longer is dropped. `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT`, default
+    /// A TLS handshake that takes longer is dropped. `SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT`, default
     /// 5 s, positive.
     pub tls_handshake_timeout: Duration,
     /// TLS handshakes in progress at once from one peer IP; more are dropped at once. `0`
-    /// disables the cap. `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`, default 32.
+    /// disables the cap. `SNODRA_SERVER_TLS_HANDSHAKES_PER_IP`, default 32.
     pub tls_handshakes_per_ip: usize,
     /// The `iss` a JWT credential must carry, compared as an exact string (ADR 0019). Unset: JWT
-    /// credentials are refused as "not configured". `KRAKEN_HUB_JWT_ISSUER`.
+    /// credentials are refused as "not configured". `SNODRA_SERVER_JWT_ISSUER`.
     pub jwt_issuer: Option<String>,
     /// Where the issuer's signing keys are fetched from; `None` exactly when [`Config::jwt_issuer`]
     /// is. Default `<issuer>/protocol/openid-connect/certs` (Keycloak). Separate from the issuer
     /// so a hub can fetch from an internal address and validate the public issuer.
-    /// `KRAKEN_HUB_JWT_JWKS_URI`.
+    /// `SNODRA_SERVER_JWT_JWKS_URI`.
     pub jwt_jwks_uri: Option<String>,
-    /// When set, a JWT's `aud` (a string or an array) must contain it. `KRAKEN_HUB_JWT_AUDIENCE`.
+    /// When set, a JWT's `aud` (a string or an array) must contain it. `SNODRA_SERVER_JWT_AUDIENCE`.
     pub jwt_audience: Option<String>,
-    /// Clock skew tolerated on `exp`, `nbf` and `iat`. `KRAKEN_HUB_JWT_LEEWAY`, default 30 s.
+    /// Clock skew tolerated on `exp`, `nbf` and `iat`. `SNODRA_SERVER_JWT_LEEWAY`, default 30 s.
     pub jwt_leeway: Duration,
-    /// How long after `exp` a session stays open without a refresh. `KRAKEN_HUB_JWT_EXPIRY_GRACE`,
+    /// How long after `exp` a session stays open without a refresh. `SNODRA_SERVER_JWT_EXPIRY_GRACE`,
     /// default 30 s.
     pub jwt_expiry_grace: Duration,
-    /// How often the signing keys are fetched again. `KRAKEN_HUB_JWKS_REFRESH`, default 5 m.
+    /// How often the signing keys are fetched again. `SNODRA_SERVER_JWKS_REFRESH`, default 5 m.
     pub jwks_refresh: Duration,
     /// An extra CA (PEM) trusted for the JWKS fetch, on top of the platform roots.
-    /// `KRAKEN_HUB_JWT_JWKS_CA`.
+    /// `SNODRA_SERVER_JWT_JWKS_CA`.
     pub jwt_jwks_ca: Option<PathBuf>,
     /// How long a control call waits for an instance's answer (pause, resume, the prepare and
-    /// finish of a reset, dead letters; ADR 0023). `KRAKEN_HUB_CONTROL_TIMEOUT`, default 10 s,
+    /// finish of a reset, dead letters; ADR 0023). `SNODRA_SERVER_CONTROL_TIMEOUT`, default 10 s,
     /// positive, at most [`Config::control_lease`] minus [`Config::control_lease_renew`].
     pub control_timeout: Duration,
     /// How long the instance that executes a reset may take (its reset handlers, the marker
-    /// deletion and the position commit). `KRAKEN_HUB_RESET_TIMEOUT`, default 120 s, positive.
+    /// deletion and the position commit). `SNODRA_SERVER_RESET_TIMEOUT`, default 120 s, positive.
     pub reset_timeout: Duration,
     /// The lease a reset's prepare asks for: an instance that hears nothing more for this long
     /// releases the operation lock and consumes again. Not an environment variable: 30 s,
@@ -175,11 +175,11 @@ pub struct Config {
     pub control_lease_renew: Duration,
     /// Payloads are served (the record detail and the `q` filter) only when this is on, a
     /// dashboard or write token is configured and the request presents one (ADR 0025): the hub
-    /// asks the event browser for a payload only then. `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS`,
+    /// asks the event browser for a payload only then. `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS`,
     /// default false.
     pub event_payloads: bool,
     /// Event tails (`/api/v1/events/tail`) open at once on this hub; one more is answered 429.
-    /// `KRAKEN_HUB_EVENT_MAX_TAILS`, default 4, 1 to [`MAX_EVENT_TAILS`].
+    /// `SNODRA_SERVER_EVENT_MAX_TAILS`, default 4, 1 to [`MAX_EVENT_TAILS`].
     pub event_max_tails: usize,
     /// The settings of [`REMOVED_SETTINGS`] the environment still sets: they are not read, and
     /// each is a startup warning ([`Config::security_warnings`]).
@@ -256,7 +256,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Starts from [`Config::default`] and overrides from `KRAKEN_HUB_*` variables.
+    /// Starts from [`Config::default`] and overrides from `SNODRA_SERVER_*` variables.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -265,110 +265,115 @@ impl Config {
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let var = |name: &str| lookup(name).filter(|s| !s.is_empty());
         let mut c = Self::default();
-        if let Some(v) = var("KRAKEN_HUB_ID") {
+        if let Some(v) = var("SNODRA_SERVER_ID") {
             c.hub_id = v.trim().to_string();
         }
-        if let Some(v) = var("KRAKEN_HUB_LISTEN") {
-            c.listen = v.parse().context("KRAKEN_HUB_LISTEN")?;
+        if let Some(v) = var("SNODRA_SERVER_LISTEN") {
+            c.listen = v.parse().context("SNODRA_SERVER_LISTEN")?;
         }
         // Unset keeps the default; an explicitly empty value disables the HTTP listener.
-        if let Some(v) = lookup("KRAKEN_HUB_HTTP_LISTEN") {
+        if let Some(v) = lookup("SNODRA_SERVER_HTTP_LISTEN") {
             c.http_listen = if v.is_empty() {
                 None
             } else {
-                Some(v.parse().context("KRAKEN_HUB_HTTP_LISTEN")?)
+                Some(v.parse().context("SNODRA_SERVER_HTTP_LISTEN")?)
             };
         }
         // Unset keeps the default; an explicitly empty value disables export.
-        if let Some(v) = lookup("KRAKEN_HUB_OTLP_ENDPOINT") {
+        if let Some(v) = lookup("SNODRA_SERVER_OTLP_ENDPOINT") {
             c.otlp_endpoint = Some(v).filter(|s| !s.is_empty());
         }
-        if let Some(v) = var("KRAKEN_HUB_LOG") {
+        if let Some(v) = var("SNODRA_SERVER_LOG") {
             c.log = v;
         }
-        if let Some(v) = var("KRAKEN_HUB_DEFAULT_TIMEOUT_MS") {
-            c.default_timeout = millis(&v).context("KRAKEN_HUB_DEFAULT_TIMEOUT_MS")?;
+        if let Some(v) = var("SNODRA_SERVER_DEFAULT_TIMEOUT_MS") {
+            c.default_timeout = millis(&v).context("SNODRA_SERVER_DEFAULT_TIMEOUT_MS")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_MAX_TIMEOUT_MS") {
-            c.max_timeout = millis(&v).context("KRAKEN_HUB_MAX_TIMEOUT_MS")?;
+        if let Some(v) = var("SNODRA_SERVER_MAX_TIMEOUT_MS") {
+            c.max_timeout = millis(&v).context("SNODRA_SERVER_MAX_TIMEOUT_MS")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_HEARTBEAT_INTERVAL") {
-            c.heartbeat_interval = parse_duration(&v).context("KRAKEN_HUB_HEARTBEAT_INTERVAL")?;
+        if let Some(v) = var("SNODRA_SERVER_HEARTBEAT_INTERVAL") {
+            c.heartbeat_interval =
+                parse_duration(&v).context("SNODRA_SERVER_HEARTBEAT_INTERVAL")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_HEARTBEAT_TIMEOUT") {
-            c.heartbeat_timeout = parse_duration(&v).context("KRAKEN_HUB_HEARTBEAT_TIMEOUT")?;
+        if let Some(v) = var("SNODRA_SERVER_HEARTBEAT_TIMEOUT") {
+            c.heartbeat_timeout = parse_duration(&v).context("SNODRA_SERVER_HEARTBEAT_TIMEOUT")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_TIMEOUT_OVERRIDES") {
-            c.timeout_overrides = parse_overrides(&v).context("KRAKEN_HUB_TIMEOUT_OVERRIDES")?;
+        if let Some(v) = var("SNODRA_SERVER_TIMEOUT_OVERRIDES") {
+            c.timeout_overrides = parse_overrides(&v).context("SNODRA_SERVER_TIMEOUT_OVERRIDES")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE") {
+        if let Some(v) = var("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE") {
             c.queue_capacity_per_instance = v
                 .trim()
                 .parse()
-                .context("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE")?;
+                .context("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE") {
+        if let Some(v) = var("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE") {
             c.queue_bytes_per_instance =
-                parse_size(&v).context("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE")?;
+                parse_size(&v).context("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_QUEUE_BYTES_TOTAL") {
-            c.queue_bytes_total = parse_size(&v).context("KRAKEN_HUB_QUEUE_BYTES_TOTAL")?;
+        if let Some(v) = var("SNODRA_SERVER_QUEUE_BYTES_TOTAL") {
+            c.queue_bytes_total = parse_size(&v).context("SNODRA_SERVER_QUEUE_BYTES_TOTAL")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_OWNER_GRACE") {
-            c.owner_grace = parse_duration(&v).context("KRAKEN_HUB_OWNER_GRACE")?;
+        if let Some(v) = var("SNODRA_SERVER_OWNER_GRACE") {
+            c.owner_grace = parse_duration(&v).context("SNODRA_SERVER_OWNER_GRACE")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_MAX_STREAM_DURATION") {
-            c.max_stream_duration = parse_duration(&v).context("KRAKEN_HUB_MAX_STREAM_DURATION")?;
+        if let Some(v) = var("SNODRA_SERVER_MAX_STREAM_DURATION") {
+            c.max_stream_duration =
+                parse_duration(&v).context("SNODRA_SERVER_MAX_STREAM_DURATION")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_SUBSCRIPTION_BUFFER") {
-            c.subscription_buffer = v.trim().parse().context("KRAKEN_HUB_SUBSCRIPTION_BUFFER")?;
+        if let Some(v) = var("SNODRA_SERVER_SUBSCRIPTION_BUFFER") {
+            c.subscription_buffer = v
+                .trim()
+                .parse()
+                .context("SNODRA_SERVER_SUBSCRIPTION_BUFFER")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE") {
+        if let Some(v) = var("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE") {
             c.max_subscriptions_per_instance = v
                 .trim()
                 .parse()
-                .context("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE")?;
+                .context("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION") {
+        if let Some(v) = var("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION") {
             c.max_subscription_duration =
-                Some(parse_duration(&v).context("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION")?)
+                Some(parse_duration(&v).context("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION")?)
                     .filter(|d| !d.is_zero());
         }
-        if let Some(v) = var("KRAKEN_HUB_SESSION_BUFFER") {
-            c.session_buffer = v.parse().context("KRAKEN_HUB_SESSION_BUFFER")?;
+        if let Some(v) = var("SNODRA_SERVER_SESSION_BUFFER") {
+            c.session_buffer = v.parse().context("SNODRA_SERVER_SESSION_BUFFER")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_HANDSHAKE_TIMEOUT") {
-            c.handshake_timeout = parse_duration(&v).context("KRAKEN_HUB_HANDSHAKE_TIMEOUT")?;
+        if let Some(v) = var("SNODRA_SERVER_HANDSHAKE_TIMEOUT") {
+            c.handshake_timeout = parse_duration(&v).context("SNODRA_SERVER_HANDSHAKE_TIMEOUT")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_DASHBOARD_ENABLED") {
-            c.dashboard_enabled = parse_bool(&v).context("KRAKEN_HUB_DASHBOARD_ENABLED")?;
+        if let Some(v) = var("SNODRA_SERVER_DASHBOARD_ENABLED") {
+            c.dashboard_enabled = parse_bool(&v).context("SNODRA_SERVER_DASHBOARD_ENABLED")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_GRAFANA_URL") {
+        if let Some(v) = var("SNODRA_SERVER_GRAFANA_URL") {
             c.grafana_url = Some(v.trim().to_string()).filter(|s| !s.is_empty());
         }
-        if let Some(v) = var("KRAKEN_HUB_EDGE_STATS_MAX_EDGES") {
+        if let Some(v) = var("SNODRA_SERVER_EDGE_STATS_MAX_EDGES") {
             c.edge_stats_max_edges = v
                 .trim()
                 .parse()
-                .context("KRAKEN_HUB_EDGE_STATS_MAX_EDGES")?;
+                .context("SNODRA_SERVER_EDGE_STATS_MAX_EDGES")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_EDGE_STATS_WINDOW") {
-            c.edge_stats_window = parse_duration(&v).context("KRAKEN_HUB_EDGE_STATS_WINDOW")?;
+        if let Some(v) = var("SNODRA_SERVER_EDGE_STATS_WINDOW") {
+            c.edge_stats_window = parse_duration(&v).context("SNODRA_SERVER_EDGE_STATS_WINDOW")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_PEERS") {
-            c.peers = parse_peers(&v).context("KRAKEN_HUB_PEERS")?;
+        if let Some(v) = var("SNODRA_SERVER_PEERS") {
+            c.peers = parse_peers(&v).context("SNODRA_SERVER_PEERS")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_AUTH_MODE") {
-            c.auth_mode = v.parse().context("KRAKEN_HUB_AUTH_MODE")?;
+        if let Some(v) = var("SNODRA_SERVER_AUTH_MODE") {
+            c.auth_mode = v.parse().context("SNODRA_SERVER_AUTH_MODE")?;
         }
-        c.acl_file = path_var(&var, "KRAKEN_HUB_ACL_FILE");
-        c.tls_cert = path_var(&var, "KRAKEN_HUB_TLS_CERT");
-        c.tls_key = path_var(&var, "KRAKEN_HUB_TLS_KEY");
-        c.http_tls_cert = path_var(&var, "KRAKEN_HUB_HTTP_TLS_CERT");
-        c.http_tls_key = path_var(&var, "KRAKEN_HUB_HTTP_TLS_KEY");
-        c.tls_client_ca = path_var(&var, "KRAKEN_HUB_TLS_CLIENT_CA");
-        if let Some(v) = var("KRAKEN_HUB_TLS_CLIENT_AUTH").filter(|v| !v.trim().is_empty()) {
-            c.tls_client_auth = Some(v.parse().context("KRAKEN_HUB_TLS_CLIENT_AUTH")?);
+        c.acl_file = path_var(&var, "SNODRA_SERVER_ACL_FILE");
+        c.tls_cert = path_var(&var, "SNODRA_SERVER_TLS_CERT");
+        c.tls_key = path_var(&var, "SNODRA_SERVER_TLS_KEY");
+        c.http_tls_cert = path_var(&var, "SNODRA_SERVER_HTTP_TLS_CERT");
+        c.http_tls_key = path_var(&var, "SNODRA_SERVER_HTTP_TLS_KEY");
+        c.tls_client_ca = path_var(&var, "SNODRA_SERVER_TLS_CLIENT_CA");
+        if let Some(v) = var("SNODRA_SERVER_TLS_CLIENT_AUTH").filter(|v| !v.trim().is_empty()) {
+            c.tls_client_auth = Some(v.parse().context("SNODRA_SERVER_TLS_CLIENT_AUTH")?);
         }
         // Secrets are trimmed (a mounted secret file ends with a newline) and kept as digests.
         let secret = |name: &str| {
@@ -376,57 +381,57 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
-        c.dashboard_token = secret("KRAKEN_HUB_DASHBOARD_TOKEN")
+        c.dashboard_token = secret("SNODRA_SERVER_DASHBOARD_TOKEN")
             .map(|t| {
-                check_dashboard_token("KRAKEN_HUB_DASHBOARD_TOKEN", &t).map(|()| Secret::new(&t))
+                check_dashboard_token("SNODRA_SERVER_DASHBOARD_TOKEN", &t).map(|()| Secret::new(&t))
             })
             .transpose()?;
-        c.dashboard_write_token = secret("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")
+        c.dashboard_write_token = secret("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN")
             .map(|t| {
-                check_dashboard_token("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", &t)
+                check_dashboard_token("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN", &t)
                     .map(|()| Secret::new(&t))
             })
             .transpose()?;
-        c.dashboard_token_file = path_var(&var, "KRAKEN_HUB_DASHBOARD_TOKEN_FILE");
-        c.dashboard_write_token_file = path_var(&var, "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE");
+        c.dashboard_token_file = path_var(&var, "SNODRA_SERVER_DASHBOARD_TOKEN_FILE");
+        c.dashboard_write_token_file = path_var(&var, "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE");
         c.load_token_files()?;
-        if let Some(v) = var("KRAKEN_HUB_RELOAD_INTERVAL") {
-            c.reload_interval = parse_duration(&v).context("KRAKEN_HUB_RELOAD_INTERVAL")?;
+        if let Some(v) = var("SNODRA_SERVER_RELOAD_INTERVAL") {
+            c.reload_interval = parse_duration(&v).context("SNODRA_SERVER_RELOAD_INTERVAL")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT") {
+        if let Some(v) = var("SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT") {
             c.tls_handshake_timeout =
-                parse_duration(&v).context("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT")?;
+                parse_duration(&v).context("SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP") {
+        if let Some(v) = var("SNODRA_SERVER_TLS_HANDSHAKES_PER_IP") {
             c.tls_handshakes_per_ip = v
                 .trim()
                 .parse()
-                .context("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP")?;
+                .context("SNODRA_SERVER_TLS_HANDSHAKES_PER_IP")?;
         }
-        c.jwt_issuer = secret("KRAKEN_HUB_JWT_ISSUER");
-        let explicit_uri = secret("KRAKEN_HUB_JWT_JWKS_URI");
-        c.jwt_audience = secret("KRAKEN_HUB_JWT_AUDIENCE");
-        c.jwt_jwks_ca = path_var(&var, "KRAKEN_HUB_JWT_JWKS_CA");
-        if let Some(v) = var("KRAKEN_HUB_JWT_LEEWAY") {
-            c.jwt_leeway = parse_duration(&v).context("KRAKEN_HUB_JWT_LEEWAY")?;
+        c.jwt_issuer = secret("SNODRA_SERVER_JWT_ISSUER");
+        let explicit_uri = secret("SNODRA_SERVER_JWT_JWKS_URI");
+        c.jwt_audience = secret("SNODRA_SERVER_JWT_AUDIENCE");
+        c.jwt_jwks_ca = path_var(&var, "SNODRA_SERVER_JWT_JWKS_CA");
+        if let Some(v) = var("SNODRA_SERVER_JWT_LEEWAY") {
+            c.jwt_leeway = parse_duration(&v).context("SNODRA_SERVER_JWT_LEEWAY")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_JWT_EXPIRY_GRACE") {
-            c.jwt_expiry_grace = parse_duration(&v).context("KRAKEN_HUB_JWT_EXPIRY_GRACE")?;
+        if let Some(v) = var("SNODRA_SERVER_JWT_EXPIRY_GRACE") {
+            c.jwt_expiry_grace = parse_duration(&v).context("SNODRA_SERVER_JWT_EXPIRY_GRACE")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_CONTROL_TIMEOUT") {
-            c.control_timeout = parse_duration(&v).context("KRAKEN_HUB_CONTROL_TIMEOUT")?;
+        if let Some(v) = var("SNODRA_SERVER_CONTROL_TIMEOUT") {
+            c.control_timeout = parse_duration(&v).context("SNODRA_SERVER_CONTROL_TIMEOUT")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_RESET_TIMEOUT") {
-            c.reset_timeout = parse_duration(&v).context("KRAKEN_HUB_RESET_TIMEOUT")?;
+        if let Some(v) = var("SNODRA_SERVER_RESET_TIMEOUT") {
+            c.reset_timeout = parse_duration(&v).context("SNODRA_SERVER_RESET_TIMEOUT")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_JWKS_REFRESH") {
-            c.jwks_refresh = parse_duration(&v).context("KRAKEN_HUB_JWKS_REFRESH")?;
+        if let Some(v) = var("SNODRA_SERVER_JWKS_REFRESH") {
+            c.jwks_refresh = parse_duration(&v).context("SNODRA_SERVER_JWKS_REFRESH")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS") {
-            c.event_payloads = parse_bool(&v).context("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS")?;
+        if let Some(v) = var("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS") {
+            c.event_payloads = parse_bool(&v).context("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS")?;
         }
-        if let Some(v) = var("KRAKEN_HUB_EVENT_MAX_TAILS") {
-            c.event_max_tails = v.trim().parse().context("KRAKEN_HUB_EVENT_MAX_TAILS")?;
+        if let Some(v) = var("SNODRA_SERVER_EVENT_MAX_TAILS") {
+            c.event_max_tails = v.trim().parse().context("SNODRA_SERVER_EVENT_MAX_TAILS")?;
         }
         c.removed_settings = REMOVED_SETTINGS
             .into_iter()
@@ -443,13 +448,13 @@ impl Config {
     fn resolve_jwt(&mut self, explicit_uri: Option<String>) -> anyhow::Result<()> {
         let Some(issuer) = &self.jwt_issuer else {
             for (name, set) in [
-                ("KRAKEN_HUB_JWT_JWKS_URI", explicit_uri.is_some()),
-                ("KRAKEN_HUB_JWT_AUDIENCE", self.jwt_audience.is_some()),
-                ("KRAKEN_HUB_JWT_JWKS_CA", self.jwt_jwks_ca.is_some()),
+                ("SNODRA_SERVER_JWT_JWKS_URI", explicit_uri.is_some()),
+                ("SNODRA_SERVER_JWT_AUDIENCE", self.jwt_audience.is_some()),
+                ("SNODRA_SERVER_JWT_JWKS_CA", self.jwt_jwks_ca.is_some()),
             ] {
                 if set {
                     bail!(
-                        "{name} needs KRAKEN_HUB_JWT_ISSUER (without an issuer JWT credentials are off)"
+                        "{name} needs SNODRA_SERVER_JWT_ISSUER (without an issuer JWT credentials are off)"
                     );
                 }
             }
@@ -460,7 +465,7 @@ impl Config {
             None => {
                 if jwks_uri_host(issuer).is_err() {
                     bail!(
-                        "KRAKEN_HUB_JWT_ISSUER is not an http(s) URL, so the JWKS URI cannot be derived from it; set KRAKEN_HUB_JWT_JWKS_URI"
+                        "SNODRA_SERVER_JWT_ISSUER is not an http(s) URL, so the JWKS URI cannot be derived from it; set SNODRA_SERVER_JWT_JWKS_URI"
                     );
                 }
                 format!(
@@ -478,12 +483,12 @@ impl Config {
     pub fn load_token_files(&mut self) -> anyhow::Result<()> {
         for (var, file, slot) in [
             (
-                "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+                "SNODRA_SERVER_DASHBOARD_TOKEN_FILE",
                 &self.dashboard_token_file,
                 &mut self.dashboard_token,
             ),
             (
-                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+                "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE",
                 &self.dashboard_write_token_file,
                 &mut self.dashboard_write_token,
             ),
@@ -521,12 +526,12 @@ impl Config {
             }
         };
         let dashboard = read(
-            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            "SNODRA_SERVER_DASHBOARD_TOKEN_FILE",
             &self.dashboard_token_file,
             &self.dashboard_token,
         );
         let write = read(
-            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+            "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE",
             &self.dashboard_write_token_file,
             &self.dashboard_write_token,
         );
@@ -549,12 +554,12 @@ impl Config {
         let mut changed = false;
         for (var, new, slot) in [
             (
-                "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+                "SNODRA_SERVER_DASHBOARD_TOKEN_FILE",
                 dashboard,
                 &self.dashboard_token,
             ),
             (
-                "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE",
+                "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE",
                 write,
                 &self.dashboard_write_token,
             ),
@@ -601,34 +606,34 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         if self.hub_id.is_empty() {
-            bail!("KRAKEN_HUB_ID must not be empty");
+            bail!("SNODRA_SERVER_ID must not be empty");
         }
         if self.queue_capacity_per_instance == 0 {
-            bail!("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE must be positive");
+            bail!("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE must be positive");
         }
         if self.queue_bytes_per_instance == 0 {
-            bail!("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE must be positive");
+            bail!("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE must be positive");
         }
         if self.queue_bytes_total == 0 {
-            bail!("KRAKEN_HUB_QUEUE_BYTES_TOTAL must be positive");
+            bail!("SNODRA_SERVER_QUEUE_BYTES_TOTAL must be positive");
         }
         if self.heartbeat_interval.is_zero() {
-            bail!("KRAKEN_HUB_HEARTBEAT_INTERVAL must be positive");
+            bail!("SNODRA_SERVER_HEARTBEAT_INTERVAL must be positive");
         }
         if self.dashboard_token.is_some() && self.dashboard_token == self.dashboard_write_token {
             bail!("{TOKENS_EQUAL}");
         }
         if self.tls_handshake_timeout.is_zero() {
-            bail!("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT must be positive");
+            bail!("SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT must be positive");
         }
         if self.reload_interval.is_zero() {
-            bail!("KRAKEN_HUB_RELOAD_INTERVAL must be positive");
+            bail!("SNODRA_SERVER_RELOAD_INTERVAL must be positive");
         }
         if self.control_timeout.is_zero() {
-            bail!("KRAKEN_HUB_CONTROL_TIMEOUT must be positive");
+            bail!("SNODRA_SERVER_CONTROL_TIMEOUT must be positive");
         }
         if self.reset_timeout.is_zero() {
-            bail!("KRAKEN_HUB_RESET_TIMEOUT must be positive");
+            bail!("SNODRA_SERVER_RESET_TIMEOUT must be positive");
         }
         if self.control_lease_renew.is_zero() || self.control_lease_renew >= self.control_lease {
             bail!(
@@ -642,7 +647,7 @@ impl Config {
         let longest = self.control_lease.saturating_sub(self.control_lease_renew);
         if self.control_timeout > longest {
             bail!(
-                "KRAKEN_HUB_CONTROL_TIMEOUT ({:?}) must be at most {longest:?}, the reset lease ({:?}) minus its renewal period ({:?}): a reset renews the lease only once every prepare is answered",
+                "SNODRA_SERVER_CONTROL_TIMEOUT ({:?}) must be at most {longest:?}, the reset lease ({:?}) minus its renewal period ({:?}): a reset renews the lease only once every prepare is answered",
                 self.control_timeout,
                 self.control_lease,
                 self.control_lease_renew
@@ -650,69 +655,73 @@ impl Config {
         }
         if self.auth_mode != AuthMode::Off && self.acl_file.is_none() {
             bail!(
-                "KRAKEN_HUB_AUTH_MODE={} needs KRAKEN_HUB_ACL_FILE",
+                "SNODRA_SERVER_AUTH_MODE={} needs SNODRA_SERVER_ACL_FILE",
                 self.auth_mode.as_str()
             );
         }
         if self.jwks_refresh.is_zero() {
-            bail!("KRAKEN_HUB_JWKS_REFRESH must be positive");
+            bail!("SNODRA_SERVER_JWKS_REFRESH must be positive");
         }
         if let Some(uri) = &self.jwt_jwks_uri {
-            jwks_uri_host(uri).context("KRAKEN_HUB_JWT_JWKS_URI")?;
+            jwks_uri_host(uri).context("SNODRA_SERVER_JWT_JWKS_URI")?;
         }
         if self.tls_cert.is_some() != self.tls_key.is_some() {
-            bail!("KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY must be set together");
+            bail!("SNODRA_SERVER_TLS_CERT and SNODRA_SERVER_TLS_KEY must be set together");
         }
         if self.http_tls_cert.is_some() != self.http_tls_key.is_some() {
-            bail!("KRAKEN_HUB_HTTP_TLS_CERT and KRAKEN_HUB_HTTP_TLS_KEY must be set together");
+            bail!(
+                "SNODRA_SERVER_HTTP_TLS_CERT and SNODRA_SERVER_HTTP_TLS_KEY must be set together"
+            );
         }
         if self.tls_client_auth.is_some() && self.tls_client_ca.is_none() {
-            bail!("KRAKEN_HUB_TLS_CLIENT_AUTH needs KRAKEN_HUB_TLS_CLIENT_CA");
+            bail!("SNODRA_SERVER_TLS_CLIENT_AUTH needs SNODRA_SERVER_TLS_CLIENT_CA");
         }
         if self.tls_client_ca.is_some() && self.grpc_tls().is_none() {
-            bail!("KRAKEN_HUB_TLS_CLIENT_CA needs KRAKEN_HUB_TLS_CERT and KRAKEN_HUB_TLS_KEY");
+            bail!(
+                "SNODRA_SERVER_TLS_CLIENT_CA needs SNODRA_SERVER_TLS_CERT and SNODRA_SERVER_TLS_KEY"
+            );
         }
         if self.edge_stats_max_edges == 0 {
-            bail!("KRAKEN_HUB_EDGE_STATS_MAX_EDGES must be positive");
+            bail!("SNODRA_SERVER_EDGE_STATS_MAX_EDGES must be positive");
         }
         if self.edge_stats_window < MIN_EDGE_STATS_WINDOW {
             bail!(
-                "KRAKEN_HUB_EDGE_STATS_WINDOW ({:?}) must be at least {MIN_EDGE_STATS_WINDOW:?}",
+                "SNODRA_SERVER_EDGE_STATS_WINDOW ({:?}) must be at least {MIN_EDGE_STATS_WINDOW:?}",
                 self.edge_stats_window
             );
         }
         if self.max_stream_duration < MIN_MAX_STREAM_DURATION {
             bail!(
-                "KRAKEN_HUB_MAX_STREAM_DURATION ({:?}) must be at least {MIN_MAX_STREAM_DURATION:?}",
+                "SNODRA_SERVER_MAX_STREAM_DURATION ({:?}) must be at least {MIN_MAX_STREAM_DURATION:?}",
                 self.max_stream_duration
             );
         }
         if self.subscription_buffer == 0 {
-            bail!("KRAKEN_HUB_SUBSCRIPTION_BUFFER must be positive");
+            bail!("SNODRA_SERVER_SUBSCRIPTION_BUFFER must be positive");
         }
         if self.max_subscriptions_per_instance == 0 {
-            bail!("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE must be positive");
+            bail!("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE must be positive");
         }
         if let Some(d) = self.max_subscription_duration
             && d < MIN_MAX_STREAM_DURATION
         {
             bail!(
-                "KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION ({d:?}) must be 0 (unlimited) or at least {MIN_MAX_STREAM_DURATION:?}"
+                "SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION ({d:?}) must be 0 (unlimited) or at least {MIN_MAX_STREAM_DURATION:?}"
             );
         }
         if let Some(url) = &self.grafana_url {
-            check_link_url(url).context("KRAKEN_HUB_GRAFANA_URL")?;
+            check_link_url(url).context("SNODRA_SERVER_GRAFANA_URL")?;
         }
         if self.event_max_tails == 0 || self.event_max_tails > MAX_EVENT_TAILS {
             bail!(
-                "KRAKEN_HUB_EVENT_MAX_TAILS ({}) must be 1 to {MAX_EVENT_TAILS}",
+                "SNODRA_SERVER_EVENT_MAX_TAILS ({}) must be 1 to {MAX_EVENT_TAILS}",
                 self.event_max_tails
             );
         }
         // At least two announced heartbeats must fit in the timeout, or one late heartbeat evicts.
         if self.heartbeat_interval * 2 > self.heartbeat_timeout {
             bail!(
-                "KRAKEN_HUB_HEARTBEAT_TIMEOUT ({:?}) must be at least twice KRAKEN_HUB_HEARTBEAT_INTERVAL ({:?})",
+                "SNODRA_SERVER_HEARTBEAT_TIMEOUT ({:?}) must be at least twice SNODRA_SERVER_HEARTBEAT_INTERVAL ({:?})",
                 self.heartbeat_timeout,
                 self.heartbeat_interval
             );
@@ -726,14 +735,14 @@ impl Config {
         let open = |a: SocketAddr| !a.ip().is_loopback();
         if self.auth_mode != AuthMode::Enforce && open(self.listen) {
             out.push(format!(
-                "KRAKEN_HUB_AUTH_MODE={} while the gRPC port listens on {}: any peer that can reach it may register as any service and send any type; set KRAKEN_HUB_AUTH_MODE=enforce (ADR 0018) or keep the port on a private network",
+                "SNODRA_SERVER_AUTH_MODE={} while the gRPC port listens on {}: any peer that can reach it may register as any service and send any type; set SNODRA_SERVER_AUTH_MODE=enforce (ADR 0018) or keep the port on a private network",
                 self.auth_mode.as_str(),
                 self.listen
             ));
         }
         if self.auth_mode != AuthMode::Off && self.grpc_tls().is_none() && open(self.listen) {
             out.push(
-                "access control is on but the gRPC port has no TLS (KRAKEN_HUB_TLS_CERT): tokens travel in clear text"
+                "access control is on but the gRPC port has no TLS (SNODRA_SERVER_TLS_CERT): tokens travel in clear text"
                     .to_string(),
             );
         }
@@ -745,7 +754,7 @@ impl Config {
             && self.http_listen.is_some();
         if let (true, Some(http)) = (enforce_open_http, self.http_listen) {
             out.push(format!(
-                "access control is enforced but KRAKEN_HUB_DASHBOARD_TOKEN is not set: the dashboard API on {http} is open to any peer that can reach it (only the gRPC Topology needs a token); set KRAKEN_HUB_DASHBOARD_TOKEN or KRAKEN_HUB_DASHBOARD_TOKEN_FILE"
+                "access control is enforced but SNODRA_SERVER_DASHBOARD_TOKEN is not set: the dashboard API on {http} is open to any peer that can reach it (only the gRPC Topology needs a token); set SNODRA_SERVER_DASHBOARD_TOKEN or SNODRA_SERVER_DASHBOARD_TOKEN_FILE"
             ));
         }
         if let Some(http) = self.http_listen
@@ -755,7 +764,7 @@ impl Config {
             if self.dashboard_token.is_none() {
                 if !enforce_open_http {
                     out.push(format!(
-                        "the HTTP port listens on {http} without KRAKEN_HUB_DASHBOARD_TOKEN: the dashboard API is open to any peer"
+                        "the HTTP port listens on {http} without SNODRA_SERVER_DASHBOARD_TOKEN: the dashboard API is open to any peer"
                     ));
                 }
             } else if self.http_tls().is_none() {
@@ -766,11 +775,11 @@ impl Config {
             && self.http_tls().is_none()
             && self.http_listen.is_some_and(open)
         {
-            out.push("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is set but the HTTP port has no TLS: the token that pauses and resets processors travels in clear text".to_string());
+            out.push("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN is set but the HTTP port has no TLS: the token that pauses and resets processors travels in clear text".to_string());
         }
         if self.jwt_issuer.is_some() && self.auth_mode == AuthMode::Off {
             out.push(
-                "KRAKEN_HUB_JWT_ISSUER is set but KRAKEN_HUB_AUTH_MODE=off: no credentials are checked, JWT or token; set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
+                "SNODRA_SERVER_JWT_ISSUER is set but SNODRA_SERVER_AUTH_MODE=off: no credentials are checked, JWT or token; set SNODRA_SERVER_AUTH_MODE=permissive or enforce (and the [[service]] tables of SNODRA_SERVER_ACL_FILE)"
                     .to_string(),
             );
         }
@@ -788,7 +797,7 @@ impl Config {
                 || !host.contains(['.', ':']))
         {
             out.push(format!(
-                "KRAKEN_HUB_JWT_JWKS_URI uses plain http to {host}: whoever can alter that traffic can mint tokens the hub accepts; use https (KRAKEN_HUB_JWT_JWKS_CA adds a private CA)"
+                "SNODRA_SERVER_JWT_JWKS_URI uses plain http to {host}: whoever can alter that traffic can mint tokens the hub accepts; use https (SNODRA_SERVER_JWT_JWKS_CA adds a private CA)"
             ));
         }
         // Payloads need a token to present (ADR 0025): without one the switch does nothing.
@@ -797,18 +806,18 @@ impl Config {
             && self.dashboard_write_token.is_none()
         {
             out.push(
-                "KRAKEN_HUB_EVENT_BROWSER_PAYLOADS is on but neither KRAKEN_HUB_DASHBOARD_TOKEN nor KRAKEN_HUB_DASHBOARD_WRITE_TOKEN is set: payloads stay hidden"
+                "SNODRA_SERVER_EVENT_BROWSER_PAYLOADS is on but neither SNODRA_SERVER_DASHBOARD_TOKEN nor SNODRA_SERVER_DASHBOARD_WRITE_TOKEN is set: payloads stay hidden"
                     .to_string(),
             );
         }
         for name in &self.removed_settings {
             out.push(format!(
-                "{name} is set but is no longer read: the hub reads no event store; the event browser is the kraken-event-browser add-on, which takes its own settings (ADR 0027)"
+                "{name} is set but is no longer read: the hub reads no event store; the event browser is the snodra-event-browser add-on, which takes its own settings (ADR 0027)"
             ));
         }
         if self.tls_client_ca.is_some() && self.auth_mode == AuthMode::Off {
             out.push(
-                "KRAKEN_HUB_TLS_CLIENT_CA is set but KRAKEN_HUB_AUTH_MODE=off: the client certificate is checked in the TLS handshake and authenticates nothing beyond it (no service, no ACL); set KRAKEN_HUB_AUTH_MODE=permissive or enforce (and the [[service]] tables of KRAKEN_HUB_ACL_FILE)"
+                "SNODRA_SERVER_TLS_CLIENT_CA is set but SNODRA_SERVER_AUTH_MODE=off: the client certificate is checked in the TLS handshake and authenticates nothing beyond it (no service, no ACL); set SNODRA_SERVER_AUTH_MODE=permissive or enforce (and the [[service]] tables of SNODRA_SERVER_ACL_FILE)"
                     .to_string(),
             );
         }
@@ -832,16 +841,16 @@ impl Config {
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
 
 /// Settings of the event browser the hub had (ADR 0025) and no longer reads (ADR 0027): the
-/// `kraken-event-browser` add-on reads the event store and takes its own settings.
+/// `snodra-event-browser` add-on reads the event store and takes its own settings.
 pub const REMOVED_SETTINGS: [&str; 8] = [
-    "KRAKEN_HUB_KAFKA_BOOTSTRAP",
-    "KRAKEN_HUB_EVENT_TOPICS",
-    "KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED",
-    "KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS",
-    "KRAKEN_HUB_EVENT_SEARCH_TIMEOUT",
-    "KRAKEN_HUB_EVENT_MAX_SEARCHES",
-    "KRAKEN_HUB_EVENT_TAIL_DURATION",
-    "KRAKEN_HUB_GROUP_LAG_INTERVAL",
+    "SNODRA_SERVER_KAFKA_BOOTSTRAP",
+    "SNODRA_SERVER_EVENT_TOPICS",
+    "SNODRA_SERVER_EVENT_SEARCH_MAX_SCANNED",
+    "SNODRA_SERVER_EVENT_SEARCH_MAX_RESULTS",
+    "SNODRA_SERVER_EVENT_SEARCH_TIMEOUT",
+    "SNODRA_SERVER_EVENT_MAX_SEARCHES",
+    "SNODRA_SERVER_EVENT_TAIL_DURATION",
+    "SNODRA_SERVER_GROUP_LAG_INTERVAL",
 ];
 
 /// Below a second a streaming query (or a subscription) could never deliver anything.
@@ -904,7 +913,7 @@ fn path_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf
 }
 
 /// Why equal dashboard and write tokens are refused (never the value).
-const TOKENS_EQUAL: &str = "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN (or _FILE) equals KRAKEN_HUB_DASHBOARD_TOKEN (or _FILE): the read-only token would pause and reset processors; give the write token its own value";
+const TOKENS_EQUAL: &str = "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN (or _FILE) equals SNODRA_SERVER_DASHBOARD_TOKEN (or _FILE): the read-only token would pause and reset processors; give the write token its own value";
 
 /// The token in `file`, trimmed (a mounted secret ends with a newline) and checked like the
 /// variable. The error names the variable and the file, never the content.
@@ -935,14 +944,14 @@ fn check_dashboard_token(name: &str, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Event tails open at once on one hub at most (`KRAKEN_HUB_EVENT_MAX_TAILS`; the event
+/// Event tails open at once on one hub at most (`SNODRA_SERVER_EVENT_MAX_TAILS`; the event
 /// browser's own bound on concurrent calls is the same).
 pub const MAX_EVENT_TAILS: usize = 1024;
 
-/// Peer hubs a dashboard merges at most (`KRAKEN_HUB_PEERS`).
+/// Peer hubs a dashboard merges at most (`SNODRA_SERVER_PEERS`).
 pub const MAX_PEERS: usize = 16;
 
-/// `KRAKEN_HUB_PEERS`: comma-separated base URLs, each normalised by [`peer_origin`], blanks and
+/// `SNODRA_SERVER_PEERS`: comma-separated base URLs, each normalised by [`peer_origin`], blanks and
 /// duplicates dropped, at most [`MAX_PEERS`].
 fn parse_peers(s: &str) -> anyhow::Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
@@ -1169,9 +1178,9 @@ mod tests {
     #[test]
     fn hub_id_and_heartbeat_settings_are_read_from_env() {
         let c = with_env(&[
-            ("KRAKEN_HUB_ID", "hub-1"),
-            ("KRAKEN_HUB_HEARTBEAT_INTERVAL", "500ms"),
-            ("KRAKEN_HUB_HEARTBEAT_TIMEOUT", "2s"),
+            ("SNODRA_SERVER_ID", "hub-1"),
+            ("SNODRA_SERVER_HEARTBEAT_INTERVAL", "500ms"),
+            ("SNODRA_SERVER_HEARTBEAT_TIMEOUT", "2s"),
         ])
         .unwrap();
         assert_eq!(c.hub_id, "hub-1");
@@ -1181,18 +1190,18 @@ mod tests {
 
     #[test]
     fn heartbeat_timeout_must_allow_at_least_two_intervals() {
-        assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "10s")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_HEARTBEAT_INTERVAL", "10s")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_HEARTBEAT_INTERVAL", "0")]).is_err());
         // 6 s interval, 10 s timeout: a single late heartbeat would evict.
-        let err = with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "6s")]).unwrap_err();
+        let err = with_env(&[("SNODRA_SERVER_HEARTBEAT_INTERVAL", "6s")]).unwrap_err();
         assert!(err.to_string().contains("at least twice"), "{err:#}");
-        assert!(with_env(&[("KRAKEN_HUB_HEARTBEAT_INTERVAL", "5s")]).is_ok());
+        assert!(with_env(&[("SNODRA_SERVER_HEARTBEAT_INTERVAL", "5s")]).is_ok());
     }
 
     #[test]
     fn timeout_overrides_parse_type_equals_millis_lists() {
         let c = with_env(&[(
-            "KRAKEN_HUB_TIMEOUT_OVERRIDES",
+            "SNODRA_SERVER_TIMEOUT_OVERRIDES",
             " files.Upload=120000 , gym.Report=500,",
         )])
         .unwrap();
@@ -1212,7 +1221,7 @@ mod tests {
             "a=5000000000",
         ] {
             assert!(
-                with_env(&[("KRAKEN_HUB_TIMEOUT_OVERRIDES", bad)]).is_err(),
+                with_env(&[("SNODRA_SERVER_TIMEOUT_OVERRIDES", bad)]).is_err(),
                 "{bad} accepted"
             );
         }
@@ -1224,8 +1233,8 @@ mod tests {
         assert_eq!(c.queue_capacity_per_instance, 10_000);
         assert_eq!(c.queue_bytes_per_instance, 64 * 1024 * 1024);
         let c = with_env(&[
-            ("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "3"),
-            ("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE", "512KiB"),
+            ("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE", "3"),
+            ("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE", "512KiB"),
         ])
         .unwrap();
         assert_eq!(
@@ -1243,17 +1252,17 @@ mod tests {
         for bad in ["", "MiB", "1.5MiB", "-1", "1TB"] {
             assert!(parse_size(bad).is_err(), "{bad} accepted");
         }
-        assert!(with_env(&[("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "0")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE", "0")]).is_err());
     }
 
     #[test]
     fn total_queue_bytes_default_parse_and_validation() {
         assert_eq!(Config::default().queue_bytes_total, 512 * 1024 * 1024);
-        let c = with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "1GiB")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_QUEUE_BYTES_TOTAL", "1GiB")]).unwrap();
         assert_eq!(c.queue_bytes_total, 1 << 30);
-        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "0")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_QUEUE_BYTES_TOTAL", "lots")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_QUEUE_BYTES_TOTAL", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_QUEUE_BYTES_TOTAL", "lots")]).is_err());
     }
 
     /// The effective-timeout table from the design (P0, F4).
@@ -1308,10 +1317,13 @@ mod tests {
         assert_eq!(c.edge_stats_max_edges, 10_000);
         assert_eq!(c.edge_stats_window, Duration::from_secs(300));
         let c = with_env(&[
-            ("KRAKEN_HUB_DASHBOARD_ENABLED", "false"),
-            ("KRAKEN_HUB_GRAFANA_URL", " https://grafana.example/d/hub "),
-            ("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "500"),
-            ("KRAKEN_HUB_EDGE_STATS_WINDOW", "10m"),
+            ("SNODRA_SERVER_DASHBOARD_ENABLED", "false"),
+            (
+                "SNODRA_SERVER_GRAFANA_URL",
+                " https://grafana.example/d/hub ",
+            ),
+            ("SNODRA_SERVER_EDGE_STATS_MAX_EDGES", "500"),
+            ("SNODRA_SERVER_EDGE_STATS_WINDOW", "10m"),
         ])
         .unwrap();
         assert!(!c.dashboard_enabled);
@@ -1327,10 +1339,10 @@ mod tests {
         for v in ["False", "0", "no", "off"] {
             assert!(!parse_bool(v).unwrap(), "{v}");
         }
-        assert!(with_env(&[("KRAKEN_HUB_DASHBOARD_ENABLED", "maybe")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_MAX_EDGES", "0")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "9s")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_EDGE_STATS_WINDOW", "10s")]).is_ok());
+        assert!(with_env(&[("SNODRA_SERVER_DASHBOARD_ENABLED", "maybe")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_EDGE_STATS_MAX_EDGES", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_EDGE_STATS_WINDOW", "9s")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_EDGE_STATS_WINDOW", "10s")]).is_ok());
     }
 
     #[test]
@@ -1339,16 +1351,17 @@ mod tests {
             Config::default().max_stream_duration,
             Duration::from_secs(600)
         );
-        let c = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "90s")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_MAX_STREAM_DURATION", "90s")]).unwrap();
         assert_eq!(c.max_stream_duration, Duration::from_secs(90));
-        let c = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "1s")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_MAX_STREAM_DURATION", "1s")]).unwrap();
         assert_eq!(c.max_stream_duration, Duration::from_secs(1));
-        let err = with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "500ms")]).unwrap_err();
+        let err = with_env(&[("SNODRA_SERVER_MAX_STREAM_DURATION", "500ms")]).unwrap_err();
         assert!(
-            err.to_string().contains("KRAKEN_HUB_MAX_STREAM_DURATION"),
+            err.to_string()
+                .contains("SNODRA_SERVER_MAX_STREAM_DURATION"),
             "{err:#}"
         );
-        assert!(with_env(&[("KRAKEN_HUB_MAX_STREAM_DURATION", "soon")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_MAX_STREAM_DURATION", "soon")]).is_err());
     }
 
     #[test]
@@ -1358,25 +1371,25 @@ mod tests {
         assert_eq!(c.max_subscriptions_per_instance, 1024);
         assert_eq!(c.max_subscription_duration, None, "unlimited by default");
         let c = with_env(&[
-            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", " 16 "),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "3"),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "2m"),
+            ("SNODRA_SERVER_SUBSCRIPTION_BUFFER", " 16 "),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE", "3"),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION", "2m"),
         ])
         .unwrap();
         assert_eq!(c.subscription_buffer, 16);
         assert_eq!(c.max_subscriptions_per_instance, 3);
         assert_eq!(c.max_subscription_duration, Some(Duration::from_secs(120)));
-        let c = with_env(&[("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "0")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION", "0")]).unwrap();
         assert_eq!(c.max_subscription_duration, None, "0 is unlimited");
-        let c = with_env(&[("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "1s")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION", "1s")]).unwrap();
         assert_eq!(c.max_subscription_duration, Some(Duration::from_secs(1)));
         for (name, value) in [
-            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", "0"),
-            ("KRAKEN_HUB_SUBSCRIPTION_BUFFER", "lots"),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "0"),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE", "-1"),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "500ms"),
-            ("KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION", "later"),
+            ("SNODRA_SERVER_SUBSCRIPTION_BUFFER", "0"),
+            ("SNODRA_SERVER_SUBSCRIPTION_BUFFER", "lots"),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE", "0"),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE", "-1"),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION", "500ms"),
+            ("SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION", "later"),
         ] {
             let err = with_env(&[(name, value)]).unwrap_err();
             assert!(err.to_string().contains(name), "{name}={value}: {err:#}");
@@ -1387,13 +1400,13 @@ mod tests {
     fn peers_default_to_none() {
         assert!(Config::default().peers.is_empty());
         assert!(
-            with_env(&[("KRAKEN_HUB_PEERS", "")])
+            with_env(&[("SNODRA_SERVER_PEERS", "")])
                 .unwrap()
                 .peers
                 .is_empty()
         );
         assert!(
-            with_env(&[("KRAKEN_HUB_PEERS", " , ")])
+            with_env(&[("SNODRA_SERVER_PEERS", " , ")])
                 .unwrap()
                 .peers
                 .is_empty()
@@ -1403,7 +1416,7 @@ mod tests {
     #[test]
     fn peers_are_normalised_to_origins_and_deduplicated() {
         let c = with_env(&[(
-            "KRAKEN_HUB_PEERS",
+            "SNODRA_SERVER_PEERS",
             " http://localhost:7001 ,HTTP://LocalHost:7011/, https://hub.example, \
              http://localhost:7001/, https://hub.example:443, http://10.0.0.5:80/, http://[::1]:7001",
         )])
@@ -1441,9 +1454,9 @@ mod tests {
             "http://hub.example,https://ok.example/path",
         ] {
             let err =
-                with_env(&[("KRAKEN_HUB_PEERS", bad)]).expect_err(&format!("{bad:?} accepted"));
+                with_env(&[("SNODRA_SERVER_PEERS", bad)]).expect_err(&format!("{bad:?} accepted"));
             let msg = format!("{err:#}");
-            assert!(msg.contains("KRAKEN_HUB_PEERS"), "{msg}");
+            assert!(msg.contains("SNODRA_SERVER_PEERS"), "{msg}");
             assert!(!msg.contains("pw@"), "the message echoes user info: {msg}");
         }
     }
@@ -1457,18 +1470,18 @@ mod tests {
                 .join(",")
         };
         assert_eq!(
-            with_env(&[("KRAKEN_HUB_PEERS", &list(16))])
+            with_env(&[("SNODRA_SERVER_PEERS", &list(16))])
                 .unwrap()
                 .peers
                 .len(),
             16
         );
-        let err = with_env(&[("KRAKEN_HUB_PEERS", &list(17))]).unwrap_err();
+        let err = with_env(&[("SNODRA_SERVER_PEERS", &list(17))]).unwrap_err();
         assert!(format!("{err:#}").contains("at most 16"), "{err:#}");
         // Duplicates count once.
         let twice = format!("{},{}", list(16), list(16));
         assert_eq!(
-            with_env(&[("KRAKEN_HUB_PEERS", &twice)])
+            with_env(&[("SNODRA_SERVER_PEERS", &twice)])
                 .unwrap()
                 .peers
                 .len(),
@@ -1483,7 +1496,7 @@ mod tests {
             "HTTPS://grafana.example/d/x?orgId=1",
         ] {
             assert!(
-                with_env(&[("KRAKEN_HUB_GRAFANA_URL", good)]).is_ok(),
+                with_env(&[("SNODRA_SERVER_GRAFANA_URL", good)]).is_ok(),
                 "{good} rejected"
             );
         }
@@ -1496,7 +1509,7 @@ mod tests {
             "ftp://grafana",
         ] {
             assert!(
-                with_env(&[("KRAKEN_HUB_GRAFANA_URL", bad)]).is_err(),
+                with_env(&[("SNODRA_SERVER_GRAFANA_URL", bad)]).is_err(),
                 "{bad} accepted"
             );
         }
@@ -1509,10 +1522,10 @@ mod tests {
             "https://user@grafana.example",
             "http://admin:hunter2@grafana.example:3000/d/hub",
         ] {
-            let err =
-                with_env(&[("KRAKEN_HUB_GRAFANA_URL", bad)]).expect_err(&format!("{bad} accepted"));
+            let err = with_env(&[("SNODRA_SERVER_GRAFANA_URL", bad)])
+                .expect_err(&format!("{bad} accepted"));
             let msg = format!("{err:#}");
-            assert!(msg.contains("KRAKEN_HUB_GRAFANA_URL"), "{msg}");
+            assert!(msg.contains("SNODRA_SERVER_GRAFANA_URL"), "{msg}");
             assert!(msg.contains("user info"), "{msg}");
             assert!(!msg.contains(bad) && !msg.contains("hunter2"), "{msg}");
         }
@@ -1523,7 +1536,7 @@ mod tests {
             "https://grafana.example/#a@b",
         ] {
             assert!(
-                with_env(&[("KRAKEN_HUB_GRAFANA_URL", good)]).is_ok(),
+                with_env(&[("SNODRA_SERVER_GRAFANA_URL", good)]).is_ok(),
                 "{good} rejected"
             );
         }
@@ -1531,7 +1544,7 @@ mod tests {
 
     fn otlp(value: Option<&str>) -> Option<String> {
         let c = Config::from_lookup(|n| {
-            (n == "KRAKEN_HUB_OTLP_ENDPOINT")
+            (n == "SNODRA_SERVER_OTLP_ENDPOINT")
                 .then(|| value.map(str::to_string))
                 .flatten()
         })
@@ -1552,7 +1565,7 @@ mod tests {
     #[test]
     fn handshake_timeout_is_read_from_env() {
         let c = Config::from_lookup(|n| {
-            (n == "KRAKEN_HUB_HANDSHAKE_TIMEOUT").then(|| "250ms".to_string())
+            (n == "SNODRA_SERVER_HANDSHAKE_TIMEOUT").then(|| "250ms".to_string())
         })
         .unwrap();
         assert_eq!(c.handshake_timeout, Duration::from_millis(250));
@@ -1562,7 +1575,7 @@ mod tests {
     fn http_listen_defaults_to_7001_and_empty_disables() {
         let with = |value: Option<&str>| {
             Config::from_lookup(|n| {
-                (n == "KRAKEN_HUB_HTTP_LISTEN")
+                (n == "SNODRA_SERVER_HTTP_LISTEN")
                     .then(|| value.map(str::to_string))
                     .flatten()
             })
@@ -1594,8 +1607,11 @@ mod tests {
 
     #[test]
     fn the_jwks_uri_defaults_to_keycloaks_certs_path_under_the_issuer() {
-        let c =
-            with_env(&[("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken")]).unwrap();
+        let c = with_env(&[(
+            "SNODRA_SERVER_JWT_ISSUER",
+            "https://sso.example/realms/kraken",
+        )])
+        .unwrap();
         assert_eq!(
             c.jwt_issuer.as_deref(),
             Some("https://sso.example/realms/kraken")
@@ -1606,7 +1622,7 @@ mod tests {
         );
         // A trailing slash does not double up in the derived URI; the issuer itself is kept exact.
         let c = with_env(&[(
-            "KRAKEN_HUB_JWT_ISSUER",
+            "SNODRA_SERVER_JWT_ISSUER",
             "https://sso.example/realms/kraken/",
         )])
         .unwrap();
@@ -1623,16 +1639,19 @@ mod tests {
     #[test]
     fn the_jwt_settings_are_read_from_the_environment() {
         let c = with_env(&[
-            ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken"),
             (
-                "KRAKEN_HUB_JWT_JWKS_URI",
+                "SNODRA_SERVER_JWT_ISSUER",
+                "https://sso.example/realms/kraken",
+            ),
+            (
+                "SNODRA_SERVER_JWT_JWKS_URI",
                 "http://keycloak:8080/realms/kraken/certs",
             ),
-            ("KRAKEN_HUB_JWT_AUDIENCE", "snodra-server"),
-            ("KRAKEN_HUB_JWT_LEEWAY", "5s"),
-            ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "0"),
-            ("KRAKEN_HUB_JWKS_REFRESH", "10m"),
-            ("KRAKEN_HUB_JWT_JWKS_CA", "/etc/hub/ca.pem"),
+            ("SNODRA_SERVER_JWT_AUDIENCE", "snodra-server"),
+            ("SNODRA_SERVER_JWT_LEEWAY", "5s"),
+            ("SNODRA_SERVER_JWT_EXPIRY_GRACE", "0"),
+            ("SNODRA_SERVER_JWKS_REFRESH", "10m"),
+            ("SNODRA_SERVER_JWT_JWKS_CA", "/etc/hub/ca.pem"),
         ])
         .unwrap();
         assert_eq!(
@@ -1649,13 +1668,13 @@ mod tests {
     #[test]
     fn jwt_settings_without_an_issuer_are_a_startup_error() {
         for (name, value) in [
-            ("KRAKEN_HUB_JWT_JWKS_URI", "https://sso.example/certs"),
-            ("KRAKEN_HUB_JWT_AUDIENCE", "snodra-server"),
-            ("KRAKEN_HUB_JWT_JWKS_CA", "/etc/hub/ca.pem"),
+            ("SNODRA_SERVER_JWT_JWKS_URI", "https://sso.example/certs"),
+            ("SNODRA_SERVER_JWT_AUDIENCE", "snodra-server"),
+            ("SNODRA_SERVER_JWT_JWKS_CA", "/etc/hub/ca.pem"),
         ] {
             let err = with_env(&[(name, value)]).unwrap_err();
             assert!(
-                format!("{err:#}").contains("KRAKEN_HUB_JWT_ISSUER"),
+                format!("{err:#}").contains("SNODRA_SERVER_JWT_ISSUER"),
                 "{name}: {err:#}"
             );
         }
@@ -1663,13 +1682,16 @@ mod tests {
 
     #[test]
     fn bad_jwt_settings_are_startup_errors() {
-        let issuer = ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken");
+        let issuer = (
+            "SNODRA_SERVER_JWT_ISSUER",
+            "https://sso.example/realms/kraken",
+        );
         // The derived JWKS URI needs an http(s) issuer; an explicit one lifts that.
-        assert!(with_env(&[("KRAKEN_HUB_JWT_ISSUER", "kraken-sso")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_JWT_ISSUER", "kraken-sso")]).is_err());
         assert!(
             with_env(&[
-                ("KRAKEN_HUB_JWT_ISSUER", "kraken-sso"),
-                ("KRAKEN_HUB_JWT_JWKS_URI", "https://sso.example/certs")
+                ("SNODRA_SERVER_JWT_ISSUER", "kraken-sso"),
+                ("SNODRA_SERVER_JWT_JWKS_URI", "https://sso.example/certs")
             ])
             .is_ok()
         );
@@ -1679,31 +1701,34 @@ mod tests {
             "https://user:secret@sso.example/certs",
             "https:///certs",
         ] {
-            let err = with_env(&[issuer, ("KRAKEN_HUB_JWT_JWKS_URI", uri)]).unwrap_err();
+            let err = with_env(&[issuer, ("SNODRA_SERVER_JWT_JWKS_URI", uri)]).unwrap_err();
             let text = format!("{err:#}");
-            assert!(text.contains("KRAKEN_HUB_JWT_JWKS_URI"), "{uri}: {text}");
+            assert!(text.contains("SNODRA_SERVER_JWT_JWKS_URI"), "{uri}: {text}");
             assert!(!text.contains("secret"), "never echo user info: {text}");
         }
-        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWKS_REFRESH", "0")]).is_err());
-        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_LEEWAY", "soon")]).is_err());
-        assert!(with_env(&[issuer, ("KRAKEN_HUB_JWT_EXPIRY_GRACE", "-1")]).is_err());
+        assert!(with_env(&[issuer, ("SNODRA_SERVER_JWKS_REFRESH", "0")]).is_err());
+        assert!(with_env(&[issuer, ("SNODRA_SERVER_JWT_LEEWAY", "soon")]).is_err());
+        assert!(with_env(&[issuer, ("SNODRA_SERVER_JWT_EXPIRY_GRACE", "-1")]).is_err());
     }
 
     #[test]
     fn an_issuer_with_access_control_off_warns_that_nothing_is_checked() {
         let jwt_off = |mode: &str| {
-            let mut env = vec![("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken")];
+            let mut env = vec![(
+                "SNODRA_SERVER_JWT_ISSUER",
+                "https://sso.example/realms/kraken",
+            )];
             if mode != "off" {
                 env.extend([
-                    ("KRAKEN_HUB_AUTH_MODE", mode),
-                    ("KRAKEN_HUB_ACL_FILE", "/acl"),
+                    ("SNODRA_SERVER_AUTH_MODE", mode),
+                    ("SNODRA_SERVER_ACL_FILE", "/acl"),
                 ]);
             }
             with_env(&env)
                 .unwrap()
                 .security_warnings()
                 .iter()
-                .filter(|w| w.contains("KRAKEN_HUB_JWT_ISSUER"))
+                .filter(|w| w.contains("SNODRA_SERVER_JWT_ISSUER"))
                 .count()
         };
         assert_eq!(jwt_off("off"), 1);
@@ -1714,7 +1739,7 @@ mod tests {
                 .unwrap()
                 .security_warnings()
                 .iter()
-                .all(|w| !w.contains("KRAKEN_HUB_JWT_ISSUER"))
+                .all(|w| !w.contains("SNODRA_SERVER_JWT_ISSUER"))
         );
     }
 
@@ -1722,13 +1747,16 @@ mod tests {
     fn a_plain_http_jwks_warns_unless_it_stays_on_the_host() {
         let warns = |uri: &str| {
             let c = with_env(&[
-                ("KRAKEN_HUB_JWT_ISSUER", "https://sso.example/realms/kraken"),
-                ("KRAKEN_HUB_JWT_JWKS_URI", uri),
+                (
+                    "SNODRA_SERVER_JWT_ISSUER",
+                    "https://sso.example/realms/kraken",
+                ),
+                ("SNODRA_SERVER_JWT_JWKS_URI", uri),
             ])
             .unwrap();
             c.security_warnings()
                 .into_iter()
-                .filter(|w| w.contains("KRAKEN_HUB_JWT_JWKS_URI"))
+                .filter(|w| w.contains("SNODRA_SERVER_JWT_JWKS_URI"))
                 .count()
         };
         assert_eq!(warns("http://sso.example/certs"), 1);
@@ -1745,11 +1773,15 @@ mod tests {
             assert_eq!(warns(quiet), 0, "{quiet}");
         }
         // One warning, however many times the hub asks.
-        let c = with_env(&[("KRAKEN_HUB_JWT_ISSUER", "http://sso.example/realms/kraken")]).unwrap();
+        let c = with_env(&[(
+            "SNODRA_SERVER_JWT_ISSUER",
+            "http://sso.example/realms/kraken",
+        )])
+        .unwrap();
         assert_eq!(
             c.security_warnings()
                 .iter()
-                .filter(|w| w.contains("KRAKEN_HUB_JWT_JWKS_URI"))
+                .filter(|w| w.contains("SNODRA_SERVER_JWT_JWKS_URI"))
                 .count(),
             1,
             "a derived plain-http URI warns too"
@@ -1760,39 +1792,42 @@ mod tests {
     fn auth_mode_needs_an_acl_file_unless_off() {
         assert_eq!(with_env(&[]).unwrap().auth_mode, AuthMode::Off);
         for mode in ["permissive", "enforce"] {
-            let err = with_env(&[("KRAKEN_HUB_AUTH_MODE", mode)]).unwrap_err();
-            assert!(err.to_string().contains("KRAKEN_HUB_ACL_FILE"), "{err:#}");
+            let err = with_env(&[("SNODRA_SERVER_AUTH_MODE", mode)]).unwrap_err();
+            assert!(
+                err.to_string().contains("SNODRA_SERVER_ACL_FILE"),
+                "{err:#}"
+            );
             let c = with_env(&[
-                ("KRAKEN_HUB_AUTH_MODE", mode),
-                ("KRAKEN_HUB_ACL_FILE", "/etc/hub/acl.toml"),
+                ("SNODRA_SERVER_AUTH_MODE", mode),
+                ("SNODRA_SERVER_ACL_FILE", "/etc/hub/acl.toml"),
             ])
             .unwrap();
             assert_eq!(c.auth_mode.as_str(), mode);
             assert_eq!(c.acl_file.as_deref(), Some(Path::new("/etc/hub/acl.toml")));
         }
-        assert!(with_env(&[("KRAKEN_HUB_AUTH_MODE", "strict")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_AUTH_MODE", "strict")]).is_err());
         // Off ignores a file that is named.
-        assert!(with_env(&[("KRAKEN_HUB_ACL_FILE", "/x")]).is_ok());
+        assert!(with_env(&[("SNODRA_SERVER_ACL_FILE", "/x")]).is_ok());
     }
 
     #[test]
     fn tls_files_come_in_pairs_and_the_http_pair_defaults_to_the_grpc_pair() {
-        assert!(with_env(&[("KRAKEN_HUB_TLS_CERT", "/c.pem")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_TLS_KEY", "/k.pem")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_HTTP_TLS_CERT", "/c.pem")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_TLS_CERT", "/c.pem")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_TLS_KEY", "/k.pem")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_HTTP_TLS_CERT", "/c.pem")]).is_err());
         let c = with_env(&[
-            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
-            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
+            ("SNODRA_SERVER_TLS_CERT", "/c.pem"),
+            ("SNODRA_SERVER_TLS_KEY", "/k.pem"),
         ])
         .unwrap();
         let pair = Some((Path::new("/c.pem"), Path::new("/k.pem")));
         assert_eq!(c.grpc_tls(), pair);
         assert_eq!(c.http_tls(), pair);
         let c = with_env(&[
-            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
-            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
-            ("KRAKEN_HUB_HTTP_TLS_CERT", "/h.pem"),
-            ("KRAKEN_HUB_HTTP_TLS_KEY", "/hk.pem"),
+            ("SNODRA_SERVER_TLS_CERT", "/c.pem"),
+            ("SNODRA_SERVER_TLS_KEY", "/k.pem"),
+            ("SNODRA_SERVER_HTTP_TLS_CERT", "/h.pem"),
+            ("SNODRA_SERVER_HTTP_TLS_KEY", "/hk.pem"),
         ])
         .unwrap();
         assert_eq!(
@@ -1801,8 +1836,8 @@ mod tests {
         );
         // HTTP only.
         let c = with_env(&[
-            ("KRAKEN_HUB_HTTP_TLS_CERT", "/h.pem"),
-            ("KRAKEN_HUB_HTTP_TLS_KEY", "/hk.pem"),
+            ("SNODRA_SERVER_HTTP_TLS_CERT", "/h.pem"),
+            ("SNODRA_SERVER_HTTP_TLS_KEY", "/hk.pem"),
         ])
         .unwrap();
         assert_eq!((c.grpc_tls(), c.http_tls().is_some()), (None, true));
@@ -1827,9 +1862,9 @@ mod tests {
         ]);
         let path = |n: &str| dir.join(n).display().to_string();
         let c = with_env(&[
-            ("KRAKEN_HUB_DASHBOARD_TOKEN", "variable-token-0123456789"),
-            ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
-            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
+            ("SNODRA_SERVER_DASHBOARD_TOKEN", "variable-token-0123456789"),
+            ("SNODRA_SERVER_DASHBOARD_TOKEN_FILE", &path("dash")),
+            ("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
         ])
         .unwrap();
         let dash = c.dashboard_token.as_ref().unwrap();
@@ -1846,7 +1881,8 @@ mod tests {
         );
         assert_eq!(c.dashboard_token_file, Some(dir.join("dash")));
         // Without the file variable the plain variable still works.
-        let c = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "variable-token-0123456789")]).unwrap();
+        let c =
+            with_env(&[("SNODRA_SERVER_DASHBOARD_TOKEN", "variable-token-0123456789")]).unwrap();
         assert!(
             c.dashboard_token
                 .unwrap()
@@ -1864,10 +1900,10 @@ mod tests {
         ]);
         let path = |n: &str| dir.join(n).display().to_string();
         for name in ["short", "spaces", "empty", "missing"] {
-            let err = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path(name))]).unwrap_err();
+            let err = with_env(&[("SNODRA_SERVER_DASHBOARD_TOKEN_FILE", &path(name))]).unwrap_err();
             let text = format!("{err:#}");
             assert!(
-                text.contains("KRAKEN_HUB_DASHBOARD_TOKEN_FILE"),
+                text.contains("SNODRA_SERVER_DASHBOARD_TOKEN_FILE"),
                 "{name}: {text}"
             );
             assert!(
@@ -1883,7 +1919,7 @@ mod tests {
         let dir = scratch(&[("dash", "first-token-0123456789abcdef\n")]);
         let file = dir.join("dash");
         let c = with_env(&[(
-            "KRAKEN_HUB_DASHBOARD_TOKEN_FILE",
+            "SNODRA_SERVER_DASHBOARD_TOKEN_FILE",
             &file.display().to_string(),
         )])
         .unwrap();
@@ -1924,20 +1960,20 @@ mod tests {
         let path = |n: &str| dir.join(n).display().to_string();
         for vars in [
             vec![
-                ("KRAKEN_HUB_DASHBOARD_TOKEN", same),
-                ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", same),
+                ("SNODRA_SERVER_DASHBOARD_TOKEN", same),
+                ("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN", same),
             ],
             // Through a file on one side: the values are compared, whatever their source.
             vec![
-                ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
-                ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", same),
+                ("SNODRA_SERVER_DASHBOARD_TOKEN_FILE", &path("dash")),
+                ("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN", same),
             ],
         ] {
             let err = with_env(&vars).unwrap_err();
             let text = format!("{err:#}");
             assert!(
-                text.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")
-                    && text.contains("KRAKEN_HUB_DASHBOARD_TOKEN "),
+                text.contains("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN")
+                    && text.contains("SNODRA_SERVER_DASHBOARD_TOKEN "),
                 "{text}"
             );
             assert!(!text.contains(same), "never the value: {text}");
@@ -1945,8 +1981,8 @@ mod tests {
 
         // A rotation that makes them equal keeps both previous tokens.
         let c = with_env(&[
-            ("KRAKEN_HUB_DASHBOARD_TOKEN_FILE", &path("dash")),
-            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
+            ("SNODRA_SERVER_DASHBOARD_TOKEN_FILE", &path("dash")),
+            ("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE", &path("write")),
         ])
         .unwrap();
         let (read, write) = (
@@ -1969,19 +2005,22 @@ mod tests {
     #[test]
     fn the_dashboard_tokens_are_trimmed_checked_and_never_shown() {
         let token = "0123456789abcdef-token\n";
-        let c = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", token)]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_DASHBOARD_TOKEN", token)]).unwrap();
         let secret = c.dashboard_token.as_ref().unwrap();
         assert!(secret.matches(Some("0123456789abcdef-token")));
         assert!(!secret.matches(Some("0123456789abcdef-token\n")));
         assert!(!format!("{c:?}").contains("0123456789abcdef"));
-        let err = with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "short")]).unwrap_err();
+        let err = with_env(&[("SNODRA_SERVER_DASHBOARD_TOKEN", "short")]).unwrap_err();
         assert!(err.to_string().contains("at least 16"), "{err:#}");
         assert!(!format!("{err:#}").contains("short\""));
-        assert!(with_env(&[("KRAKEN_HUB_DASHBOARD_TOKEN", "has a space in it, 16+")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_DASHBOARD_TOKEN", "has a space in it, 16+")]).is_err());
         // The write token is parsed and kept like the dashboard token.
         let c = with_env(&[
-            ("KRAKEN_HUB_DASHBOARD_TOKEN", token),
-            ("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", "fedcba9876543210-write"),
+            ("SNODRA_SERVER_DASHBOARD_TOKEN", token),
+            (
+                "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN",
+                "fedcba9876543210-write",
+            ),
         ])
         .unwrap();
         assert!(
@@ -2005,15 +2044,18 @@ mod tests {
             "not variables: the lease the hub asks for and how often it renews it"
         );
         let c = with_env(&[
-            ("KRAKEN_HUB_CONTROL_TIMEOUT", "3s"),
-            ("KRAKEN_HUB_RESET_TIMEOUT", "5m"),
+            ("SNODRA_SERVER_CONTROL_TIMEOUT", "3s"),
+            ("SNODRA_SERVER_RESET_TIMEOUT", "5m"),
         ])
         .unwrap();
         assert_eq!(
             (c.control_timeout, c.reset_timeout),
             (Duration::from_secs(3), Duration::from_secs(300))
         );
-        for var in ["KRAKEN_HUB_CONTROL_TIMEOUT", "KRAKEN_HUB_RESET_TIMEOUT"] {
+        for var in [
+            "SNODRA_SERVER_CONTROL_TIMEOUT",
+            "SNODRA_SERVER_RESET_TIMEOUT",
+        ] {
             let err = with_env(&[(var, "0")]).unwrap_err();
             assert!(err.to_string().contains(var), "{err:#}");
             assert!(with_env(&[(var, "soon")]).is_err());
@@ -2029,21 +2071,21 @@ mod tests {
     }
 
     /// The renewals of a reset start once every prepare is answered, so an instance that
-    /// prepared at once waits up to `KRAKEN_HUB_CONTROL_TIMEOUT` for its first one: the timeout
+    /// prepared at once waits up to `SNODRA_SERVER_CONTROL_TIMEOUT` for its first one: the timeout
     /// may not eat more of the lease than a renewal period does (H-5).
     #[test]
     fn the_control_timeout_leaves_a_renewal_period_of_the_lease() {
-        let c = with_env(&[("KRAKEN_HUB_CONTROL_TIMEOUT", "20s")]).unwrap();
+        let c = with_env(&[("SNODRA_SERVER_CONTROL_TIMEOUT", "20s")]).unwrap();
         assert_eq!(
             c.control_timeout,
             Duration::from_secs(20),
             "lease 30 s - renewal 10 s"
         );
         for long in ["21s", "30s", "1m"] {
-            let err = with_env(&[("KRAKEN_HUB_CONTROL_TIMEOUT", long)]).unwrap_err();
+            let err = with_env(&[("SNODRA_SERVER_CONTROL_TIMEOUT", long)]).unwrap_err();
             let text = err.to_string();
             assert!(
-                text.contains("KRAKEN_HUB_CONTROL_TIMEOUT") && text.contains("at most 20s"),
+                text.contains("SNODRA_SERVER_CONTROL_TIMEOUT") && text.contains("at most 20s"),
                 "{long}: {text}"
             );
         }
@@ -2051,13 +2093,17 @@ mod tests {
 
     #[test]
     fn the_write_token_has_an_effect_and_warns_only_without_tls() {
-        let c =
-            with_env(&[("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", "fedcba9876543210-write")]).unwrap();
+        let c = with_env(&[(
+            "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN",
+            "fedcba9876543210-write",
+        )])
+        .unwrap();
         let w = c.security_warnings();
         assert!(w.iter().all(|w| !w.contains("no effect")), "{w:?}");
         assert!(
             w.iter()
-                .any(|w| w.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN") && w.contains("clear text")),
+                .any(|w| w.contains("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN")
+                    && w.contains("clear text")),
             "an open HTTP port without TLS: {w:?}"
         );
         let local = Config {
@@ -2068,7 +2114,7 @@ mod tests {
             local
                 .security_warnings()
                 .iter()
-                .all(|w| !w.contains("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN")),
+                .all(|w| !w.contains("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN")),
             "loopback only"
         );
     }
@@ -2078,11 +2124,12 @@ mod tests {
         let open = Config::default();
         let w = open.security_warnings();
         assert!(
-            w.iter().any(|m| m.contains("KRAKEN_HUB_AUTH_MODE=off")),
+            w.iter().any(|m| m.contains("SNODRA_SERVER_AUTH_MODE=off")),
             "{w:?}"
         );
         assert!(
-            w.iter().any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
+            w.iter()
+                .any(|m| m.contains("SNODRA_SERVER_DASHBOARD_TOKEN")),
             "{w:?}"
         );
         let permissive = Config {
@@ -2093,7 +2140,7 @@ mod tests {
             permissive
                 .security_warnings()
                 .iter()
-                .any(|m| m.contains("KRAKEN_HUB_AUTH_MODE=permissive"))
+                .any(|m| m.contains("SNODRA_SERVER_AUTH_MODE=permissive"))
         );
         let local = Config {
             listen: "127.0.0.1:7000".parse().unwrap(),
@@ -2124,7 +2171,7 @@ mod tests {
         let w = enforced.security_warnings();
         assert_eq!(
             w.iter()
-                .filter(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN"))
+                .filter(|m| m.contains("SNODRA_SERVER_DASHBOARD_TOKEN"))
                 .count(),
             1,
             "{w:?}"
@@ -2142,7 +2189,7 @@ mod tests {
         assert!(
             !off.security_warnings()
                 .iter()
-                .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
+                .any(|m| m.contains("SNODRA_SERVER_DASHBOARD_TOKEN")),
         );
         let with_token = Config {
             dashboard_token: Some(crate::auth::Secret::new("0123456789abcdef0123")),
@@ -2152,15 +2199,15 @@ mod tests {
             !with_token
                 .security_warnings()
                 .iter()
-                .any(|m| m.contains("KRAKEN_HUB_DASHBOARD_TOKEN")),
+                .any(|m| m.contains("SNODRA_SERVER_DASHBOARD_TOKEN")),
         );
     }
 
     #[test]
     fn the_client_ca_needs_the_server_pair_and_defaults_to_optional() {
         let pair = [
-            ("KRAKEN_HUB_TLS_CERT", "/c.pem"),
-            ("KRAKEN_HUB_TLS_KEY", "/k.pem"),
+            ("SNODRA_SERVER_TLS_CERT", "/c.pem"),
+            ("SNODRA_SERVER_TLS_KEY", "/k.pem"),
         ];
         let d = Config::default();
         assert_eq!((d.tls_client_ca.as_ref(), d.client_auth()), (None, None));
@@ -2169,7 +2216,7 @@ mod tests {
             vars.extend_from_slice(extra);
             with_env(&vars)
         };
-        let c = with(&[("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem")]).unwrap();
+        let c = with(&[("SNODRA_SERVER_TLS_CLIENT_CA", "/ca.pem")]).unwrap();
         assert_eq!(c.tls_client_ca.as_deref(), Some(Path::new("/ca.pem")));
         assert_eq!(c.client_auth(), Some(ClientAuthMode::Optional));
         for (value, expected) in [
@@ -2178,32 +2225,32 @@ mod tests {
             (" Required ", ClientAuthMode::Required),
         ] {
             let c = with(&[
-                ("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem"),
-                ("KRAKEN_HUB_TLS_CLIENT_AUTH", value),
+                ("SNODRA_SERVER_TLS_CLIENT_CA", "/ca.pem"),
+                ("SNODRA_SERVER_TLS_CLIENT_AUTH", value),
             ])
             .unwrap();
             assert_eq!(c.client_auth(), Some(expected), "{value}");
         }
         // A value that is not a mode is a startup error naming the variable.
         let e = with(&[
-            ("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem"),
-            ("KRAKEN_HUB_TLS_CLIENT_AUTH", "sometimes"),
+            ("SNODRA_SERVER_TLS_CLIENT_CA", "/ca.pem"),
+            ("SNODRA_SERVER_TLS_CLIENT_AUTH", "sometimes"),
         ])
         .unwrap_err();
         assert!(
-            format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_AUTH"),
+            format!("{e:#}").contains("SNODRA_SERVER_TLS_CLIENT_AUTH"),
             "{e:#}"
         );
         // The mode without the CA, and the CA without the server pair, are startup errors.
-        let e = with(&[("KRAKEN_HUB_TLS_CLIENT_AUTH", "required")]).unwrap_err();
+        let e = with(&[("SNODRA_SERVER_TLS_CLIENT_AUTH", "required")]).unwrap_err();
         assert!(
-            format!("{e:#}").contains("KRAKEN_HUB_TLS_CLIENT_CA"),
+            format!("{e:#}").contains("SNODRA_SERVER_TLS_CLIENT_CA"),
             "{e:#}"
         );
-        let e = with_env(&[("KRAKEN_HUB_TLS_CLIENT_CA", "/ca.pem")]).unwrap_err();
-        assert!(format!("{e:#}").contains("KRAKEN_HUB_TLS_CERT"), "{e:#}");
+        let e = with_env(&[("SNODRA_SERVER_TLS_CLIENT_CA", "/ca.pem")]).unwrap_err();
+        assert!(format!("{e:#}").contains("SNODRA_SERVER_TLS_CERT"), "{e:#}");
         // An empty value is unset, like every path variable.
-        let c = with(&[("KRAKEN_HUB_TLS_CLIENT_CA", " ")]).unwrap();
+        let c = with(&[("SNODRA_SERVER_TLS_CLIENT_CA", " ")]).unwrap();
         assert_eq!(c.tls_client_ca, None);
     }
 
@@ -2219,7 +2266,7 @@ mod tests {
         };
         let w = base.security_warnings();
         assert!(
-            w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")
+            w.iter().any(|m| m.contains("SNODRA_SERVER_TLS_CLIENT_CA")
                 && m.contains("AUTH_MODE=off")
                 && m.contains("handshake")),
             "{w:?}"
@@ -2231,7 +2278,7 @@ mod tests {
         };
         let w = enforced.security_warnings();
         assert!(
-            !w.iter().any(|m| m.contains("KRAKEN_HUB_TLS_CLIENT_CA")),
+            !w.iter().any(|m| m.contains("SNODRA_SERVER_TLS_CLIENT_CA")),
             "{w:?}"
         );
     }
@@ -2242,8 +2289,8 @@ mod tests {
         assert_eq!(d.tls_handshake_timeout, Duration::from_secs(5));
         assert_eq!(d.tls_handshakes_per_ip, 32);
         let c = with_env(&[
-            ("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT", "750ms"),
-            ("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP", "0"),
+            ("SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT", "750ms"),
+            ("SNODRA_SERVER_TLS_HANDSHAKES_PER_IP", "0"),
         ])
         .unwrap();
         assert_eq!(c.tls_handshake_timeout, Duration::from_millis(750));
@@ -2252,8 +2299,8 @@ mod tests {
         assert_eq!(limits.timeout, Duration::from_millis(750));
         assert_eq!(limits.per_ip, 0);
         assert_eq!(limits.slots, crate::tls::MAX_HANDSHAKES);
-        assert!(with_env(&[("KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT", "0")]).is_err());
-        assert!(with_env(&[("KRAKEN_HUB_TLS_HANDSHAKES_PER_IP", "many")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_TLS_HANDSHAKES_PER_IP", "many")]).is_err());
     }
 
     #[test]
@@ -2267,20 +2314,20 @@ mod tests {
     #[test]
     fn the_event_settings_are_read_from_the_environment() {
         let c = with_env(&[
-            ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "true"),
-            ("KRAKEN_HUB_EVENT_MAX_TAILS", "1"),
+            ("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS", "true"),
+            ("SNODRA_SERVER_EVENT_MAX_TAILS", "1"),
         ])
         .unwrap();
         assert!(c.event_payloads);
         assert_eq!(c.event_max_tails, 1);
-        let most = with_env(&[("KRAKEN_HUB_EVENT_MAX_TAILS", "1024")]).unwrap();
+        let most = with_env(&[("SNODRA_SERVER_EVENT_MAX_TAILS", "1024")]).unwrap();
         assert_eq!(most.event_max_tails, MAX_EVENT_TAILS);
         for (var, value) in [
-            ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "maybe"),
-            ("KRAKEN_HUB_EVENT_MAX_TAILS", "0"),
-            ("KRAKEN_HUB_EVENT_MAX_TAILS", "many"),
-            ("KRAKEN_HUB_EVENT_MAX_TAILS", "1025"),
-            ("KRAKEN_HUB_EVENT_MAX_TAILS", "18446744073709551615"),
+            ("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS", "maybe"),
+            ("SNODRA_SERVER_EVENT_MAX_TAILS", "0"),
+            ("SNODRA_SERVER_EVENT_MAX_TAILS", "many"),
+            ("SNODRA_SERVER_EVENT_MAX_TAILS", "1025"),
+            ("SNODRA_SERVER_EVENT_MAX_TAILS", "18446744073709551615"),
         ] {
             let err = with_env(&[(var, value)]).expect_err(&format!("{var}={value:?}"));
             assert!(err.to_string().contains(var), "{var}: {err:#}");
@@ -2292,17 +2339,17 @@ mod tests {
     #[test]
     fn removed_event_store_settings_are_startup_warnings() {
         let c = with_env(&[
-            ("KRAKEN_HUB_KAFKA_BOOTSTRAP", "kafka:9092"),
-            ("KRAKEN_HUB_EVENT_TOPICS", "kraken.events"),
-            ("KRAKEN_HUB_GROUP_LAG_INTERVAL", "not even a duration"),
+            ("SNODRA_SERVER_KAFKA_BOOTSTRAP", "kafka:9092"),
+            ("SNODRA_SERVER_EVENT_TOPICS", "kraken.events"),
+            ("SNODRA_SERVER_GROUP_LAG_INTERVAL", "not even a duration"),
         ])
         .unwrap();
         assert_eq!(
             c.removed_settings,
             [
-                "KRAKEN_HUB_KAFKA_BOOTSTRAP",
-                "KRAKEN_HUB_EVENT_TOPICS",
-                "KRAKEN_HUB_GROUP_LAG_INTERVAL"
+                "SNODRA_SERVER_KAFKA_BOOTSTRAP",
+                "SNODRA_SERVER_EVENT_TOPICS",
+                "SNODRA_SERVER_GROUP_LAG_INTERVAL"
             ]
         );
         let warnings: Vec<String> = c
@@ -2312,10 +2359,10 @@ mod tests {
             .collect();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
-            warnings[0].starts_with("KRAKEN_HUB_KAFKA_BOOTSTRAP is set but is no longer read"),
+            warnings[0].starts_with("SNODRA_SERVER_KAFKA_BOOTSTRAP is set but is no longer read"),
             "{warnings:?}"
         );
-        assert!(warnings[0].contains("kraken-event-browser"), "{warnings:?}");
+        assert!(warnings[0].contains("snodra-event-browser"), "{warnings:?}");
         for removed in REMOVED_SETTINGS {
             let c = with_env(&[(removed, "x")]).unwrap();
             assert_eq!(c.removed_settings, [removed]);
@@ -2329,13 +2376,16 @@ mod tests {
                 .unwrap()
                 .security_warnings()
                 .into_iter()
-                .filter(|w| w.contains("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS"))
+                .filter(|w| w.contains("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS"))
                 .collect::<Vec<_>>()
         };
-        let on = ("KRAKEN_HUB_EVENT_BROWSER_PAYLOADS", "true");
-        let token = ("KRAKEN_HUB_DASHBOARD_TOKEN", "a-dashboard-token-0123456789");
+        let on = ("SNODRA_SERVER_EVENT_BROWSER_PAYLOADS", "true");
+        let token = (
+            "SNODRA_SERVER_DASHBOARD_TOKEN",
+            "a-dashboard-token-0123456789",
+        );
         let write = (
-            "KRAKEN_HUB_DASHBOARD_WRITE_TOKEN",
+            "SNODRA_SERVER_DASHBOARD_WRITE_TOKEN",
             "a-write-token-0123456789",
         );
         let w = warned(&[on]);
@@ -2355,11 +2405,11 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(
-            with_env(&[("KRAKEN_HUB_RELOAD_INTERVAL", "250ms")])
+            with_env(&[("SNODRA_SERVER_RELOAD_INTERVAL", "250ms")])
                 .unwrap()
                 .reload_interval,
             Duration::from_millis(250)
         );
-        assert!(with_env(&[("KRAKEN_HUB_RELOAD_INTERVAL", "0")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_RELOAD_INTERVAL", "0")]).is_err());
     }
 }

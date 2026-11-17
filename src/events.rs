@@ -1,7 +1,7 @@
 //! The dashboard's event pages over the event browser add-on (ADR 0027): the hub reads no event
 //! store itself. Each `/api/v1/events*` call becomes one hub-internal query
 //! ([`crate::router::Router::query_internal`], `stream_internal` for the tail) to a
-//! `kraken-event-browser` instance: `kraken.events.Search`, `Get`, `Sources`, `Lag` and `Tail`.
+//! `snodra-event-browser` instance: `snodra.events.Search`, `Get`, `Sources`, `Lag` and `Tail`.
 //!
 //! This module builds those requests from the HTTP call, reads the browser's answers as untrusted
 //! input (bounded in size, parsed into the hub's own types: whatever the hub does not know is
@@ -23,18 +23,18 @@ use crate::registry::Registry;
 use crate::router::RouteError;
 
 /// The event browser's query types (ADR 0027).
-pub const SEARCH: &str = "kraken.events.Search";
-pub const GET: &str = "kraken.events.Get";
-pub const SOURCES: &str = "kraken.events.Sources";
-pub const LAG: &str = "kraken.events.Lag";
+pub const SEARCH: &str = "snodra.events.Search";
+pub const GET: &str = "snodra.events.Get";
+pub const SOURCES: &str = "snodra.events.Sources";
+pub const LAG: &str = "snodra.events.Lag";
 /// The streaming one.
-pub const TAIL: &str = "kraken.events.Tail";
+pub const TAIL: &str = "snodra.events.Tail";
 
 /// The answer of every `/api/v1/events*` call while no browser is connected.
 pub const NOT_INSTALLED: &str = "event browser not installed";
 
 /// What the hub asks as the timeout of a point query (`Request.timeout_ms`); the router clamps
-/// it as any client's (`KRAKEN_HUB_MAX_TIMEOUT_MS`, `KRAKEN_HUB_TIMEOUT_OVERRIDES`).
+/// it as any client's (`SNODRA_SERVER_MAX_TIMEOUT_MS`, `SNODRA_SERVER_TIMEOUT_OVERRIDES`).
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// A search's own time budget (`timeoutMs`) ends this long before the hub stops waiting, so the
 /// browser answers what it found rather than the hub timing out.
@@ -117,7 +117,7 @@ fn bounded<'a>(name: &str, value: &'a str, max: usize) -> Result<&'a str, String
     }
 }
 
-/// The longest tail the hub asks for: a little under `KRAKEN_HUB_MAX_STREAM_DURATION`, so the
+/// The longest tail the hub asks for: a little under `SNODRA_SERVER_MAX_STREAM_DURATION`, so the
 /// browser ends it (`maxDuration`) before the router would.
 pub fn tail_duration(config: &Config) -> Duration {
     let max = config.max_stream_duration;
@@ -138,7 +138,7 @@ fn ms(d: Duration) -> u64 {
 /// Why a payload is not served: the first condition of ADR 0025 that does not hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hidden {
-    /// `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS` is not on.
+    /// `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS` is not on.
     Off,
     /// The hub has neither a dashboard token nor a write token.
     NoToken,
@@ -158,7 +158,7 @@ impl Hidden {
 
     pub fn reason(self) -> &'static str {
         match self {
-            Hidden::Off => "payloads are off on this hub (KRAKEN_HUB_EVENT_BROWSER_PAYLOADS)",
+            Hidden::Off => "payloads are off on this hub (SNODRA_SERVER_EVENT_BROWSER_PAYLOADS)",
             Hidden::NoToken => {
                 "this hub has no dashboard or write token, and payloads are only served to a request that presents one"
             }
@@ -279,7 +279,7 @@ impl Params {
         Ok(())
     }
 
-    /// `kraken.events.Search`: the source, the filters, the page size, the cursor and the time
+    /// `snodra.events.Search`: the source, the filters, the page size, the cursor and the time
     /// budget the hub leaves the browser.
     pub fn search_request(&self, with_q: bool, budget: Duration) -> Result<Value, String> {
         let mut request = Map::new();
@@ -302,7 +302,7 @@ impl Params {
         Ok(request.into())
     }
 
-    /// `kraken.events.Tail`: the source, the filters, the heartbeat and the longest duration.
+    /// `snodra.events.Tail`: the source, the filters, the heartbeat and the longest duration.
     pub fn tail_request(
         &self,
         with_q: bool,
@@ -327,7 +327,7 @@ fn query_name(filter: &str) -> &str {
     }
 }
 
-/// `kraken.events.Get`: one record, with its payload only when `payload`; `Err` with the reason
+/// `snodra.events.Get`: one record, with its payload only when `payload`; `Err` with the reason
 /// for a 400 when a part of its place is longer than the browser takes.
 pub fn get_request(
     source: &str,
@@ -341,7 +341,7 @@ pub fn get_request(
     Ok(json!({ "source": source, "segment": segment, "position": position, "payload": payload }))
 }
 
-/// `kraken.events.Lag` of `source` (the browser's default when absent); `Err` with the reason
+/// `snodra.events.Lag` of `source` (the browser's default when absent); `Err` with the reason
 /// for a 400 when the source is longer than the browser takes.
 pub fn lag_request(source: Option<&str>) -> Result<Value, String> {
     Ok(match source.filter(|s| !s.is_empty()) {
@@ -429,7 +429,7 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d).map(Some)
 }
 
-/// The browser's answer to `kraken.events.Get`.
+/// The browser's answer to `snodra.events.Get`.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordAnswer {
@@ -624,7 +624,7 @@ pub struct TailEnd {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Beat {}
 
-/// One part of `kraken.events.Tail`.
+/// One part of `snodra.events.Tail`.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum TailEvent {
@@ -748,7 +748,7 @@ impl Refusal {
         }
     }
 
-    /// The `outcome` of `kraken_hub_event_browser_requests_total`.
+    /// The `outcome` of `snodra_hub_event_browser_requests_total`.
     pub fn outcome(&self) -> &'static str {
         match self {
             Refusal::NotInstalled => "not_installed",

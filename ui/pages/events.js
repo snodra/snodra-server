@@ -228,7 +228,7 @@ export default {
     root.append(
       h('div', { class: 'card-head' }, h('h1', null, 'Events'), meta),
       form,
-      payload ? null : h('p', { class: 'note' }, 'Payloads are not served to this page (KRAKEN_HUB_EVENT_BROWSER_PAYLOADS and a dashboard or write token): records show their headers only.'),
+      payload ? null : h('p', { class: 'note' }, 'Payloads are not served to this page (SNODRA_SERVER_EVENT_BROWSER_PAYLOADS and a dashboard or write token): records show their headers only.'),
       detail,
       h('section', { class: 'card', 'aria-label': 'Live tail' },
         h('div', { class: 'card-head' }, h('h2', null, 'Tail'), tailButton, h('label', null, pause, 'Pause')),

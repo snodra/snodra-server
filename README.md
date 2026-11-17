@@ -74,60 +74,60 @@ cargo run
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_HUB_ID` | hostname + `-` + 8 random hex digits | identifies this hub process in `RegisterAck.hub_id` and the topology (`hubId`) |
-| `KRAKEN_HUB_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
-| `KRAKEN_HUB_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for the dashboard and its API; empty disables the HTTP listener |
-| `KRAKEN_HUB_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
-| `KRAKEN_HUB_LOG` | `info` | `tracing` filter, for example `kraken_hub=debug,info` |
-| `KRAKEN_HUB_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
-| `KRAKEN_HUB_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` on types without an override |
-| `KRAKEN_HUB_TIMEOUT_OVERRIDES` | none | per-type timeouts, `type=ms,type=ms` (for example `files.Upload=120000`); see [Request timeouts](#request-timeouts) |
-| `KRAKEN_HUB_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to clients in `RegisterAck`; `KRAKEN_HUB_HEARTBEAT_TIMEOUT` must be at least twice it |
-| `KRAKEN_HUB_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold (`10`, `10s` or `500ms`) |
-| `KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one instance before new ones are rejected |
-| `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
-| `KRAKEN_HUB_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
-| `KRAKEN_HUB_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
-| `KRAKEN_HUB_MAX_STREAM_DURATION` | `10m` | a [streaming query](#query-modes) open for longer ends with `ReplyEnd{error = CANCELLED}` and its handler is cancelled; at least `1s` |
-| `KRAKEN_HUB_SUBSCRIPTION_BUFFER` | `256` | updates of a [subscription](#query-modes) the hub holds while its sender owes credit; one more ends it with `ReplyEnd{error = RESOURCE_EXHAUSTED}`; positive |
-| `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` | `1024` | subscription targets one handler instance serves at once; a subscription that would exceed it on any target is refused with `Error{RESOURCE_EXHAUSTED}` before anything is sent; positive |
-| `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` | `0` | a subscription open for longer ends with `ReplyEnd{error = CANCELLED}` and its targets are cancelled; `0` is unlimited, otherwise at least `1s` |
-| `KRAKEN_HUB_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
-| `KRAKEN_HUB_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
-| `KRAKEN_HUB_DASHBOARD_ENABLED` | `true` | serve the dashboard (`/ui/`) and its API (`/api/v1/`, the processor controls included) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `KRAKEN_HUB_GRAFANA_URL` | none | Grafana base URL the dashboard links to; must be `http://` or `https://` without user info (`user:password@` is rejected at startup, as the link is served unauthenticated) |
-| `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` | `10000` | cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least recently used go first |
-| `KRAKEN_HUB_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
-| `KRAKEN_HUB_PEERS` | none | the other hubs' dashboard base URLs as the operator's browser reaches them, comma-separated, for example `http://localhost:7001,http://localhost:7011` (this hub's own URL may be listed; the page skips it by hub id). Each must be `http://` or `https://` with a host and optional port, no user info, no path beyond `/`; normalised to origins (lowercase, default port dropped), duplicates removed, at most 16; anything else stops the hub at startup. See [Multiple hubs](#multiple-hubs) |
+| `SNODRA_SERVER_ID` | hostname + `-` + 8 random hex digits | identifies this hub process in `RegisterAck.hub_id` and the topology (`hubId`) |
+| `SNODRA_SERVER_LISTEN` | `0.0.0.0:7000` | gRPC bind address |
+| `SNODRA_SERVER_HTTP_LISTEN` | `0.0.0.0:7001` | HTTP bind address for the dashboard and its API; empty disables the HTTP listener |
+| `SNODRA_SERVER_OTLP_ENDPOINT` | `http://otel-lgtm:4317` | OTLP gRPC endpoint for traces and metrics |
+| `SNODRA_SERVER_LOG` | `info` | `tracing` filter, for example `snodra_hub=debug,info` |
+| `SNODRA_SERVER_DEFAULT_TIMEOUT_MS` | `5000` | used when `Request.timeout_ms` is 0 and the type has no override |
+| `SNODRA_SERVER_MAX_TIMEOUT_MS` | `60000` | upper clamp for `Request.timeout_ms` on types without an override |
+| `SNODRA_SERVER_TIMEOUT_OVERRIDES` | none | per-type timeouts, `type=ms,type=ms` (for example `files.Upload=120000`); see [Request timeouts](#request-timeouts) |
+| `SNODRA_SERVER_HEARTBEAT_INTERVAL` | `3s` | heartbeat period announced to clients in `RegisterAck`; `SNODRA_SERVER_HEARTBEAT_TIMEOUT` must be at least twice it |
+| `SNODRA_SERVER_HEARTBEAT_TIMEOUT` | `10s` | dead-instance threshold (`10`, `10s` or `500ms`) |
+| `SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE` | `10000` | requests queued for one instance before new ones are rejected |
+| `SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE` | `64MiB` | encoded bytes queued for one instance before new requests are rejected (`B`, `KiB`, `MiB`, `GiB`, or plain bytes) |
+| `SNODRA_SERVER_QUEUE_BYTES_TOTAL` | `512MiB` | encoded bytes queued over all instances together before new requests are rejected (reason `queue_bytes_total`; same units) |
+| `SNODRA_SERVER_OWNER_GRACE` | `60s` | keep type ownership after the last instance leaves |
+| `SNODRA_SERVER_MAX_STREAM_DURATION` | `10m` | a [streaming query](#query-modes) open for longer ends with `ReplyEnd{error = CANCELLED}` and its handler is cancelled; at least `1s` |
+| `SNODRA_SERVER_SUBSCRIPTION_BUFFER` | `256` | updates of a [subscription](#query-modes) the hub holds while its sender owes credit; one more ends it with `ReplyEnd{error = RESOURCE_EXHAUSTED}`; positive |
+| `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE` | `1024` | subscription targets one handler instance serves at once; a subscription that would exceed it on any target is refused with `Error{RESOURCE_EXHAUSTED}` before anything is sent; positive |
+| `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION` | `0` | a subscription open for longer ends with `ReplyEnd{error = CANCELLED}` and its targets are cancelled; `0` is unlimited, otherwise at least `1s` |
+| `SNODRA_SERVER_SESSION_BUFFER` | `1024` | per-session outbound buffer, in messages |
+| `SNODRA_SERVER_HANDSHAKE_TIMEOUT` | `10s` | a new `Connect` stream must send `Register` within this (`10`, `10s` or `500ms`) |
+| `SNODRA_SERVER_DASHBOARD_ENABLED` | `true` | serve the dashboard (`/ui/`) and its API (`/api/v1/`, the processor controls included) on the HTTP port and keep the edge statistics; `false` makes them 404 (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `SNODRA_SERVER_GRAFANA_URL` | none | Grafana base URL the dashboard links to; must be `http://` or `https://` without user info (`user:password@` is rejected at startup, as the link is served unauthenticated) |
+| `SNODRA_SERVER_EDGE_STATS_MAX_EDGES` | `10000` | cap on `(sender service, type)` edges kept for the dashboard graph; at the cap the least recently used go first |
+| `SNODRA_SERVER_EDGE_STATS_WINDOW` | `5m` | sliding window of the edge statistics, at least `10s` |
+| `SNODRA_SERVER_PEERS` | none | the other hubs' dashboard base URLs as the operator's browser reaches them, comma-separated, for example `http://localhost:7001,http://localhost:7011` (this hub's own URL may be listed; the page skips it by hub id). Each must be `http://` or `https://` with a host and optional port, no user info, no path beyond `/`; normalised to origins (lowercase, default port dropped), duplicates removed, at most 16; anything else stops the hub at startup. See [Multiple hubs](#multiple-hubs) |
 
-| `KRAKEN_HUB_AUTH_MODE` | `off` | `off`, `permissive` (evaluate every rule, log and count violations, allow everything) or `enforce` (refuse them); anything but `off` needs `KRAKEN_HUB_ACL_FILE`. See [Security](#security) |
-| `KRAKEN_HUB_ACL_FILE` | none | TOML ACL: SHA-256 of each static token to its service, `handle` and `send` patterns; reloaded when it changes |
-| `KRAKEN_HUB_JWT_ISSUER` | none | the `iss` a JWT credential must carry, exact match; unset: JWT credentials are off and refused as "not configured". Needs an auth mode other than `off`. See [Security](#security) |
-| `KRAKEN_HUB_JWT_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | where the signing keys are fetched from (Keycloak's path, no OIDC discovery); separate from the issuer so a hub can fetch internally and validate the public issuer. `http://` warns once unless loopback or a single-label name. Without an issuer it is a startup error |
-| `KRAKEN_HUB_JWT_AUDIENCE` | none | when set, a JWT's `aud` (string or array) must contain it |
-| `KRAKEN_HUB_JWT_LEEWAY` | `30s` | clock skew tolerated on `exp`, `nbf` and `iat` |
-| `KRAKEN_HUB_JWT_EXPIRY_GRACE` | `30s` | how long after `exp` a JWT session stays open without a refresh |
-| `KRAKEN_HUB_JWKS_REFRESH` | `5m` | how often the signing keys are fetched again (an unknown `kid` fetches at most once per 30 s on top); positive |
-| `KRAKEN_HUB_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots; an unreadable file is a startup error whatever the URI scheme (unused, with a warning, over `http://`) |
-| `KRAKEN_HUB_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
-| `KRAKEN_HUB_TLS_CERT`, `KRAKEN_HUB_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
-| `KRAKEN_HUB_TLS_CLIENT_CA` | none | PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS); needs the gRPC pair; an unreadable or empty bundle is a startup error; reloaded with the certificates (a bad file keeps the previous CAs, counted); the HTTP port never asks for a certificate; with `AUTH_MODE=off` it authenticates nothing beyond the handshake (startup warning). See [Security](#security) |
-| `KRAKEN_HUB_TLS_CLIENT_AUTH` | `optional` (when the CA is set) | `optional`: no certificate is fine (token or JWT), one that is presented must verify; `required`: a client without a valid certificate fails the handshake. Without `KRAKEN_HUB_TLS_CLIENT_CA` it is a startup error |
-| `KRAKEN_HUB_HTTP_TLS_CERT`, `KRAKEN_HUB_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
-| `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` | `5s` | a TLS handshake that takes longer is dropped; positive |
-| `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
-| `KRAKEN_HUB_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
-| `KRAKEN_HUB_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `KRAKEN_HUB_DASHBOARD_TOKEN` when both are set (as `KRAKEN_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
-| `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN`, `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN_FILE` | none | at least 16 characters; the [processor controls](#processor-control)' token (`Authorization: Bearer <token>` on the mutating calls), which also reads what the dashboard token reads; the file variant is read and reloaded like `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`. Equal to the dashboard token (whatever the source) is a config error at start, and a reload that would make them equal keeps both previous tokens. Unset and no ACL entry with `control = true`: the controls answer 403 `controls are disabled` |
-| `KRAKEN_HUB_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters); at most `20s`, the 30 s reset lease minus its 10 s renewal period |
-| `KRAKEN_HUB_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
-| `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS` | `false` | ask the [event browser](#event-browser) for event payloads (record detail, `q`) for a request that presents the dashboard or write token (a token must be configured too) |
-| `KRAKEN_HUB_EVENT_MAX_TAILS` | `4` | event tails open at once on this hub (1 to 1024); one more is 429 |
+| `SNODRA_SERVER_AUTH_MODE` | `off` | `off`, `permissive` (evaluate every rule, log and count violations, allow everything) or `enforce` (refuse them); anything but `off` needs `SNODRA_SERVER_ACL_FILE`. See [Security](#security) |
+| `SNODRA_SERVER_ACL_FILE` | none | TOML ACL: SHA-256 of each static token to its service, `handle` and `send` patterns; reloaded when it changes |
+| `SNODRA_SERVER_JWT_ISSUER` | none | the `iss` a JWT credential must carry, exact match; unset: JWT credentials are off and refused as "not configured". Needs an auth mode other than `off`. See [Security](#security) |
+| `SNODRA_SERVER_JWT_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | where the signing keys are fetched from (Keycloak's path, no OIDC discovery); separate from the issuer so a hub can fetch internally and validate the public issuer. `http://` warns once unless loopback or a single-label name. Without an issuer it is a startup error |
+| `SNODRA_SERVER_JWT_AUDIENCE` | none | when set, a JWT's `aud` (string or array) must contain it |
+| `SNODRA_SERVER_JWT_LEEWAY` | `30s` | clock skew tolerated on `exp`, `nbf` and `iat` |
+| `SNODRA_SERVER_JWT_EXPIRY_GRACE` | `30s` | how long after `exp` a JWT session stays open without a refresh |
+| `SNODRA_SERVER_JWKS_REFRESH` | `5m` | how often the signing keys are fetched again (an unknown `kid` fetches at most once per 30 s on top); positive |
+| `SNODRA_SERVER_JWT_JWKS_CA` | none | an extra CA (PEM) trusted for the key fetch, on top of the platform roots; an unreadable file is a startup error whatever the URI scheme (unused, with a warning, over `http://`) |
+| `SNODRA_SERVER_RELOAD_INTERVAL` | `5s` | how often the ACL and the TLS pairs are checked for changes; SIGHUP reloads at once |
+| `SNODRA_SERVER_TLS_CERT`, `SNODRA_SERVER_TLS_KEY` | none | PEM pair of the gRPC listener, both or neither; the listener then accepts TLS only |
+| `SNODRA_SERVER_TLS_CLIENT_CA` | none | PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS); needs the gRPC pair; an unreadable or empty bundle is a startup error; reloaded with the certificates (a bad file keeps the previous CAs, counted); the HTTP port never asks for a certificate; with `AUTH_MODE=off` it authenticates nothing beyond the handshake (startup warning). See [Security](#security) |
+| `SNODRA_SERVER_TLS_CLIENT_AUTH` | `optional` (when the CA is set) | `optional`: no certificate is fine (token or JWT), one that is presented must verify; `required`: a client without a valid certificate fails the handshake. Without `SNODRA_SERVER_TLS_CLIENT_CA` it is a startup error |
+| `SNODRA_SERVER_HTTP_TLS_CERT`, `SNODRA_SERVER_HTTP_TLS_KEY` | the gRPC pair | PEM pair of the HTTP listener |
+| `SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT` | `5s` | a TLS handshake that takes longer is dropped; positive |
+| `SNODRA_SERVER_TLS_HANDSHAKES_PER_IP` | `32` | TLS handshakes in progress at once from one peer IP; more are dropped at once; `0` removes the cap |
+| `SNODRA_SERVER_DASHBOARD_TOKEN` | none | at least 16 characters; when set `/api/v1/*` and the gRPC `Topology` call need `Authorization: Bearer <token>` |
+| `SNODRA_SERVER_DASHBOARD_TOKEN_FILE` | none | a file holding the dashboard token (trailing newline trimmed, same rules as the variable); read at startup and again on the reload poll, so a rotation needs no restart. Wins over `SNODRA_SERVER_DASHBOARD_TOKEN` when both are set (as `SNODRA_MESSAGING_HUB_TOKEN_FILE` does in the client libraries). An unreadable or invalid file stops the hub at startup; at a reload it keeps the previous token and logs an error. Prefer it to the variable: an environment variable shows in `docker inspect` and `/proc` |
+| `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN`, `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE` | none | at least 16 characters; the [processor controls](#processor-control)' token (`Authorization: Bearer <token>` on the mutating calls), which also reads what the dashboard token reads; the file variant is read and reloaded like `SNODRA_SERVER_DASHBOARD_TOKEN_FILE`. Equal to the dashboard token (whatever the source) is a config error at start, and a reload that would make them equal keeps both previous tokens. Unset and no ACL entry with `control = true`: the controls answer 403 `controls are disabled` |
+| `SNODRA_SERVER_CONTROL_TIMEOUT` | `10s` | how long a control call waits for an instance's answer (pause, resume, a reset's prepare and finish, dead letters); at most `20s`, the 30 s reset lease minus its 10 s renewal period |
+| `SNODRA_SERVER_RESET_TIMEOUT` | `120s` | how long the instance that executes a reset may take |
+| `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS` | `false` | ask the [event browser](#event-browser) for event payloads (record detail, `q`) for a request that presents the dashboard or write token (a token must be configured too) |
+| `SNODRA_SERVER_EVENT_MAX_TAILS` | `4` | event tails open at once on this hub (1 to 1024); one more is 429 |
 
 The event browser's own settings (sources, scan and time budgets, concurrent searches and tails, tail duration) are the
-`kraken-event-browser` add-on's. `KRAKEN_HUB_KAFKA_BOOTSTRAP`, `KRAKEN_HUB_EVENT_TOPICS`,
-`KRAKEN_HUB_EVENT_SEARCH_MAX_SCANNED`, `KRAKEN_HUB_EVENT_SEARCH_MAX_RESULTS`, `KRAKEN_HUB_EVENT_SEARCH_TIMEOUT`,
-`KRAKEN_HUB_EVENT_MAX_SEARCHES`, `KRAKEN_HUB_EVENT_TAIL_DURATION` and `KRAKEN_HUB_GROUP_LAG_INTERVAL` are no longer
+`snodra-event-browser` add-on's. `SNODRA_SERVER_KAFKA_BOOTSTRAP`, `SNODRA_SERVER_EVENT_TOPICS`,
+`SNODRA_SERVER_EVENT_SEARCH_MAX_SCANNED`, `SNODRA_SERVER_EVENT_SEARCH_MAX_RESULTS`, `SNODRA_SERVER_EVENT_SEARCH_TIMEOUT`,
+`SNODRA_SERVER_EVENT_MAX_SEARCHES`, `SNODRA_SERVER_EVENT_TAIL_DURATION` and `SNODRA_SERVER_GROUP_LAG_INTERVAL` are no longer
 read: a hub that still sets one logs a startup warning naming it and starts as usual.
 
 Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
@@ -135,19 +135,19 @@ Durations accept `30` (seconds), `30s`, `500ms` and `5m`.
 The topology view (`GET /api/v1/topology`, `snodra-server --topology`) is described in [Topology view](#topology-view),
 the dashboard in [Dashboard](#dashboard).
 
-- **Builder call:** `KRAKEN_HUB_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
+- **Builder call:** `SNODRA_SERVER_OTLP_ENDPOINT` defaults to `http://otel-lgtm:4317`. Leaving it
   unset keeps that default; setting it to an empty string disables OTLP export, which is useful
   for `cargo run` without a collector. (For every other variable an empty value means "unset".)
-- **Builder call:** `KRAKEN_HUB_HANDSHAKE_TIMEOUT` (default `10s`): a stream that sends nothing,
+- **Builder call:** `SNODRA_SERVER_HANDSHAKE_TIMEOUT` (default `10s`): a stream that sends nothing,
   or no `Register`, within it is closed with `DEADLINE_EXCEEDED` `no Register within 10s`. A
   `Register` with an empty `instance_id` or `service_name`, or with `initial_permits` 0, is closed
   with `INVALID_ARGUMENT`.
-- Startup fails on a malformed `KRAKEN_HUB_TIMEOUT_OVERRIDES` (entry without `=`, empty type,
+- Startup fails on a malformed `SNODRA_SERVER_TIMEOUT_OVERRIDES` (entry without `=`, empty type,
   non-numeric, zero or above `u32::MAX` milliseconds, a type listed twice) and when
-  `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is less than twice `KRAKEN_HUB_HEARTBEAT_INTERVAL` (one late
+  `SNODRA_SERVER_HEARTBEAT_TIMEOUT` is less than twice `SNODRA_SERVER_HEARTBEAT_INTERVAL` (one late
   heartbeat would evict).
 - **Builder call:** on macOS, port 7000 is held by Control Center (AirPlay Receiver). Either disable
-  AirPlay Receiver in System Settings or set `KRAKEN_HUB_LISTEN=0.0.0.0:7002` (7001 is the dashboard's HTTP port; map the compose
+  AirPlay Receiver in System Settings or set `SNODRA_SERVER_LISTEN=0.0.0.0:7002` (7001 is the dashboard's HTTP port; map the compose
   host port accordingly).
 
 ## Topology view
@@ -158,7 +158,7 @@ and query types each instance handles, who owns each type, and how many requests
 three ways:
 
 ```sh
-grpcurl -plaintext -import-path proto -proto hub.proto localhost:7000 kraken.hub.v1.Hub/Topology   # gRPC, same port as Connect
+grpcurl -plaintext -import-path proto -proto hub.proto localhost:7000 snodra.hub.v1.Hub/Topology   # gRPC, same port as Connect
 curl localhost:7001/api/v1/topology                            # HTTP JSON (the dashboard API)
 snodra-server --topology [--json]                                 # CLI inside the container
 ```
@@ -168,20 +168,20 @@ docker exec snodra-server /app/snodra-server --topology
 docker exec snodra-server /app/snodra-server --topology --json
 ```
 
-- `GET /api/v1/topology` is served on `KRAKEN_HUB_HTTP_LISTEN` (camelCase fields, `kind` as
+- `GET /api/v1/topology` is served on `SNODRA_SERVER_HTTP_LISTEN` (camelCase fields, `kind` as
   `COMMAND` or `QUERY`) with the rest of the [dashboard API](#dashboard). Besides the dashboard
   paths (`/`, `/ui`, `/ui/...`, `/api/v1/...`) every path is 404, and with
-  `KRAKEN_HUB_DASHBOARD_ENABLED=false` every path is: the gRPC call and the CLI remain.
+  `SNODRA_SERVER_DASHBOARD_ENABLED=false` every path is: the gRPC call and the CLI remain.
   **Builder call:** the HTTP endpoint is a second port (7001), because the gRPC port speaks only
-  HTTP/2 gRPC. An empty `KRAKEN_HUB_HTTP_LISTEN` disables it.
+  HTTP/2 gRPC. An empty `SNODRA_SERVER_HTTP_LISTEN` disables it.
 - `snodra-server --topology` prints a table (`--json` prints the JSON). It probes `127.0.0.1` on the
-  port of `KRAKEN_HUB_LISTEN` (or `--address host:port|https://host:port`) with a 3 s timeout, over
+  port of `SNODRA_SERVER_LISTEN` (or `--address host:port|https://host:port`) with a 3 s timeout, over
   TLS as `--tls-ca <pem>`, an `https://` address or the environment's TLS setting say, with
-  `KRAKEN_HUB_DASHBOARD_TOKEN` from its environment when the hub has one. Exit codes: 0 success, 1 failure (hub
+  `SNODRA_SERVER_DASHBOARD_TOKEN` from its environment when the hub has one. Exit codes: 0 success, 1 failure (hub
   unreachable or timeout), 2 usage error (unknown or conflicting flags; usage goes to stderr).
   With nothing connected it prints `no services connected` and a totals line.
-- Without `KRAKEN_HUB_DASHBOARD_TOKEN` the topology has no authentication, like the rest of the
-  port-7000 surface, except that with `KRAKEN_HUB_AUTH_MODE=enforce` the gRPC call needs an ACL token;
+- Without `SNODRA_SERVER_DASHBOARD_TOKEN` the topology has no authentication, like the rest of the
+  port-7000 surface, except that with `SNODRA_SERVER_AUTH_MODE=enforce` the gRPC call needs an ACL token;
   with the token, the gRPC call and `GET /api/v1/topology` need it (see [Security](#security)).
 - The hub has no gRPC server reflection, hence the `-proto` flags. grpcurl's proto-JSON prints
   int64 as strings and omits default values, so its output differs textually from
@@ -193,10 +193,10 @@ Top level:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `hubId` | string | `KRAKEN_HUB_ID` |
+| `hubId` | string | `SNODRA_SERVER_ID` |
 | `hubStartedAtMs` | int64 | hub start, epoch milliseconds |
 | `nowMs` | int64 | snapshot time, epoch milliseconds |
-| `heartbeatTimeoutMs` | int64 | the configured `KRAKEN_HUB_HEARTBEAT_TIMEOUT`, in ms |
+| `heartbeatTimeoutMs` | int64 | the configured `SNODRA_SERVER_HEARTBEAT_TIMEOUT`, in ms |
 | `services` | list | one entry per service with at least one live session |
 | `types` | list | one entry per owned type, including orphaned ones |
 | `totals` | object | `services`, `instances`, `commandTypes`, `queryTypes`, `inFlight`, `queued` (all counts; `inFlight` includes queued requests) |
@@ -214,7 +214,7 @@ Top level:
 | `commandTypes` | list of string | command types this instance registered |
 | `queryTypes` | list of string | query types this instance registered (shared ones included) |
 | `sharedQueryTypes` | list of string | the query types it registered as shared (`Register.shared_query_types`) |
-| `clientVersion` | string | `Register.client_version`, for example `kraken-messaging/0.1.0`; empty when the client sent none |
+| `clientVersion` | string | `Register.client_version`, for example `snodra-messaging/0.1.0`; empty when the client sent none |
 | `permitsAvailable` | uint32 | permits left: requests the hub may still forward before the next `Permits` |
 | `queued` | uint32 | requests waiting in the hub's queue for this instance |
 | `loadFactor` | uint32 | `Register.load_factor` as applied (0 reads as 100) |
@@ -249,14 +249,14 @@ types and in-flight counts are attached by instance id (empty or zero when absen
 ### Staleness
 
 **Builder call:** an instance is `stale` when its last heartbeat is older than a third of the
-eviction threshold (`KRAKEN_HUB_HEARTBEAT_TIMEOUT`).
+eviction threshold (`SNODRA_SERVER_HEARTBEAT_TIMEOUT`).
 It is still connected and still receives requests; the flag is an early warning before the hub
 evicts it at the full timeout. A brief `stale: true` right before a heartbeat arrives is normal.
 
 ### Orphaned types
 
 **Builder call:** when the last instance of a service leaves, its types stay in `types` with
-`orphaned: true` and a growing `orphanedForMs` until `KRAKEN_HUB_OWNER_GRACE` expires and the
+`orphaned: true` and a growing `orphanedForMs` until `SNODRA_SERVER_OWNER_GRACE` expires and the
 sweep removes them. Requests for an orphaned type fail with `NO_HANDLER`.
 
 ### Register rejections
@@ -281,7 +281,7 @@ A web dashboard is compiled into the binary and served on the HTTP port: open
 calls whom and how that goes, and controls the services' event processors. Decision record:
 umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 
-> **Authentication is opt-in for reads.** Without `KRAKEN_HUB_DASHBOARD_TOKEN` the dashboard and
+> **Authentication is opt-in for reads.** Without `SNODRA_SERVER_DASHBOARD_TOKEN` the dashboard and
 > the reads of `/api/v1/` are open to anyone who reaches port 7001: keep the
 > port on the private network (the page footer says the same). With the token set the page asks
 > for it and every data endpoint needs it; see [Security](#security). The only writes, the
@@ -293,13 +293,13 @@ umbrella `docs/adr/0015-embedded-hub-dashboard.md`.
 | Overview | totals (services, instances and how many are stale, types, in flight, queued, requests and errors over the window); a graph in three columns, sender services, types, owner services, with edge thickness by request count (log scale) and colour by error share (1 % warning, 5 % critical); hovering or focusing a node follows its traffic; a table of the same edges with requests, errors, p50 and p99 |
 | Services | every service with its event processors (a count linking to the Processors page and a dead-letter badge) and its live instances: instance id, client version, permits, queued, in flight as handler and as sender, load factor, tags, heartbeat age with a stale flag, connected since, the hubs it reports (flagged when this hub is missing or the report is older than 15 s); the types each service handles. With peers under "All hubs": every reachable hub's instances merged by instance id, with "Seen by" and per-instance disagreements |
 | Types | every type: kind, owners (with a "shared" badge for a shared query type), live instances, state (owned, orphaned for how long, no owner), senders, requests, errors, p50, p99; filters by text, kind and problems |
-| Settings | hub id, version, start time, dashboard build, and every `KRAKEN_HUB_*` setting with its effective value and default |
+| Settings | hub id, version, start time, dashboard build, and every `SNODRA_SERVER_*` setting with its effective value and default |
 | Processors | every (service, processor): subscription, source, event store (its capabilities in the title), worst state over its instances, instances, segments, lag (sum of the known lags), dead letters (or the mode `event-store` / `log`), the latest error with its age; a row opens to every instance's report and segments (position, committed, head and replay end as text, lag), kept open in the URL (`#/processors?open=service-b/orders`); filters by text and problems. Under "All hubs" merged over every reachable hub, the freshest report of an instance winning (see [Event processors](#event-processors)). While an [event browser](#event-browser) is connected, a second card lists the subscriptions with a committed position that no live instance reports (state, segments, lag, as `events/lag` of the browser's default source reads them, at most every 15 s); without a browser nothing extra |
 | Dead letters | the processors that keep letters, and per processor (`#/dead-letters?service=…&processor=…`) its letters as one instance lists them through the hub (no payloads); with a write credential Retry, Retry all and Discard (confirmed). Read on demand, not live |
 | Events | only while an event browser is connected (the navigation follows `version.eventBrowser.installed`; opened without one it says so): a search form (source, time presets or from/to, type with `*` prefixes, key, publishing service, correlation id, user id, event id, payload text where payloads are served), results newest first with "Load more" and the scan statistics, a record's headers and payload (pretty-printed JSON) or the reason it is hidden, a tail (new rows drawn once per animation frame, at most 500 kept, pause; `tail=on` in the page's URL opens it tailing); type and correlation id link to a search. This hub only. See [Event browser](#event-browser) |
 
 Filters live in the URL (`#/types?q=orders&kind=QUERY`), so a filtered view can be linked. With
-`KRAKEN_HUB_GRAFANA_URL` set the header links to Grafana. With `KRAKEN_HUB_PEERS` set the header
+`SNODRA_SERVER_GRAFANA_URL` set the header links to Grafana. With `SNODRA_SERVER_PEERS` set the header
 lists this hub and every peer with its reachability, and offers "All hubs" (the default,
 remembered per browser) or "This hub"; see [Multiple hubs](#multiple-hubs).
 
@@ -322,7 +322,7 @@ All under `/api/v1/`, `GET`, JSON (camelCase), `Cache-Control: no-store`:
 | `types` | `types[]`: `type`, `kind`, `owners` (a list, room for shared query types), `registered` (false for a type only seen in traffic, i.e. answered `NO_HANDLER`), `instances`, `liveInstances`, `orphaned`, `orphanedForMs`, `senders`, `traffic {count, errors, p50Ms, p99Ms}`; `windowMs` |
 | `graph` | `nodes[]` (`kind: service` with `instances`, `staleInstances`; `kind: type` with `typeKind`, `owners`, `registered`, `orphaned`; ids `service:<name>`, `type:<name>`), `edges[]` (`from`, `to`, `role: send` sender -> type, `role: handle` type -> owner merged over senders, every owned type even without traffic; `count`, `errors`, `p50Ms`, `p99Ms`), `totals`, `windowMs`, `maxEdges`, `evictedEdges` |
 | `settings` | `settings[]`: `name`, `value`, `default`, `secret`, `description`; a secret is listed with `value: null` (none exist yet; URL user info is replaced by `***`) |
-| `version` | `hubId`, `version`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`KRAKEN_HUB_PEERS` as origins; empty without peers), `eventBrowser` (`installed`, `payloads`) |
+| `version` | `hubId`, `version`, `startedAtMs`, `nowMs`, `buildId`, `grafanaUrl` (never with user info), `windowMs`, `peers` (`SNODRA_SERVER_PEERS` as origins; empty without peers), `eventBrowser` (`installed`, `payloads`) |
 | `events`, `events/{source}/{segment}/{position}`, `events/sources`, `events/lag`, `events/tail` | the [event browser](#event-browser) |
 | `processors` | the event processors per service, aggregated over the instances (see [Event processors](#event-processors)) |
 | `services/{service}/processors/{processor}/dead-letters?limit=` | a processor's dead letters, listed by one instance; the mutating routes under `services/` are in [Processor control](#processor-control) |
@@ -343,22 +343,22 @@ The router counts every request that reaches a terminal state on its `(sender se
 edge: requests, errors (any outcome but `ok`) and its latency. In memory only, like everything
 in the hub.
 
-- Window: `KRAKEN_HUB_EDGE_STATS_WINDOW` (5 min) in ten slots (30 s each), so a view covers
+- Window: `SNODRA_SERVER_EDGE_STATS_WINDOW` (5 min) in ten slots (30 s each), so a view covers
   between 4.5 and 5 minutes. Expired edges are swept once per slot.
 - Latency: a sparse log-scale histogram per slot, 8 bins per power of two; p50 and p99 are off by
   at most about 4.4 %.
 - **Builder call:** requests the hub answers without routing them (`NO_HANDLER`,
   `INVALID_REQUEST`, a duplicate id) count as errors but have no latency, so they do not drag
   the percentiles to zero. Requests whose sender disconnected are not counted (as in
-  `kraken_hub_requests_total`). The `handle` edge of a type merges all its requests, including
+  `snodra_hub_requests_total`). The `handle` edge of a type merges all its requests, including
   `NO_HANDLER` answers while the owner had no instance.
-- **Builder call:** cap `KRAKEN_HUB_EDGE_STATS_MAX_EDGES` (10 000). At the cap a new edge drops
+- **Builder call:** cap `SNODRA_SERVER_EDGE_STATS_MAX_EDGES` (10 000). At the cap a new edge drops
   the least recently used edges, 1 % of the cap at a time (at least one), counted in
   `evictedEdges` and shown on the overview. Names longer than 200 bytes are cut (with `…`), so
   a client cannot grow the map with huge type names.
 - **Builder call:** error colours start at 1 % (warning) and 5 % (critical) of the window's
   requests; below 1 % the edge keeps the neutral colour and the table still shows its errors.
-- `KRAKEN_HUB_DASHBOARD_ENABLED=false` also stops collecting the statistics.
+- `SNODRA_SERVER_DASHBOARD_ENABLED=false` also stops collecting the statistics.
 
 ### Assets, caching and headers
 
@@ -374,12 +374,12 @@ package manager and no build step; the files are compiled into the binary with `
 - Every dashboard and API response carries `Content-Security-Policy: default-src 'self';
   script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' <peers>; font-src 'self';
   object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` (`<peers>`:
-  the `KRAKEN_HUB_PEERS` origins, nothing without peers), plus
+  the `SNODRA_SERVER_PEERS` origins, nothing without peers), plus
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
   Names registered by clients only ever reach the page as text, also those read from peers.
 - **Builder call:** `/` and `/ui` redirect to `/ui/` with `307` and a relative `Location`
   (`ui/`), so the redirect works behind a proxy that mounts the hub under a path and is not
-  cached past a `KRAKEN_HUB_DASHBOARD_ENABLED=false`.
+  cached past a `SNODRA_SERVER_DASHBOARD_ENABLED=false`.
 
 ### Multiple hubs
 
@@ -391,7 +391,7 @@ talk to each other; each instance connects to every hub. The hub side:
   report per session, replaced by each and dropped with the session, and shows it as
   `connectedHubIds` / `statusAgeMs`. **Builder call:** at most 64 ids of at most 128 bytes are
   kept; empty, over-long (ignored, never cut) and duplicate ids are dropped.
-- **Dashboard peers.** The page reads `/api/v1/topology` of every `KRAKEN_HUB_PEERS` entry from
+- **Dashboard peers.** The page reads `/api/v1/topology` of every `SNODRA_SERVER_PEERS` entry from
   the browser (3 s timeout each; on every refresh of a merging page, otherwise every 5 s for the
   header) and, under "All hubs", merges them: the Services page by instance id with "Seen by",
   the Overview with totals over all hubs and a list of disagreements (at most 200 rows): an
@@ -399,14 +399,14 @@ talk to each other; each instance connects to every hub. The hub side:
   type owned by different services on different hubs, an instance whose reported hubs omit a
   reachable hub. An unreachable peer is shown as unreachable, not as a disagreement. The traffic
   graph and the Types page stay per hub.
-- **CORS.** `/api/v1/*` answers an `Origin` that is exactly one of `KRAKEN_HUB_PEERS` with
+- **CORS.** `/api/v1/*` answers an `Origin` that is exactly one of `SNODRA_SERVER_PEERS` with
   `Access-Control-Allow-Origin: <that origin>` (and `Vary: Origin` whenever peers are set), never
   a wildcard, never credentials; a preflight is `204` (`GET` only) for such an origin and `403`
   otherwise. Other origins, the page and its assets get no CORS header.
 
 Developing the page: edit `ui/`, `cargo run` (assets are embedded in debug builds too) and
 reload. `tests/dashboard_ui.rs` checks that every referenced asset and every import resolves,
-and loads each page in headless Chrome when one is installed (`KRAKEN_HUB_TEST_BROWSER=<path>`
+and loads each page in headless Chrome when one is installed (`SNODRA_SERVER_TEST_BROWSER=<path>`
 picks a binary, `none` skips; CI without a browser runs the static checks only).
 
 ## Event processors
@@ -470,8 +470,8 @@ Decision record: umbrella `docs/adr/0023-hub-control-plane-for-event-processors.
 JSON body is the umbrella's `docs/05-services/hub.md`, "Processor control"). The hub is a stateless control plane:
 `src/control.rs` sends `ServerMessage.control` to every live session of the service whose latest status lists the
 processor, matches each `ClientMessage.control_reply`
-to its request by `control_id` and session, times requests out (`KRAKEN_HUB_CONTROL_TIMEOUT`, 10 s; a reset's execute
-`KRAKEN_HUB_RESET_TIMEOUT`, 120 s), fails them at once when the session leaves, and drops (and counts) replies nobody
+to its request by `control_id` and session, times requests out (`SNODRA_SERVER_CONTROL_TIMEOUT`, 10 s; a reset's execute
+`SNODRA_SERVER_RESET_TIMEOUT`, 120 s), fails them at once when the session leaves, and drops (and counts) replies nobody
 waits for. The state lives in each service's store (`processor_control`), not in the hub.
 
 | Route under `/api/v1/services/{service}/processors/{processor}/` | Credential | Does |
@@ -481,7 +481,7 @@ waits for. The state lives in each service's store (`processor_control`), not in
 | `GET dead-letters?limit=n` | read | the oldest `n` letters (default 50, at most 100) and the total, from the instance with the freshest status |
 | `POST dead-letters/{id}/retry`, `POST dead-letters/retry-all`, `DELETE dead-letters/{id}` | write | the library's retry, retry all and discard |
 
-- **Write credential:** `Authorization: Bearer` with `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` (constant-time against its
+- **Write credential:** `Authorization: Bearer` with `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN` (constant-time against its
   digest) or a static ACL token or JWT whose ACL entry has `control = true`. Neither configured: every write is 403
   `controls are disabled`. The dashboard token never writes; the write token also reads.
 - **Status codes:** 400 bad body, 401 no or an unknown credential, 403 no right or disabled, 404 unknown service or
@@ -492,13 +492,13 @@ waits for. The state lives in each service's store (`processor_control`), not in
   finish or may already have run reset handlers or deleted markers (its `error.message` says so). The finish goes out
   once the lease renewals in flight are answered, so a late renewal never re-takes the lock.
 - **Audit:** one `info` line `control` per call past the credential check (caller, service, processor, action,
-  outcome, duration, the reset's operation id) and `kraken_hub_control_total{action,outcome}`.
+  outcome, duration, the reset's operation id) and `snodra_hub_control_total{action,outcome}`.
 - **Dashboard:** a second password field, "Write token" (`sessionStorage`, never a URL), shows the controls on the
   Processors and Dead letters pages; with peers a control goes to the hub that served the page, which reaches every
   instance.
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $KRAKEN_HUB_DASHBOARD_WRITE_TOKEN" -H 'Content-Type: application/json' \
+curl -s -X POST -H "Authorization: Bearer $SNODRA_SERVER_DASHBOARD_WRITE_TOKEN" -H 'Content-Type: application/json' \
   -d '{"to":"earliest"}' http://localhost:7001/api/v1/services/service-b/processors/audit/reset
 ```
 
@@ -506,13 +506,13 @@ curl -s -X POST -H "Authorization: Bearer $KRAKEN_HUB_DASHBOARD_WRITE_TOKEN" -H 
 
 Decision records: umbrella `docs/adr/0027-modular-event-store.md` (the event browser as an add-on of the hub) and
 `docs/adr/0025-hub-event-browser-reads-kafka.md` (the routes, bounds and payload rules, which stay). The hub reads no
-event store. The `kraken-event-browser` add-on connects to the hub like any service and handles the reserved query
-types `kraken.events.Search`, `kraken.events.Get`, `kraken.events.Sources`, `kraken.events.Lag` (point queries) and
-`kraken.events.Tail` (a streaming query). Each `/api/v1/events*` call becomes one hub-internal query to a live browser
+event store. The `snodra-event-browser` add-on connects to the hub like any service and handles the reserved query
+types `snodra.events.Search`, `snodra.events.Get`, `snodra.events.Sources`, `snodra.events.Lag` (point queries) and
+`snodra.events.Tail` (a streaming query). Each `/api/v1/events*` call becomes one hub-internal query to a live browser
 instance (`Router::query_internal`, `Router::stream_internal`), routed, timed and flow-controlled like a client's;
 `src/events.rs` builds the requests, reads the answers and keeps the payload rules. Whether a browser is installed is
-read from the registry (a live instance handling `kraken.events.Search`; not the type's owner kept through
-`KRAKEN_HUB_OWNER_GRACE` after the last browser left), not from a setting, and per hub: a hub answers the
+read from the registry (a live instance handling `snodra.events.Search`; not the type's owner kept through
+`SNODRA_SERVER_OWNER_GRACE` after the last browser left), not from a setting, and per hub: a hub answers the
 events routes only while a browser is connected to *that* hub. The add-on connects to every hub of its list, as every
 service instance does, so each hub of a deployment has it.
 
@@ -538,24 +538,24 @@ service (the record header `source`). Empty parameters count as absent; times ar
   within the deadline is 504; anything else (the browser left, its own error without those details, an answer that is
   not the expected JSON or over 2 MiB, a tail part over 64 KiB) is 502 "the event browser failed to answer", never the
   browser's raw words.
-- **Deadlines:** a point query asks a 30 s timeout, clamped by the router as any client's (`KRAKEN_HUB_MAX_TIMEOUT_MS`,
-  and `KRAKEN_HUB_TIMEOUT_OVERRIDES` per `kraken.events.*` type); a search asks the browser for a time budget 2 s under
+- **Deadlines:** a point query asks a 30 s timeout, clamped by the router as any client's (`SNODRA_SERVER_MAX_TIMEOUT_MS`,
+  and `SNODRA_SERVER_TIMEOUT_OVERRIDES` per `snodra.events.*` type); a search asks the browser for a time budget 2 s under
   that deadline, so it answers what it found (`stoppedBy: "timeBudget"`) before the hub gives up.
 - **Tail:** the hub answers once the browser's `start` came (a refused tail is an HTTP error, not a stream). The
-  `start` must arrive within the internal stream's idle timeout (`KRAKEN_HUB_DEFAULT_TIMEOUT_MS`, 5 s by default,
-  counted from the forward to the browser), else the tail is 504; a `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for
-  `kraken.events.Tail` raises it for a source with many segments or a slow store. It asks a
+  `start` must arrive within the internal stream's idle timeout (`SNODRA_SERVER_DEFAULT_TIMEOUT_MS`, 5 s by default,
+  counted from the forward to the browser), else the tail is 504; a `SNODRA_SERVER_TIMEOUT_OVERRIDES` entry for
+  `snodra.events.Tail` raises it for a source with many segments or a slow store. It asks a
   heartbeat of two fifths of the internal stream's idle timeout (2 s with the default 5 s; between 100 ms and 15 s) and
   turns each `heartbeat` part into the SSE heartbeat, stamped with the hub's clock, and a longest duration 2 s under
-  `KRAKEN_HUB_MAX_STREAM_DURATION`. A reader that leaves cancels the browser's tail (`Cancel`); a browser that goes away
+  `SNODRA_SERVER_MAX_STREAM_DURATION`. A reader that leaves cancels the browser's tail (`Cancel`); a browser that goes away
   or sends a part the hub cannot read ends the stream with `end` `failed`; this hub stopping ends it with `shutdown`.
-  At most `KRAKEN_HUB_EVENT_MAX_TAILS` (4, at most 1024) tails are open on a hub; one more is 429.
-- **Payloads** (the detail, `q`) only with `KRAKEN_HUB_EVENT_BROWSER_PAYLOADS=true`, a dashboard or write token
+  At most `SNODRA_SERVER_EVENT_MAX_TAILS` (4, at most 1024) tails are open on a hub; one more is 429.
+- **Payloads** (the detail, `q`) only with `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS=true`, a dashboard or write token
   configured, and one presented: only then does the hub ask the browser for the payload (`Get.payload: true`) or send
   `q`. Otherwise `"payload": {"hidden": "payloads-off" | "no-token-configured" | "no-token-presented", "reason":
   "..."}` and `q` is 403 before the browser is asked. A payload the hub did not ask for is dropped, whatever the
   browser sends. Each payload served: one `info` line `event payload served` (caller, source, segment, position, size,
-  correlation id) and `kraken_hub_event_payload_views_total`; a payload search: one line `event payload search`
+  correlation id) and `snodra_hub_event_payload_views_total`; a payload search: one line `event payload search`
   (caller, source, tail, correlation id; never the text). Never logged, cached, in a metric, a result, the tail or an
   error.
 - **Who asked:** each query carries the headers `userId` (the token presented, `dashboard-token` or `write-token`,
@@ -563,30 +563,30 @@ service (the record header `source`). Empty parameters count as absent; times ar
   else a fresh one); every answer carries `X-Correlation-Id` back, and the audit lines the same id. The sender is the
   hub itself (service `snodra-server`, instance `snodra-server/<uuid>`: no client may register that service name or that
   instance prefix). The browser treats `userId` and `correlationId` as information for its logs, not as an identity:
-  any client allowed to send a `kraken.events.*` type can set them.
+  any client allowed to send a `snodra.events.*` type can set them.
 - **Bounds** of the reads (records scanned, results, time per search, concurrent searches and tails, tail duration,
   buffer for a slow reader) are the add-on's settings.
-- **Metrics:** `kraken_hub_event_browser_requests_total{kind=search|record|sources|lag|tail,
+- **Metrics:** `snodra_hub_event_browser_requests_total{kind=search|record|sources|lag|tail,
   outcome=ok|bad_request|forbidden|not_found|too_many|unavailable|not_installed|timeout|failed}`,
-  `kraken_hub_event_browser_scanned_records` (as the browser reports it), `kraken_hub_event_tails` (open on this hub),
-  `kraken_hub_event_payload_views_total`. The lag of subscriptions without a live instance is the add-on's metric.
+  `snodra_hub_event_browser_scanned_records` (as the browser reports it), `snodra_hub_event_tails` (open on this hub),
+  `snodra_hub_event_payload_views_total`. The lag of subscriptions without a live instance is the add-on's metric.
 
 To install a browser under access control, give its credential the `event-browser` right; nothing else may handle a
-`kraken.events.*` type ([Security](#security)):
+`snodra.events.*` type ([Security](#security)):
 
 ```toml
 [[service]]
-name = "kraken-event-browser"
+name = "snodra-event-browser"
 event-browser = true
 ```
 
-With `KRAKEN_HUB_AUTH_MODE` `off` (the default) or `permissive`, the ACL decides nothing: any connected client may
-register the `kraken.events.*` types or send them, and a client that sends them reads events straight from the
+With `SNODRA_SERVER_AUTH_MODE` `off` (the default) or `permissive`, the ACL decides nothing: any connected client may
+register the `snodra.events.*` types or send them, and a client that sends them reads events straight from the
 browser, without the hub's payload rules or audit lines. Run the browser with access control enforced wherever those
 rules matter.
 
 ```bash
-H="Authorization: Bearer $KRAKEN_HUB_DASHBOARD_TOKEN"
+H="Authorization: Bearer $SNODRA_SERVER_DASHBOARD_TOKEN"
 curl -s -H "$H" 'http://localhost:7001/api/v1/events?correlationId=c-7f1e&limit=20'
 curl -s -H "$H" 'http://localhost:7001/api/v1/events/kraken.events/3/1841'
 curl -sN -H "$H" 'http://localhost:7001/api/v1/events/tail?type=orders.*'
@@ -599,8 +599,8 @@ Decision records: umbrella `docs/adr/0018-hub-access-control.md`,
 `docs/adr/0019-hub-jwt-authentication.md` and `docs/adr/0020-hub-mutual-tls.md`; operator how-to:
 umbrella `docs/06-security.md`. Everything here is opt-in; the default (`off`) checks nothing.
 
-**Service tokens and the ACL.** With `KRAKEN_HUB_AUTH_MODE=enforce` a service must send a static
-token in `Register.credentials.token`. The ACL file (`KRAKEN_HUB_ACL_FILE`) holds one `[[token]]`
+**Service tokens and the ACL.** With `SNODRA_SERVER_AUTH_MODE=enforce` a service must send a static
+token in `Register.credentials.token`. The ACL file (`SNODRA_SERVER_ACL_FILE`) holds one `[[token]]`
 table per token, keyed by the token's SHA-256 (never the token):
 
 ```toml
@@ -613,27 +613,27 @@ send    = ["orders.*"]               # types it may send, in every request mode
 
 Patterns are an exact type, `prefix.*` or `*`. `control = true` lets the entry's credentials call the
 [processor controls](#processor-control); `event-browser = true` lets them register the event browser's
-reserved `kraken.events.*` query types (`kraken-event-browser`), which no `handle` pattern grants, not even
-`*` (a `handle` pattern that reaches for them, `kraken.*`, `kraken.events.*` or one of the types, logs a warning when
+reserved `snodra.events.*` query types (`snodra-event-browser`), which no `handle` pattern grants, not even
+`*` (a `handle` pattern that reaches for them, `snodra.*`, `snodra.events.*` or one of the types, logs a warning when
 the file is read; a bare `*` does not). Sending a
-`kraken.events.*` type likewise needs a `send` pattern that names it, `kraken.events.*` or the type itself (`*` and
-`kraken.*` do not grant it): an operator who grants one lets that service read events directly from the browser,
+`snodra.events.*` type likewise needs a `send` pattern that names it, `snodra.events.*` or the type itself (`*` and
+`snodra.*` do not grant it): an operator who grants one lets that service read events directly from the browser,
 without the hub's payload rules. `contexts` only accepts `["default"]`. Generate a token with `openssl rand -hex 32` and hash it without echoing it:
 `printf %s "$TOKEN" | snodra-server acl hash -` (or `snodra-server acl hash <token>`).
 
 | Violation | `enforce` | `permissive` |
 |---|---|---|
 | no credentials, unknown token | stream closed with `UNAUTHENTICATED` | logged, counted, allowed |
-| `jwt` credentials with no `KRAKEN_HUB_JWT_ISSUER` | `UNAUTHENTICATED` "jwt credentials are not configured on this hub" | same |
+| `jwt` credentials with no `SNODRA_SERVER_JWT_ISSUER` | `UNAUTHENTICATED` "jwt credentials are not configured on this hub" | same |
 | an invalid JWT (expired, wrong issuer or audience, bad signature, `none`/`HS*`, an ID or refresh token) | `UNAUTHENTICATED` with a short reason, never the token | logged, counted (`jwt_invalid`), allowed as unauthenticated |
 | a JWT for another service (`azp` differs), or for a service with no `[[service]]` table | `PERMISSION_DENIED` "token azp `<a>` is not service `<b>`" / "no ACL entry for service `<a>`" | logged, counted, allowed |
 | a JWT before the first fetch of the signing keys | `UNAVAILABLE` "jwks not loaded yet" (clients retry) | the same, counted (`jwks_unavailable`) |
 | a JWT whose `kid` is not in the key set and no fetch made for it has looked yet (a rotation) | `UNAVAILABLE` "signing key not known yet" (clients retry at the normal backoff); `UNAUTHENTICATED` "unknown signing key" once a fetch made for it found it missing | the same, counted (`jwks_unavailable` / `jwt_invalid`) |
-| a JWT session past `exp` + `KRAKEN_HUB_JWT_EXPIRY_GRACE` without a refresh | stream closed with `UNAUTHENTICATED` "credentials expired" | counted once (`expired`), logged once, session kept |
+| a JWT session past `exp` + `SNODRA_SERVER_JWT_EXPIRY_GRACE` without a refresh | stream closed with `UNAUTHENTICATED` "credentials expired" | counted once (`expired`), logged once, session kept |
 | a service name the token does not grant, a handled type outside `handle` | stream closed with `PERMISSION_DENIED`, naming the type | logged, counted, allowed |
-| a handled `kraken.events.*` type without `event-browser = true` | stream closed with `PERMISSION_DENIED` "service `<s>` may not handle type `<t>`: kraken.events.* types need the event-browser right" | logged, counted (`event_browser_denied`), allowed |
-| a handled `kraken.events.*` type and another type outside `handle` | as above: the event-browser denial is the one reported | as above |
-| a request for a type outside `send` (unary, scatter-gather, streaming, subscription); for a `kraken.events.*` type, a `send` without a pattern naming `kraken.events` | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
+| a handled `snodra.events.*` type without `event-browser = true` | stream closed with `PERMISSION_DENIED` "service `<s>` may not handle type `<t>`: snodra.events.* types need the event-browser right" | logged, counted (`event_browser_denied`), allowed |
+| a handled `snodra.events.*` type and another type outside `handle` | as above: the event-browser denial is the one reported | as above |
+| a request for a type outside `send` (unary, scatter-gather, streaming, subscription); for a `snodra.events.*` type, a `send` without a pattern naming `kraken.events` | `Error{PERMISSION_DENIED}`, nothing routed | logged, counted, routed |
 | a `Register` whose instance id starts with `snodra-server/` or whose service name is `snodra-server` (reserved for the hub's own requests) | stream closed with `INVALID_ARGUMENT`, in every mode | the same |
 | a `Register` whose instance id belongs to a live session of **another service** | stream closed with `PERMISSION_DENIED` "instance id `<8 chars>` belongs to another service"; nothing of the holder changes | the same: logged, counted (`instance_takeover`) **and refused**, because handing one service's queue and pending replies to another is never legitimate |
 | the gRPC `Topology` call without the dashboard token or an ACL token | `UNAUTHENTICATED` | allowed when no dashboard token is set; logged, counted (`topology_unauthenticated`) |
@@ -642,9 +642,9 @@ A reconnect of the **same** service takes over its instance id (also between two
 entries of one service, as in a token rotation). With `off` an instance id may change service.
 
 The ACL reloads when the file changes (5 s poll, or SIGHUP); a file that does not parse keeps the
-previous ACL (`kraken_hub_acl_generation`, `kraken_hub_acl_reload_errors_total`). Live sessions are
+previous ACL (`snodra_hub_acl_generation`, `snodra_hub_acl_reload_errors_total`). Live sessions are
 judged again on a change: a removed token or a registration the file no longer allows closes the
-session. Violations are counted in `kraken_hub_auth_violations_total{reason,service}`; logs show a
+session. Violations are counted in `snodra_hub_auth_violations_total{reason,service}`; logs show a
 token only as the first 8 hex characters of its digest. Roll out with `permissive` first.
 
 Refusals are logged once per refused `Register` (the status sent back lists up to 10 forbidden types,
@@ -654,13 +654,13 @@ opens, how many lines were dropped. The metric counts every refusal regardless.
 
 **JWT credentials.** Decision record: umbrella `docs/adr/0019-hub-jwt-authentication.md`. A
 service may register with a Keycloak client-credentials access token in
-`Register.credentials.jwt` instead of a static token. Set `KRAKEN_HUB_JWT_ISSUER` (and an auth
-mode other than `off`); the keys are fetched from `KRAKEN_HUB_JWT_JWKS_URI` in the background, at
-startup, every `KRAKEN_HUB_JWKS_REFRESH` and, throttled to once per 30 s, when a token names an
+`Register.credentials.jwt` instead of a static token. Set `SNODRA_SERVER_JWT_ISSUER` (and an auth
+mode other than `off`); the keys are fetched from `SNODRA_SERVER_JWT_JWKS_URI` in the background, at
+startup, every `SNODRA_SERVER_JWKS_REFRESH` and, throttled to once per 30 s, when a token names an
 unknown `kid` (a rotation needs no restart; a failed fetch keeps the last good keys; startup never
 waits for Keycloak). Algorithms `RS256/384/512`, `PS256/384/512`, `ES256/384`; `none` and `HS*` are
-refused. Checked: signature, `iss` (exact), `exp`, `nbf`, `iat` (with `KRAKEN_HUB_JWT_LEEWAY`), `aud`
-when `KRAKEN_HUB_JWT_AUDIENCE` is set, `typ` when present (must be `Bearer`), and `azp` (required;
+refused. Checked: signature, `iss` (exact), `exp`, `nbf`, `iat` (with `SNODRA_SERVER_JWT_LEEWAY`), `aud`
+when `SNODRA_SERVER_JWT_AUDIENCE` is set, `typ` when present (must be `Bearer`), and `azp` (required;
 it must equal `Register.service_name`). The rights come from a **`[[service]]` table** named after
 the service, never from a `[[token]]` entry (and `[[service]]` tables never apply to static tokens):
 
@@ -684,16 +684,16 @@ service's table closes its session in `enforce`. The topology and the dashboard 
 instance's `authKind` (`token`, `jwt`, `certificate`, `none`), a JWT's or certificate's `expiresAt` and a
 certificate's `certFingerprint`. In Keycloak, give each
 service a confidential client with service accounts only and client id = service name, add an
-audience mapper and set `KRAKEN_HUB_JWT_AUDIENCE`; a user's access token (`azp` = the gateway
+audience mapper and set `SNODRA_SERVER_JWT_AUDIENCE`; a user's access token (`azp` = the gateway
 client) must never get a `[[service]]` table. A token is never logged. The gRPC `Topology` call
 in `enforce` also accepts a valid JWT, or a client certificate, of a service that has a table.
 
 **Client certificates.** Decision record: umbrella `docs/adr/0020-hub-mutual-tls.md`. Set
-`KRAKEN_HUB_TLS_CLIENT_CA` (with the gRPC pair) and the gRPC listener asks for client certificates
-(`KRAKEN_HUB_TLS_CLIENT_AUTH`: `optional` by default, `required` to refuse a client without one; a
+`SNODRA_SERVER_TLS_CLIENT_CA` (with the gRPC pair) and the gRPC listener asks for client certificates
+(`SNODRA_SERVER_TLS_CLIENT_AUTH`: `optional` by default, `required` to refuse a client without one; a
 certificate that is presented must always verify against the bundle, or the handshake fails). A
 service authenticates with a certificate that carries **exactly one URI SAN
-`kraken://service/<name>`** (`<name>`: 1 to 128 characters of `[A-Za-z0-9._-]`; DNS and other SANs
+`snodra://service/<name>`** (`<name>`: 1 to 128 characters of `[A-Za-z0-9._-]`; DNS and other SANs
 are ignored); none, or several, is `PERMISSION_DENIED` "certificate names no service" / "certificate
 names more than one service" at `Register`. The certificate is the session's principal: its rights are
 the `[[service]]` table of that name (the same tables JWTs use), `Register.service_name` must equal the
@@ -705,12 +705,12 @@ the certificate wins; nothing is merged). The session is closed at the certifica
 reloads its certificate and reconnects before `notAfter`; `permissive` counts the expiry once, `off`
 never looks. An ACL reload re-judges certificate sessions like JWT ones; a CA reload applies to new
 handshakes only. Logs and the topology show a certificate only by the first 8 hex characters of its
-SHA-256 fingerprint. Metrics: `kraken_hub_client_certificates_total{result}` (`ok`, `no_service`,
+SHA-256 fingerprint. Metrics: `snodra_hub_client_certificates_total{result}` (`ok`, `no_service`,
 `multiple_services`, `mismatch`, `expired`; one per `Register` that carries a certificate, plus one
 `expired` per session that reaches `notAfter`, none in `off`; `ok` is a usable certificate, the ACL
-may still refuse the `Register`), `kraken_hub_tls_handshake_failures_total{listener,reason}`
+may still refuse the `Register`), `snodra_hub_tls_handshake_failures_total{listener,reason}`
 (`client_cert_missing`, `client_cert_invalid`, `timeout`, `other`),
-`kraken_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
+`snodra_hub_tls_client_ca_reload_errors_total`. There is no CRL or OCSP: issue short-lived
 certificates and remove the service's table to cut it off. `--health-check` and `--topology` take
 `--tls-client-cert <pem>` and `--tls-client-key <pem>` (an error with a plain-text target). Give the
 healthcheck a dedicated probe pair, a client certificate from the client CA naming a service with no
@@ -720,12 +720,12 @@ with the client usage, but then every server certificate of that CA passes the T
 that signs nothing else). With `AUTH_MODE=off` the certificate is only a handshake gate and the hub warns.
 Session resumption is off on a listener with a client CA, so a CA reload applies to every new handshake.
 
-**TLS.** `KRAKEN_HUB_TLS_CERT` / `KRAKEN_HUB_TLS_KEY` (PEM, rustls) make the gRPC listener
-TLS-only, and the HTTP listener too unless `KRAKEN_HUB_HTTP_TLS_*` gives it its own pair. The pair
+**TLS.** `SNODRA_SERVER_TLS_CERT` / `SNODRA_SERVER_TLS_KEY` (PEM, rustls) make the gRPC listener
+TLS-only, and the HTTP listener too unless `SNODRA_SERVER_HTTP_TLS_*` gives it its own pair. The pair
 reloads on change without dropping open connections. Handshakes are bounded: one that takes longer
-than `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT` is dropped, and when every slot (512 per listener) or the
-peer IP's share (`KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`) is busy a new connection is dropped at once
-and counted in `kraken_hub_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
+than `SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT` is dropped, and when every slot (512 per listener) or the
+peer IP's share (`SNODRA_SERVER_TLS_HANDSHAKES_PER_IP`) is busy a new connection is dropped at once
+and counted in `snodra_hub_tls_handshakes_shed_total{listener,reason}` (`slots` or `per_ip`), so a
 flood of half-open connections cannot stall the accept loop. At startup and on each reload
 the hub warns when the private key file is readable by its group or others (Unix: any of `0o077`
 set); `chmod 600` it. The dev sandbox's key is `0644` on purpose (see `dev-hub-pki.sh`) and warns. `--health-check` and `--topology` take
@@ -733,28 +733,28 @@ set); `chmod 600` it. The dev sandbox's key is `0644` on purpose (see `dev-hub-p
 image `HEALTHCHECK` needs no change. The pin is the
 certificate file's content **at the moment of each probe**, not at hub start: while a rotation is
 in flight the file on disk is new before the hub has reloaded it (up to one
-`KRAKEN_HUB_RELOAD_INTERVAL`, 5 s by default, or `kill -HUP` for an immediate reload), so the
+`SNODRA_SERVER_RELOAD_INTERVAL`, 5 s by default, or `kill -HUP` for an immediate reload), so the
 local healthcheck can be red for up to one poll. Let the healthcheck's `retries` cover that, and
 rotate the pair by replacing the key and the certificate together. Client certificates: see above.
 
-**Dashboard token.** `KRAKEN_HUB_DASHBOARD_TOKEN` guards `/api/v1/*`, the event stream
+**Dashboard token.** `SNODRA_SERVER_DASHBOARD_TOKEN` guards `/api/v1/*`, the event stream
 and the gRPC `Topology` call; the page and its assets stay public. In `enforce` mode the gRPC
 `Topology` call also accepts any ACL token (`authorization: Bearer <token>` metadata) and, with no
 dashboard token set, refuses everything else; the HTTP topology is then still open, and the hub
 warns at startup. The token goes in an
 `Authorization: Bearer` header (the page keeps it in `sessionStorage` and reads the event stream
 with `fetch`, so it is never in a URL); a wrong or missing token is a bare `401`. Rotate it by
-rewriting the file behind `KRAKEN_HUB_DASHBOARD_TOKEN_FILE`: the new token applies within one reload
+rewriting the file behind `SNODRA_SERVER_DASHBOARD_TOKEN_FILE`: the new token applies within one reload
 poll and the old one stops working at once. Peers
-(`KRAKEN_HUB_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
-**Write token.** `KRAKEN_HUB_DASHBOARD_WRITE_TOKEN` authorizes the [processor controls](#processor-control) and
+(`SNODRA_SERVER_PEERS`) receive the same token from the page, so all hubs of a deployment share it.
+**Write token.** `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN` authorizes the [processor controls](#processor-control) and
 reads what the dashboard token reads; an ACL entry with `control = true` authorizes them too. Serve the HTTP port over
 TLS when it is set (the hub warns otherwise).
 
-Both libraries send the token, with their OAuth2 settings (`kraken.messaging.hub.oauth2.*`,
-`KRAKEN_HUB_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT, or present a
-client certificate (Kotlin `kraken.messaging.hub.tls.client-cert-file` and `client-key-file`, Rust
-`KRAKEN_HUB_TLS_CLIENT_CERT` and `KRAKEN_HUB_TLS_CLIENT_KEY`; they read the files again and roll their
+Both libraries send the token, with their OAuth2 settings (`snodra.messaging.hub.oauth2.*`,
+`SNODRA_SERVER_OAUTH2_*`) fetch, cache, renew and send a Keycloak client-credentials JWT, or present a
+client certificate (Kotlin `snodra.messaging.hub.tls.client-cert-file` and `client-key-file`, Rust
+`SNODRA_SERVER_TLS_CLIENT_CERT` and `SNODRA_SERVER_TLS_CLIENT_KEY`; they read the files again and roll their
 connections over to a renewed pair without a restart), so `enforce` works with every service that has a
 `[[token]]` entry or a `[[service]]` table; a refused service waits the reconnect backoff cap between
 attempts. The JWT and mTLS sandboxes are the umbrella's `infra/compose.jwt.yaml` and `infra/compose.mtls.yaml`.
@@ -777,18 +777,18 @@ Error codes:
 - Hub-produced: `NO_HANDLER`, `TIMEOUT`, `HANDLER_DISCONNECTED`, **Builder call:**
   `INVALID_REQUEST` (malformed request: missing id, kind or type, or a duplicate in-flight
   `Request.id`, or a request mode this hub does not know), `RESOURCE_EXHAUSTED` (full queue or
-  session buffer; also a subscription refused by `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` or
-  ended by a full `KRAKEN_HUB_SUBSCRIPTION_BUFFER`), `UNAUTHENTICATED` or `PERMISSION_DENIED` (a
+  session buffer; also a subscription refused by `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE` or
+  ended by a full `SNODRA_SERVER_SUBSCRIPTION_BUFFER`), `UNAUTHENTICATED` or `PERMISSION_DENIED` (a
   request access control refuses, see [Security](#security)) and `CANCELLED` (as `ReplyEnd.error` of a stream that
-  outlived `KRAKEN_HUB_MAX_STREAM_DURATION` or a subscription that outlived
-  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`).
+  outlived `SNODRA_SERVER_MAX_STREAM_DURATION` or a subscription that outlived
+  `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION`).
 - Handler-produced codes in a `Reply{error}`, a `ReplyPart.error` or a `ReplyEnd.error` are
   forwarded unchanged.
 
 Metrics outcome labels are `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`,
 `invalid_request`, `resource_exhausted`, `denied` and `cancelled` (a stream or subscription
-the sender cancelled, or one that outlived its max duration); `kraken_hub_requests_total` and
-`kraken_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
+the sender cancelled, or one that outlived its max duration); `snodra_hub_requests_total` and
+`snodra_hub_request_duration_seconds` also have a `mode` label (`unary`, `scatter_gather`,
 `streaming`, `subscription`), so a gather's or stream's latency (to its `ReplyEnd`) and a
 subscription's (to its initial part) stay apart from the unary latency of the same type.
 **Builder call:** any handler `Reply{error}` counts as
@@ -809,7 +809,7 @@ with `HubClient::new(channel)`.
   session's outbound buffer is full). It carries `hub_id`, `heartbeat_interval_ms`,
   `heartbeat_timeout_ms`, `default_timeout_ms`, `max_timeout_ms`, `context` (`default`) and
   `type_timeouts_ms` (the overrides).
-- A session is evicted after `KRAKEN_HUB_HEARTBEAT_TIMEOUT` (10 s) without a heartbeat; clients
+- A session is evicted after `SNODRA_SERVER_HEARTBEAT_TIMEOUT` (10 s) without a heartbeat; clients
   heartbeat at the announced interval (3 s).
 - `credentials` (static token or JWT) is checked in `permissive` and `enforce` and ignored in
   `off`; it is never logged. A client may send `ClientMessage.credentials` to replace its
@@ -818,8 +818,8 @@ with `HubClient::new(channel)`.
   [Multiple hubs](#multiple-hubs)), `Permits`, the multi-part `ReplyPart`, `ReplyEnd`, `Flow` and
   `Cancel` (see [Query modes](#query-modes)) and `ControlReply` (see
   [Processor control](#processor-control)). A request `mode` this file does not define is
-  `INVALID_REQUEST`; `CANCELLED` (9) ends a stream that outlived `KRAKEN_HUB_MAX_STREAM_DURATION`
-  (or a subscription that outlived `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`).
+  `INVALID_REQUEST`; `CANCELLED` (9) ends a stream that outlived `SNODRA_SERVER_MAX_STREAM_DURATION`
+  (or a subscription that outlived `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION`).
 
 ### Flow control
 
@@ -846,9 +846,9 @@ Decision record: umbrella `docs/adr/0014-hub-flow-control-and-priority.md`.
 - An instance that re-registers without types (a graceful stop) is no routing target any more
   (not a candidate, not on the ring) and its queue is routed to the other instances at once; it
   still answers what it was forwarded.
-- A full queue (`KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE` entries or
-  `KRAKEN_HUB_QUEUE_BYTES_PER_INSTANCE` bytes), a hub whose queues together hold
-  `KRAKEN_HUB_QUEUE_BYTES_TOTAL` bytes, like a full session buffer, answers
+- A full queue (`SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE` entries or
+  `SNODRA_SERVER_QUEUE_BYTES_PER_INSTANCE` bytes), a hub whose queues together hold
+  `SNODRA_SERVER_QUEUE_BYTES_TOTAL` bytes, like a full session buffer, answers
   `RESOURCE_EXHAUSTED`.
 - Permits, load factor and tags are read from the first `Register` of a stream.
 
@@ -893,8 +893,8 @@ umbrella `docs/05-services/hub.md` (Query modes).
   target that leaves, also while its request is still queued, is a failed part
   (`HANDLER_DISCONNECTED`).
 - **Accounting:** a scatter-gather is one request in flight, on its edge (latency to the
-  `ReplyEnd`, an error when no part succeeded) and in `kraken_hub_requests_total{mode="scatter_gather"}`;
-  `kraken_hub_scatter_targets{type}` records its targets.
+  `ReplyEnd`, an error when no part succeeded) and in `snodra_hub_requests_total{mode="scatter_gather"}`;
+  `snodra_hub_scatter_targets{type}` records its targets.
 - `tests/scatter_gather.rs` drives it over gRPC with raw clients.
 - **Streaming.** A sender sends a query with
   `Request.mode = STREAMING` (and `initial_credit`, `max_results`, `timeout_ms`). The hub picks
@@ -918,7 +918,7 @@ umbrella `docs/05-services/hub.md` (Query modes).
   rules; from the forward, reset by every part, paused while the sender's credit is exhausted
   and restarted by the `Flow` that raises it; a queue wait is bounded by it too):
   `ReplyEnd{error = TIMEOUT}` and `Cancel{<id>#1, "idle timeout"}`. Open for
-  `KRAKEN_HUB_MAX_STREAM_DURATION`: `ReplyEnd{error = CANCELLED "max stream duration (10m)
+  `SNODRA_SERVER_MAX_STREAM_DURATION`: `ReplyEnd{error = CANCELLED "max stream duration (10m)
   exceeded"}` and a `Cancel` with that reason. Handler gone: `ReplyEnd{error =
   HANDLER_DISCONNECTED}`; sender gone: `Cancel{<id>#1, "sender disconnected"}`. A `Cancel` goes
   only to a handler that was written the request; a stream that ends between the pop of its
@@ -934,12 +934,12 @@ umbrella `docs/05-services/hub.md` (Query modes).
 - **Streaming accounting:** one request in flight (the sender's `inFlightAsSender`, the
   handler's `inFlightAsHandler`, one handler permit from the forward to the end, released on
   every ending path); one count on its edge with the latency to the end (an error when the end
-  carries one); `kraken_hub_requests_total{mode="streaming"}` and the duration histogram;
-  `kraken_hub_streams_open{service,instance_id}` (the handler's) and
-  `kraken_hub_stream_parts_total{service,type}`.
+  carries one); `snodra_hub_requests_total{mode="streaming"}` and the duration histogram;
+  `snodra_hub_streams_open{service,instance_id}` (the handler's) and
+  `snodra_hub_stream_parts_total{service,type}`.
 - `tests/streaming.rs` drives it over gRPC with raw clients. The client APIs are in the
-  libraries' READMEs: [kraken-messaging, Streaming queries](../kraken-messaging/README.md#streaming-queries)
-  (Kotlin) and [kraken-messaging-rs, Streaming queries](../kraken-messaging-rs/README.md#streaming-queries)
+  libraries' READMEs: [snodra-messaging, Streaming queries](../snodra-messaging/README.md#streaming-queries)
+  (Kotlin) and [snodra-messaging-rs, Streaming queries](../snodra-messaging-rs/README.md#streaming-queries)
   (Rust).
 - **Subscription.** A sender sends a query with
   `Request.mode = SUBSCRIPTION` (and `initial_credit`, `max_results`, `timeout_ms`). The targets
@@ -972,7 +972,7 @@ umbrella `docs/05-services/hub.md` (Query modes).
 - **Credits and buffer.** The sender's credit is `initial_credit` (64 when 0) plus every
   `Flow{<id>, credits}`; the initial part takes one, every update one. Updates beyond the credit
   (or before the initial part) are buffered per subscription, up to
-  `KRAKEN_HUB_SUBSCRIPTION_BUFFER` (256); one more ends it with `ReplyEnd{error =
+  `SNODRA_SERVER_SUBSCRIPTION_BUFFER` (256); one more ends it with `ReplyEnd{error =
   RESOURCE_EXHAUSTED "subscriber buffer (256) exceeded"}` and a `Cancel` to every target. A
   `Flow` drains the buffer in order. Nothing is relayed to the targets: updates are pushed, a
   slow sender is the hub's problem, not the handlers'.
@@ -986,40 +986,40 @@ umbrella `docs/05-services/hub.md` (Query modes).
   every target, and to `<id>#0` while the initial request is still forwarded; nothing more to
   the sender. The sender gone: the same with `"sender disconnected"`. A target gone: its target
   ends silently; the last one gone: `ReplyEnd{error = HANDLER_DISCONNECTED}`. Open for
-  `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` (off by default): `ReplyEnd{error = CANCELLED "max
+  `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION` (off by default): `ReplyEnd{error = CANCELLED "max
   subscription duration (<d>) exceeded"}` and a `Cancel` with that reason. There is no idle
   timeout: a subscription without updates is a quiet one. The hub's shutdown closes every
   session (as for unary requests).
 - **Subscription errors:** a command by request kind `INVALID_REQUEST`; no owner, or no live
   instance that lists the type, `NO_HANDLER`; a command by registered kind `INVALID_REQUEST`; a
   duplicate id (`<id>`, `<id>#0`, or a pending `<id>#n`) `INVALID_REQUEST`;
-  a target already serving `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024) subscriptions
+  a target already serving `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024) subscriptions
   `RESOURCE_EXHAUSTED`. The gates apply in that order, all before anything is sent. **Builder
   call:** an update target's id is no pending id (it is matched through its subscription), so a
   request whose id equals one is routed normally.
 - **Subscription accounting:** one request in flight (`inFlight`, the sender's
   `inFlightAsSender`; the initial request in its handler's `inFlightAsHandler`) until the initial
   part is delivered, then the subscription counts nowhere but in
-  `kraken_hub_subscriptions_open{service,instance_id}` (targets per handler instance); one count on
+  `snodra_hub_subscriptions_open{service,instance_id}` (targets per handler instance); one count on
   its edge at the initial reply (an error when the initial failed, or when the subscription ended
-  before it other than by the sender's cancel), `kraken_hub_requests_total{mode="subscription"}`
+  before it other than by the sender's cancel), `snodra_hub_requests_total{mode="subscription"}`
   and the duration histogram (the time to the initial part), outcome `cancelled` for a cancel or
-  the max duration before the initial part; `kraken_hub_subscription_updates_total{service,type}`
+  the max duration before the initial part; `snodra_hub_subscription_updates_total{service,type}`
   per update relayed. A subscription that ends after its initial part counts nothing more.
 - `tests/subscription.rs` drives it over gRPC with raw clients. The client libraries implement
   the sender and handler sides; their READMEs:
-  [kraken-messaging, Subscription queries](../kraken-messaging/README.md#subscription-queries)
-  (Kotlin) and [kraken-messaging-rs, Subscription queries](../kraken-messaging-rs/README.md#subscription-queries)
+  [snodra-messaging, Subscription queries](../snodra-messaging/README.md#subscription-queries)
+  (Kotlin) and [snodra-messaging-rs, Subscription queries](../snodra-messaging-rs/README.md#subscription-queries)
   (Rust).
 
 ### Request timeouts
 
-With `override` the `KRAKEN_HUB_TIMEOUT_OVERRIDES` entry for the request's type:
+With `override` the `SNODRA_SERVER_TIMEOUT_OVERRIDES` entry for the request's type:
 
 | `Request.timeout_ms` | Deadline |
 |---|---|
-| `> 0` | `min(timeout_ms, override or KRAKEN_HUB_MAX_TIMEOUT_MS)` |
-| `0` | `override or KRAKEN_HUB_DEFAULT_TIMEOUT_MS` |
+| `> 0` | `min(timeout_ms, override or SNODRA_SERVER_MAX_TIMEOUT_MS)` |
+| `0` | `override or SNODRA_SERVER_DEFAULT_TIMEOUT_MS` |
 
 An override thus also moves the clamp for its type, up (long-running commands) or down. Clients
 send `timeout_ms = 0` unless their caller chose a timeout, so an override applies to them without
@@ -1032,7 +1032,7 @@ any client change.
   rolling deploy of a service a request may reach an instance that dropped the type; that instance's
   library answers `NO_HANDLER` and the sender sees a transient error.
 - Single hub instance; no clustering or failover.
-- No authentication or authorization on the gRPC port unless `KRAKEN_HUB_AUTH_MODE` is `permissive`
+- No authentication or authorization on the gRPC port unless `SNODRA_SERVER_AUTH_MODE` is `permissive`
   or `enforce` (see [Security](#security)).
 - Not durable: registrations, in-flight and queued requests and sessions are in memory only.
   Clients re-register after a reconnect.
@@ -1043,7 +1043,7 @@ any client change.
 
 - **Builder call:** HTTP/2 keepalive PINGs every 10 s, the connection is dropped when a PING is
   not answered within 20 s; TCP keepalive is 30 s. These are constants in `src/lib.rs`.
-- A stream that misses heartbeats for `KRAKEN_HUB_HEARTBEAT_TIMEOUT` is evicted: its session is removed, its
+- A stream that misses heartbeats for `SNODRA_SERVER_HEARTBEAT_TIMEOUT` is evicted: its session is removed, its
   stream task stops at once (even if the client no longer reads), its registration is dropped and
   its in-flight requests fail with `HANDLER_DISCONNECTED`. **Builder call:** the watchdog checks
   every tenth of the threshold (10 ms to 1 s), so an eviction lands at most about a
@@ -1054,63 +1054,63 @@ any client change.
   request arrived on), requests it sent are dropped; the new session's requests are untouched.
 - **Builder call:** when a sender's buffer is full, a terminal `Reply` or `Error` is retried in
   the background for up to 5 s before it is dropped (logged at `warn`, counted in
-  `kraken_hub_session_buffer_full_total{service}`).
+  `snodra_hub_session_buffer_full_total{service}`).
 - Graceful shutdown on SIGTERM or Ctrl-C: health turns `NOT_SERVING`, every stream is closed with
   `UNAVAILABLE` `hub shutting down` (in-flight requests fail as on a disconnect), connections get
   at most 5 s to drain, then telemetry is flushed and the process exits.
 
 ## Observability
 
-- Traces: one span `hub.route` per request, with the outcome in `kraken.outcome`; parent context
+- Traces: one span `hub.route` per request, with the outcome in `snodra.outcome`; parent context
   is taken from the request's trace headers. Exported over OTLP.
 - Dashboard: `http://localhost:7001/` for a live view of services, types and traffic (see
   [Dashboard](#dashboard)); Grafana for history.
 - Metrics (OTLP, ADR 0026, `../kraken/docs/adr/0026-metrics-and-dashboards.md`): the resource is
-  `service.name=snodra-server`, `service.instance.id=<KRAKEN_HUB_ID>`, so in Prometheus every series carries
+  `service.name=snodra-server`, `service.instance.id=<SNODRA_SERVER_ID>`, so in Prometheus every series carries
   `job="snodra-server"` and `instance="<hub id>"`; no data point carries a hub id. Exported every 60 s
   (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it). Every metric with its labels and meaning is in
   `../kraken/docs/05-services/hub.md` (Observability); in short:
-  - routing: `kraken_hub_requests_total{kind,type,mode,service,outcome}` and
-    `kraken_hub_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
+  - routing: `snodra_hub_requests_total{kind,type,mode,service,outcome}` and
+    `snodra_hub_request_duration_seconds{kind,type,mode,service}` (`service` is the handling service, absent when
     there was none or a gather's targets span services; outcome `denied` for a refused request; a request answered
     before routing whose type has no owner is counted as type `other`, so senders cannot grow the series),
-    `kraken_hub_in_flight{kind}` (queued requests included), `kraken_hub_connected_instances{service}`,
-    `kraken_hub_registered_types{service,kind}`, `kraken_hub_session_buffer_full_total{service}`;
-  - flow control: `kraken_hub_queue_depth{service,type}`, `kraken_hub_permits_available{service}`,
-    `kraken_hub_queue_wait_seconds{service,type}`, `kraken_hub_rejected_total{service,reason}` (`queue_full`,
+    `snodra_hub_in_flight{kind}` (queued requests included), `snodra_hub_connected_instances{service}`,
+    `snodra_hub_registered_types{service,kind}`, `snodra_hub_session_buffer_full_total{service}`;
+  - flow control: `snodra_hub_queue_depth{service,type}`, `snodra_hub_permits_available{service}`,
+    `snodra_hub_queue_wait_seconds{service,type}`, `snodra_hub_rejected_total{service,reason}` (`queue_full`,
     `queue_bytes`, `queue_bytes_total`, `buffer_full`), refreshed by the watchdog every tick (at most a second);
-  - query modes: `kraken_hub_scatter_targets{type}`, `kraken_hub_streams_open{service,instance_id}` and
-    `kraken_hub_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
+  - query modes: `snodra_hub_scatter_targets{type}`, `snodra_hub_streams_open{service,instance_id}` and
+    `snodra_hub_subscriptions_open{service,instance_id}` (gauges per handler instance with one open: the only metrics
     with an instance label, named `instance_id` because Prometheus overwrites `instance`; an instance whose last one
-    closed reads 0 once, then is not exported), `kraken_hub_stream_parts_total{service,type}`,
-    `kraken_hub_subscription_updates_total{service,type}`;
-  - event processors, from the instances' status (no event-store read): `kraken_hub_processor_lag{service,processor}`,
-    `kraken_hub_processor_dead_letters{service,processor}`, `kraken_hub_processor_state{service,processor,state}`
-    (1 for the current state, 0 for the others), `kraken_hub_processor_processed{service,processor}` and
-    `kraken_hub_processor_failed{service,processor}` (since-start totals summed over the live instances: gauges, not
-    counters); `kraken_hub_control_total{action,outcome}`, `kraken_hub_control_unknown_replies_total`;
-  - the events API ([Event browser](#event-browser)): `kraken_hub_event_browser_requests_total{kind,outcome}`,
-    `kraken_hub_event_browser_scanned_records`, `kraken_hub_event_tails`, `kraken_hub_event_payload_views_total`
-    (the lag of subscriptions without a live instance is the `kraken-event-browser` add-on's metric);
-  - security: `kraken_hub_auth_violations_total{reason,service}`, `kraken_hub_acl_generation`,
-    `kraken_hub_acl_reload_errors_total`, `kraken_hub_jwt_validations_total{result}`,
-    `kraken_hub_jwks_fetches_total{result}`, `kraken_hub_jwks_keys`, `kraken_hub_credentials_refreshes_total{result}`,
-    `kraken_hub_client_certificates_total{result}`, `kraken_hub_tls_handshake_failures_total{listener,reason}`,
-    `kraken_hub_tls_handshakes_shed_total{listener,reason}`, `kraken_hub_tls_client_ca_reload_errors_total`.
+    closed reads 0 once, then is not exported), `snodra_hub_stream_parts_total{service,type}`,
+    `snodra_hub_subscription_updates_total{service,type}`;
+  - event processors, from the instances' status (no event-store read): `snodra_hub_processor_lag{service,processor}`,
+    `snodra_hub_processor_dead_letters{service,processor}`, `snodra_hub_processor_state{service,processor,state}`
+    (1 for the current state, 0 for the others), `snodra_hub_processor_processed{service,processor}` and
+    `snodra_hub_processor_failed{service,processor}` (since-start totals summed over the live instances: gauges, not
+    counters); `snodra_hub_control_total{action,outcome}`, `snodra_hub_control_unknown_replies_total`;
+  - the events API ([Event browser](#event-browser)): `snodra_hub_event_browser_requests_total{kind,outcome}`,
+    `snodra_hub_event_browser_scanned_records`, `snodra_hub_event_tails`, `snodra_hub_event_payload_views_total`
+    (the lag of subscriptions without a live instance is the `snodra-event-browser` add-on's metric);
+  - security: `snodra_hub_auth_violations_total{reason,service}`, `snodra_hub_acl_generation`,
+    `snodra_hub_acl_reload_errors_total`, `snodra_hub_jwt_validations_total{result}`,
+    `snodra_hub_jwks_fetches_total{result}`, `snodra_hub_jwks_keys`, `snodra_hub_credentials_refreshes_total{result}`,
+    `snodra_hub_client_certificates_total{result}`, `snodra_hub_tls_handshake_failures_total{listener,reason}`,
+    `snodra_hub_tls_handshakes_shed_total{listener,reason}`, `snodra_hub_tls_client_ca_reload_errors_total`.
 
   Over several hubs, counters, histograms and the hub-local gauges add up (`sum`); connected instances, registered
   types and the processor gauges are the same on every hub (`max`).
 - Health: the standard `grpc.health.v1.Health` service on the same port (service
-  `kraken.hub.v1.Hub`, and `""` for the whole server). `snodra-server --health-check` probes it on
-  `127.0.0.1:<port of KRAKEN_HUB_LISTEN>` within 3 s, prints one line and exits 0 when
+  `snodra.hub.v1.Hub`, and `""` for the whole server). `snodra-server --health-check` probes it on
+  `127.0.0.1:<port of SNODRA_SERVER_LISTEN>` within 3 s, prints one line and exits 0 when
   `SERVING`, 1 otherwise.
-- Logs: JSON on stdout, filtered by `KRAKEN_HUB_LOG`.
+- Logs: JSON on stdout, filtered by `SNODRA_SERVER_LOG`.
 
 ## Image
 
 ```sh
 docker build -t snodra-server:dev .
-docker run --rm -p 7000:7000 -p 7001:7001 -e KRAKEN_HUB_OTLP_ENDPOINT= snodra-server:dev
+docker run --rm -p 7000:7000 -p 7001:7001 -e SNODRA_SERVER_OTLP_ENDPOINT= snodra-server:dev
 ```
 
 The builder installs `protobuf-compiler` only; the hub links no event-store client (`tests/dependencies.rs` checks
@@ -1123,7 +1123,7 @@ services:
   snodra-server:
     image: snodra-server:dev
     environment:
-      KRAKEN_HUB_OTLP_ENDPOINT: http://otel-lgtm:4317
+      SNODRA_SERVER_OTLP_ENDPOINT: http://otel-lgtm:4317
     # The image already declares this healthcheck; repeat it only to change the timings.
     healthcheck:
       test: ["CMD", "/app/snodra-server", "--health-check"]
@@ -1146,7 +1146,7 @@ releases (`vX.Y.Z`) to `harbor.damoreira.ml/kraken-org/snodra-server:<tag>` and 
 ```
 src/lib.rs        crate root, proto module, serve()
 src/main.rs       thin binary: config, telemetry, serve
-src/config.rs     KRAKEN_HUB_* parsing, effective request timeout, per-version heartbeat timeout
+src/config.rs     SNODRA_SERVER_* parsing, effective request timeout, per-version heartbeat timeout
 src/context.rs    ContextId (always "default")
 src/protocol.rs   the RegisterAck, a Debug for credentials that never prints them
 src/registry.rs   service/type ownership and instance selection
@@ -1162,7 +1162,7 @@ src/auth.rs       auth modes, ACL parsing and lookup, Principal, Register, refre
 src/jwt.rs        JWT validation and the JWKS cache and fetch (the tests' key and server helpers are src/jwt_test_support.rs)
 src/reload.rs     mtime polling and SIGHUP for the ACL and the TLS pairs
 src/tls.rs        rustls listeners, reloadable certificate, the client CA store (mTLS)
-src/mtls.rs       the service a client certificate names (kraken://service/<name>), notAfter, fingerprint
+src/mtls.rs       the service a client certificate names (snodra://service/<name>), notAfter, fingerprint
 src/client.rs     TLS client side of the probes (--tls-ca, pinned local certificate)
 src/edges.rs      edge statistics per (sender service, type): sliding window, latency sketch, cap
 src/http.rs       the HTTP port: /api/v1 (JSON, the summary stream, the processor controls and their write credential, the event browser), security headers
@@ -1212,7 +1212,7 @@ flowchart LR
 `type!:` subject is major, a `feat` subject minor, anything else patch (`SEMVER_BUMP` or `RELEASE_VERSION` override
 it; nothing to do when `HEAD` is already tagged or no commit is new; `DRY_RUN=true` stops before publishing). It
 then tags `vX.Y.Z` and pushes the tag, builds the `Dockerfile` and pushes `<harbor>/<project>/snodra-server:X.Y.Z` and
-`:latest`, sets the GitLab group variable `KRAKEN_HUB_IMAGE` to the new image (creating it when missing) so the
+`:latest`, sets the GitLab group variable `SNODRA_SERVER_IMAGE` to the new image (creating it when missing) so the
 libraries' end-to-end jobs use it, and creates the GitLab release.
 
 The image is distroless with the binary's own `--health-check` probe; the compose `apps` profile and the Kotlin starter's end-to-end tests consume it (locally as `snodra-server:dev`).

@@ -163,7 +163,7 @@ async fn the_topology_mode_sends_the_dashboard_token_from_its_environment() {
         cmd.args(["--topology", "--address", &addr.to_string()])
             .env_clear();
         if let Some(t) = env {
-            cmd.env("KRAKEN_HUB_DASHBOARD_TOKEN", t);
+            cmd.env("SNODRA_SERVER_DASHBOARD_TOKEN", t);
         }
         async move { cmd.output().await.unwrap() }
     };

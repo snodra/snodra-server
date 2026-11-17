@@ -50,12 +50,12 @@ pub const MAX_HANDSHAKES: usize = 512;
 /// keep honest clients out for longer than one handshake timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandshakeLimits {
-    /// A handshake that takes longer is dropped. `KRAKEN_HUB_TLS_HANDSHAKE_TIMEOUT`, default 5 s.
+    /// A handshake that takes longer is dropped. `SNODRA_SERVER_TLS_HANDSHAKE_TIMEOUT`, default 5 s.
     pub timeout: Duration,
     /// Handshakes in progress at once, over all peers.
     pub slots: usize,
     /// Handshakes in progress at once from one peer IP; 0 means no cap.
-    /// `KRAKEN_HUB_TLS_HANDSHAKES_PER_IP`, default 32.
+    /// `SNODRA_SERVER_TLS_HANDSHAKES_PER_IP`, default 32.
     pub per_ip: usize,
 }
 
@@ -219,7 +219,7 @@ impl ResolvesServerCert for CertStore {
     }
 }
 
-/// `KRAKEN_HUB_TLS_CLIENT_AUTH`: whether a client must present a certificate.
+/// `SNODRA_SERVER_TLS_CLIENT_AUTH`: whether a client must present a certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClientAuthMode {
     /// A client may present one (it must then verify) or none (token or JWT).
@@ -322,7 +322,7 @@ impl ClientCaStore {
     }
 
     /// Re-reads the bundle. One that cannot be loaded keeps the previous CAs, logs an error and is
-    /// counted (`kraken_hub_tls_client_ca_reload_errors_total`). New handshakes use the new CAs;
+    /// counted (`snodra_hub_tls_client_ca_reload_errors_total`). New handshakes use the new CAs;
     /// sessions that are live are not judged again.
     pub fn reload(&self) -> bool {
         match load_client_verifier(&self.path, self.mode) {
@@ -464,7 +464,7 @@ pub fn server_config(
 /// handshakes in its own task, bounded by `limits.timeout`; a client that does not speak TLS
 /// (plain text, a port scan) is dropped and logged at debug level. The accept loop never waits
 /// for a slot: a connection that finds every slot busy (or its peer IP at its cap) is dropped at
-/// once and counted in `kraken_hub_tls_handshakes_shed_total`. The accept task ends, and with it
+/// once and counted in `snodra_hub_tls_handshakes_shed_total`. The accept task ends, and with it
 /// the listening socket, when the returned receiver is dropped or `stopping` fires; pending
 /// handshakes end with it. `listener` (`grpc` or `http`) labels the counter.
 pub fn accept<S>(
@@ -829,7 +829,7 @@ mod tests {
             "the connection must be shed, not left waiting for a slot"
         );
         assert_eq!(
-            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "slots"),
+            f.m.counter("snodra_hub_tls_handshakes_shed_total", "reason", "slots"),
             Some(1)
         );
         // The silent clients leave: slots free up and a real client completes its handshake.
@@ -866,11 +866,11 @@ mod tests {
         let mut third = TcpStream::connect(f.addr).await.unwrap();
         assert!(closed_by_server(&mut third, Duration::from_secs(2)).await);
         assert_eq!(
-            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "per_ip"),
+            f.m.counter("snodra_hub_tls_handshakes_shed_total", "reason", "per_ip"),
             Some(1)
         );
         assert_eq!(
-            f.m.counter("kraken_hub_tls_handshakes_shed_total", "reason", "slots"),
+            f.m.counter("snodra_hub_tls_handshakes_shed_total", "reason", "slots"),
             None
         );
         drop(held);
@@ -1007,7 +1007,7 @@ mod tests {
 
         fn failures(&self, reason: &str) -> Option<u64> {
             self.m
-                .counter("kraken_hub_tls_handshake_failures_total", "reason", reason)
+                .counter("snodra_hub_tls_handshake_failures_total", "reason", reason)
         }
     }
 
@@ -1225,7 +1225,7 @@ mod tests {
         std::fs::remove_file(mx.ca_file()).unwrap();
         assert!(!mx.store.reload());
         assert_eq!(
-            mx.m.counter_total("kraken_hub_tls_client_ca_reload_errors_total"),
+            mx.m.counter_total("snodra_hub_tls_client_ca_reload_errors_total"),
             Some(4)
         );
         mx.try_connect(Some(identity)).await.unwrap();

@@ -163,7 +163,7 @@ function renderHeader(summary) {
   const fact = (k, v) => h('div', null, h('dt', null, k), h('dd', null, v));
   const now = summary?.nowMs ?? version.nowMs;
   fill($('hub-meta'),
-    fact('hub', h('span', { class: 'mono', title: 'KRAKEN_HUB_ID' }, version.hubId)),
+    fact('hub', h('span', { class: 'mono', title: 'SNODRA_SERVER_ID' }, version.hubId)),
     fact('version', version.version),
     fact('up', fmt.span(now - version.startedAtMs)));
   const grafana = $('grafana');

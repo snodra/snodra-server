@@ -1,4 +1,4 @@
-// kraken hub protocol.
+// Snodra server protocol.
 //
 // A service opens one bidirectional stream per instance with Hub.Connect, announces the command
 // and query types it handles with a Register message, and then exchanges Request and Reply
@@ -6,17 +6,17 @@
 // connected instances and forwards each Request to one instance that registered its type.
 //
 // The hub never inspects or persists payloads. Payloads are JSON documents produced by the
-// kraken-messaging libraries; the JSON shape of each type is defined by the owning service's
+// Snodra messaging libraries; the JSON shape of each type is defined by the owning service's
 // *-api module (JVM) or documented contract (Rust).
 //
-// This file lives in the umbrella repository (kraken/protocol/hub.proto) and is consumed by
-// kraken-hub, kraken-messaging and kraken-messaging-rs as a git submodule.
+// This file is the source of truth. snodra-messaging (Kotlin) and snodra-messaging-rs (Rust)
+// vendor a byte-identical copy and their CI compares it with this one.
 
 syntax = "proto3";
 
-package kraken.hub.v1;
+package snodra.hub.v1;
 
-option java_package = "io.damoreira.kraken.hub.v1";
+option java_package = "com.damoreira.snodra.server.v1";
 option java_multiple_files = true;
 
 // Routing and relaying of commands and queries between services.
@@ -107,7 +107,7 @@ message Register {
   repeated string command_types = 3;
   // Fully qualified query type names this instance handles, for example "files.GetFileMetadata".
   repeated string query_types = 4;
-  // Checked when KRAKEN_HUB_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
+  // Checked when SNODRA_SERVER_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
   Credentials credentials = 7;
   // Flow control (ADR 0014): requests the hub may forward before the next Permits message, and
   // the session's permit cap. At least 1; a Register with 0 is rejected with INVALID_ARGUMENT.
@@ -120,7 +120,7 @@ message Register {
   // Free-form labels (for example "zone" -> "eu-1"). Unkeyed requests prefer instances whose tags
   // match more of the sender's tags.
   map<string, string> tags = 10;
-  // Free text naming the client library and its version, for example "kraken-messaging/0.1.0".
+  // Free text naming the client library and its version, for example "snodra-messaging/0.1.0".
   // Shown in the topology view; never used for routing decisions.
   string client_version = 12;
   // Fully qualified query type names this instance handles that many services may own (ADR
@@ -493,7 +493,7 @@ message Credentials {
 // the values the client needs to align with this hub: heartbeat cadence, the eviction threshold
 // applied to this session and the request timeout rules.
 message RegisterAck {
-  // Identifies this hub process (KRAKEN_HUB_ID, default hostname plus a random suffix).
+  // Identifies this hub process (SNODRA_SERVER_ID, default hostname plus a random suffix).
   string hub_id = 1;
   // How often the client should send a Heartbeat.
   uint32 heartbeat_interval_ms = 4;

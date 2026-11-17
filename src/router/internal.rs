@@ -1,5 +1,5 @@
 //! Hub-originated requests (ADR 0027): the hub asks a handler a query, or opens a streaming
-//! query, itself, as the dashboard's event pages ask the `kraken-event-browser` add-on.
+//! query, itself, as the dashboard's event pages ask the `snodra-event-browser` add-on.
 //!
 //! No bypass: each request gets a session of its own in [`crate::session::Sessions`] (hidden
 //! from the topology, the ACL reload, the heartbeat sweep and the instance counts) and goes
@@ -309,11 +309,11 @@ mod tests {
 
     static D: std::sync::LazyLock<ContextId> = std::sync::LazyLock::new(ContextId::default);
 
-    const SEARCH: &str = "kraken.events.Search";
-    const TAIL: &str = "kraken.events.Tail";
+    const SEARCH: &str = "snodra.events.Search";
+    const TAIL: &str = "snodra.events.Tail";
     const PERMITS: u32 = 1024;
 
-    /// A router with one handler session `e1` (service `kraken-event-browser`) for [`SEARCH`]
+    /// A router with one handler session `e1` (service `snodra-event-browser`) for [`SEARCH`]
     /// and [`TAIL`], opened with `permits`.
     struct Fx {
         router: Arc<Router>,
@@ -342,7 +342,7 @@ mod tests {
             Arc::new(config),
             Metrics::noop(),
         );
-        let service = "kraken-event-browser";
+        let service = "snodra-event-browser";
         let token = sessions.allocate_token();
         assert!(
             router
@@ -501,13 +501,13 @@ mod tests {
         // No handler: the router's own answer.
         let err = f
             .router
-            .query_internal("kraken.events.Lag", vec![], Duration::from_secs(3), none())
+            .query_internal("snodra.events.Lag", vec![], Duration::from_secs(3), none())
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NoHandler);
         assert_eq!(
             err.to_string(),
-            "NO_HANDLER: no handler registered for type kraken.events.Lag"
+            "NO_HANDLER: no handler registered for type snodra.events.Lag"
         );
         assert_eq!(f.sessions(), 1);
     }
@@ -722,7 +722,7 @@ mod tests {
         let f = fixture(PERMITS);
         let mut rx = f
             .router
-            .stream_internal("kraken.events.Nothing", vec![], 4, none());
+            .stream_internal("snodra.events.Nothing", vec![], 4, none());
         let err = rx.recv().await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::NoHandler);
         assert_eq!(rx.recv().await, None);
