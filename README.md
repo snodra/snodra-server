@@ -15,7 +15,7 @@
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
   <img alt="image" src="https://img.shields.io/badge/image-distroless-blue?logo=docker&logoColor=white">
   <a href="https://snodra.damoreira.com/"><img alt="Snodra docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
-  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-green"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
 ---
@@ -1228,4 +1228,4 @@ Conventions: [`../kraken/docs/04-repositories.md`](../kraken/docs/04-repositorie
 
 ## License
 
-[MIT](LICENSE) © 2026 Guilherme D'Amoreira.
+[Apache-2.0](LICENSE) © 2026 Guilherme D'Amoreira.
