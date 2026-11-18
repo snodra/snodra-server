@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn the_jwt_settings_are_listed_with_their_effective_values() {
         let c = Config {
-            jwt_issuer: Some("https://sso.example/realms/kraken".into()),
+            jwt_issuer: Some("https://sso.example/realms/snodra".into()),
             jwt_jwks_uri: Some("http://keycloak:8080/certs".into()),
             jwt_audience: Some("snodra-server".into()),
             jwt_leeway: Duration::from_secs(5),
@@ -1368,7 +1368,7 @@ mod tests {
         let get = |name: &str| v.settings.iter().find(|s| s.name == name).unwrap();
         assert_eq!(
             get("SNODRA_SERVER_JWT_ISSUER").value.as_deref(),
-            Some("https://sso.example/realms/kraken")
+            Some("https://sso.example/realms/snodra")
         );
         assert_eq!(
             get("SNODRA_SERVER_JWT_JWKS_URI").value.as_deref(),

@@ -1609,30 +1609,30 @@ mod tests {
     fn the_jwks_uri_defaults_to_keycloaks_certs_path_under_the_issuer() {
         let c = with_env(&[(
             "SNODRA_SERVER_JWT_ISSUER",
-            "https://sso.example/realms/kraken",
+            "https://sso.example/realms/snodra",
         )])
         .unwrap();
         assert_eq!(
             c.jwt_issuer.as_deref(),
-            Some("https://sso.example/realms/kraken")
+            Some("https://sso.example/realms/snodra")
         );
         assert_eq!(
             c.jwt_jwks_uri.as_deref(),
-            Some("https://sso.example/realms/kraken/protocol/openid-connect/certs")
+            Some("https://sso.example/realms/snodra/protocol/openid-connect/certs")
         );
         // A trailing slash does not double up in the derived URI; the issuer itself is kept exact.
         let c = with_env(&[(
             "SNODRA_SERVER_JWT_ISSUER",
-            "https://sso.example/realms/kraken/",
+            "https://sso.example/realms/snodra/",
         )])
         .unwrap();
         assert_eq!(
             c.jwt_issuer.as_deref(),
-            Some("https://sso.example/realms/kraken/")
+            Some("https://sso.example/realms/snodra/")
         );
         assert_eq!(
             c.jwt_jwks_uri.as_deref(),
-            Some("https://sso.example/realms/kraken/protocol/openid-connect/certs")
+            Some("https://sso.example/realms/snodra/protocol/openid-connect/certs")
         );
     }
 
@@ -1641,11 +1641,11 @@ mod tests {
         let c = with_env(&[
             (
                 "SNODRA_SERVER_JWT_ISSUER",
-                "https://sso.example/realms/kraken",
+                "https://sso.example/realms/snodra",
             ),
             (
                 "SNODRA_SERVER_JWT_JWKS_URI",
-                "http://keycloak:8080/realms/kraken/certs",
+                "http://keycloak:8080/realms/snodra/certs",
             ),
             ("SNODRA_SERVER_JWT_AUDIENCE", "snodra-server"),
             ("SNODRA_SERVER_JWT_LEEWAY", "5s"),
@@ -1656,7 +1656,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             c.jwt_jwks_uri.as_deref(),
-            Some("http://keycloak:8080/realms/kraken/certs")
+            Some("http://keycloak:8080/realms/snodra/certs")
         );
         assert_eq!(c.jwt_audience.as_deref(), Some("snodra-server"));
         assert_eq!(c.jwt_leeway, Duration::from_secs(5));
@@ -1684,7 +1684,7 @@ mod tests {
     fn bad_jwt_settings_are_startup_errors() {
         let issuer = (
             "SNODRA_SERVER_JWT_ISSUER",
-            "https://sso.example/realms/kraken",
+            "https://sso.example/realms/snodra",
         );
         // The derived JWKS URI needs an http(s) issuer; an explicit one lifts that.
         assert!(with_env(&[("SNODRA_SERVER_JWT_ISSUER", "kraken-sso")]).is_err());
@@ -1716,7 +1716,7 @@ mod tests {
         let jwt_off = |mode: &str| {
             let mut env = vec![(
                 "SNODRA_SERVER_JWT_ISSUER",
-                "https://sso.example/realms/kraken",
+                "https://sso.example/realms/snodra",
             )];
             if mode != "off" {
                 env.extend([
@@ -1749,7 +1749,7 @@ mod tests {
             let c = with_env(&[
                 (
                     "SNODRA_SERVER_JWT_ISSUER",
-                    "https://sso.example/realms/kraken",
+                    "https://sso.example/realms/snodra",
                 ),
                 ("SNODRA_SERVER_JWT_JWKS_URI", uri),
             ])
@@ -1775,7 +1775,7 @@ mod tests {
         // One warning, however many times the hub asks.
         let c = with_env(&[(
             "SNODRA_SERVER_JWT_ISSUER",
-            "http://sso.example/realms/kraken",
+            "http://sso.example/realms/snodra",
         )])
         .unwrap();
         assert_eq!(
