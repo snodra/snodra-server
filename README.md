@@ -66,8 +66,8 @@ check it byte for byte.
 
 ## Contributing
 
-Branches off `main`, conventional commits, a pull request with a green workflow. Design changes go to the
-umbrella repository first.
+Branches off `main`, conventional commits, a pull request with a green workflow. Design changes that
+span repositories open on the server's tracker first.
 
 ## License
 

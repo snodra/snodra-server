@@ -56,7 +56,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
         vec![ProcessorStatus {
             name: "invoices".to_string(),
             subscription: "billing.invoices".to_string(),
-            source: "kraken.events".to_string(),
+            source: "snodra.events".to_string(),
             state: ProcessorState::ProcessorRunning as i32,
             segments: vec![SegmentStatus {
                 segment: "0".to_string(),
@@ -89,7 +89,7 @@ async fn topology_probe_shows_the_processors_an_instance_reports() {
     assert!(text.contains("processor | instance"), "{text}");
     assert!(
         text.contains("invoices  | ")
-            && text.contains("| RUNNING | billing.invoices | kraken.events | 0        | 2 "),
+            && text.contains("| RUNNING | billing.invoices | snodra.events | 0        | 2 "),
         "{text}"
     );
 }

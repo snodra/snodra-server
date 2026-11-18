@@ -1687,10 +1687,10 @@ mod tests {
             "https://sso.example/realms/snodra",
         );
         // The derived JWKS URI needs an http(s) issuer; an explicit one lifts that.
-        assert!(with_env(&[("SNODRA_SERVER_JWT_ISSUER", "kraken-sso")]).is_err());
+        assert!(with_env(&[("SNODRA_SERVER_JWT_ISSUER", "snodra-sso")]).is_err());
         assert!(
             with_env(&[
-                ("SNODRA_SERVER_JWT_ISSUER", "kraken-sso"),
+                ("SNODRA_SERVER_JWT_ISSUER", "snodra-sso"),
                 ("SNODRA_SERVER_JWT_JWKS_URI", "https://sso.example/certs")
             ])
             .is_ok()
@@ -1846,7 +1846,7 @@ mod tests {
 
     /// A scratch directory with `files` written into it; removed by the caller.
     fn scratch(files: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kraken-cfg-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-cfg-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, content) in files {
             std::fs::write(dir.join(name), content).unwrap();
@@ -2340,7 +2340,7 @@ mod tests {
     fn removed_event_store_settings_are_startup_warnings() {
         let c = with_env(&[
             ("SNODRA_SERVER_KAFKA_BOOTSTRAP", "kafka:9092"),
-            ("SNODRA_SERVER_EVENT_TOPICS", "kraken.events"),
+            ("SNODRA_SERVER_EVENT_TOPICS", "snodra.events"),
             ("SNODRA_SERVER_GROUP_LAG_INTERVAL", "not even a duration"),
         ])
         .unwrap();

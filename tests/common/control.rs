@@ -81,7 +81,7 @@ pub fn processor(name: &str) -> ProcessorStatus {
     ProcessorStatus {
         name: name.to_string(),
         subscription: format!("svc.{name}"),
-        source: "kraken.events".to_string(),
+        source: "snodra.events".to_string(),
         event_store: "kafka".to_string(),
         capabilities: ["replay", "browse", "lag", "native-dead-letter"]
             .map(String::from)

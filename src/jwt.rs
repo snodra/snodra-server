@@ -1393,7 +1393,7 @@ mod tests {
         let key = Signer::es256("k1");
         let (ca, cert, private) = tls_pair();
         let server = JwksServer::start_tls(&cert, &private, &[&key]).await;
-        let dir = std::env::temp_dir().join(format!("kraken-jwks-ca-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-jwks-ca-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca_file = dir.join("ca.pem");
         std::fs::write(&ca_file, ca).unwrap();
@@ -1459,7 +1459,7 @@ mod tests {
             eprintln!("no IPv6 loopback on this host: skipped");
             return;
         };
-        let dir = std::env::temp_dir().join(format!("kraken-jwks-ca-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-jwks-ca-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca_file = dir.join("ca.pem");
         std::fs::write(&ca_file, ca).unwrap();

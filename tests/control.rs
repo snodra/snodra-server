@@ -699,7 +699,7 @@ fn letter(n: usize, long: bool) -> snodra_server::proto::DeadLetterSummary {
             format!("letter-{n}")
         },
         processor: "audit".into(),
-        source: "kraken.events".into(),
+        source: "snodra.events".into(),
         segment: "1".into(),
         position: (100 + n).to_string(),
         key: "order-7".into(),
@@ -784,7 +784,7 @@ async fn dead_letters_are_listed_bounded_and_retried_or_discarded_by_one_instanc
     assert_eq!(
         body["letters"][0],
         json!({
-            "id": "letter-0", "processor": "audit", "source": "kraken.events", "segment": "1",
+            "id": "letter-0", "processor": "audit", "source": "snodra.events", "segment": "1",
             "position": "100", "key": "order-7", "eventId": "evt-0", "eventType": "examples.OrderPlaced",
             "reason": "HANDLER_FAILED", "errorType": "IllegalStateException", "errorMessage": "boom ",
             "blockedBy": "", "attempts": 3, "parkedAtMs": 1762250000000i64, "lastAttemptAtMs": 1762250001000i64,

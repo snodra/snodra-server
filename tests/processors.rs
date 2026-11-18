@@ -105,7 +105,7 @@ fn processor(name: &str, state: ProcessorState, segments: Vec<SegmentStatus>) ->
         } else {
             format!("service-b.{name}")
         },
-        source: "kraken.events".to_string(),
+        source: "snodra.events".to_string(),
         event_store: "kafka".to_string(),
         capabilities: ["replay", "browse", "lag", "native-dead-letter"]
             .map(String::from)
@@ -205,7 +205,7 @@ async fn a_client_reports_processors_and_every_view_shows_them() {
     let orders = &processors[1];
     assert_eq!(orders["name"], "orders");
     assert_eq!(orders["subscription"], "service-b.orders");
-    assert_eq!(orders["source"], "kraken.events");
+    assert_eq!(orders["source"], "snodra.events");
     assert_eq!(orders["deadLetterMode"], "collection");
     assert_eq!(
         orders["state"], "FAILING",
@@ -327,13 +327,13 @@ async fn processor_status_reports_segments_and_capabilities() {
     let streams = ProcessorStatus {
         name: "orders".to_string(),
         subscription: "service-b.orders".to_string(),
-        source: "kraken.events".to_string(),
+        source: "snodra.events".to_string(),
         event_store: "rabbitmq-streams".to_string(),
         capabilities: vec!["replay".to_string(), "lag".to_string()],
         state: ProcessorState::ProcessorRunning as i32,
         segments: vec![
-            segment("kraken.events-10", "5", "9", 4, ""),
-            segment("kraken.events-2", "3:abc", "", -1, "7"),
+            segment("snodra.events-10", "5", "9", 4, ""),
+            segment("snodra.events-2", "3:abc", "", -1, "7"),
         ],
         replaying: true,
         dead_letter_mode: "event-store".to_string(),
@@ -373,7 +373,7 @@ async fn processor_status_reports_segments_and_capabilities() {
     assert_eq!(orders["eventStore"], "rabbitmq-streams");
     assert_eq!(orders["capabilities"], json!(["lag", "replay"]));
     assert_eq!(orders["subscription"], "service-b.orders");
-    assert_eq!(orders["source"], "kraken.events");
+    assert_eq!(orders["source"], "snodra.events");
     assert_eq!(orders["deadLetterMode"], "event-store");
     assert_eq!(orders["assignedSegments"], 2);
     assert_eq!(orders["lag"], 4, "the unknown lag is left out");
@@ -381,8 +381,8 @@ async fn processor_status_reports_segments_and_capabilities() {
     assert_eq!(
         orders["instances"][0]["segments"],
         json!([
-            {"segment": "kraken.events-10", "position": "5", "committed": "5", "head": "9", "lag": 4, "replayUntil": ""},
-            {"segment": "kraken.events-2", "position": "3:abc", "committed": "3:abc", "head": "", "lag": -1, "replayUntil": "7"},
+            {"segment": "snodra.events-10", "position": "5", "committed": "5", "head": "9", "lag": 4, "replayUntil": ""},
+            {"segment": "snodra.events-2", "position": "3:abc", "committed": "3:abc", "head": "", "lag": -1, "replayUntil": "7"},
         ]),
         "positions are opaque text; names that are not decimal sort by their bytes"
     );

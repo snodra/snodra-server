@@ -71,7 +71,7 @@ async fn get(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, Value) 
 
 const ROUTES: [&str; 6] = [
     "/api/v1/events",
-    "/api/v1/events/kraken.events/0/0",
+    "/api/v1/events/snodra.events/0/0",
     "/api/v1/events/sources",
     "/api/v1/events/lag",
     "/api/v1/events/tail",
@@ -210,7 +210,7 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
             Answer::Json(p)
         }
         LAG => Answer::Json(
-            json!({"source": request["source"].as_str().unwrap_or("kraken.events"),
+            json!({"source": request["source"].as_str().unwrap_or("snodra.events"),
             "subscriptions": [{"subscription": "orders.projector", "state": "Empty", "members": 0,
             "segments": [{"segment": "0", "committed": "4", "head": "10", "lag": 6},
                          {"segment": "1", "committed": null, "head": "3", "lag": null}],
@@ -221,7 +221,7 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
     .await;
     until_installed_as(http, Some(READ)).await;
 
-    let path = "/api/v1/events?source=kraken.events&from=2026-11-05T10:00:00Z&to=1730000000000\
+    let path = "/api/v1/events?source=snodra.events&from=2026-11-05T10:00:00Z&to=1730000000000\
 &type=orders.*&key=order-42&service=service-b&correlationId=c-1&userId=u-1&eventId=&limit=20\
 &cursor=abc";
     let (r, body) = get_with(http, path, Some(READ), &[("X-Correlation-Id", "corr-7")]).await;
@@ -229,7 +229,7 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
     assert_eq!(r.header("x-correlation-id"), Some("corr-7"));
     assert_eq!(
         body,
-        json!({"source": "kraken.events", "results": [{"source": "kraken.events",
+        json!({"source": "snodra.events", "results": [{"source": "snodra.events",
             "segment": "3", "position": "42", "timestamp": 1_730_000_000_000_i64,
             "key": "order-42", "headers": {"type": "orders.Placed", "id": "e-1"}, "size": 17}],
             "scanned": 2, "exhausted": false, "stoppedBy": "limit", "cursor": "eyJmIjoi"})
@@ -239,7 +239,7 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
     assert!((1..30_000).contains(&timeout), "{timeout}");
     assert_eq!(
         seen.request,
-        json!({"source": "kraken.events", "filters": {"from": "2026-11-05T10:00:00Z",
+        json!({"source": "snodra.events", "filters": {"from": "2026-11-05T10:00:00Z",
             "to": "1730000000000", "type": "orders.*", "key": "order-42",
             "source": "service-b", "correlationId": "c-1", "userId": "u-1"},
             "limit": 20, "cursor": "abc", "timeoutMs": timeout})
@@ -261,16 +261,16 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
     assert_eq!(fake.last(SOURCES).request, json!({}));
     let (status, lag) = get(
         http,
-        "/api/v1/events/lag?source=kraken.events.dlt",
+        "/api/v1/events/lag?source=snodra.events.dlt",
         Some(READ),
     )
     .await;
     assert_eq!(status, 200, "{lag}");
     assert_eq!(
         fake.last(LAG).request,
-        json!({"source": "kraken.events.dlt"})
+        json!({"source": "snodra.events.dlt"})
     );
-    assert_eq!(lag["source"], "kraken.events.dlt");
+    assert_eq!(lag["source"], "snodra.events.dlt");
     assert_eq!(
         lag["subscriptions"][0]["segments"][1]["committed"],
         Value::Null
@@ -305,7 +305,7 @@ async fn every_route_asks_its_query_and_passes_the_neutral_answer() {
     assert_eq!(status, 400);
     let (status, _) = get(
         http,
-        &format!("/api/v1/events/kraken.events/{}/0", "1".repeat(129)),
+        &format!("/api/v1/events/snodra.events/{}/0", "1".repeat(129)),
         Some(READ),
     )
     .await;
@@ -361,7 +361,7 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     .await;
     let fake = start(grpc, secret.clone()).await;
     until_installed_as(off, Some(READ)).await;
-    let (status, d) = get(off, "/api/v1/events/kraken.events/0/0", Some(READ)).await;
+    let (status, d) = get(off, "/api/v1/events/snodra.events/0/0", Some(READ)).await;
     assert_eq!(status, 200, "{d}");
     assert_eq!(fake.last(GET).request["payload"], false);
     assert_eq!(d["payload"]["hidden"], "payloads-off");
@@ -384,7 +384,7 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     .await;
     let _fake = start(grpc, secret.clone()).await;
     until_installed(open).await;
-    let (_, d) = get(open, "/api/v1/events/kraken.events/0/0", None).await;
+    let (_, d) = get(open, "/api/v1/events/snodra.events/0/0", None).await;
     assert_eq!(d["payload"]["hidden"], "no-token-configured");
     let (status, q) = get(open, &format!("/api/v1/events?q={secret}"), None).await;
     assert_eq!(
@@ -401,10 +401,10 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     .await;
     let fake = start(grpc, secret.clone()).await;
     until_installed(writer).await;
-    let (_, d) = get(writer, "/api/v1/events/kraken.events/0/0", None).await;
+    let (_, d) = get(writer, "/api/v1/events/snodra.events/0/0", None).await;
     assert_eq!(d["payload"]["hidden"], "no-token-presented");
     assert!(!d.to_string().contains(&secret));
-    let (_, d) = get(writer, "/api/v1/events/kraken.events/0/0", Some(WRITE)).await;
+    let (_, d) = get(writer, "/api/v1/events/snodra.events/0/0", Some(WRITE)).await;
     assert_eq!(fake.last(GET).request["payload"], true);
     assert_eq!(d["payload"], format!("{{\"secret\":\"{secret}\"}}"));
 
@@ -418,15 +418,15 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
     .await;
     let fake = start(grpc, secret.clone()).await;
     until_installed_as(secure, Some(READ)).await;
-    let (_, d) = get(secure, "/api/v1/events/kraken.events/0/0", Some(READ)).await;
+    let (_, d) = get(secure, "/api/v1/events/snodra.events/0/0", Some(READ)).await;
     assert_eq!(d["payload"], format!("{{\"secret\":\"{secret}\"}}"));
-    let (_, raw) = get(secure, "/api/v1/events/kraken.events/0/1", Some(READ)).await;
+    let (_, raw) = get(secure, "/api/v1/events/snodra.events/0/1", Some(READ)).await;
     assert_eq!(raw["payloadBase64"], "//4=");
     assert!(raw.get("payload").is_none(), "{raw}");
     let (status, _) = get(secure, &format!("/api/v1/events?q={secret}"), Some(READ)).await;
     assert_eq!(status, 200);
     assert_eq!(fake.last(SEARCH).request["filters"]["q"], secret.as_str());
-    let (status, d) = get(secure, "/api/v1/events/kraken.events/0/2", Some(READ)).await;
+    let (status, d) = get(secure, "/api/v1/events/snodra.events/0/2", Some(READ)).await;
     assert_eq!(status, 200, "{d}");
     // A payload search the hub refuses (a filter over the browser's bound) is not audited: it
     // never reaches the browser.
@@ -478,7 +478,7 @@ async fn payload_rules_stay_in_the_hub_and_are_audited() {
             audits[1].field("position"),
             audits[1].field("size"),
         ),
-        (Some("kraken.events"), Some("0"), Some("0"), Some("17"))
+        (Some("snodra.events"), Some("0"), Some("0"), Some("17"))
     );
     assert!(audits[1].field("correlation_id").is_some());
     assert_eq!(audits[2].field("position"), Some("1"));
@@ -526,14 +526,14 @@ async fn payload_dropped_when_not_asked() {
     };
     let mut fake = FakeBrowser::start(grpc, hostile).await;
     until_installed(http).await;
-    let (status, d) = get(http, "/api/v1/events/kraken.events/0/0", None).await;
+    let (status, d) = get(http, "/api/v1/events/snodra.events/0/0", None).await;
     assert_eq!(status, 200, "{d}");
     assert_eq!(fake.last(GET).request["payload"], false);
     assert_eq!(d["payload"]["hidden"], "payloads-off");
     let (_, s) = get(http, "/api/v1/events", None).await;
     let (mut tail, mut t) = open_tail(http, "/api/v1/events/tail", &mut fake, 1).await;
     t.part(
-        json!({"record": {"source": "kraken.events", "segment": "0", "position": "5",
+        json!({"record": {"source": "snodra.events", "segment": "0", "position": "5",
         "headers": {}, "size": 6, "payload": "SECRET", "payloadBase64": "U0VDUkVU"}}),
     )
     .await;
@@ -609,7 +609,7 @@ async fn browser_errors_map_to_http_statuses() {
             assert_eq!(r.header("retry-after"), Some("1"));
         }
     }
-    let (status, body) = get(http, "/api/v1/events/kraken.events/0/0", None).await;
+    let (status, body) = get(http, "/api/v1/events/snodra.events/0/0", None).await;
     assert_eq!(
         (status, body["error"].as_str()),
         (504, Some("the event browser did not answer in time"))
@@ -702,7 +702,7 @@ async fn a_tail_streams_start_records_heartbeats_and_end() {
     let start: Value = serde_json::from_str(&data).unwrap();
     assert_eq!(
         start,
-        json!({"source": "kraken.events", "segments": 6, "endsAtMs": 1_900_000_000_000_i64})
+        json!({"source": "snodra.events", "segments": 6, "endsAtMs": 1_900_000_000_000_i64})
     );
     tail.part(json!({"record": summary("2", "9", 5, "k-1", json!({"type": "orders.Placed"}))}))
         .await;
@@ -855,7 +855,7 @@ async fn the_hub_refuses_a_zero_limit_and_a_long_lag_source() {
         (400, Some("source is longer than 1024 bytes"))
     );
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
-    let (status, _) = get(http, "/api/v1/events/lag?source=kraken.events", None).await;
+    let (status, _) = get(http, "/api/v1/events/lag?source=snodra.events", None).await;
     assert_eq!(status, 200);
 }
 

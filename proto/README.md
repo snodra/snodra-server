@@ -1,9 +1,6 @@
 # proto/
 
-`hub.proto` is a verbatim copy of `kraken/protocol/hub.proto` from the umbrella repository.
+`hub.proto` is the protocol's source of truth: the server owns it, and the client libraries vendor it.
 
-> **Builder call:** until the GitLab group exists this directory is a plain copy. Once the
-> repositories are pushed it becomes a git submodule pointing at the umbrella repo
-> (`git submodule add ../kraken.git proto-src` and a symlink or build.rs path change), so the hub,
-> `snodra-messaging` and `snodra-messaging-rs` compile the same file. Do not edit it here; edit it
-> in the umbrella repo and re-sync.
+> Do not edit the copies in the client libraries. Change `hub.proto` here, then re-sync their vendored
+> copies from this repository.

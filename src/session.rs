@@ -924,7 +924,7 @@ mod tests {
         crate::proto::ProcessorStatus {
             name: name.to_string(),
             subscription: "svc".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             state: crate::proto::ProcessorState::ProcessorRunning as i32,
             dead_letter_mode: "collection".into(),
             ..Default::default()

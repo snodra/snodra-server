@@ -1604,7 +1604,7 @@ mod tests {
         crate::proto::ProcessorStatus {
             name: name.to_string(),
             subscription: "g".to_string(),
-            source: "kraken.events".to_string(),
+            source: "snodra.events".to_string(),
             state: state as i32,
             segments: lags
                 .iter()

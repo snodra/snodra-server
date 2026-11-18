@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn one_kraken_service_uri_names_the_service() {
+    fn one_snodra_service_uri_names_the_service() {
         let cert = identify(&der(&ClientSpec::service("billing-service"))).unwrap();
         assert_eq!(cert.service, "billing-service");
     }
@@ -179,13 +179,13 @@ mod tests {
     }
 
     #[test]
-    fn a_uri_that_is_not_a_kraken_service_is_ignored() {
+    fn a_uri_that_is_not_a_snodra_service_is_ignored() {
         for uri in [
             "spiffe://example.org/ns/prod/sa/billing",
             "https://billing.example/",
             "snodra://other/billing",
             "snodra://service",
-            "KRAKEN://service/billing",
+            "SNODRA://service/billing",
         ] {
             let spec = ClientSpec {
                 uris: vec![uri.into()],
