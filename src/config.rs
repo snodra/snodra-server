@@ -26,6 +26,9 @@ pub struct Config {
     pub otlp_endpoint: Option<String>,
     /// `tracing` filter. `SNODRA_SERVER_LOG`, default `info`.
     pub log: String,
+    /// How log lines are written. `SNODRA_SERVER_LOG_FORMAT`: `text` (default, for a terminal) or
+    /// `json` (one object per line, for a collector).
+    pub log_format: crate::telemetry::LogFormat,
     /// Used when `Request.timeout_ms` is zero. `SNODRA_SERVER_DEFAULT_TIMEOUT_MS`, default 5000.
     pub default_timeout: Duration,
     /// Upper bound for `Request.timeout_ms`; larger hints are clamped.
@@ -201,6 +204,7 @@ impl Default for Config {
             http_listen: Some(SocketAddr::from(([0, 0, 0, 0], 7001))),
             otlp_endpoint: None,
             log: "info".to_string(),
+            log_format: crate::telemetry::LogFormat::Text,
             default_timeout: Duration::from_millis(5_000),
             max_timeout: Duration::from_millis(60_000),
             heartbeat_interval: Duration::from_secs(3),
@@ -286,6 +290,9 @@ impl Config {
         }
         if let Some(v) = var("SNODRA_SERVER_LOG") {
             c.log = v;
+        }
+        if let Some(v) = var("SNODRA_SERVER_LOG_FORMAT") {
+            c.log_format = v.parse().context("SNODRA_SERVER_LOG_FORMAT")?;
         }
         if let Some(v) = var("SNODRA_SERVER_DEFAULT_TIMEOUT_MS") {
             c.default_timeout = millis(&v).context("SNODRA_SERVER_DEFAULT_TIMEOUT_MS")?;

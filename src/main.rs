@@ -30,11 +30,20 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Mode::AclHash { token } = mode {
         return Ok(acl_hash(token));
     }
-    let config = Config::from_env()?;
-    match mode {
-        Mode::HealthCheck(remote) => return Ok(health_check(&config, &remote).await),
-        Mode::Topology { json, remote } => return Ok(topology(&config, &remote, json).await),
-        Mode::Serve | Mode::AclHash { .. } => {}
+    if matches!(mode, Mode::Help) {
+        println!("{}", cli::USAGE);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(mode, Mode::Version) {
+        println!("snodra-server {}", env!("SNODRA_SERVER_BUILD_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut config = Config::from_env()?;
+    match &mode {
+        Mode::HealthCheck(remote) => return Ok(health_check(&config, remote).await),
+        Mode::Topology { json, remote } => return Ok(topology(&config, remote, *json).await),
+        Mode::Serve(settings) => settings.apply(&mut config)?,
+        Mode::Help | Mode::Version | Mode::AclHash { .. } => {}
     }
     let telemetry = snodra_server::telemetry::init(&config)?;
     for warning in config.security_warnings() {

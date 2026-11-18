@@ -114,7 +114,7 @@ pub struct EventBrowser {
 pub fn version(config: &Config, t: &Topology, build_id: &str, installed: bool) -> Version {
     Version {
         hub_id: t.hub_id.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("SNODRA_SERVER_BUILD_VERSION").to_string(),
         started_at_ms: t.hub_started_at_ms,
         now_ms: t.now_ms,
         build_id: build_id.to_string(),

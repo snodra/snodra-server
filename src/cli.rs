@@ -6,7 +6,39 @@ use std::path::PathBuf;
 
 use crate::topology::{InstanceTopology, Topology};
 
-pub const USAGE: &str = "usage:\n  snodra-server                     run the hub\n  snodra-server --health-check [REMOTE]      probe the hub's gRPC health service\n  snodra-server --topology [--json] [REMOTE] print the hub's topology (table, or JSON with --json)\n  snodra-server acl hash <token|->  print the SHA-256 (hex) of a token for the ACL file; `-` reads it from stdin\n\nREMOTE (default: the local hub, TLS when the environment configures it):\n  --address <host:port|https://host:port>  the hub to probe\n  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots\n  --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate (a hub with SNODRA_SERVER_TLS_CLIENT_AUTH=required)\n\nA hub with SNODRA_SERVER_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
+pub const USAGE: &str = "\
+usage:
+  snodra-server [SETTINGS]                     run the hub
+  snodra-server --health-check [REMOTE]        probe the hub's gRPC health service
+  snodra-server --topology [--json] [REMOTE]   print the hub's topology (table, or JSON with --json)
+  snodra-server acl hash <token|->             print the SHA-256 (hex) of a token for the ACL file
+  snodra-server --version | --help
+
+SETTINGS: every one is also an SNODRA_SERVER_* environment variable, and a flag wins over it.
+  --listen <addr>                 gRPC bind address                 (SNODRA_SERVER_LISTEN, 0.0.0.0:7000)
+  --http-listen <addr|\"\">         HTTP bind address, empty: off     (SNODRA_SERVER_HTTP_LISTEN, 0.0.0.0:7001)
+  --id <id>                       this hub's id                    (SNODRA_SERVER_ID)
+  --log <filter>                  tracing filter                   (SNODRA_SERVER_LOG, info)
+  --log-format <text|json>        log lines for a terminal or a collector (SNODRA_SERVER_LOG_FORMAT, text)
+  --otlp-endpoint <url|\"\">        OTLP/gRPC endpoint, empty: no telemetry (SNODRA_SERVER_OTLP_ENDPOINT, off)
+  --auth-mode <off|permissive|enforce>                             (SNODRA_SERVER_AUTH_MODE, permissive)
+  --acl-file <path>               token digests and their rights   (SNODRA_SERVER_ACL_FILE)
+  --dashboard-token-file <path>   bearer token of the read API     (SNODRA_SERVER_DASHBOARD_TOKEN_FILE)
+  --write-token-file <path>       bearer token of the controls     (SNODRA_SERVER_DASHBOARD_WRITE_TOKEN_FILE)
+  --jwt-issuer <iss>              accepted JWT issuer              (SNODRA_SERVER_JWT_ISSUER)
+  --jwt-jwks-uri <url>            where its signing keys live      (SNODRA_SERVER_JWT_JWKS_URI)
+  --jwt-audience <aud>            required aud, when set            (SNODRA_SERVER_JWT_AUDIENCE)
+  --tls-cert <pem> --tls-key <pem>            TLS for gRPC          (SNODRA_SERVER_TLS_CERT / _TLS_KEY)
+  --http-tls-cert <pem> --http-tls-key <pem>  TLS for HTTP          (SNODRA_SERVER_HTTP_TLS_CERT / _KEY)
+  --grafana-url <url>             Grafana link in the dashboard    (SNODRA_SERVER_GRAFANA_URL)
+  --peers <url[,url]>             other hubs' dashboards           (SNODRA_SERVER_PEERS)
+
+REMOTE (default: the local hub, TLS when the environment configures it):
+  --address <host:port|https://host:port>  the hub to probe
+  --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots
+  --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate
+
+A hub with SNODRA_SERVER_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
 
 /// Which hub a probe talks to; see [`crate::client::Target::resolve`].
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -21,9 +53,118 @@ pub struct Remote {
     pub tls_client_key: Option<PathBuf>,
 }
 
+/// Settings given as flags for the serving mode; each overrides the environment variable of the
+/// same name (see [`USAGE`]). Empty strings for `--http-listen` and `--otlp-endpoint` turn the
+/// listener off and telemetry off respectively.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Settings {
+    pub listen: Option<String>,
+    pub http_listen: Option<String>,
+    pub id: Option<String>,
+    pub log: Option<String>,
+    pub log_format: Option<String>,
+    pub otlp_endpoint: Option<String>,
+    pub auth_mode: Option<String>,
+    pub acl_file: Option<PathBuf>,
+    pub dashboard_token_file: Option<PathBuf>,
+    pub write_token_file: Option<PathBuf>,
+    pub jwt_issuer: Option<String>,
+    pub jwt_jwks_uri: Option<String>,
+    pub jwt_audience: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub http_tls_cert: Option<PathBuf>,
+    pub http_tls_key: Option<PathBuf>,
+    pub grafana_url: Option<String>,
+    pub peers: Option<String>,
+}
+
+impl Settings {
+    /// No flag was given; the environment alone decides.
+    pub fn is_empty(&self) -> bool {
+        *self == Settings::default()
+    }
+
+    /// Applies the flags on top of the environment-derived configuration.
+    pub fn apply(&self, c: &mut crate::config::Config) -> anyhow::Result<()> {
+        if let Some(v) = &self.listen {
+            c.listen = v.parse().map_err(|e| anyhow::anyhow!("--listen: {e}"))?;
+        }
+        if let Some(v) = &self.http_listen {
+            c.http_listen = if v.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    v.parse()
+                        .map_err(|e| anyhow::anyhow!("--http-listen: {e}"))?,
+                )
+            };
+        }
+        if let Some(v) = &self.id {
+            c.hub_id = v.trim().to_string();
+        }
+        if let Some(v) = &self.log {
+            c.log = v.clone();
+        }
+        if let Some(v) = &self.log_format {
+            c.log_format = v.parse()?;
+        }
+        if let Some(v) = &self.otlp_endpoint {
+            c.otlp_endpoint = Some(v.clone()).filter(|v| !v.trim().is_empty());
+        }
+        if let Some(v) = &self.auth_mode {
+            c.auth_mode = v.parse()?;
+        }
+        if let Some(v) = &self.acl_file {
+            c.acl_file = Some(v.clone());
+        }
+        if let Some(v) = &self.dashboard_token_file {
+            c.dashboard_token_file = Some(v.clone());
+        }
+        if let Some(v) = &self.write_token_file {
+            c.dashboard_write_token_file = Some(v.clone());
+        }
+        if let Some(v) = &self.jwt_issuer {
+            c.jwt_issuer = Some(v.clone()).filter(|v| !v.trim().is_empty());
+        }
+        if let Some(v) = &self.jwt_jwks_uri {
+            c.jwt_jwks_uri = Some(v.clone()).filter(|v| !v.trim().is_empty());
+        }
+        if let Some(v) = &self.jwt_audience {
+            c.jwt_audience = Some(v.clone()).filter(|v| !v.trim().is_empty());
+        }
+        if let Some(v) = &self.tls_cert {
+            c.tls_cert = Some(v.clone());
+        }
+        if let Some(v) = &self.tls_key {
+            c.tls_key = Some(v.clone());
+        }
+        if let Some(v) = &self.http_tls_cert {
+            c.http_tls_cert = Some(v.clone());
+        }
+        if let Some(v) = &self.http_tls_key {
+            c.http_tls_key = Some(v.clone());
+        }
+        if let Some(v) = &self.grafana_url {
+            c.grafana_url = Some(v.clone()).filter(|v| !v.trim().is_empty());
+        }
+        if let Some(v) = &self.peers {
+            c.peers = v
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Mode {
-    Serve,
+    Serve(Box<Settings>),
+    Help,
+    Version,
     HealthCheck(Remote),
     Topology {
         json: bool,
@@ -59,6 +200,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
     }
     let (mut health, mut topology, mut json) = (false, false, false);
     let mut remote = Remote::default();
+    let mut settings = Settings::default();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let value = |name: &str, it: &mut dyn Iterator<Item = String>| {
@@ -66,6 +208,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
                 .ok_or_else(|| UsageError(format!("{name} needs a value")))
         };
         match arg.as_str() {
+            "--help" | "-h" => return Ok(Mode::Help),
+            "--version" | "-V" => return Ok(Mode::Version),
             "--health-check" => health = true,
             "--topology" => topology = true,
             "--json" => json = true,
@@ -77,6 +221,34 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
             "--tls-client-key" => {
                 remote.tls_client_key = Some(value("--tls-client-key", &mut it)?.into())
             }
+            "--listen" => settings.listen = Some(value("--listen", &mut it)?),
+            "--http-listen" => settings.http_listen = Some(value("--http-listen", &mut it)?),
+            "--id" => settings.id = Some(value("--id", &mut it)?),
+            "--log" => settings.log = Some(value("--log", &mut it)?),
+            "--log-format" => settings.log_format = Some(value("--log-format", &mut it)?),
+            "--otlp-endpoint" => settings.otlp_endpoint = Some(value("--otlp-endpoint", &mut it)?),
+            "--auth-mode" => settings.auth_mode = Some(value("--auth-mode", &mut it)?),
+            "--acl-file" => settings.acl_file = Some(value("--acl-file", &mut it)?.into()),
+            "--dashboard-token-file" => {
+                settings.dashboard_token_file =
+                    Some(value("--dashboard-token-file", &mut it)?.into())
+            }
+            "--write-token-file" => {
+                settings.write_token_file = Some(value("--write-token-file", &mut it)?.into())
+            }
+            "--jwt-issuer" => settings.jwt_issuer = Some(value("--jwt-issuer", &mut it)?),
+            "--jwt-jwks-uri" => settings.jwt_jwks_uri = Some(value("--jwt-jwks-uri", &mut it)?),
+            "--jwt-audience" => settings.jwt_audience = Some(value("--jwt-audience", &mut it)?),
+            "--tls-cert" => settings.tls_cert = Some(value("--tls-cert", &mut it)?.into()),
+            "--tls-key" => settings.tls_key = Some(value("--tls-key", &mut it)?.into()),
+            "--http-tls-cert" => {
+                settings.http_tls_cert = Some(value("--http-tls-cert", &mut it)?.into())
+            }
+            "--http-tls-key" => {
+                settings.http_tls_key = Some(value("--http-tls-key", &mut it)?.into())
+            }
+            "--grafana-url" => settings.grafana_url = Some(value("--grafana-url", &mut it)?),
+            "--peers" => settings.peers = Some(value("--peers", &mut it)?),
             _ => return Err(UsageError(format!("unknown argument: {arg}"))),
         }
     }
@@ -99,12 +271,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
                 .into(),
         ));
     }
+    if !settings.is_empty() && (topology || health) {
+        return Err(UsageError(
+            "SETTINGS apply when running the hub; --topology and --health-check take --address and --tls-*"
+                .into(),
+        ));
+    }
     Ok(if topology {
         Mode::Topology { json, remote }
     } else if health {
         Mode::HealthCheck(remote)
     } else {
-        Mode::Serve
+        Mode::Serve(Box::new(settings))
     })
 }
 
@@ -386,7 +564,7 @@ mod tests {
 
     #[test]
     fn parse_modes_and_usage_errors() {
-        assert_eq!(args(&[]), Ok(Mode::Serve));
+        assert_eq!(args(&[]), Ok(Mode::Serve(Box::default())));
         let local = Remote::default;
         assert_eq!(args(&["--health-check"]), Ok(Mode::HealthCheck(local())));
         assert_eq!(

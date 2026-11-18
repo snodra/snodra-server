@@ -1,4 +1,5 @@
-//! Telemetry: JSON logs, OTLP traces and metrics, and the router's instruments.
+//! Telemetry: logs (human-readable by default, JSON on request), OTLP traces and metrics, and the
+//! router's instruments.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -48,17 +49,50 @@ impl Drop for TelemetryGuard {
     }
 }
 
-/// Installs the JSON `tracing` subscriber filtered by `config.log`; with an OTLP endpoint it also
-/// exports spans and metrics over OTLP gRPC. Must run inside a tokio runtime when exporting.
+/// How the process writes its log lines: for a terminal, or one JSON object per line for a collector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" | "plain" | "human" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => anyhow::bail!("unknown log format {other:?} (expected text or json)"),
+        }
+    }
+}
+
+/// Installs the `tracing` subscriber filtered by `config.log`, in the configured format; with an OTLP
+/// endpoint it also exports spans and metrics over OTLP gRPC. Must run inside a tokio runtime when
+/// exporting.
 pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
     global::set_text_map_propagator(TraceContextPropagator::new());
     let (filter, bad_filter) = match EnvFilter::try_new(&config.log) {
         Ok(f) => (f, None),
         Err(e) => (EnvFilter::new("info"), Some(e)),
     };
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().json());
+    type Base = tracing_subscriber::layer::Layered<EnvFilter, tracing_subscriber::Registry>;
+    let format: Box<dyn tracing_subscriber::Layer<Base> + Send + Sync> = match config.log_format {
+        LogFormat::Json => Box::new(fmt::layer().json()),
+        LogFormat::Text => Box::new(fmt::layer().compact()),
+    };
+    let registry = tracing_subscriber::registry().with(filter).with(format);
 
     let guard = match &config.otlp_endpoint {
         None => {
