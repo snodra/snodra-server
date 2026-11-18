@@ -1,4 +1,4 @@
-//! JWT credentials (roadmap P5b, ADR 0019): validation of a Keycloak client-credentials access
+//! JWT credentials (roadmap P5b, ADR 0019): validation of an OAuth2 client-credentials access
 //! token against the issuer's signing keys, and the cache of those keys.
 //!
 //! * [`Jwt`] holds the settings and the key cache. The keys are fetched in the background
@@ -49,7 +49,7 @@ pub(crate) mod test_support;
 /// The most bytes a JWKS response may have.
 pub const MAX_JWKS_BYTES: usize = 1 << 20;
 
-/// The longest token that is looked at; a Keycloak access token is a few kilobytes.
+/// The longest token that is looked at; an OAuth2 access token is a few kilobytes.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// Longest wait between two fetches while the last one failed.
@@ -160,7 +160,7 @@ impl Key {
 
 /// The signing keys of a JWKS document, and how many entries were skipped. Entries that are not
 /// signing keys (encryption keys, `oct`, `OKP`, unknown types, junk) are skipped, not errors:
-/// Keycloak serves an RSA-OAEP key next to the signing key.
+/// An OIDC provider may serve an RSA-OAEP encryption key next to the signing key.
 fn parse_jwks(body: &[u8]) -> Result<(Vec<Key>, usize), FetchError> {
     #[derive(Deserialize)]
     struct Doc {
@@ -1489,7 +1489,7 @@ mod tests {
         for ca in ["/nonexistent/ca.pem", "/dev/null"] {
             let config = Config {
                 jwt_jwks_ca: Some(ca.into()),
-                ..config("http://keycloak:8080/certs")
+                ..config("http://auth.example:8080/certs")
             };
             let err = Jwt::from_config(&config, test_metrics().metrics.clone())
                 .err()

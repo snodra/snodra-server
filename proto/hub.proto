@@ -482,7 +482,7 @@ message Credentials {
   oneof kind {
     // Static pre-shared token.
     string token = 1;
-    // Client-credentials access token (JWT) issued by Keycloak; its azp claim names the service.
+    // Client-credentials access token (JWT) issued by the OAuth2 provider; its azp claim names the service.
     string jwt = 2;
   }
 }

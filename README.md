@@ -30,7 +30,7 @@ state, and the server only routes.
 - **Commands and queries** routed by type, with consistent-hash or round-robin across instances.
 - **Deadlines, retries and flow control** enforced at the router, not in every client.
 - **Multi-server** without server-to-server traffic: every instance is independent.
-- **Authentication** by static token, Keycloak JWT or mTLS, with per-service ACLs.
+- **Authentication** by static token, an OAuth2/OIDC JWT or mTLS, with per-service ACLs.
 - **Dashboard**: live topology, types, processors, streams and the event browser, served from the same binary.
 - **Two clients, one protocol**: `snodra-messaging` (Kotlin) and `snodra-messaging-rs` (Rust) speak `snodra.hub.v1`.
 

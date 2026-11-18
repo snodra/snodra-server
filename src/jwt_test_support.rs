@@ -31,7 +31,7 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// The claims of a Keycloak client-credentials access token: `iss`, `azp` (the service), `typ`
+/// The claims of an OAuth2 client-credentials access token: `iss`, `azp` (the service), `typ`
 /// `Bearer`, and an `exp` `exp_in` seconds from now (negative: already expired).
 pub fn claims(iss: &str, azp: &str, exp_in: i64) -> Value {
     json!({
@@ -117,7 +117,7 @@ impl Signer {
         }
     }
 
-    /// `RS256`, what Keycloak signs with by default.
+    /// `RS256`, the usual default.
     pub fn rs256(kid: &str) -> Self {
         Self::rsa(kid, Algorithm::RS256)
     }
@@ -167,9 +167,9 @@ pub fn jwks_document(keys: &[Value]) -> Vec<u8> {
     json!({ "keys": keys }).to_string().into_bytes()
 }
 
-/// The JWKS Keycloak serves: the signing keys plus the realm's RSA-OAEP encryption key, which a
+/// The JWKS a provider serves: the signing keys plus the RSA-OAEP encryption key, which a
 /// verifier must skip.
-pub fn keycloak_jwks(signers: &[&Signer]) -> Vec<u8> {
+pub fn provider_jwks(signers: &[&Signer]) -> Vec<u8> {
     let mut keys: Vec<Value> = signers.iter().map(|s| s.jwk()).collect();
     let mut enc = Signer::rs256("enc-key").jwk();
     enc["use"] = json!("enc");
@@ -225,7 +225,7 @@ fn fresh_state() -> Arc<Mutex<Serve>> {
 }
 
 impl JwksServer {
-    /// Serves `keys` (Keycloak's layout) over plain HTTP on a free port.
+    /// Serves `keys` (the provider's layout) over plain HTTP on a free port.
     pub async fn start(signers: &[&Signer]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = Self::on(listener, "http");
@@ -338,7 +338,7 @@ impl JwksServer {
 
     /// Serves these keys from now on (status 200).
     pub fn serve(&self, signers: &[&Signer]) {
-        self.set_body(keycloak_jwks(signers));
+        self.set_body(provider_jwks(signers));
     }
 
     pub fn set_body(&self, body: Vec<u8>) {

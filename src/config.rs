@@ -143,7 +143,7 @@ pub struct Config {
     /// credentials are refused as "not configured". `SNODRA_SERVER_JWT_ISSUER`.
     pub jwt_issuer: Option<String>,
     /// Where the issuer's signing keys are fetched from; `None` exactly when [`Config::jwt_issuer`]
-    /// is. Default `<issuer>/protocol/openid-connect/certs` (Keycloak). Separate from the issuer
+    /// is. Default `<issuer>/protocol/openid-connect/certs` (the default OpenID Connect path). Separate from the issuer
     /// so a hub can fetch from an internal address and validate the public issuer.
     /// `SNODRA_SERVER_JWT_JWKS_URI`.
     pub jwt_jwks_uri: Option<String>,
@@ -442,7 +442,7 @@ impl Config {
         Ok(c)
     }
 
-    /// Settles the JWKS URI: the explicit one, else Keycloak's path under the issuer. The JWT
+    /// Settles the JWKS URI: the explicit one, else the default OpenID Connect path under the issuer. The JWT
     /// settings that only mean something with an issuer are an error without one, so a hub whose
     /// operator thinks JWT is on does not quietly refuse every JWT as "not configured".
     fn resolve_jwt(&mut self, explicit_uri: Option<String>) -> anyhow::Result<()> {
@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn the_jwks_uri_defaults_to_keycloaks_certs_path_under_the_issuer() {
+    fn the_jwks_uri_defaults_to_the_openid_connect_certs_path_under_the_issuer() {
         let c = with_env(&[(
             "SNODRA_SERVER_JWT_ISSUER",
             "https://sso.example/realms/snodra",
@@ -1645,7 +1645,7 @@ mod tests {
             ),
             (
                 "SNODRA_SERVER_JWT_JWKS_URI",
-                "http://keycloak:8080/realms/snodra/certs",
+                "http://auth.example:8080/realms/snodra/certs",
             ),
             ("SNODRA_SERVER_JWT_AUDIENCE", "snodra-server"),
             ("SNODRA_SERVER_JWT_LEEWAY", "5s"),
@@ -1656,7 +1656,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             c.jwt_jwks_uri.as_deref(),
-            Some("http://keycloak:8080/realms/snodra/certs")
+            Some("http://auth.example:8080/realms/snodra/certs")
         );
         assert_eq!(c.jwt_audience.as_deref(), Some("snodra-server"));
         assert_eq!(c.jwt_leeway, Duration::from_secs(5));
@@ -1767,7 +1767,7 @@ mod tests {
             "http://localhost:8180/certs",
             "http://127.0.0.1:8180/certs",
             "http://[::1]:8180/certs",
-            "http://keycloak:8080/certs",
+            "http://oauth2:8080/certs",
             "https://sso.example/certs",
         ] {
             assert_eq!(warns(quiet), 0, "{quiet}");
