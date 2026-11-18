@@ -57,6 +57,8 @@ uuid = { version = "1", features = ["v4"] }
 [build-dependencies]
 tonic-prost-build = "0.14.8"
 prost-build = "0.14.4"
+# A protoc per build host, so a cross-compiled release needs no system package.
+protoc-bin-vendored = "3.3"
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v7"] }

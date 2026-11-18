@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE: snodra/snodra-server
 
@@ -40,12 +44,53 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: GitHub release
+  # The same binary, without Docker: static musl builds for Linux, native builds for macOS and
+  # Windows. protoc comes from the build dependency, so no runner needs a system package.
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: snodra-server
+          target: ${{ matrix.target }}
+          archive: snodra-server-$tag-$target
+          include: LICENSE,README.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notes:
+    needs: [image, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "${GITHUB_REPOSITORY#*/} $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "Container image: \`$IMAGE:${{ steps.v.outputs.version }}\`"
+          NOTES="Container image: \`$IMAGE:${VERSION#v}\`
+          Binaries: \`snodra-server-$VERSION-<target>\` (Linux musl and gnu on amd64/arm64, macOS amd64/arm64, Windows amd64)."
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $VERSION" --notes "$NOTES"
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $VERSION" --generate-notes --notes "$NOTES"
+          fi
