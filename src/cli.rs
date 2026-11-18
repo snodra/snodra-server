@@ -15,7 +15,8 @@ usage:
   snodra-server --version | --help
 
 SETTINGS: every one is also an SNODRA_SERVER_* environment variable, and a flag wins over it.
-  --listen <addr>                 gRPC bind address                 (SNODRA_SERVER_LISTEN, 0.0.0.0:7000)
+  --listen <addr>                 gRPC bind address                 (SNODRA_SERVER_LISTEN, 0.0.0.0:7000);
+                                  with --health-check/--topology, the hub to probe
   --http-listen <addr|\"\">         HTTP bind address, empty: off     (SNODRA_SERVER_HTTP_LISTEN, 0.0.0.0:7001)
   --id <id>                       this hub's id                    (SNODRA_SERVER_ID)
   --log <filter>                  tracing filter                   (SNODRA_SERVER_LOG, info)
@@ -38,7 +39,9 @@ REMOTE (default: the local hub, TLS when the environment configures it):
   --tls-ca <pem>                          trust this CA (turns TLS on); https:// alone uses the system roots
   --tls-client-cert <pem> --tls-client-key <pem>  present this client certificate
 
-A hub with SNODRA_SERVER_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.";
+A hub with SNODRA_SERVER_DASHBOARD_TOKEN needs the same variable in the probe's environment for --topology.
+Without --address or --listen the probes use SNODRA_SERVER_LISTEN's port on 127.0.0.1 (7000 by default);
+on macOS port 7000 is AirPlay's, so pass --listen when the hub runs elsewhere.";
 
 /// Which hub a probe talks to; see [`crate::client::Target::resolve`].
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -51,6 +54,8 @@ pub struct Remote {
     /// present, for a hub that asks for one (ADR 0020). Both or neither.
     pub tls_client_cert: Option<PathBuf>,
     pub tls_client_key: Option<PathBuf>,
+    /// `--listen` in a probe mode: the address the hub was started on, when it is not the default.
+    pub local: Option<String>,
 }
 
 /// Settings given as flags for the serving mode; each overrides the environment variable of the
@@ -201,6 +206,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
     let (mut health, mut topology, mut json) = (false, false, false);
     let mut remote = Remote::default();
     let mut settings = Settings::default();
+    let mut listen: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let value = |name: &str, it: &mut dyn Iterator<Item = String>| {
@@ -221,7 +227,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
             "--tls-client-key" => {
                 remote.tls_client_key = Some(value("--tls-client-key", &mut it)?.into())
             }
-            "--listen" => settings.listen = Some(value("--listen", &mut it)?),
+            "--listen" => listen = Some(value("--listen", &mut it)?),
             "--http-listen" => settings.http_listen = Some(value("--http-listen", &mut it)?),
             "--id" => settings.id = Some(value("--id", &mut it)?),
             "--log" => settings.log = Some(value("--log", &mut it)?),
@@ -270,6 +276,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, UsageError
             "--address, --tls-ca and --tls-client-cert/--tls-client-key need --topology or --health-check"
                 .into(),
         ));
+    }
+    if (topology || health) && listen.is_some() {
+        remote.local = listen.take();
+    } else {
+        settings.listen = listen;
     }
     if !settings.is_empty() && (topology || health) {
         return Err(UsageError(
@@ -596,6 +607,20 @@ mod tests {
         assert_eq!(
             err(&["--health-check", "--topology", "--json"]),
             "--topology and --health-check are mutually exclusive"
+        );
+        assert_eq!(
+            args(&["--topology", "--listen", "0.0.0.0:7010"]),
+            Ok(Mode::Topology {
+                json: false,
+                remote: Remote {
+                    local: Some("0.0.0.0:7010".into()),
+                    ..Remote::default()
+                },
+            })
+        );
+        assert_eq!(
+            err(&["--topology", "--log-format", "json"]),
+            "SETTINGS apply when running the hub; --topology and --health-check take --address and --tls-*"
         );
         assert_eq!(err(&["--bogus"]), "unknown argument: --bogus");
         assert_eq!(err(&["--topology", "extra"]), "unknown argument: extra");

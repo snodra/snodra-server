@@ -83,7 +83,26 @@ fn acl_hash(token: Option<String>) -> ExitCode {
 
 /// The hub to probe: `--address` or the local hub, with TLS as `--tls-ca`, the address scheme or
 /// the environment says.
+/// The usual cause of a failed probe is talking to something that is not a Snodra server.
+fn hint(addr: &str) -> &'static str {
+    if addr.ends_with(":7000") {
+        " — is a Snodra server listening there? On macOS port 7000 belongs to AirPlay; pass --listen or --address"
+    } else {
+        " — is a Snodra server listening there? pass --listen or --address"
+    }
+}
+
 fn target(config: &Config, remote: &Remote) -> Target {
+    // `--listen` names the hub this probe talks to; an unspecified host (0.0.0.0, ::) means loopback.
+    let local =
+        remote
+            .local
+            .as_deref()
+            .map(|listen| match listen.parse::<std::net::SocketAddr>() {
+                Ok(addr) if addr.ip().is_unspecified() => format!("127.0.0.1:{}", addr.port()),
+                _ => listen.to_string(),
+            });
+    let address = remote.address.clone().or(local);
     let identity = ClientIdentity::resolve(
         remote
             .tls_client_cert
@@ -94,7 +113,7 @@ fn target(config: &Config, remote: &Remote) -> Target {
         config.client_auth() == Some(ClientAuthMode::Required),
     );
     Target::resolve(
-        remote.address.as_deref(),
+        address.as_deref(),
         remote.tls_ca.as_deref(),
         config.listen.port(),
         config.grpc_tls().map(|(cert, _key)| cert),
@@ -115,7 +134,10 @@ async fn health_check(config: &Config, remote: &Remote) -> ExitCode {
             ExitCode::FAILURE
         }
         Ok(Err(e)) => {
-            println!("snodra-server at {addr}: health check failed: {e:#}");
+            println!(
+                "snodra-server at {addr}: health check failed: {e:#}{}",
+                hint(addr)
+            );
             ExitCode::FAILURE
         }
         Err(_) => {
@@ -151,7 +173,10 @@ async fn topology(config: &Config, remote: &Remote, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("snodra-server at {addr}: topology failed: {e}");
+            eprintln!(
+                "snodra-server at {addr}: topology failed: {e}{}",
+                hint(addr)
+            );
             ExitCode::FAILURE
         }
     }
