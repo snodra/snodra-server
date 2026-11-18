@@ -811,7 +811,7 @@ mod tests {
     use jsonwebtoken::Algorithm;
     use serde_json::json;
 
-    const ISS: &str = "https://sso.example/realms/kraken";
+    const ISS: &str = "https://sso.example/realms/snodra";
 
     struct Fx {
         jwt: Arc<Jwt>,
@@ -995,7 +995,7 @@ mod tests {
     async fn a_token_from_the_wrong_issuer_is_refused() {
         let key = Signer::es256("k1");
         let fx = loaded(&[&key]).await;
-        let t = key.sign(&claims("https://evil.example/realms/kraken", "orders", 60));
+        let t = key.sign(&claims("https://evil.example/realms/snodra", "orders", 60));
         assert_eq!(fx.check(&t).await, Err(JwtError::WrongIssuer));
         // Exact match: a trailing slash is a different issuer.
         let t = key.sign(&claims(&format!("{ISS}/"), "orders", 60));

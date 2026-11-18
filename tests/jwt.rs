@@ -21,7 +21,7 @@ use snodra_server::proto::{
 };
 use tonic::{Code, Status};
 
-const ISS: &str = "https://sso.example/realms/kraken";
+const ISS: &str = "https://sso.example/realms/snodra";
 const AUD: &str = "snodra-server";
 
 fn service_entry(name: &str, handle: &[&str], send: &[&str]) -> String {
@@ -308,11 +308,11 @@ async fn a_token_for_another_service_or_without_a_table_is_refused() {
     assert_eq!(status.code(), Code::PermissionDenied);
     assert_eq!(status.message(), "token azp web is not service orders");
     // A user's access token: azp is the frontend client, which has no [[service]] table.
-    let t = hub.jwt("kraken-frontend", 300);
-    let mut c = FakeClient::register_spec(hub.addr, &spec("kraken-frontend", &t)).await;
+    let t = hub.jwt("snodra-frontend", 300);
+    let mut c = FakeClient::register_spec(hub.addr, &spec("snodra-frontend", &t)).await;
     let status = c.expect_closed().await;
     assert_eq!(status.code(), Code::PermissionDenied);
-    assert_eq!(status.message(), "no ACL entry for service kraken-frontend");
+    assert_eq!(status.message(), "no ACL entry for service snodra-frontend");
     // A [[token]] entry for the name does not help: token entries never apply to JWTs.
     let t = hub.jwt("tok-web", 300);
     let mut c = FakeClient::register_spec(hub.addr, &spec("tok-web", &t)).await;
@@ -336,7 +336,7 @@ async fn an_invalid_jwt_is_refused_with_unauthenticated_and_a_reason() {
     let mut nbf = base();
     nbf["nbf"] = json!(now() + 3600);
     let mut other_iss = base();
-    other_iss["iss"] = json!("https://evil.example/realms/kraken");
+    other_iss["iss"] = json!("https://evil.example/realms/snodra");
     let mut wrong_aud = base();
     wrong_aud["aud"] = json!("someone-else");
     let mut id_token = base();
@@ -846,7 +846,7 @@ async fn the_topology_rpc_takes_a_jwt_whose_service_has_a_table() {
             .is_ok()
     );
     for (what, bad) in [
-        ("no table", hub.jwt("kraken-frontend", 300)),
+        ("no table", hub.jwt("snodra-frontend", 300)),
         ("expired", hub.jwt("web", -300)),
         ("garbage", "a.b.c".to_string()),
     ] {

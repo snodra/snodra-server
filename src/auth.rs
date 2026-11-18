@@ -3147,7 +3147,7 @@ event-browser = false
 
     use crate::jwt::test_support::{JwksServer, Signer, claims};
 
-    const ISS: &str = "https://sso.example/realms/kraken";
+    const ISS: &str = "https://sso.example/realms/snodra";
 
     struct JwtFx {
         auth: Arc<Authorizer>,
@@ -3275,7 +3275,7 @@ event-browser = false
         let fx = jwt_fx(AuthMode::Enforce).await;
         // `web` has a token elsewhere in the file but no [[service]] table; the user-token case
         // (azp = the frontend client) is the same refusal.
-        for service in ["ghost", "kraken-frontend"] {
+        for service in ["ghost", "snodra-frontend"] {
             let adm = fx.auth.admit(Some(&fx.token(service, 300)), service, &[]);
             let d = adm.refused.expect("refused");
             assert_eq!(
