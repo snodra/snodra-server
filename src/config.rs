@@ -21,7 +21,8 @@ pub struct Config {
     /// Address of the dashboard and its API (`/ui/`, `/api/v1/`). `SNODRA_SERVER_HTTP_LISTEN`, default
     /// `0.0.0.0:7001`; an explicitly empty value disables the HTTP listener.
     pub http_listen: Option<SocketAddr>,
-    /// OTLP gRPC endpoint for traces and metrics. `SNODRA_SERVER_OTLP_ENDPOINT`, default `http://otel-lgtm:4317`; empty disables export.
+    /// OTLP gRPC endpoint for traces and metrics. `SNODRA_SERVER_OTLP_ENDPOINT`, unset by default: no
+    /// telemetry is exported unless it is set (and an empty value disables it explicitly).
     pub otlp_endpoint: Option<String>,
     /// `tracing` filter. `SNODRA_SERVER_LOG`, default `info`.
     pub log: String,
@@ -198,7 +199,7 @@ impl Default for Config {
             hub_id: default_hub_id(hostname().as_deref()),
             listen: SocketAddr::from(([0, 0, 0, 0], 7000)),
             http_listen: Some(SocketAddr::from(([0, 0, 0, 0], 7001))),
-            otlp_endpoint: Some("http://otel-lgtm:4317".to_string()),
+            otlp_endpoint: None,
             log: "info".to_string(),
             default_timeout: Duration::from_millis(5_000),
             max_timeout: Duration::from_millis(60_000),
@@ -1151,7 +1152,7 @@ mod tests {
     fn defaults_match_spec() {
         let c = Config::default();
         assert_eq!(c.listen, "0.0.0.0:7000".parse().unwrap());
-        assert_eq!(c.otlp_endpoint.as_deref(), Some("http://otel-lgtm:4317"));
+        assert_eq!(c.otlp_endpoint, None);
         assert_eq!(c.default_timeout, Duration::from_millis(5000));
         assert_eq!(c.max_timeout, Duration::from_millis(60_000));
         assert_eq!(c.heartbeat_interval, Duration::from_secs(3));
@@ -1553,8 +1554,8 @@ mod tests {
     }
 
     #[test]
-    fn otlp_endpoint_unset_keeps_default_empty_disables_value_overrides() {
-        assert_eq!(otlp(None).as_deref(), Some("http://otel-lgtm:4317"));
+    fn otlp_endpoint_is_off_by_default_empty_keeps_it_off_and_a_value_turns_it_on() {
+        assert_eq!(otlp(None), None);
         assert_eq!(otlp(Some("")), None);
         assert_eq!(
             otlp(Some("http://x:4317")).as_deref(),
