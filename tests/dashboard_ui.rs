@@ -650,7 +650,7 @@ fn processor(
         } else {
             format!("service-b.{name}")
         },
-        source: "kraken.events".to_string(),
+        source: "snodra.events".to_string(),
         event_store: "kafka".to_string(),
         capabilities: ["replay", "browse", "lag", "native-dead-letter"]
             .map(String::from)
@@ -1265,7 +1265,7 @@ async fn the_dead_letters_page_lists_a_processors_letters_through_the_hub() {
     let letter = |id: &str, reason: &str, blocked_by: &str| DeadLetterSummary {
         id: id.to_string(),
         processor: "audit".to_string(),
-        source: "kraken.events".to_string(),
+        source: "snodra.events".to_string(),
         segment: "2".to_string(),
         position: "41".to_string(),
         key: "order-7".to_string(),
@@ -1441,7 +1441,7 @@ async fn the_events_page_renders_the_browsers_answers_as_text_and_hides_without_
                 json!([{"name": "type", "value": "orders.<img src=x onerror=alert(1)>"}]);
             Answer::Json(r)
         }
-        browser::LAG => Answer::Json(json!({"source": "kraken.events", "subscriptions": [
+        browser::LAG => Answer::Json(json!({"source": "snodra.events", "subscriptions": [
             {"subscription": "service-b.audit", "state": "Empty", "members": 0,
              "segments": [{"segment": "0", "committed": "0", "head": "7", "lag": 7}], "lag": 7}],
             "truncated": false})),
@@ -1455,7 +1455,7 @@ async fn the_events_page_renders_the_browsers_answers_as_text_and_hides_without_
     let (dom, _) = rendered(
         &chrome,
         http,
-        "events?record=kraken.events%2F0%2F0",
+        "events?record=snodra.events%2F0%2F0",
         &profiles.join("events"),
     )
     .await;
@@ -1464,16 +1464,16 @@ async fn the_events_page_renders_the_browsers_answers_as_text_and_hides_without_
         "Scanned 2 records; every segment searched.",
         "orders.Shipped",
         "orders.&lt;img src=x onerror=alert(1)&gt;",
-        "href=\"#/events?source=kraken.events&amp;type=",
+        "href=\"#/events?source=snodra.events&amp;type=",
         "correlationId=corr-ui",
         ">corr-ui</a>",
         ">0 / 0</button>",
         "aria-label=\"Record\"",
-        "kraken.events 0 / 0",
+        "snodra.events 0 / 0",
         "payload hidden",
         "no-token-configured",
         "Payloads are not served to this page",
-        "<select aria-label=\"Source\"><option value=\"kraken.events\">kraken.events</option>",
+        "<select aria-label=\"Source\"><option value=\"snodra.events\">snodra.events</option>",
         "href=\"#/events\"",
     ] {
         assert!(dom.contains(marker), "events: {marker:?} missing in {dom}");

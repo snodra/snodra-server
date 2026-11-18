@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn a_search_request_carries_the_filters_and_drops_empty_values() {
         let p = params(&[
-            ("source", "kraken.events.dlt"),
+            ("source", "snodra.events.dlt"),
             ("from", "2026-11-05T10:00:00Z"),
             ("to", "1730000000000"),
             ("type", "orders.*"),
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(
             request,
             json!({
-                "source": "kraken.events.dlt",
+                "source": "snodra.events.dlt",
                 "filters": {
                     "from": "2026-11-05T10:00:00Z", "to": "1730000000000", "type": "orders.*",
                     "key": "order-42", "source": "service-b", "correlationId": "c-1",
@@ -870,16 +870,16 @@ mod tests {
     #[test]
     fn a_record_request_bounds_its_place() {
         assert_eq!(
-            get_request("kraken.events", "3", "42", true).unwrap(),
-            json!({"source": "kraken.events", "segment": "3", "position": "42", "payload": true})
+            get_request("snodra.events", "3", "42", true).unwrap(),
+            json!({"source": "snodra.events", "segment": "3", "position": "42", "payload": true})
         );
         let long = "1".repeat(MAX_PLACE + 1);
         assert_eq!(
-            get_request("kraken.events", &long, "1", false).unwrap_err(),
+            get_request("snodra.events", &long, "1", false).unwrap_err(),
             format!("segment is longer than {MAX_PLACE} bytes")
         );
         assert_eq!(
-            get_request("kraken.events", "1", &long, false).unwrap_err(),
+            get_request("snodra.events", "1", &long, false).unwrap_err(),
             format!("position is longer than {MAX_PLACE} bytes")
         );
         assert!(get_request(&"s".repeat(MAX_FILTER + 1), "1", "1", false).is_err());
@@ -890,8 +890,8 @@ mod tests {
         assert_eq!(lag_request(None).unwrap(), json!({}));
         assert_eq!(lag_request(Some("")).unwrap(), json!({}));
         assert_eq!(
-            lag_request(Some("kraken.events")).unwrap(),
-            json!({"source": "kraken.events"})
+            lag_request(Some("snodra.events")).unwrap(),
+            json!({"source": "snodra.events"})
         );
         assert!(lag_request(Some(&"s".repeat(MAX_FILTER))).is_ok());
         assert_eq!(
@@ -989,7 +989,7 @@ mod tests {
     fn a_page_carries_a_long_cursor_back_intact() {
         let cursor = "c".repeat(MAX_CURSOR);
         let answer = format!(
-            "{{\"source\":\"kraken.events\",\"results\":[],\"scanned\":1,\"exhausted\":false,\"stoppedBy\":\"limit\",\"cursor\":\"{cursor}\"}}"
+            "{{\"source\":\"snodra.events\",\"results\":[],\"scanned\":1,\"exhausted\":false,\"stoppedBy\":\"limit\",\"cursor\":\"{cursor}\"}}"
         );
         let page = read_page(answer.as_bytes()).unwrap();
         assert_eq!(page.cursor.as_deref(), Some(cursor.as_str()));
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     fn answers_keep_only_what_the_hub_knows() {
         let page = read_page(
-            br#"{"source":"kraken.events","results":[{"source":"kraken.events","segment":"3",
+            br#"{"source":"snodra.events","results":[{"source":"snodra.events","segment":"3",
                 "position":"42","timestamp":17,"key":"k","headers":{"type":"a.B","x-other":"y"},
                 "size":9,"payload":"secret","payloadBase64":"c2VjcmV0"}],"scanned":5,
                 "exhausted":true,"stoppedBy":null,"cursor":null,"extra":1}"#,
@@ -1007,7 +1007,7 @@ mod tests {
         let out = serde_json::to_value(&page).unwrap();
         assert_eq!(
             out,
-            json!({"source": "kraken.events", "results": [{"source": "kraken.events",
+            json!({"source": "snodra.events", "results": [{"source": "snodra.events",
                 "segment": "3", "position": "42", "timestamp": 17, "key": "k",
                 "headers": {"type": "a.B"}, "size": 9}], "scanned": 5, "exhausted": true,
                 "stoppedBy": null, "cursor": null})
@@ -1025,7 +1025,7 @@ mod tests {
 
     fn record(extra: &str) -> RecordAnswer {
         let text = format!(
-            r#"{{"source":"kraken.events","segment":"0","position":"7","timestamp":1,"key":null,
+            r#"{{"source":"snodra.events","segment":"0","position":"7","timestamp":1,"key":null,
                 "headers":{{"type":"a.B"}},"size":6,"allHeaders":[{{"name":"type","value":"a.B"}},
                 {{"name":"bin","value":null,"valueHex":"00ff","truncated":true}}]{extra}}}"#
         );

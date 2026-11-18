@@ -90,7 +90,7 @@ impl Tail {
     /// `start` with `segments`.
     pub async fn start(&mut self, segments: u64) {
         self.part(
-            serde_json::json!({"start": {"source": "kraken.events", "segments": segments,
+            serde_json::json!({"start": {"source": "snodra.events", "segments": segments,
             "endsAtMs": 1_900_000_000_000_i64}}),
         )
         .await;
@@ -263,13 +263,13 @@ fn end_err(id: &str, code: ErrorCode, message: &str, details: Vec<u8>) -> Client
 
 /// A summary as the browser writes one.
 pub fn summary(segment: &str, position: &str, ts: i64, key: &str, headers: Value) -> Value {
-    serde_json::json!({"source": "kraken.events", "segment": segment, "position": position,
+    serde_json::json!({"source": "snodra.events", "segment": segment, "position": position,
         "timestamp": ts, "key": key, "headers": headers, "size": 17})
 }
 
 /// A search page with `results`.
 pub fn page(results: Vec<Value>) -> Value {
-    serde_json::json!({"source": "kraken.events", "results": results, "scanned": 2,
+    serde_json::json!({"source": "snodra.events", "results": results, "scanned": 2,
         "exhausted": true, "stoppedBy": null, "cursor": null})
 }
 
@@ -279,10 +279,10 @@ pub fn defaults(type_name: &str, _request: &Value) -> Answer {
     match type_name {
         SEARCH => Answer::Json(page(vec![])),
         GET => refusal("not-found", "no record at that position"),
-        SOURCES => Answer::Json(serde_json::json!({"sources": [{"source": "kraken.events",
+        SOURCES => Answer::Json(serde_json::json!({"sources": [{"source": "snodra.events",
             "segments": [{"segment": "0", "first": "0", "head": "2"}]}]})),
         LAG => Answer::Json(
-            serde_json::json!({"source": "kraken.events", "subscriptions": [],
+            serde_json::json!({"source": "snodra.events", "subscriptions": [],
             "truncated": false}),
         ),
         _ => Answer::Stream,

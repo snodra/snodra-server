@@ -1,5 +1,5 @@
 //! snodra-server: routes commands and queries between Snodra services over gRPC.
-//! See kraken/docs/05-services/hub.md.
+//! See `README.md` for the settings, the protocol and the dashboard.
 
 pub mod api;
 pub mod assets;

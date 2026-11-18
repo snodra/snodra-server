@@ -596,7 +596,7 @@ mod tests {
         proto::ProcessorStatus {
             name: name.to_string(),
             subscription: "svc".to_string(),
-            source: "kraken.events".to_string(),
+            source: "snodra.events".to_string(),
             event_store: "kafka".to_string(),
             capabilities: vec!["lag".to_string(), "replay".to_string()],
             state: state as i32,
@@ -618,9 +618,9 @@ mod tests {
 
     #[test]
     fn decimal_segments_sort_by_value_before_other_names() {
-        let mut names = vec!["b", "10", "a", "2", "02", "0", "kraken.events-1"];
+        let mut names = vec!["b", "10", "a", "2", "02", "0", "snodra.events-1"];
         names.sort_by(|a, b| segment_order(a, b));
-        assert_eq!(names, ["0", "02", "2", "10", "a", "b", "kraken.events-1"]);
+        assert_eq!(names, ["0", "02", "2", "10", "a", "b", "snodra.events-1"]);
         // Only ASCII digits are decimal (no sign); any length compares by value, no overflow;
         // equal values by their bytes. ui/processors.js sorts this list the same way.
         let mut names = vec![
@@ -849,7 +849,7 @@ mod tests {
         ProcessorReport {
             name: "default".into(),
             subscription: "svc".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             event_store: "kafka".into(),
             capabilities: vec!["lag".into(), "replay".into()],
             state,
@@ -916,7 +916,7 @@ mod tests {
         stale.subscription = "old-subscription".into();
         let mut fresh = report(Running, &[("0", 2)]);
         fresh.subscription = "svc".into();
-        fresh.source = "kraken.events".into();
+        fresh.source = "snodra.events".into();
         let a = aggregate(
             "default",
             vec![

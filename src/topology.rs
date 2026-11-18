@@ -681,7 +681,7 @@ mod tests {
             processors: vec![proto::ProcessorStatus {
                 name: "default".into(),
                 subscription: "svc".into(),
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
                 state: proto::ProcessorState::ProcessorFailing as i32,
                 segments: vec![proto::SegmentStatus {
                     segment: "0".into(),

@@ -70,7 +70,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_changed_file_triggers_one_reload() {
-        let dir = std::env::temp_dir().join(format!("kraken-reload-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("snodra-reload-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("f");
         std::fs::write(&file, "one").unwrap();

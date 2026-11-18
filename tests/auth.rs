@@ -187,7 +187,7 @@ async fn enforce_refuses_a_handled_type_outside_handle_and_names_it() {
 }
 
 #[tokio::test]
-async fn enforce_refuses_kraken_events_types_without_the_event_browser_right() {
+async fn enforce_refuses_snodra_events_types_without_the_event_browser_right() {
     let dir = TempDir::new();
     let browser = format!(
         "{}event-browser = true\n\n",

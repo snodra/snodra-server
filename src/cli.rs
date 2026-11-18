@@ -666,7 +666,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
             ProcessorReport {
                 name: "default".into(),
                 subscription: "billing".into(),
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
                 state: ProcessorStateName::Running,
                 segments: parts(&[("0", 2), ("1", -1), ("2", 10), ("5", 0)]),
                 processed_total: 120,
@@ -677,7 +677,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
             ProcessorReport {
                 name: "invoices".into(),
                 subscription: "billing.invoices".into(),
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
                 state: ProcessorStateName::Failing,
                 segments: parts(&[("3", -1)]),
                 processed_total: 7,
@@ -691,7 +691,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         t.services[0].instances[1].processors = vec![ProcessorReport {
             name: "default".into(),
             subscription: "billing".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             state: ProcessorStateName::Starting,
             dead_letter_mode: "collection".into(),
             ..Default::default()
@@ -702,9 +702,9 @@ service billing (2 instances)
   b-1      | 1h05m         | 800ms         | false | 0/1           | Pay,Refund | GetInvoice
   b-2      | 3m05s         | 45s           | true  | 2/0           | -          | -
   processor | instance | state    | subscription     | source        | segments | lag | processed | failed | dead letters  | last error
-  default   | b-1      | RUNNING  | billing          | kraken.events | 0-2,5    | 12  | 120       | 0      | 3             | -
-  default   | b-2      | STARTING | billing          | kraken.events | -        | -   | 0         | 0      | 0             | -
-  invoices  | b-1      | FAILING  | billing.invoices | kraken.events | 3        | -   | 7         | 2      | (event-store) | handler failed: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (2m05s ago)
+  default   | b-1      | RUNNING  | billing          | snodra.events | 0-2,5    | 12  | 120       | 0      | 3             | -
+  default   | b-2      | STARTING | billing          | snodra.events | -        | -   | 0         | 0      | 0             | -
+  invoices  | b-1      | FAILING  | billing.invoices | snodra.events | 3        | -   | 7         | 2      | (event-store) | handler failed: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (2m05s ago)
 
 service catalog (1 instances)
   instance | connected for | heartbeat age | stale | in-flight h/s | commands | queries
@@ -804,7 +804,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         i.processors = vec![ProcessorReport {
             name: bad("audit"),
             subscription: bad("billing.audit"),
-            source: bad("kraken.events"),
+            source: bad("snodra.events"),
             operation_id: bad("op"),
             state: ProcessorStateName::Running,
             dead_letter_mode: bad("log"),
@@ -829,7 +829,7 @@ totals: services=2 instances=3 commandTypes=3 queryTypes=2 inFlight=3
         assert!(table.contains("\n  b-1 [2J x "), "{table}");
         assert!(table.contains("| Pay [2J x "), "{table}");
         assert!(
-            table.contains("\n  audit [2J x | b-1 [2J x | RUNNING op op [2J | billing.audit [2J x | kraken.events [2J x |"),
+            table.contains("\n  audit [2J x | b-1 [2J x | RUNNING op op [2J | billing.audit [2J x | snodra.events [2J x |"),
             "{table}"
         );
         assert!(table.contains("| (log [2J x)  |"), "{table}");

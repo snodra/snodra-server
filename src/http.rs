@@ -1695,10 +1695,10 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
         fake_browser(&s, |type_name, request| match type_name {
-            events::SEARCH => serde_json::json!({"source": "kraken.events", "results": [],
+            events::SEARCH => serde_json::json!({"source": "snodra.events", "results": [],
                 "scanned": 3, "exhausted": true, "stoppedBy": null, "cursor": null}),
             events::GET => {
-                let mut record = serde_json::json!({"source": "kraken.events", "segment": "0",
+                let mut record = serde_json::json!({"source": "snodra.events", "segment": "0",
                     "position": "1", "timestamp": 1, "key": "k", "headers": {}, "size": 7,
                     "allHeaders": []});
                 if request["payload"] == true {
@@ -1706,7 +1706,7 @@ mod tests {
                 }
                 record
             }
-            _ => serde_json::json!({"start": {"source": "kraken.events", "segments": 1,
+            _ => serde_json::json!({"start": {"source": "snodra.events", "segments": 1,
                 "endsAtMs": 1}}),
         });
         let r = app.clone().oneshot(get("/api/v1/events")).await.unwrap();
@@ -1720,7 +1720,7 @@ mod tests {
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         let r = app
             .clone()
-            .oneshot(get("/api/v1/events/kraken.events/0/1"))
+            .oneshot(get("/api/v1/events/snodra.events/0/1"))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -1778,7 +1778,7 @@ mod tests {
         assert_eq!(audits.len(), 1, "{audits:?}");
         for (field, value) in [
             ("caller", "dashboard-token"),
-            ("source", "kraken.events"),
+            ("source", "snodra.events"),
             ("segment", "0"),
             ("position", "1"),
             ("size", "7"),
