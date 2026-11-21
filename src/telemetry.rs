@@ -370,7 +370,7 @@ impl Metrics {
                 .build(),
             auth_violations: meter
                 .u64_counter("snodra_server_auth_violations_total")
-                .with_description("Access-control violations (ADR 0018), refused in enforce mode and allowed in permissive mode, per reason and service (`unknown` for a service name the ACL does not hold)")
+                .with_description("Access-control violations, refused in enforce mode and allowed in permissive mode, per reason and service (`unknown` for a service name the ACL does not hold)")
                 .build(),
             acl_generation: meter
                 .u64_gauge("snodra_server_acl_generation")
@@ -394,11 +394,11 @@ impl Metrics {
                 .build(),
             client_certificates: meter
                 .u64_counter("snodra_server_client_certificates_total")
-                .with_description("Client certificates judged (ADR 0020; not in off): one per Register that carries one, per result: ok (it names one service and has not ended; the Register may still be refused by the ACL), no_service, multiple_services, mismatch (credentials name another service), expired (it had ended at Register); plus one expired when a session reaches notAfter (closed, or in permissive kept)")
+                .with_description("Client certificates judged (not in off): one per Register that carries one, per result: ok (it names one service and has not ended; the Register may still be refused by the ACL), no_service, multiple_services, mismatch (credentials name another service), expired (it had ended at Register); plus one expired when a session reaches notAfter (closed, or in permissive kept)")
                 .build(),
             jwt_validations: meter
                 .u64_counter("snodra_server_jwt_validations_total")
-                .with_description("JWT credentials validated (ADR 0019), per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, key_pending, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
+                .with_description("JWT credentials validated, per result: ok, or why not (expired, not_yet_valid, bad_signature, bad_alg, unknown_kid, key_pending, wrong_issuer, wrong_audience, wrong_type, missing_claim, malformed, not_loaded)")
                 .build(),
             jwks_fetches: meter
                 .u64_counter("snodra_server_jwks_fetches_total")
@@ -414,7 +414,7 @@ impl Metrics {
                 .build(),
             control: meter
                 .u64_counter("snodra_server_control_total")
-                .with_description("Processor control calls of the HTTP API (ADR 0023), per action (pause, resume, reset, dead_letter_list, dead_letter_retry, dead_letter_retry_all, dead_letter_discard) and outcome (ok, bad_request, not_found, conflict, failed, unavailable, timeout, unauthenticated, forbidden, disabled)")
+                .with_description("Processor control calls of the HTTP API, per action (pause, resume, reset, dead_letter_list, dead_letter_retry, dead_letter_retry_all, dead_letter_discard) and outcome (ok, bad_request, not_found, conflict, failed, unavailable, timeout, unauthenticated, forbidden, disabled)")
                 .build(),
             control_unknown_replies: meter
                 .u64_counter("snodra_server_control_unknown_replies_total")
@@ -422,7 +422,7 @@ impl Metrics {
                 .build(),
             event_browser_requests: meter
                 .u64_counter("snodra_server_event_browser_requests_total")
-                .with_description("Calls of the events API (ADR 0027), per kind (search, record, sources, lag, tail) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, not_installed, timeout, failed)")
+                .with_description("Calls of the events API, per kind (search, record, sources, lag, tail) and outcome (ok, bad_request, forbidden, not_found, too_many, unavailable, not_installed, timeout, failed)")
                 .build(),
             event_browser_scanned: meter
                 .u64_histogram("snodra_server_event_browser_scanned_records")
