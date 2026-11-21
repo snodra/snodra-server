@@ -98,7 +98,7 @@ message ServerMessage {
 // are read from the first Register of a stream only; later Registers cannot change them. Field 11
 // is allocated to a later roadmap phase (contexts).
 message Register {
-  // Logical service name, for example "gym-notes-service"; each event-store add-on derives its
+  // Logical service name, for example "orders-service"; each event-store add-on derives its
   // own names from it.
   string service_name = 1;
   // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
@@ -542,7 +542,7 @@ message Request {
   // Unique id chosen by the sender (UUID). Replies and errors carry it back.
   string id = 1;
   RequestKind kind = 2;
-  // Fully qualified type name, for example "gymnotes.LogWorkout".
+  // Fully qualified type name, for example "orders.PlaceOrder".
   string type = 3;
   // Optional. When present, all requests with the same key for the same type go to the same
   // instance of the owning service (consistent hashing). Typically the aggregate id.

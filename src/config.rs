@@ -1210,14 +1210,14 @@ mod tests {
     fn timeout_overrides_parse_type_equals_millis_lists() {
         let c = with_env(&[(
             "SNODRA_SERVER_TIMEOUT_OVERRIDES",
-            " files.Upload=120000 , gym.Report=500,",
+            " files.Upload=120000 , orders.Report=500,",
         )])
         .unwrap();
         assert_eq!(
             c.timeout_overrides,
             BTreeMap::from([
                 ("files.Upload".to_string(), Duration::from_millis(120_000)),
-                ("gym.Report".to_string(), Duration::from_millis(500)),
+                ("orders.Report".to_string(), Duration::from_millis(500)),
             ])
         );
         for bad in [
