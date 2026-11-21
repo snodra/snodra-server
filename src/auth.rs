@@ -1,4 +1,4 @@
-//! Hub access control (roadmap P5a, ADR 0018): who may register as which service, which types a
+//! Hub access control: who may register as which service, which types a
 //! session may handle and which it may send.
 //!
 //! Three pieces:
@@ -15,9 +15,9 @@
 //! Tokens are never logged and never stored: a token is hashed as soon as it is read, and logs
 //! carry at most [`short`] (the first 8 hex characters of the digest). Every credential kind
 //! produces a [`Principal`]: who the credential speaks for and the ACL entry it resolves through
-//! (a token's digest, or a service name for a JWT, ADR 0019). A session keeps its principal
+//! (a token's digest, or a service name for a JWT). A session keeps its principal
 //! ([`crate::session::SessionMeta::principal`]) and every later check looks the entry up again,
-//! so a reload takes effect on live sessions. A client certificate (P5c, ADR 0020) is the third
+//! so a reload takes effect on live sessions. A client certificate is the third
 //! kind: the handshake proves it, [`crate::mtls::identify`] reads the service from it, and
 //! [`Authorizer::admit`] resolves that service through its `[[service]]` table.
 
@@ -45,10 +45,10 @@ use crate::telemetry::Metrics;
 /// SHA-256 of a token.
 pub type Digest = [u8; 32];
 
-/// The only context contexts-aware ACL files may name (contexts are deferred, roadmap P8).
+/// The only context contexts-aware ACL files may name (contexts are deferred).
 pub const DEFAULT_CONTEXT: &str = "default";
 
-/// The reserved namespace of the event browser's query types (ADR 0027): only a session whose
+/// The reserved namespace of the event browser's query types: only a session whose
 /// ACL entry has `event-browser = true` may register a type in it, whatever its `handle` says.
 pub const EVENTS_NAMESPACE: &str = "snodra.events.";
 
@@ -285,7 +285,7 @@ impl fmt::Debug for Secret {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
     Any,
-    /// Stored with its trailing dot: `files.`.
+    /// Stored with its trailing dot: `orders.`.
     Prefix(String),
     Exact(String),
 }
@@ -380,9 +380,9 @@ pub struct AclEntry {
     pub handle: Vec<Pattern>,
     /// Types it may send, in every request mode.
     pub send: Vec<Pattern>,
-    /// The token may also call the hub's processor controls (ADR 0023).
+    /// The token may also call the hub's processor controls.
     pub control: bool,
-    /// The token may register the event browser's `snodra.events.*` types (ADR 0027).
+    /// The token may register the event browser's `snodra.events.*` types.
     pub event_browser: bool,
     /// Free text for the operator ("rotation 2026-11"); never used for decisions.
     pub label: Option<String>,
@@ -407,9 +407,9 @@ pub struct Rights<'a> {
     pub service: &'a str,
     pub handle: &'a [Pattern],
     pub send: &'a [Pattern],
-    /// The processor controls of the HTTP API (ADR 0023).
+    /// The processor controls of the HTTP API.
     pub control: bool,
-    /// Registering the event browser's `snodra.events.*` types (ADR 0027); `handle` never
+    /// Registering the event browser's `snodra.events.*` types; `handle` never
     /// grants them.
     pub event_browser: bool,
 }
@@ -428,7 +428,7 @@ pub enum AclKey {
 pub enum CredentialKind {
     Token,
     Jwt,
-    /// A client certificate presented in the TLS handshake (ADR 0020).
+    /// A client certificate presented in the TLS handshake.
     Certificate,
 }
 
@@ -484,7 +484,7 @@ impl Principal {
         }
     }
 
-    /// The principal of a client certificate (ADR 0020): its service's `[[service]]` table is
+    /// The principal of a client certificate: its service's `[[service]]` table is
     /// its entry, and it ends at `notAfter`.
     pub fn certificate(cert: &ClientCert) -> Self {
         Self {
@@ -512,16 +512,16 @@ impl Principal {
     }
 }
 
-/// What one service's JWTs may do (ADR 0019): the `[[service]]` table named after the service.
+/// What one service's JWTs may do: the `[[service]]` table named after the service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceEntry {
     /// The service name, which is the `azp` of its tokens.
     pub name: String,
     pub handle: Vec<Pattern>,
     pub send: Vec<Pattern>,
-    /// The service's JWTs may also call the hub's processor controls (ADR 0023).
+    /// The service's JWTs may also call the hub's processor controls.
     pub control: bool,
-    /// The service may register the event browser's `snodra.events.*` types (ADR 0027).
+    /// The service may register the event browser's `snodra.events.*` types.
     pub event_browser: bool,
 }
 
@@ -607,7 +607,7 @@ impl Acl {
     /// Parses the TOML text of an ACL file. Unknown keys are errors (a misspelt `send` must not
     /// silently grant nothing, or something else); so are duplicate token digests, an empty
     /// service name, a bad pattern and `contexts` other than `["default"]` (contexts are deferred
-    /// indefinitely, roadmap P8).
+    /// indefinitely).
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let raw: RawAcl = toml::from_str(text).context("invalid ACL file")?;
         let mut entries = Vec::with_capacity(raw.token.len());
@@ -891,7 +891,7 @@ pub struct Admission {
     pub refused: Option<Denied>,
 }
 
-/// What a bearer credential may do with the hub's processor controls (ADR 0023).
+/// What a bearer credential may do with the hub's processor controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlRight {
     /// An ACL credential whose entry has `control = true`; the service it names.
@@ -1031,7 +1031,7 @@ impl Authorizer {
     }
 
     /// A credentials refresh was ignored because the session's principal is its client
-    /// certificate, which no message can replace (ADR 0020).
+    /// certificate, which no message can replace.
     pub fn refresh_ignored_for_certificate(&self) {
         self.metrics
             .credentials_refresh("ignored_certificate_session");
@@ -1417,8 +1417,8 @@ impl Authorizer {
             Err(denials) if denials[0].code == DeniedCode::Unavailable => {
                 // The credential is not bad: the hub cannot judge it yet (the key set is not
                 // loaded, or a rotated key is still being fetched). The session keeps what it
-                // has until the client's next refresh or the expiry decides (ADR 0019,
-                // amendment 2); closing it would punish a client for the identity provider.
+                // has until the client's next refresh or the expiry decides; closing it would
+                // punish a client for the identity provider.
                 self.metrics.credentials_refresh("unavailable");
                 if self.may_log(denials[0].reason) {
                     warn!(
@@ -1489,7 +1489,7 @@ impl Authorizer {
         if self.mode == AuthMode::Off {
             return Expiry::Keep;
         }
-        // The timer is monotonic; the wall clock decides (amended in H1).
+        // The timer is monotonic; the wall clock decides.
         if self
             .expires_at(principal)
             .is_none_or(|at| at > SystemTime::now())
@@ -1561,7 +1561,7 @@ impl Authorizer {
     }
 
     /// True when `token` is a valid JWT of a service that has a `[[service]]` table: a service
-    /// may read the topology, like any ACL token (ADR 0019). A user's access token (`azp` is a
+    /// may read the topology, like any ACL token. A user's access token (`azp` is a
     /// frontend client) has no table, so it never does.
     fn jwt_has_entry(&self, token: &str) -> bool {
         let Some(jwt) = &self.jwt else { return false };
@@ -1601,7 +1601,7 @@ impl Authorizer {
     /// [`Authorizer::check_topology`] for a call that came over a TLS connection whose peer
     /// presented the client certificate `peer` (DER): in `permissive` and `enforce` a certificate
     /// that names a service with a `[[service]]` table, and has not ended, is accepted like an ACL
-    /// token (ADR 0020).
+    /// token.
     pub fn check_topology_peer(
         &self,
         presented: Option<&str>,
@@ -1641,7 +1641,7 @@ impl Authorizer {
         Ok(())
     }
 
-    /// True when some ACL entry grants the processor controls (ADR 0023). Never in `off`, which
+    /// True when some ACL entry grants the processor controls. Never in `off`, which
     /// reads no ACL. Asked per call, so a reload that adds or removes `control` applies at once.
     pub fn controls_configured(&self) -> bool {
         if self.mode == AuthMode::Off {
@@ -1916,7 +1916,7 @@ fn judge(
             },
         ));
     }
-    // The event browser's namespace is the `event-browser` right's alone (ADR 0027): `handle`
+    // The event browser's namespace is the `event-browser` right's alone: `handle`
     // never grants it, so `handle = ["*"]` cannot register a browser by accident. Its denial
     // comes first: a Register refused for both says why the reserved types were refused.
     let (events, others): (Vec<&String>, Vec<&String>) =
@@ -2257,13 +2257,13 @@ contexts = ["default"]
     fn patterns_match_exact_prefix_and_any() {
         let p = |s| Pattern::parse(s).unwrap();
         assert!(p("*").matches("anything.At.All"));
-        assert!(p("files.*").matches("files.Attach"));
-        assert!(p("files.*").matches("files.sub.Attach"));
-        assert!(!p("files.*").matches("files."));
-        assert!(!p("files.*").matches("filesX.Attach"));
-        assert!(!p("files.*").matches("files"));
-        assert!(p("files.Attach").matches("files.Attach"));
-        assert!(!p("files.Attach").matches("files.AttachMore"));
+        assert!(p("orders.*").matches("orders.Attach"));
+        assert!(p("orders.*").matches("orders.sub.Attach"));
+        assert!(!p("orders.*").matches("orders."));
+        assert!(!p("orders.*").matches("ordersX.Attach"));
+        assert!(!p("orders.*").matches("orders"));
+        assert!(p("orders.Attach").matches("orders.Attach"));
+        assert!(!p("orders.Attach").matches("orders.AttachMore"));
         for bad in ["", "*.x", "a*", "a.*.b", "a.**", "a b"] {
             assert!(Pattern::parse(bad).is_err(), "{bad:?} should be rejected");
         }
@@ -2700,7 +2700,7 @@ contexts = ["default"]
         assert!("strict".parse::<AuthMode>().is_err());
     }
 
-    // ---- processor control (ADR 0023) ----
+    // ---- processor control ----
 
     #[test]
     fn only_an_acl_entry_with_control_may_control_processors() {
@@ -2751,7 +2751,7 @@ contexts = ["default"]
         );
     }
 
-    // ---- [[service]] tables (ADR 0019) ----
+    // ---- [[service]] tables ----
 
     fn service_acl_text() -> String {
         format!(
@@ -2790,7 +2790,7 @@ handle = ["*"]
         assert_ne!(Acl::parse(&acl_text()).unwrap(), acl);
     }
 
-    // ---- the event-browser right (ADR 0027) ----
+    // ---- the event-browser right ----
 
     /// A browser token with the right, a token handling `*` without it, and the same pair as
     /// `[[service]]` tables.
@@ -3720,7 +3720,7 @@ event-browser = false
 
     /// The timer is monotonic, armed from the wall clock once: a wall-clock step back (or a
     /// look-again wake-up) makes it fire before `exp` plus the grace by the wall clock. That is
-    /// not an expiry: nothing is counted and the caller arms the timer again (amended in H1).
+    /// not an expiry: nothing is counted and the caller arms the timer again.
     #[tokio::test]
     async fn a_timer_that_fires_before_exp_plus_the_grace_by_the_wall_clock_expires_nothing() {
         for mode in [AuthMode::Enforce, AuthMode::Permissive] {
@@ -3739,7 +3739,7 @@ event-browser = false
     }
 
     /// A wall-clock step forward or a suspend leaves a monotonic timer late; it never waits more
-    /// than [`EXPIRY_RECHECK`] before comparing `exp` with the wall clock again (amended in H1).
+    /// than [`EXPIRY_RECHECK`] before comparing `exp` with the wall clock again.
     #[tokio::test]
     async fn a_distant_expiry_is_looked_at_again_within_the_recheck() {
         let fx = jwt_fx(AuthMode::Enforce).await;
@@ -3806,7 +3806,7 @@ event-browser = false
     }
 }
 
-/// Client certificates as credentials (roadmap P5c, ADR 0020).
+/// Client certificates as credentials.
 #[cfg(test)]
 mod cert_tests {
     use super::*;

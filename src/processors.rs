@@ -1,8 +1,8 @@
-//! Event processors (ADR 0022): what each instance reports about its event processors in
+//! Event processors: what each instance reports about its event processors in
 //! `InstanceStatus.processors`, bounded as the hub keeps it, and the per-service view the
 //! dashboard and `GET /api/v1/processors` show. A report also says whether the processor replays
-//! and which reset holds its lock (ADR 0023), and which event store it reads with which
-//! capabilities (ADR 0027).
+//! and which reset holds its lock, and which event store it reads with which
+//! capabilities.
 //!
 //! The hub only relays and aggregates what the libraries report: it reads no event store, keeps
 //! no history and stores nothing beyond the latest report of each live session (in the session's
@@ -46,7 +46,7 @@ pub const MAX_MODE_BYTES: usize = 32;
 /// Longest reset operation id kept, in bytes (the hub's are UUIDs, 36).
 pub const MAX_OPERATION_ID_BYTES: usize = 64;
 
-/// The capability that offers a reset (and so a replay) of a processor (ADR 0027).
+/// The capability that offers a reset (and so a replay) of a processor.
 pub const CAPABILITY_REPLAY: &str = "replay";
 /// `ProcessorState` as the hub shows it (JSON: `"RUNNING"` and so on, without the
 /// `PROCESSOR_` prefix). A number this hub does not know reads as `Unspecified`.
@@ -108,7 +108,7 @@ impl ProcessorStateName {
         Self::Unspecified,
     ];
 
-    /// The `state` label of the processor state gauge (ADR 0026): the name in lowercase.
+    /// The `state` label of the processor state gauge: the name in lowercase.
     pub fn label(self) -> &'static str {
         match self {
             Self::Unspecified => "unspecified",
@@ -166,7 +166,7 @@ pub struct SegmentReport {
     pub committed: String,
     pub head: String,
     pub lag: i64,
-    /// The end (exclusive) of the segment's open replay range (ADR 0023); empty when none.
+    /// The end (exclusive) of the segment's open replay range; empty when none.
     pub replay_until: String,
 }
 
@@ -198,7 +198,7 @@ pub struct ProcessorReport {
     pub event_types: Vec<String>,
     /// `collection`, `event-store` or `log` as reported.
     pub dead_letter_mode: String,
-    /// A replay range is open on this instance's segments (ADR 0023).
+    /// A replay range is open on this instance's segments.
     pub replaying: bool,
     /// The reset operation holding the processor's lock; empty when none.
     pub operation_id: String,
@@ -401,7 +401,7 @@ pub struct ProcessorAggregate {
     pub event_types: Vec<String>,
     /// The most recent last error of its instances; `None` when none reported one.
     pub last_error: Option<LastError>,
-    /// Some instance replays (ADR 0023).
+    /// Some instance replays.
     pub replaying: bool,
     /// The reset operation of the freshest report that names one; empty when none does.
     pub operation_id: String,
@@ -540,7 +540,7 @@ pub fn view(t: &Topology) -> ProcessorsView {
 
 /// Every service's processors, each aggregated over the instances that report it
 /// ([`aggregate`]), from `(service, one instance's report of one processor)`; services sorted
-/// by name. The Processors page and the processor gauges (ADR 0026) both read this.
+/// by name. The Processors page and the processor gauges both read this.
 pub fn by_service(
     reports: impl IntoIterator<Item = (String, ProcessorInstance)>,
 ) -> Vec<ServiceProcessors> {

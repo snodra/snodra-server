@@ -56,11 +56,11 @@ pub struct Config {
     /// Type ownership is kept this long after the last instance leaves.
     /// `SNODRA_SERVER_OWNER_GRACE`, default 60 s.
     pub owner_grace: Duration,
-    /// A streaming query (ADR 0017, P4b) open for longer than this ends with
+    /// A streaming query open for longer than this ends with
     /// `ReplyEnd{error = CANCELLED}` and a `Cancel` to its handler, however active it is.
     /// `SNODRA_SERVER_MAX_STREAM_DURATION`, default 10 minutes, at least 1 s.
     pub max_stream_duration: Duration,
-    /// Updates of a subscription query (ADR 0017, P4c) the hub holds for a sender whose credit
+    /// Updates of a subscription query the hub holds for a sender whose credit
     /// is exhausted; one more ends the subscription with `RESOURCE_EXHAUSTED`.
     /// `SNODRA_SERVER_SUBSCRIPTION_BUFFER`, default 256, positive.
     pub subscription_buffer: usize,
@@ -91,12 +91,12 @@ pub struct Config {
     /// at least 10 s.
     pub edge_stats_window: Duration,
     /// The other hubs' dashboards, as their HTTP base URLs reachable from the operator's browser
-    /// (ADR 0016). `SNODRA_SERVER_PEERS`, comma-separated, default none. Normalised to origins
+    ///. `SNODRA_SERVER_PEERS`, comma-separated, default none. Normalised to origins
     /// (`scheme://host[:port]`, lowercase, default port dropped), deduplicated, at most
     /// [`MAX_PEERS`]. The list may include this hub (the page skips it by hub id). The dashboard
     /// merges the peers in the browser; each peer answers CORS for these origins only.
     pub peers: Vec<String>,
-    /// Access control for `Connect` (ADR 0018): `off` (default, no checks), `permissive`
+    /// Access control for `Connect`: `off` (default, no checks), `permissive`
     /// (evaluate, log and count violations, allow everything) or `enforce` (refuse violations).
     /// `SNODRA_SERVER_AUTH_MODE`.
     pub auth_mode: AuthMode,
@@ -111,8 +111,8 @@ pub struct Config {
     /// `SNODRA_SERVER_HTTP_TLS_KEY`, both or neither.
     pub http_tls_cert: Option<PathBuf>,
     pub http_tls_key: Option<PathBuf>,
-    /// PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS,
-    /// ADR 0020); needs the gRPC pair. Reloaded when it changes. The HTTP listener never asks for
+    /// PEM bundle of the CAs whose client certificates the gRPC listener accepts (mutual TLS);
+    /// needs the gRPC pair. Reloaded when it changes. The HTTP listener never asks for
     /// a client certificate. `SNODRA_SERVER_TLS_CLIENT_CA`.
     pub tls_client_ca: Option<PathBuf>,
     /// Whether a client must present a certificate: `optional` (default when the CA is set) or
@@ -123,7 +123,7 @@ pub struct Config {
     /// `Authorization: Bearer <token>`. Only its digest is kept. `SNODRA_SERVER_DASHBOARD_TOKEN`,
     /// at least 16 characters. Unrelated to the ACL tokens.
     pub dashboard_token: Option<Secret>,
-    /// The processor controls' token (ADR 0023): the mutating calls under `/api/v1/services/`
+    /// The processor controls' token: the mutating calls under `/api/v1/services/`
     /// accept it, or an ACL credential whose entry has `control = true`; it also reads everything
     /// the dashboard token reads. Only its digest is kept. `SNODRA_SERVER_DASHBOARD_WRITE_TOKEN`, at
     /// least 16 characters.
@@ -143,7 +143,7 @@ pub struct Config {
     /// TLS handshakes in progress at once from one peer IP; more are dropped at once. `0`
     /// disables the cap. `SNODRA_SERVER_TLS_HANDSHAKES_PER_IP`, default 32.
     pub tls_handshakes_per_ip: usize,
-    /// The `iss` a JWT credential must carry, compared as an exact string (ADR 0019). Unset: JWT
+    /// The `iss` a JWT credential must carry, compared as an exact string. Unset: JWT
     /// credentials are refused as "not configured". `SNODRA_SERVER_JWT_ISSUER`.
     pub jwt_issuer: Option<String>,
     /// Where the issuer's signing keys are fetched from; `None` exactly when [`Config::jwt_issuer`]
@@ -164,7 +164,7 @@ pub struct Config {
     /// `SNODRA_SERVER_JWT_JWKS_CA`.
     pub jwt_jwks_ca: Option<PathBuf>,
     /// How long a control call waits for an instance's answer (pause, resume, the prepare and
-    /// finish of a reset, dead letters; ADR 0023). `SNODRA_SERVER_CONTROL_TIMEOUT`, default 10 s,
+    /// finish of a reset, dead letters). `SNODRA_SERVER_CONTROL_TIMEOUT`, default 10 s,
     /// positive, at most [`Config::control_lease`] minus [`Config::control_lease_renew`].
     pub control_timeout: Duration,
     /// How long the instance that executes a reset may take (its reset handlers, the marker
@@ -178,7 +178,7 @@ pub struct Config {
     /// environment variable: 10 s, shortened by tests.
     pub control_lease_renew: Duration,
     /// Payloads are served (the record detail and the `q` filter) only when this is on, a
-    /// dashboard or write token is configured and the request presents one (ADR 0025): the hub
+    /// dashboard or write token is configured and the request presents one: the hub
     /// asks the event browser for a payload only then. `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS`,
     /// default false.
     pub event_payloads: bool,
@@ -808,7 +808,7 @@ impl Config {
                 "SNODRA_SERVER_JWT_JWKS_URI uses plain http to {host}: whoever can alter that traffic can mint tokens the hub accepts; use https (SNODRA_SERVER_JWT_JWKS_CA adds a private CA)"
             ));
         }
-        // Payloads need a token to present (ADR 0025): without one the switch does nothing.
+        // Payloads need a token to present: without one the switch does nothing.
         if self.event_payloads
             && self.dashboard_token.is_none()
             && self.dashboard_write_token.is_none()
@@ -848,7 +848,7 @@ impl Config {
 /// Ten slots of at least a second each.
 const MIN_EDGE_STATS_WINDOW: Duration = Duration::from_secs(10);
 
-/// Settings of the event browser the hub had (ADR 0025) and no longer reads (ADR 0027): the
+/// Settings of the event browser the hub had and no longer reads: the
 /// `snodra-event-browser` add-on reads the event store and takes its own settings.
 pub const REMOVED_SETTINGS: [&str; 8] = [
     "SNODRA_SERVER_KAFKA_BOOTSTRAP",
@@ -1210,18 +1210,21 @@ mod tests {
     fn timeout_overrides_parse_type_equals_millis_lists() {
         let c = with_env(&[(
             "SNODRA_SERVER_TIMEOUT_OVERRIDES",
-            " files.Upload=120000 , orders.Report=500,",
+            " orders.PlaceOrder=120000 , orders.Report=500,",
         )])
         .unwrap();
         assert_eq!(
             c.timeout_overrides,
             BTreeMap::from([
-                ("files.Upload".to_string(), Duration::from_millis(120_000)),
+                (
+                    "orders.PlaceOrder".to_string(),
+                    Duration::from_millis(120_000)
+                ),
                 ("orders.Report".to_string(), Duration::from_millis(500)),
             ])
         );
         for bad in [
-            "files.Upload",
+            "orders.PlaceOrder",
             "=5",
             "a=b",
             "a=0",
@@ -1273,7 +1276,7 @@ mod tests {
         assert!(with_env(&[("SNODRA_SERVER_QUEUE_BYTES_TOTAL", "lots")]).is_err());
     }
 
-    /// The effective-timeout table from the design (P0, F4).
+    /// The effective-timeout table from the design.
     #[test]
     fn effective_timeout_table() {
         let c = Config {
@@ -2342,7 +2345,7 @@ mod tests {
         }
     }
 
-    /// The hub reads no event store (ADR 0027): a setting of the event browser it had is no longer
+    /// The hub reads no event store: a setting of the event browser it had is no longer
     /// read, and a hub that still sets one says so at startup, once per setting.
     #[test]
     fn removed_event_store_settings_are_startup_warnings() {

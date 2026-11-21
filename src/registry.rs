@@ -2,7 +2,7 @@
 //!
 //! Model and routing rules (docs/05-services/hub.md):
 //! - a message type is owned by exactly one service; another service registering it is rejected;
-//!   except a shared query type (`Register.shared_query_types`, ADR 0017), which many services may
+//!   except a shared query type (`Register.shared_query_types`), which many services may
 //!   own; registrants must agree on exclusive vs shared;
 //! - when the last instance of a service listing a type goes away the service keeps ownership for
 //!   `owner_grace` so a restarting service does not lose its types; `sweep` then drops it;
@@ -11,7 +11,7 @@
 //!   membership is stable; identical on every hub);
 //! - commands without a key and all queries return every live instance of the owning service
 //!   (of every owner, for a shared type) ([`Target::Candidates`]); the router picks one by tag
-//!   match and load (ADR 0014). [`Registry::pick`] keeps the plain round-robin choice for callers
+//!   match and load. [`Registry::pick`] keeps the plain round-robin choice for callers
 //!   without load information;
 //! - a scatter-gather query goes to every live instance of every owner that lists the type
 //!   ([`Registry::scatter_targets`]).
@@ -82,7 +82,7 @@ pub struct ScatterTarget {
     pub service: String,
 }
 
-/// The instances a streaming query may go to (ADR 0017, P4b): those of every owner that list
+/// The instances a streaming query may go to: those of every owner that list
 /// the type, sorted by id, with the rotation counter of the type (shared) or of its service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamPool {
@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------------------
-    // Shared query types (ADR 0017)
+    // Shared query types
 
     /// Registers `id` of `service` with `shared` as shared query types (default placement).
     fn shared(r: &Registry, id: &str, service: &str, shared: &[&str]) -> Result<(), RegisterError> {

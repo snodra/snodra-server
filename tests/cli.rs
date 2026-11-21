@@ -40,7 +40,7 @@ async fn topology_probe_against_test_hub() {
     assert!(snodra_server::cli::render_table(&topology).contains("service billing (1 instances)"));
 }
 
-/// The probe reads the processors over gRPC (`InstanceTopology.processors`, ADR 0022) and the
+/// The probe reads the processors over gRPC (`InstanceTopology.processors`) and the
 /// table shows them under their service.
 #[tokio::test]
 async fn topology_probe_shows_the_processors_an_instance_reports() {

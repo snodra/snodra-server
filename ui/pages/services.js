@@ -1,4 +1,4 @@
-// Services and their live instances; with peer hubs (ADR 0016) optionally merged over every
+// Services and their live instances; with peer hubs optionally merged over every
 // reachable hub, keyed by instance id, with the hubs that list each instance and disagreements.
 
 import { badge, fill, h, keepScroll, num, selectionIn, table } from '../dom.js';
@@ -147,7 +147,7 @@ export default {
         const commands = [...new Set(svc.instances.flatMap((i) => i.commandTypes))].sort();
         const queries = [...new Set(svc.instances.flatMap((i) => i.queryTypes))].sort();
         const handles = commands.length + queries.length;
-        // Event processors the instances report (ADR 0022); nothing for clients before P6a.
+        // Event processors the instances report; nothing for older clients.
         const processors = serviceSummary(svc.instances);
         return h('section', { class: 'card', 'aria-label': `Service ${svc.serviceName}` },
           h('div', { class: 'card-head' },

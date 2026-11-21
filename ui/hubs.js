@@ -1,4 +1,4 @@
-// Multi-hub view (ADR 0016). Hubs never talk to each other: the page reads every peer listed in
+// Multi-hub view. Hubs never talk to each other: the page reads every peer listed in
 // SNODRA_SERVER_PEERS itself (CORS) and merges their topologies here, keyed by instance id, flagging
 // where the reachable hubs disagree. An unreachable peer is shown as unreachable, never as a
 // disagreement. Everything a peer sends is data: it is checked for shape and rendered as text.
@@ -110,7 +110,7 @@ export async function merged(ownTopology) {
 
 /**
  * /api/v1/<name> of every reachable peer other than this hub, for a page that merges a view
- * other than the topology (the Processors page, ADR 0022): `{ views: [{ hubId, data }] }`.
+ * other than the topology (the Processors page): `{ views: [{ hubId, data }] }`.
  */
 export async function collect(name, valid) {
   if (!enabled()) return { views: [] };
@@ -150,7 +150,7 @@ export function merge(ownTopology, remote, peerStates) {
       typeNames.add(type);
       let byOwner = owners.get(type);
       if (!byOwner) owners.set(type, byOwner = new Map());
-      // A shared query type (ADR 0017) is owned by the whole set.
+      // A shared query type is owned by the whole set.
       const owner = arr(t.ownerServices).map(str).join(' + ');
       if (!byOwner.has(owner)) byOwner.set(owner, []);
       byOwner.get(owner).push(v.hubId);

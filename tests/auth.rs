@@ -1,4 +1,4 @@
-//! Access control over gRPC (roadmap P5a, ADR 0018): the three modes, the `Register` checks,
+//! Access control over gRPC: the three modes, the `Register` checks,
 //! the request checks in every mode, and ACL reloads, against an in-process hub.
 
 mod common;

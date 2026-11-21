@@ -1,5 +1,5 @@
 //! Contexts: the unit the hub would partition its registry by. The owner deferred contexts
-//! indefinitely (no tenant use case); P0 keeps the door open.
+//! indefinitely (no tenant use case); this keeps the door open.
 //!
 //! Every session lives in the `default` context. The registry, session and router APIs
 //! already take a [`ContextId`] so adding contexts later changes their implementation, not their

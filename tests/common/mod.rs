@@ -284,7 +284,7 @@ impl FakeClient {
         self.send_raw_register(reg).await;
     }
 
-    /// Sends an `InstanceStatus` (multi-hub HA, ADR 0016).
+    /// Sends an `InstanceStatus` (multi-hub HA).
     pub async fn status(&self, connected_hub_ids: &[&str], handlers_in_flight: u32) {
         let msg = ClientMessage {
             message: Some(client_message::Message::Status(InstanceStatus {
@@ -296,7 +296,7 @@ impl FakeClient {
         self.tx.send(msg).await.unwrap();
     }
 
-    /// Sends an `InstanceStatus` with event processors (ADR 0022).
+    /// Sends an `InstanceStatus` with event processors.
     pub async fn status_with_processors(
         &self,
         connected_hub_ids: &[&str],
@@ -379,7 +379,7 @@ impl FakeClient {
         }
     }
 
-    /// A handler's streamed part (ADR 0017, P4b).
+    /// A handler's streamed part.
     pub fn part_ok(request_id: &str, seq: u64, payload: &[u8]) -> ClientMessage {
         ClientMessage {
             message: Some(client_message::Message::Part(ReplyPart {
@@ -473,7 +473,7 @@ impl MessageOrStatus for Streaming<ServerMessage> {
     }
 }
 
-// ---- access control and TLS (P5a) ---------------------------------------------------------
+// ---- access control and TLS ---------------------------------------------------------
 
 /// A scratch directory under the system temp dir, removed on drop.
 pub struct TempDir(PathBuf);

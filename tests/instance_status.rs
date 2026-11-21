@@ -1,4 +1,4 @@
-//! Multi-hub HA, hub side (ADR 0016): the latest `InstanceStatus` of a session shows in the
+//! Multi-hub HA, hub side: the latest `InstanceStatus` of a session shows in the
 //! topology (gRPC and `GET /api/v1/topology`).
 
 mod common;

@@ -1,4 +1,4 @@
-//! Per-instance request queue for flow-controlled instances (roadmap P1, ADR 0014).
+//! Per-instance request queue for flow-controlled instances.
 //!
 //! Ordered by priority (higher first), then arrival (FIFO within a priority). Bounded by a
 //! number of entries and a number of bytes per instance, and by the bytes queued over all

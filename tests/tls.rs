@@ -1,4 +1,4 @@
-//! TLS on both listeners (roadmap P5a, ADR 0018): certificates are generated at test time with
+//! TLS on both listeners: certificates are generated at test time with
 //! rcgen; nothing is checked in.
 
 mod common;

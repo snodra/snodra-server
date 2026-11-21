@@ -1,5 +1,5 @@
 //! Change detection for the files the hub reloads without a restart: the ACL
-//! (`SNODRA_SERVER_ACL_FILE`) and the TLS certificate and key (ADR 0018).
+//! (`SNODRA_SERVER_ACL_FILE`) and the TLS certificate and key.
 //!
 //! A watcher polls the files' modification time and size every `SNODRA_SERVER_RELOAD_INTERVAL`
 //! (5 s); [`request_reload`] (the binary calls it on SIGHUP) makes every watcher reload at once.

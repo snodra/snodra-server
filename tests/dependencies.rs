@@ -1,4 +1,4 @@
-//! The hub reads no event store and no message store (ADR 0027, 0028): no store client is built
+//! The hub reads no event store and no message store: no store client is built
 //! into it or its image. A cheap stand-in for inspecting the image: the lock file the image is
 //! built from (`cargo build --locked`) has no such crate, and the builder installs no C toolchain
 //! for one.

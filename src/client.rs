@@ -1,5 +1,5 @@
 //! The gRPC client side of the binary's own modes (`--health-check`, `--topology`): where to
-//! connect and how to trust the hub (roadmap P5a, ADR 0018).
+//! connect and how to trust the hub.
 //!
 //! A [`Target`] speaks TLS when its address is `https://...`, when `--tls-ca <pem>` is given, or
 //! when it is the local hub and the hub's environment configures TLS. It then verifies the
@@ -36,7 +36,7 @@ pub enum Trust {
 }
 
 /// The client certificate and key (PEM files) a probe presents to a hub that asks for one
-/// (ADR 0020).
+///.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     pub cert: PathBuf,

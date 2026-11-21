@@ -327,7 +327,7 @@ async fn every_page_renders_in_a_headless_browser_without_console_messages() {
     drop((a, b));
 }
 
-/// A shared query type (ADR 0017): the Types page lists every owner with a "shared" badge and
+/// A shared query type: the Types page lists every owner with a "shared" badge and
 /// the Overview graph draws an owner edge to each.
 #[tokio::test]
 async fn a_shared_query_type_shows_every_owner_and_a_shared_badge() {
@@ -619,7 +619,7 @@ async fn two_peer_hubs_merge_in_the_browser_and_flag_disagreements() {
     let _ = std::fs::remove_dir_all(&profiles);
 }
 
-// ---- processors (ADR 0022) ---------------------------------------------------------------
+// ---- processors ---------------------------------------------------------------
 
 /// A segment with decimal positions, as the first-wave event stores report them.
 fn segment(
@@ -883,7 +883,7 @@ async fn processors_merge_over_two_hubs_and_the_freshest_report_wins() {
     drop((on_a, on_b, only_b));
 }
 
-// ---- processor control (ADR 0023) -------------------------------------------------------
+// ---- processor control -------------------------------------------------------
 
 /// The Processors page shows a paused processor, one stopped for a reset with its operation id
 /// and one that replays (with the end of each segment's replay range); without a write
@@ -984,7 +984,7 @@ fn processor_rows(devtools: &mut Devtools) -> Vec<(String, String)> {
 }
 
 /// With a write credential the page offers a reset only for a processor whose event store
-/// declares the `replay` capability (ADR 0027); pause and resume stay for every processor. The
+/// declares the `replay` capability; pause and resume stay for every processor. The
 /// event store shows in its column, with its capabilities in the title.
 #[tokio::test]
 async fn reset_offered_only_with_replay_capability() {
@@ -1057,7 +1057,7 @@ async fn reset_offered_only_with_replay_capability() {
 }
 
 /// An instance answers a reset its event store cannot do with `CONTROL_REFUSAL_UNSUPPORTED`
-/// (ADR 0027): the API answers 409 with the code and the instance's reason, and the Processors
+///: the API answers 409 with the code and the instance's reason, and the Processors
 /// page shows both on its status line.
 #[tokio::test]
 async fn unsupported_refusal_reaches_the_dashboard() {
@@ -1358,7 +1358,7 @@ fn path_resolution_handles_dot_segments() {
 }
 
 /// With a dashboard token the page loads, finds out from the first 401 that it needs one, and
-/// shows the sign-in form instead of data (ADR 0018). The console shows the failed request; the
+/// shows the sign-in form instead of data. The console shows the failed request; the
 /// page itself must not break.
 #[tokio::test]
 async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
@@ -1394,7 +1394,7 @@ async fn a_hub_with_a_dashboard_token_shows_the_sign_in_form() {
     panic!("the sign-in form never appeared: {last}");
 }
 
-/// The Events page (ADR 0025, ADR 0027) over a fake event browser: it lists the browser's
+/// The Events page over a fake event browser: it lists the browser's
 /// records newest first and opens one (its headers, the reason its payload is hidden), every
 /// value as text. The Processors page lists a subscription no live instance reports with the
 /// browser's lag. A hub without a browser has no Events page in its navigation.

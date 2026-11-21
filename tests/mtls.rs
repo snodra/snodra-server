@@ -1,4 +1,4 @@
-//! Mutual TLS on the gRPC listener (roadmap P5c, ADR 0020): the handshake with a client CA, the
+//! Mutual TLS on the gRPC listener: the handshake with a client CA, the
 //! client certificate as the session's identity, its expiry, reloads and the topology. CAs and
 //! certificates are generated at test time; nothing is checked in.
 

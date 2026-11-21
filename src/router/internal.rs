@@ -1,4 +1,4 @@
-//! Hub-originated requests (ADR 0027): the hub asks a handler a query, or opens a streaming
+//! Hub-originated requests: the hub asks a handler a query, or opens a streaming
 //! query, itself, as the dashboard's event pages ask the `snodra-event-browser` add-on.
 //!
 //! No bypass: each request gets a session of its own in [`crate::session::Sessions`] (hidden

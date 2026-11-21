@@ -1,4 +1,4 @@
-//! JWT credentials (roadmap P5b, ADR 0019): validation of an OAuth2 client-credentials access
+//! JWT credentials: validation of an OAuth2 client-credentials access
 //! token against the issuer's signing keys, and the cache of those keys.
 //!
 //! * [`Jwt`] holds the settings and the key cache. The keys are fetched in the background
@@ -728,7 +728,7 @@ impl Jwt {
                     .collect();
                 if named.is_empty() {
                     // Missing for sure only when a fetch made for this `kid` has found it
-                    // missing; otherwise the set may predate a rotation (ADR 0019, amendment 1).
+                    // missing; otherwise the set may predate a rotation.
                     return Err(if absent {
                         JwtError::UnknownKid
                     } else {

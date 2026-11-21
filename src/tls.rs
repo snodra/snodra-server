@@ -1,9 +1,9 @@
-//! TLS for both listeners (roadmap P5a, ADR 0018), with rustls and the `ring` provider.
+//! TLS for both listeners, with rustls and the `ring` provider.
 //!
 //! * [`CertStore`] holds the current certificate and key and hands them to every handshake
 //!   (`ResolvesServerCert`), so a reloaded certificate applies to new connections while the
 //!   existing ones keep running on the one they started with.
-//! * [`server_config`] builds the rustls server configuration. With a client CA (P5c, ADR 0020)
+//! * [`server_config`] builds the rustls server configuration. With a client CA
 //!   it verifies client certificates through [`ClientCaStore`] ([`ClientAuth`]: none, optional or
 //!   required) and turns session resumption off, so every handshake meets the current CA bundle.
 //! * [`accept`] turns a stream of accepted TCP connections into completed TLS handshakes, one
@@ -404,7 +404,7 @@ impl ClientCertVerifier for CurrentVerifier {
     }
 }
 
-/// Whether and how clients must present certificates (ADR 0020): `None` authenticates the server
+/// Whether and how clients must present certificates: `None` authenticates the server
 /// only (the HTTP listener always, and a gRPC listener without a client CA); otherwise the client
 /// CA store the listener verifies against, in the mode it was loaded with.
 #[derive(Debug, Clone, Default)]
@@ -447,7 +447,7 @@ pub fn server_config(
     let mut config = builder.with_cert_resolver(store);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     if verifies_clients {
-        // No session resumption (ADR 0020 review ruling 17). On resumption rustls copies the
+        // No session resumption. On resumption rustls copies the
         // cached client certificate chain into `peer_certificates` without calling the verifier,
         // so a client whose CA a reload dropped would keep authenticating with the old
         // certificate. Without a session cache and without tickets every handshake is a full one
@@ -594,7 +594,7 @@ fn log_shed(last: &mut Option<Instant>, count: &mut u64, listener: &'static str)
 pub struct TlsConn(pub TlsStream<TcpStream>);
 
 impl tonic::transport::server::Connected for TlsConn {
-    /// The client certificate the peer presented, for the requests on this connection (ADR 0020).
+    /// The client certificate the peer presented, for the requests on this connection.
     type ConnectInfo = crate::mtls::PeerCertificate;
     fn connect_info(&self) -> Self::ConnectInfo {
         crate::mtls::PeerCertificate(
@@ -911,7 +911,7 @@ mod tests {
         let _ = &mut f;
     }
 
-    // ---- client certificates (ADR 0020) ----
+    // ---- client certificates ----
 
     use crate::pki_test_support::{ClientSpec, Pki};
 

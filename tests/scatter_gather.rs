@@ -1,4 +1,4 @@
-//! Scatter-gather queries and shared query types end to end (ADR 0017), over real gRPC with raw
+//! Scatter-gather queries and shared query types end to end, over real gRPC with raw
 //! clients.
 
 mod common;

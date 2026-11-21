@@ -44,7 +44,7 @@ pub const MAX_STATUS_HUB_IDS: usize = 64;
 /// can never match another hub's id by accident).
 pub const MAX_STATUS_HUB_ID_BYTES: usize = 128;
 
-/// The latest `InstanceStatus` of a session (ADR 0016), bounded; replaced by each report and
+/// The latest `InstanceStatus` of a session, bounded; replaced by each report and
 /// dropped with the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusDetail {
@@ -52,7 +52,7 @@ pub struct StatusDetail {
     /// [`MAX_STATUS_HUB_IDS`], in the reported order.
     pub connected_hub_ids: Vec<String>,
     pub handlers_in_flight: u32,
-    /// `processors` as reported, bounded ([`crate::processors::bound`], ADR 0022).
+    /// `processors` as reported, bounded ([`crate::processors::bound`]).
     pub processors: Vec<ProcessorReport>,
     /// When the hub received the report.
     pub at: Instant,
@@ -90,7 +90,7 @@ pub struct SessionMeta {
     pub client_version: String,
     /// Load factor and tags from the first `Register`, re-applied on every re-register.
     pub placement: Placement,
-    /// Who the session's credentials speak for, when their ACL entry existed (ADR 0018, 0019);
+    /// Who the session's credentials speak for, when their ACL entry existed;
     /// every later request is judged against the current ACL entry this names.
     pub principal: Option<Arc<Principal>>,
     /// How the session authenticated, for the topology and the dashboard.
@@ -111,7 +111,7 @@ pub struct Session {
     /// Cancelled when the session is removed or replaced; the stream task exits on it at once
     /// instead of waiting for the client to drain the response body.
     pub cancel: CancellationToken,
-    /// The latest `InstanceStatus`, if the session reported one (ADR 0016).
+    /// The latest `InstanceStatus`, if the session reported one.
     pub status: Option<StatusDetail>,
     /// Every type of the latest accepted `Register` (commands, queries, shared queries), for
     /// re-checking the registration when the ACL changes.
@@ -142,14 +142,14 @@ pub struct SessionDetail {
     pub last_heartbeat: Instant,
     /// The latest `InstanceStatus`, `None` when never reported.
     pub status: Option<StatusDetail>,
-    /// How the session authenticated (ADR 0018).
+    /// How the session authenticated.
     pub auth: AuthStatus,
     /// Who its credentials speak for: the kind and, for a JWT, the expiry the topology shows.
     pub principal: Option<Arc<Principal>>,
 }
 
 /// A session whose latest status lists an event processor: where a control request for it can go
-/// (ADR 0023).
+///.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessorHolder {
     pub context: ContextId,
@@ -157,7 +157,7 @@ pub struct ProcessorHolder {
     pub token: u64,
     /// When the hub received the status that lists the processor.
     pub reported_at: Instant,
-    /// The event store that status names for the processor (ADR 0027); empty when it names none.
+    /// The event store that status names for the processor; empty when it names none.
     pub event_store: String,
     /// That event store declares the `replay` capability (a reset is offered only then).
     pub replay: bool,
@@ -259,7 +259,7 @@ impl Sessions {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         // Tokens grow with every stream, so the newest stream of an instance id always wins, in
-        // the sessions map and (opened first, ADR 0014) in the router's flow state alike.
+        // the sessions map and (opened first) in the router's flow state alike.
         if inner.get(instance_id).is_some_and(|s| s.token > token) {
             return Err(Superseded);
         }
@@ -473,7 +473,7 @@ impl Sessions {
             .collect()
     }
 
-    /// Keeps `report` (bounded, ADR 0016 and 0022) as the latest `InstanceStatus` of the session
+    /// Keeps `report` (bounded) as the latest `InstanceStatus` of the session
     /// `token`, replacing the previous one. Ignored (`false`) unless that session is still the
     /// current one for `instance_id`.
     pub fn set_status(

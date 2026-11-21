@@ -1,4 +1,4 @@
-//! Subscription queries end to end (ADR 0017), over real gRPC with raw clients: the initial
+//! Subscription queries end to end, over real gRPC with raw clients: the initial
 //! result and the updates, credits, endings, cancels and the refusals.
 
 mod common;

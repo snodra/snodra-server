@@ -1,8 +1,8 @@
 //! The HTTP port (`SNODRA_SERVER_HTTP_LISTEN`, default 7001): unless
 //! `SNODRA_SERVER_DASHBOARD_ENABLED=false`, the dashboard (`/ui/`, see [`crate::assets`]) and its API
-//! under `/api/v1/` (`processors`, ADR 0022; the processor controls under `/api/v1/services/`,
-//! ADR 0023); with the dashboard disabled every path is 404. With `SNODRA_SERVER_DASHBOARD_TOKEN`
-//! set (ADR 0018), every read under `/api/v1/` (the event stream included) needs
+//! under `/api/v1/` (`processors`; the processor controls under `/api/v1/services/`);
+//! with the dashboard disabled every path is 404. With `SNODRA_SERVER_DASHBOARD_TOKEN`
+//! set, every read under `/api/v1/` (the event stream included) needs
 //! `Authorization: Bearer <token>` (the dashboard token, or the write token, which reads too);
 //! the page and its assets stay public, because the page is what asks for the token. The mutating control calls need the write token or an ACL credential whose
 //! entry has `control = true`, whatever the dashboard token; with neither configured they answer
@@ -53,7 +53,7 @@ pub const STREAM_EVERY: Duration = Duration::from_secs(2);
 pub const MAX_STREAMS: usize = 64;
 
 /// `Content-Security-Policy` of every dashboard and API response: only the hub's own scripts,
-/// styles, images and API, plus the peer hubs' APIs (`SNODRA_SERVER_PEERS`, ADR 0016) for
+/// styles, images and API, plus the peer hubs' APIs (`SNODRA_SERVER_PEERS`) for
 /// `connect-src`; no inline script or style, no framing, no plugins.
 pub fn csp(peers: &[String]) -> String {
     let mut connect = String::from("'self'");
@@ -75,7 +75,7 @@ pub struct HttpState {
     pub sessions: Arc<Sessions>,
     pub router: Arc<Router>,
     pub config: Arc<Config>,
-    /// Access control (ADR 0018): an ACL credential with `control = true` may call the
+    /// Access control: an ACL credential with `control = true` may call the
     /// processor controls.
     pub auth: Arc<Authorizer>,
     pub anchor: ClockAnchor,
@@ -170,7 +170,7 @@ pub fn app(state: HttpState) -> axum::Router {
                 require_token,
             ));
         }
-        // The mutating control calls (ADR 0023) judge the write credential themselves, so the
+        // The mutating control calls judge the write credential themselves, so the
         // dashboard token's guard does not apply to them.
         let controls = axum::Router::new()
             .route(&format!("{PROCESSOR}/pause"), post(api_pause))
@@ -220,7 +220,7 @@ pub fn security_headers(mut response: Response, csp: HeaderValue) -> Response {
     response
 }
 
-/// The tokens that read: the dashboard token and, when set, the write token (ADR 0023).
+/// The tokens that read: the dashboard token and, when set, the write token.
 pub struct ReadGuard {
     read: Secret,
     write: Option<Secret>,
@@ -249,7 +249,7 @@ fn presented(headers: &HeaderMap) -> Option<&str> {
         .and_then(auth::bearer)
 }
 
-/// The dashboard token check (ADR 0018). A missing, malformed or wrong token is the same bare
+/// The dashboard token check. A missing, malformed or wrong token is the same bare
 /// 401: no detail in the body, and the same work done (both sides are hashed and compared in
 /// constant time), so the answer does not tell which. The write token reads too.
 async fn require_token(
@@ -272,12 +272,12 @@ async fn require_token(
     next.run(request).await
 }
 
-/// CORS for `/api/v1/*` (ADR 0016): a request whose `Origin` is exactly one of the peer origins
+/// CORS for `/api/v1/*`: a request whose `Origin` is exactly one of the peer origins
 /// gets it back in `Access-Control-Allow-Origin` (never a wildcard, never credentials), so a
 /// peer hub's dashboard can merge this hub in the browser. A preflight (`OPTIONS` with
 /// `Access-Control-Request-Method`) is answered 204 for a peer asking for `GET`, else 403. Other
 /// origins get no CORS header, so the browser keeps the answer from their scripts. `POST` and
-/// `DELETE` (the processor controls, ADR 0023) are allowed like `GET`: the page sends its control
+/// `DELETE` (the processor controls) are allowed like `GET`: the page sends its control
 /// calls to the hub that served it, but a peer's page or a tool in a peer's origin may too.
 async fn cors(
     State(peers): State<Arc<[String]>>,
@@ -310,8 +310,8 @@ async fn cors(
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            // `authorization`: the page forwards the dashboard token to its peers (ADR 0018);
-            // `content-type`: a reset's JSON body (ADR 0023).
+            // `authorization`: the page forwards the dashboard token to its peers;
+            // `content-type`: a reset's JSON body.
             HeaderValue::from_static("accept, authorization, content-type"),
         );
         h.insert(
@@ -372,13 +372,13 @@ async fn api_version(State(s): State<HttpState>) -> Response {
     ))
 }
 
-/// The event processors of every service, aggregated over its instances (ADR 0022).
+/// The event processors of every service, aggregated over its instances.
 async fn api_processors(State(s): State<HttpState>) -> Response {
     fresh_json(processors::view(&s.topology()))
 }
 
 // ---------------------------------------------------------------------------------------------
-// Events, over the event browser add-on (ADR 0027; payload rules ADR 0025)
+// Events, over the event browser add-on
 
 /// The request header a caller may bring its correlation id in; every events answer carries the
 /// id it was asked under.
@@ -539,7 +539,7 @@ async fn api_events(
 }
 
 /// `GET /api/v1/events/{source}/{segment}/{position}`: one record, with every header and, under
-/// the payload rules (ADR 0025), its payload, each served payload audited (`snodra.events.Get`).
+/// the payload rules, its payload, each served payload audited (`snodra.events.Get`).
 async fn api_event(
     State(s): State<HttpState>,
     Path((source, segment, position)): Path<(String, String, String)>,
@@ -738,7 +738,7 @@ async fn api_events_tail(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Processor control (ADR 0023)
+// Processor control
 
 /// Every control route starts here.
 const PROCESSOR: &str = "/api/v1/services/{service}/processors/{processor}";

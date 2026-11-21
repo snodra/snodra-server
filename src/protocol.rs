@@ -99,7 +99,7 @@ mod tests {
             let message = ClientMessage {
                 message: Some(client_message::Message::Register(register.clone())),
             };
-            // A refresh carries the credential too (ADR 0019).
+            // A refresh carries the credential too.
             let refresh = ClientMessage {
                 message: Some(client_message::Message::Credentials(credentials.clone())),
             };

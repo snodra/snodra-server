@@ -1,4 +1,4 @@
-//! A fake event browser (ADR 0027) for the hub's tests: a client that registers as service
+//! A fake event browser for the hub's tests: a client that registers as service
 //! `snodra-event-browser` with the five `snodra.events.*` query types and answers each request
 //! as the test says (canned JSON, the browser's errors, garbage, nothing), records what it was
 //! asked (type, JSON, headers) and hands every tail to the test to stream by hand. Plus a reader
