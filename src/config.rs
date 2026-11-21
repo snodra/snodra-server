@@ -743,7 +743,7 @@ impl Config {
         let open = |a: SocketAddr| !a.ip().is_loopback();
         if self.auth_mode != AuthMode::Enforce && open(self.listen) {
             out.push(format!(
-                "SNODRA_SERVER_AUTH_MODE={} while the gRPC port listens on {}: any peer that can reach it may register as any service and send any type; set SNODRA_SERVER_AUTH_MODE=enforce (ADR 0018) or keep the port on a private network",
+                "SNODRA_SERVER_AUTH_MODE={} while the gRPC port listens on {}: any peer that can reach it may register as any service and send any type; set SNODRA_SERVER_AUTH_MODE=enforce or keep the port on a private network",
                 self.auth_mode.as_str(),
                 self.listen
             ));
@@ -820,7 +820,7 @@ impl Config {
         }
         for name in &self.removed_settings {
             out.push(format!(
-                "{name} is set but is no longer read: the hub reads no event store; the event browser is the snodra-event-browser add-on, which takes its own settings (ADR 0027)"
+                "{name} is set but is no longer read: the hub reads no event store; the event browser is the snodra-event-browser add-on, which takes its own settings"
             ));
         }
         if self.tls_client_ca.is_some() && self.auth_mode == AuthMode::Off {
