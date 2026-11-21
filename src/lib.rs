@@ -118,10 +118,10 @@ pub async fn serve_with_shutdown(
     );
 
     let stopping = CancellationToken::new();
-    // JWT credentials (ADR 0019): the signing keys load in the background, never blocking or
+    // JWT credentials: the signing keys load in the background, never blocking or
     // failing startup.
     auth.start_jwks(stopping.clone());
-    // TLS and reloads (ADR 0018): load the certificates now (a bad pair is fatal), then watch
+    // TLS and reloads: load the certificates now (a bad pair is fatal), then watch
     // them and the ACL for changes until shutdown.
     let grpc_tls = config
         .grpc_tls()
@@ -132,7 +132,7 @@ pub async fn serve_with_shutdown(
         (Some((cert, key)), ..) => Some(tls::CertStore::load(cert, key, "http")?),
         (None, ..) => None,
     };
-    // Client certificates (ADR 0020, gRPC listener only): the client CAs are loaded now (a bad
+    // Client certificates (gRPC listener only): the client CAs are loaded now (a bad
     // bundle is fatal) and reloaded with the certificates.
     let client_auth = match (
         &grpc_tls,

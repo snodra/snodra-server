@@ -1,5 +1,5 @@
-//! Processor control (roadmap P6b, ADR 0023): the hub as a stateless control plane for the event
-//! processors of the libraries (ADR 0022), whatever their event store (ADR 0027).
+//! Processor control: the hub as a stateless control plane for the event
+//! processors of the libraries, whatever their event store.
 //!
 //! The hub asks instances to act (`ServerMessage.control`) and
 //! matches their answers (`ClientMessage.control_reply`) to the requests by `control_id`. It keeps
@@ -49,7 +49,7 @@ const MAX_TYPE_BYTES: usize = 256;
 /// Longest dead-letter reason or retry result kept, in bytes (the defined ones are at most 14).
 const MAX_WORD_BYTES: usize = 32;
 
-/// How long the hub waits for the answers of one control call (ADR 0023).
+/// How long the hub waits for the answers of one control call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     /// Every request but `reset_execute` (`SNODRA_SERVER_CONTROL_TIMEOUT`).
@@ -135,7 +135,7 @@ pub enum Refusal {
     /// A reset of the processor already runs on this hub (its operation id).
     Running(String),
     /// A reset of a processor whose event store does not declare the `replay` capability, as the
-    /// freshest report has it (ADR 0027); the event store's name, empty when unnamed.
+    /// freshest report has it; the event store's name, empty when unnamed.
     Unsupported(String),
 }
 
@@ -1060,7 +1060,7 @@ impl Control {
         target: Target,
     ) -> Result<ResetReport, Refusal> {
         let holders = self.holders(ctx, service, processor)?;
-        // The hub offers only what the event store declares (ADR 0027), as the freshest report
+        // The hub offers only what the event store declares, as the freshest report
         // has it (the rule of the dashboard's aggregate): no instance is asked otherwise.
         let newest = freshest(&holders).ok_or(Refusal::UnknownProcessor)?;
         if !newest.replay {
@@ -1288,7 +1288,7 @@ impl Control {
         Renewing(stopped)
     }
 
-    /// The audit line of one control call (ADR 0023) and its count in
+    /// The audit line of one control call and its count in
     /// `snodra_server_control_total{action,outcome}`. `caller` is `write-token`, the ACL service
     /// name, or for a read the read credential (`dashboard-token`, `write-token`, `anonymous`).
     #[allow(clippy::too_many_arguments)] // the fields of the audit line

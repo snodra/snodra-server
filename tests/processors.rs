@@ -1,4 +1,4 @@
-//! Event processors, hub side (ADR 0022, 0027): a client reports its event processors in
+//! Event processors, hub side: a client reports its event processors in
 //! `InstanceStatus.processors`; the hub keeps the latest report per session (bounded, never an
 //! error), shows it in the topology (gRPC, `/api/v1/topology`) and aggregates it per service in
 //! `/api/v1/processors`.
@@ -306,7 +306,7 @@ async fn a_new_report_replaces_the_list_and_a_reconnect_starts_without_one() {
     assert_eq!(v["services"], json!([]), "{v}");
 }
 
-/// The neutral status (ADR 0027): segments named and positioned by opaque strings (sorted with
+/// The neutral status: segments named and positioned by opaque strings (sorted with
 /// decimal names by value), the subscription, the source, the event store and its capabilities,
 /// bounded as the proto says (event_store 64 bytes, at most 16 capabilities of 64 bytes, cut at a
 /// UTF-8 boundary), in the topology and in the per-service aggregate.

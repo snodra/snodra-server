@@ -1,4 +1,4 @@
-// The sign-in form of a hub that has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN, ADR 0018).
+// The sign-in form of a hub that has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN).
 // The token is typed into a password field, kept in sessionStorage by api.js and sent as a header;
 // the form never puts it in a URL.
 

@@ -1,4 +1,4 @@
-// Dead letters (ADR 0022, ADR 0023 P6b): without a processor chosen, every processor whose letters
+// Dead letters: without a processor chosen, every processor whose letters
 // park in its service's dead_letters collection; with one (`?service=&processor=`), its letters as
 // one instance lists them through the hub (no payloads), and with a write credential retry, retry
 // all and discard. Not live: a list asks an instance, so it is read on demand.

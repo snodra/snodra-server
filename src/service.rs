@@ -50,7 +50,7 @@ pub struct HubService {
     pub sessions: Arc<Sessions>,
     pub router: Arc<Router>,
     pub config: Arc<Config>,
-    /// Access control for `Register` (ADR 0018); the router holds the same one for requests.
+    /// Access control for `Register`; the router holds the same one for requests.
     pub auth: Arc<Authorizer>,
     /// Anchor for converting monotonic instants to wall-clock time in topology snapshots.
     pub anchor: ClockAnchor,
@@ -92,7 +92,7 @@ pub fn disconnect(
     true
 }
 
-/// Re-judges every session against the current ACL after a reload (ADR 0018). In `enforce`, a
+/// Re-judges every session against the current ACL after a reload. In `enforce`, a
 /// session whose token is gone or whose registration is no longer allowed is closed with the
 /// matching status (`UNAUTHENTICATED` or `PERMISSION_DENIED`) and its pending requests end as on
 /// any disconnect; in `permissive` the violation is only logged. Returns the sessions closed.
@@ -176,7 +176,7 @@ impl Hub for HubService {
         &self,
         request: Request<Streaming<ClientMessage>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
-        // The client certificate of the connection, when there is one (ADR 0020).
+        // The client certificate of the connection, when there is one.
         let peer = request
             .extensions()
             .get::<PeerCertificate>()
@@ -213,7 +213,7 @@ impl Hub for HubService {
         request: Request<TopologyRequest>,
     ) -> Result<Response<TopologyResponse>, Status> {
         // The same data as `GET /api/v1/topology`, so the same dashboard token (the CLI sends it
-        // as metadata); in permissive and enforce mode an ACL token reads it too (ADR 0018).
+        // as metadata); in permissive and enforce mode an ACL token reads it too.
         let presented = request
             .metadata()
             .get("authorization")
@@ -221,7 +221,7 @@ impl Hub for HubService {
             .and_then(crate::auth::bearer);
         // A service's JWT reads it like an ACL token; its rotated key is fetched first.
         self.auth.prepare_bearer(presented).await;
-        // A client certificate of the connection counts too (ADR 0020).
+        // A client certificate of the connection counts too.
         let peer = request.extensions().get::<PeerCertificate>();
         self.auth.check_topology_peer(
             presented,
@@ -423,7 +423,7 @@ async fn run_stream(
             .await;
         return;
     }
-    // The hub's own request sessions (ADR 0027) are `snodra-server/<uuid>`: a client's id must not
+    // The hub's own request sessions are `snodra-server/<uuid>`: a client's id must not
     // be able to collide with one.
     if first
         .instance_id
@@ -460,12 +460,12 @@ async fn run_stream(
     }
     let instance_id = first.instance_id.clone();
     let service = first.service_name.clone();
-    // Access control (ADR 0018): the credentials and the claimed service and types are judged
+    // Access control: the credentials and the claimed service and types are judged
     // before any session state exists. Like the client version, the permits and the placement,
     // the credentials are read from the first Register only; a later one cannot change who the
     // session is.
     let mut handled = handled_types(&first);
-    // A rotated signing key is fetched before the credentials are judged (ADR 0019).
+    // A rotated signing key is fetched before the credentials are judged.
     ctx.auth.prepare(first.credentials.as_ref()).await;
     let admission = ctx.auth.admit_peer(
         peer.as_deref(),
@@ -479,7 +479,7 @@ async fn run_stream(
     }
     let mut principal = admission.principal;
     let ack = protocol::register_ack(&ctx.config, &ctx.context);
-    // So is the placement (ADR 0014).
+    // So is the placement.
     let placement = Placement {
         load_factor: effective_load_factor(first.load_factor),
         tags: first
@@ -494,7 +494,7 @@ async fn run_stream(
         principal: principal.clone(),
         auth: admission.status.clone(),
     };
-    // Flow state, then the session, then the registration under it (ADR 0014): a request routed
+    // Flow state, then the session, then the registration under it: a request routed
     // to the session always finds its flow, and a late disconnect of an older stream with the
     // same instance id can never unregister this stream's registration. Tokens grow per stream,
     // so of two concurrent handshakes of one instance id the newer wins in both maps.
@@ -513,7 +513,7 @@ async fn run_stream(
         }
         Err(OpenRefused::OtherService) => {
             // Nothing was changed: the holder keeps its session, its queue and its pending
-            // entries (ADR 0018). Refused in `permissive` too.
+            // entries. Refused in `permissive` too.
             let denied = ctx.auth.instance_takeover(&service, &instance_id);
             refuse(&tx, &denied).await;
             return;
@@ -585,9 +585,9 @@ async fn run_stream(
     let out = tx.downgrade();
     drop(tx);
 
-    // A JWT session is judged expired at `exp` plus the grace unless a refresh moved it (ADR
-    // 0019). One timer per stream, re-armed by a refresh: no sweeper, and a token session or a
-    // hub in `off` never arms it.
+    // A JWT session is judged expired at `exp` plus the grace unless a refresh moved it. One
+    // timer per stream, re-armed by a refresh: no sweeper, and a token session or a hub in `off`
+    // never arms it.
     let expiry = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(expiry);
     let mut expiry_armed = arm_expiry(&ctx.auth, principal.as_deref(), expiry.as_mut());
@@ -729,7 +729,7 @@ async fn run_stream(
                 ctx.sessions
                     .set_status(&ctx.context, &instance_id, token, &status, Instant::now());
             }
-            // Multi-part messages from a client (ADR 0017): a handler's streamed parts and end (or
+            // Multi-part messages from a client: a handler's streamed parts and end (or
             // pushed updates), a sender's credits and cancellation.
             Some(client_message::Message::Part(part)) => {
                 ctx.router
@@ -759,7 +759,7 @@ async fn run_stream(
                     continue;
                 }
                 // A TLS session cannot be refreshed on a live stream: the certificate is the
-                // principal until the connection ends, and no message replaces it (ADR 0020). It
+                // principal until the connection ends, and no message replaces it. It
                 // costs no verification, so it needs no throttle.
                 if principal
                     .as_deref()

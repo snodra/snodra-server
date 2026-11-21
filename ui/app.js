@@ -1,5 +1,5 @@
 // snodra-server dashboard: hash routing, the header, live updates; the processor controls need a
-// write credential (ADR 0023); the Events page (ADR 0025, ADR 0027) shows only while an event
+// write credential; the Events page shows only while an event
 // browser add-on is connected to the hub. No third-party code.
 
 import * as api from './api.js';

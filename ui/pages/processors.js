@@ -1,9 +1,9 @@
-// Event processors (ADR 0022, P6a): one row per (service, processor), merged over every reachable
+// Event processors: one row per (service, processor), merged over every reachable
 // hub like the other pages; a row opens to every instance's segments. With a write credential
-// the page pauses, resumes and resets a processor (ADR 0023, P6b); the call goes to the hub that
+// the page pauses, resumes and resets a processor; the call goes to the hub that
 // served the page, which reaches every instance. A reset is offered only when the processor's
-// event store declares the `replay` capability (ADR 0027). While an event browser add-on is
-// connected (ADR 0027), the page also lists the subscriptions no live instance reports, with the
+// event store declares the `replay` capability. While an event browser add-on is
+// connected, the page also lists the subscriptions no live instance reports, with the
 // lag the browser reads (snodra.events.Lag), so a stopped service's backlog stays visible.
 
 import * as controls from '../controls.js';
@@ -25,7 +25,7 @@ function stateBadge(state, prefix = '') {
   return badge(level, state, prefix ? `${prefix}: ${title}` : title);
 }
 
-/** The state, then a replaying badge and the reset operation holding the lock (ADR 0023). */
+/** The state, then a replaying badge and the reset operation holding the lock. */
 function stateCell(p, prefix = '') {
   return [
     stateBadge(p.state, prefix),

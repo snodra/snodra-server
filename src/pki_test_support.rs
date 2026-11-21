@@ -1,4 +1,4 @@
-//! Test-only support for the TLS tests (ADR 0018, 0020): a throwaway CA, server certificates and
+//! Test-only support for the TLS tests: a throwaway CA, server certificates and
 //! client certificates generated at test time (nothing is checked in).
 //!
 //! This file is compiled twice, by `#[path]`: as `pki_test_support` into the library's own unit

@@ -1,4 +1,4 @@
-//! Dashboard peers (ADR 0016): `SNODRA_SERVER_PEERS` reaches the page through `/api/v1/version` and
+//! Dashboard peers: `SNODRA_SERVER_PEERS` reaches the page through `/api/v1/version` and
 //! `/api/v1/settings`, the CSP's `connect-src` gains exactly the peer origins, and the API answers
 //! CORS for those origins only (GET and its preflight, `/api/v1/*` only, never credentials).
 
@@ -116,7 +116,7 @@ async fn preflight_is_answered_for_peers_only() {
     let ok = preflight(PEER).await;
     assert_eq!(ok.status, 204);
     assert_eq!(ok.header("access-control-allow-origin"), Some(PEER));
-    // POST and DELETE are the processor controls (ADR 0023).
+    // POST and DELETE are the processor controls.
     assert_eq!(
         ok.header("access-control-allow-methods"),
         Some("GET, POST, DELETE")

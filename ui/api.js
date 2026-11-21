@@ -1,12 +1,12 @@
 // The hub's JSON API, relative to the page so the dashboard also works behind a proxy that
-// mounts the hub under a path. When the hub has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN,
-// ADR 0018) every call carries it as `Authorization: Bearer <token>`: the page asks for it once,
+// mounts the hub under a path. When the hub has a dashboard token (SNODRA_SERVER_DASHBOARD_TOKEN)
+// every call carries it as `Authorization: Bearer <token>`: the page asks for it once,
 // keeps it in sessionStorage (this tab only, gone when it closes) and never puts it in a URL, a
-// cookie or a log line. Peer hubs (SNODRA_SERVER_PEERS, ADR 0016) are read with `getFrom`,
+// cookie or a log line. Peer hubs (SNODRA_SERVER_PEERS) are read with `getFrom`,
 // cross-origin, without cookies, with the same token (the hubs of one deployment share it).
-// The processor controls (ADR 0023) send a second credential, the write token, kept the same way
+// The processor controls send a second credential, the write token, kept the same way
 // under its own key, only on `control` calls and only to this hub (it reaches every instance).
-// The event browser (ADR 0025) reads this hub only, with the dashboard token, or the write token
+// The event browser reads this hub only, with the dashboard token, or the write token
 // when the tab holds no dashboard token (the write token reads too, and a hub that has only a
 // write token serves payloads to a request that presents it).
 
@@ -133,7 +133,7 @@ export async function getFrom(origin, name) {
 }
 
 /**
- * A processor control call (ADR 0023): `method` (POST or DELETE) on /api/v1/<path> of this hub,
+ * A processor control call: `method` (POST or DELETE) on /api/v1/<path> of this hub,
  * with the write credential as the Authorization header and `body` as JSON when given. Resolves
  * to `{ ok, status, data }` for every answer (`data`: its JSON, null when it has none), so the
  * page can show why the hub refused; a 401 here never signs the page out (the write credential
@@ -172,7 +172,7 @@ export function readStream({ signal, onOpen, onEvent }) {
 }
 
 /**
- * GET /api/v1/<path> of the events API (ADR 0025, ADR 0027), with its credential. Resolves to
+ * GET /api/v1/<path> of the events API, with its credential. Resolves to
  * `{ ok, status, data }` for every answer (`data`: its JSON, null when it has none), so the page
  * can show why the hub refused; throws AuthError on 401 and an Error on a network error.
  */

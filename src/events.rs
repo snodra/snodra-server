@@ -1,4 +1,4 @@
-//! The dashboard's event pages over the event browser add-on (ADR 0027): the hub reads no event
+//! The dashboard's event pages over the event browser add-on: the hub reads no event
 //! store itself. Each `/api/v1/events*` call becomes one hub-internal query
 //! ([`crate::router::Router::query_internal`], `stream_internal` for the tail) to a
 //! `snodra-event-browser` instance: `snodra.events.Search`, `Get`, `Sources`, `Lag` and `Tail`.
@@ -6,7 +6,7 @@
 //! This module builds those requests from the HTTP call, reads the browser's answers as untrusted
 //! input (bounded in size, parsed into the hub's own types: whatever the hub does not know is
 //! dropped, malformed JSON is an error, never a panic), maps the browser's errors to HTTP
-//! statuses, and keeps the payload rules of ADR 0025: a payload (and the `q` filter) is asked for
+//! statuses, and keeps the payload rules: a payload (and the `q` filter) is asked for
 //! only when the caller may see it, and a payload the hub did not ask for is dropped.
 
 use std::collections::BTreeMap;
@@ -22,7 +22,7 @@ use crate::proto::ErrorCode;
 use crate::registry::Registry;
 use crate::router::RouteError;
 
-/// The event browser's query types (ADR 0027).
+/// The event browser's query types.
 pub const SEARCH: &str = "snodra.events.Search";
 pub const GET: &str = "snodra.events.Get";
 pub const SOURCES: &str = "snodra.events.Sources";
@@ -55,7 +55,7 @@ pub const MAX_FILTER: usize = 1024;
 pub const MAX_CURSOR: usize = 64 * 1024;
 /// A segment and a position are at most this many bytes (the browser's bound).
 pub const MAX_PLACE: usize = 128;
-/// The heartbeat the hub asks of a tail at most (its SSE heartbeat of ADR 0025)...
+/// The heartbeat the hub asks of a tail at most (its SSE heartbeat)...
 pub const MAX_HEARTBEAT: Duration = Duration::from_secs(15);
 /// ...and at least (the browser's own floor).
 pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
@@ -133,9 +133,9 @@ fn ms(d: Duration) -> u64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Payload rules (ADR 0025)
+// Payload rules
 
-/// Why a payload is not served: the first condition of ADR 0025 that does not hold.
+/// Why a payload is not served: the first payload condition that does not hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hidden {
     /// `SNODRA_SERVER_EVENT_BROWSER_PAYLOADS` is not on.
@@ -351,7 +351,7 @@ pub fn lag_request(source: Option<&str>) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Answers (the browser's JSON, ADR 0027): read into the hub's types and written back
+// Answers (the browser's JSON): read into the hub's types and written back
 
 /// A record in a search result or the tail: where it is, its key, the library headers and the
 /// payload's size. Never the payload: a summary has no field for one.
@@ -700,7 +700,7 @@ pub enum Refusal {
     Failed,
 }
 
-/// The browser's error, as it puts it in `Error.details` (task E1-R).
+/// The browser's error, as it puts it in `Error.details`.
 #[derive(Deserialize)]
 struct BrowseError {
     error: String,

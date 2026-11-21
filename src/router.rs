@@ -9,13 +9,13 @@
 //! HANDLER_DISCONNECTED, INVALID_REQUEST); a capacity rejection is `ResourceExhausted` whichever
 //! code the sender gets.
 //!
-//! Scatter-gather (ADR 0017): a [`Pending::Scatter`] keyed by the sender's request id holds the
+//! Scatter-gather: a [`Pending::Scatter`] keyed by the sender's request id holds the
 //! gather; each target is an ordinary [`Pending::Unary`] keyed `<id>#<n>` whose `part_of` names
 //! the gather, so flow control, queues, priority and disconnects apply per target unchanged. A
 //! target's terminal message becomes a `ReplyPart` to the sender instead; the gather's own
 //! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map.
 //!
-//! Streaming queries (ADR 0017, P4b): a [`Pending::Stream`] keyed by the sender's request id
+//! Streaming queries: a [`Pending::Stream`] keyed by the sender's request id
 //! holds the stream; its one target is a [`Pending::Unary`] keyed `<id>#1` with `part_of` set,
 //! forwarded (with `mode = STREAMING` and the credit) through the same flow control as any
 //! request and kept in the map, holding its permit, until the stream ends. The handler's parts
@@ -24,7 +24,7 @@
 //! removes both entries, sends the sender its `ReplyEnd` where one is due and the handler a
 //! `Cancel` where it still streams.
 //!
-//! Subscription queries (ADR 0017, P4c): a [`Pending::Subscription`] keyed by the sender's
+//! Subscription queries: a [`Pending::Subscription`] keyed by the sender's
 //! request id holds the subscription. Its initial result is an ordinary [`Pending::Unary`]
 //! target `<id>#0` (forwarded through flow control, holding a permit, with its own timeout)
 //! whose answer becomes the first part; its update targets (`<id>#n`, n >= 1: every live
@@ -35,10 +35,10 @@
 //! ending path removes both entries, sends the sender its `ReplyEnd` where one is due and every
 //! target still serving a `Cancel`.
 //!
-//! Hub-originated requests (ADR 0027, [`Router::query_internal`], [`Router::stream_internal`]):
+//! Hub-originated requests ([`Router::query_internal`], [`Router::stream_internal`]):
 //! the hub is the sender, through a session of its own per request and the same paths.
 //!
-//! Flow control (ADR 0014): every session has a [`Flow`] keyed by instance id and session token.
+//! Flow control: every session has a [`Flow`] keyed by instance id and session token.
 //! A session is forwarded a request only while it has a permit;
 //! further requests wait in its [`InstanceQueue`] (priority, then age) until `Permits` arrive or
 //! their own deadline passes. Lock order: the pending lock and the flows lock are never held
@@ -142,7 +142,7 @@ impl Unary {
     }
 }
 
-/// A scatter-gather in progress (ADR 0017).
+/// A scatter-gather in progress.
 struct Scatter {
     context: ContextId,
     sender: InstanceId,
@@ -170,7 +170,7 @@ struct Scatter {
     last_failure: Option<Outcome>,
 }
 
-/// A streaming query in progress (ADR 0017, P4b).
+/// A streaming query in progress.
 struct Stream {
     context: ContextId,
     sender: InstanceId,
@@ -227,7 +227,7 @@ struct ClosedStream {
     end: StreamEnd,
 }
 
-/// A subscription query in progress (ADR 0017, P4c).
+/// A subscription query in progress.
 struct Subscription {
     /// The sender's request id: the entry's key.
     id: String,
@@ -488,7 +488,7 @@ struct Flow {
     permits: u32,
     /// Permits never exceed it, whatever a client sends back. Starts at
     /// `Register.initial_permits`; only a `Permits.grant` from the session raises it (multi-hub
-    /// top-up, ADR 0016), and nothing lowers it.
+    /// top-up), and nothing lowers it.
     cap: u32,
     queue: InstanceQueue,
     /// Ids of the requests assigned to this session and not ended yet: queued plus forwarded.
@@ -572,11 +572,11 @@ pub struct Router {
     queued_bytes: Arc<TotalBytes>,
     config: Arc<Config>,
     metrics: Arc<Metrics>,
-    /// Access control (ADR 0018): judges every request against the sender's token.
+    /// Access control: judges every request against the sender's token.
     auth: Arc<Authorizer>,
     /// `(sender service, type)` statistics for the dashboard; `None` with the dashboard off.
     edges: Option<EdgeStats>,
-    /// Processor control (ADR 0023): its requests in flight end with the sessions they went to.
+    /// Processor control: its requests in flight end with the sessions they went to.
     control: Arc<Control>,
 }
 
@@ -708,7 +708,7 @@ impl Router {
         self.edges.as_ref()
     }
 
-    /// The processor control plane (ADR 0023).
+    /// The processor control plane.
     pub fn control(&self) -> &Arc<Control> {
         &self.control
     }
@@ -756,7 +756,7 @@ impl Router {
     /// ([`OpenRefused::Superseded`]: a concurrent, older handshake must give up) or, with access
     /// control on, when the flow state held for the instance id belongs to another service
     /// ([`OpenRefused::OtherService`]): replacing it would hand that service's queue, and the
-    /// requests pending on it, to the newcomer (ADR 0018, review amendments). The check runs under
+    /// requests pending on it, to the newcomer. The check runs under
     /// the flows lock, before the queue is touched, so it cannot be raced.
     pub fn open_session(
         &self,
@@ -793,7 +793,7 @@ impl Router {
             }
             let replaced = flows.remove(instance_id).map(|mut old| {
                 // Requests the replaced session never got wait for this one instead of failing
-                // with it (ADR 0014): same order, same deadlines.
+                // with it: same order, same deadlines.
                 for item in old.queue.drain() {
                     let id = item.id.clone();
                     match flow.queue.push(item) {
@@ -1115,7 +1115,7 @@ impl Router {
             );
             return;
         };
-        // Access control (ADR 0018), before anything is routed and for every mode: a type the
+        // Access control, before anything is routed and for every mode: a type the
         // sender's token may not send is answered at once, whatever mode it asked for. The same
         // immediate `Error` as every other gate (a ReplyEnd exists only after a mode was
         // accepted).
@@ -1826,7 +1826,7 @@ impl Router {
     }
 
     /// As [`Router::record_rejected`] for a request of `mode`. The type is the sender's choice,
-    /// so the metrics name it only when it has an owner, else [`OTHER_TYPE`] (ADR 0026): the
+    /// so the metrics name it only when it has an owner, else [`OTHER_TYPE`]: the
     /// series stay bounded by the registered types whatever the senders send.
     fn record_rejected_mode(
         &self,
@@ -1848,7 +1848,7 @@ impl Router {
         self.record_edge(sender_service, type_name, kind, outcome, None);
     }
 
-    /// A request with a mode other than UNARY (ADR 0017). Gates, in this order: a mode this hub
+    /// A request with a mode other than UNARY. Gates, in this order: a mode this hub
     /// does not know, or a sender whose session is gone, is INVALID_REQUEST; the modes are for
     /// queries only (INVALID_REQUEST); no live target is NO_HANDLER; a duplicate id is
     /// INVALID_REQUEST.
@@ -2242,7 +2242,7 @@ impl Router {
     }
 
     // ------------------------------------------------------------------------------------
-    // Streaming queries (ADR 0017, P4b)
+    // Streaming queries
 
     /// A query with mode STREAMING: one live instance gets the request with the credit, as the
     /// target `<id>#1` of a [`Pending::Stream`].
@@ -2688,7 +2688,7 @@ impl Router {
             };
             let end = match result {
                 Ok(payload) => {
-                    // Numbered as a streaming handler would (ruling 15: `seq` from 1), so a
+                    // Numbered as a streaming handler would (`seq` from 1), so a
                     // sender checking continuity accepts it.
                     stream.parts += 1;
                     let seq = u64::from(stream.parts);
@@ -2875,7 +2875,7 @@ impl Router {
     }
 
     // ------------------------------------------------------------------------------------
-    // Subscription queries (ADR 0017, P4c)
+    // Subscription queries
 
     /// A query with mode SUBSCRIPTION: every live instance of every owner
     /// gets `Request{<id>#n, mode = SUBSCRIPTION}` written directly (no permit, no queue), one
@@ -4330,7 +4330,7 @@ mod tests {
         assert!(s2_rx.try_recv().is_err());
     }
 
-    // ---- flow control (P1) ----
+    // ---- flow control ----
 
     struct FlowFx {
         router: Arc<Router>,
@@ -4829,7 +4829,7 @@ mod tests {
         assert_eq!((view.permits_available, view.queued), (1, 0));
     }
 
-    /// Requests and their latency carry the service that handled them (ADR 0026), so dashboards
+    /// Requests and their latency carry the service that handled them, so dashboards
     /// break them down by service; a request that found no handler has no `service`.
     #[tokio::test]
     async fn request_metrics_name_the_handling_service() {
@@ -4865,7 +4865,7 @@ mod tests {
 
     /// The `type` of a request answered before routing is the sender's choice: a type nobody
     /// registered is counted as `other`, so the series stay bounded by the registered types
-    /// (ADR 0026); a registered type keeps its name.
+    ///; a registered type keeps its name.
     #[tokio::test]
     async fn a_type_nobody_registered_is_counted_as_other() {
         let m = crate::telemetry::test_support::test_metrics();
@@ -5164,7 +5164,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------------------
-    // Scatter-gather (ADR 0017)
+    // Scatter-gather
 
     use crate::proto::{ReplyEnd, ReplyPart, RequestMode};
     use crate::registry::RegisteredTypes;
@@ -5797,7 +5797,7 @@ mod tests {
 
 #[cfg(test)]
 mod stream_tests {
-    //! Streaming queries (ADR 0017, P4b).
+    //! Streaming queries.
     use super::*;
     use crate::proto::{Cancel, Flow, ReplyEnd, ReplyPart, RequestMode};
     use crate::registry::RegisteredTypes;
@@ -6985,7 +6985,7 @@ mod stream_tests {
 
 #[cfg(test)]
 mod subscription_tests {
-    //! Subscription queries (ADR 0017, P4c).
+    //! Subscription queries.
     use super::*;
     use crate::proto::{Cancel, Flow, ReplyEnd, ReplyPart, RequestMode};
     use crate::registry::RegisteredTypes;
@@ -7879,7 +7879,7 @@ mod subscription_tests {
 
     /// A library registers a subscription when it reads `<id>#n` and buffers emits until the
     /// initial request is answered, relying on the hub writing `<id>#n` to an instance's stream
-    /// BEFORE `<id>#0` to that same instance (ADR 0017, P4c rulings). The order on the stream of
+    /// BEFORE `<id>#0` to that same instance. The order on the stream of
     /// the instance that gets the initial request, whichever instance that is.
     #[tokio::test]
     async fn every_target_request_is_written_before_the_initial_request_to_the_same_instance() {
@@ -8395,7 +8395,7 @@ mod subscription_tests {
     }
 }
 
-/// Access control at the router (ADR 0018): a request outside the sender token's `send` patterns
+/// Access control at the router: a request outside the sender token's `send` patterns
 /// is answered before anything is routed, in every mode, and is counted.
 #[cfg(test)]
 mod auth_tests {

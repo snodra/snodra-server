@@ -3,7 +3,7 @@
 //! `snodra-server --health-check` instead probes the local hub's gRPC health service (for the
 //! image's `HEALTHCHECK`; the distroless image has no shell or curl) and exits 0 when it is
 //! `SERVING`, 1 otherwise. `snodra-server --topology [--json]` prints the local hub's topology; both
-//! take `--address` and `--tls-ca` to probe another hub or speak TLS (ADR 0018).
+//! take `--address` and `--tls-ca` to probe another hub or speak TLS.
 //! `snodra-server acl hash <token|->` prints the digest an ACL file holds for a token.
 
 use std::io::Read;

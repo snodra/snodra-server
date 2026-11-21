@@ -1,4 +1,4 @@
-// Events (ADR 0025, ADR 0027): a read-only browser over the event store, through the event browser
+// Events: a read-only browser over the event store, through the event browser
 // add-on connected to this hub (snodra-event-browser); the page is hidden while none is. A search
 // runs newest first over every segment of a source and pages with the browser's cursor; a record
 // opens to its headers and, where this hub serves payloads to the token the tab holds, its

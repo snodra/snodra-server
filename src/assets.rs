@@ -1,5 +1,5 @@
 //! The dashboard's static assets (`ui/`), compiled into the binary with `rust-embed` and served
-//! under `/ui/` (roadmap P2). Plain HTML, CSS and JavaScript modules written for the hub: no
+//! under `/ui/`. Plain HTML, CSS and JavaScript modules written for the hub: no
 //! third-party code.
 //!
 //! Caching: `/ui/` (the page) is `no-cache`. It references every asset under

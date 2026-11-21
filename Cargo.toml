@@ -44,14 +44,14 @@ toml = "0.9"
 rustls-native-certs = "0.8"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
-# JWT credentials (ADR 0019): rust_crypto like snodra-messaging-rs, so the image still needs no C
+# JWT credentials: rust_crypto like snodra-messaging-rs, so the image still needs no C
 # toolchain; the JWKS fetch is a small hyper HTTP/1 client over the rustls the hub already has.
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
 x509-parser = { version = "0.18", default-features = false }
-# Control and reset operation ids (ADR 0023).
+# Control and reset operation ids.
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]

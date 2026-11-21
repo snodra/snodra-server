@@ -9,7 +9,7 @@ function state(t) {
   return badge('good', 'owned');
 }
 
-/** The owners cell: every owner, and a "shared" badge for a shared query type (ADR 0017). */
+/** The owners cell: every owner, and a "shared" badge for a shared query type. */
 function owners(t) {
   if (!t.owners.length) return { class: 'dim', content: 'none' };
   if (!t.shared) return t.owners.join(', ');

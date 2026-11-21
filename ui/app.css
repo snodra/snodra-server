@@ -131,7 +131,7 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .hub-meta dt { color: var(--muted); }
 .hub-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Peer hubs (ADR 0016): this hub, each peer's reachability, and the all/this scope. */
+/* Peer hubs: this hub, each peer's reachability, and the all/this scope. */
 .hubs {
   display: flex;
   flex-wrap: wrap;
@@ -488,7 +488,7 @@ button {
 }
 button:hover { background: var(--surface-2); }
 
-/* Processors (ADR 0022) -------------------------------------------------------------------- */
+/* Processors -------------------------------------------------------------------- */
 
 button.disclose {
   display: inline-flex;
@@ -535,7 +535,7 @@ table.data.segments th, table.data.segments td { padding-left: 14px; }
 .login input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .login .error-line { margin: 0; }
 
-/* Processor controls (ADR 0023) ------------------------------------------------------------- */
+/* Processor controls ------------------------------------------------------------- */
 
 .write-token { max-width: 760px; }
 .login.inline { flex-direction: row; flex-wrap: wrap; align-items: center; }
@@ -575,7 +575,7 @@ fieldset.reset-target > .choice { display: flex; }
 table.data.letters { min-width: 1100px; }
 table.data.letters td:nth-child(8) { overflow-wrap: anywhere; min-width: 24ch; }
 
-/* Event browser (ADR 0025) ------------------------------------------------------------------- */
+/* Event browser ------------------------------------------------------------------- */
 
 .event-form input[type="search"] { flex: 1 1 180px; max-width: 260px; }
 .event-form input[type="datetime-local"] {

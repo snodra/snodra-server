@@ -64,7 +64,7 @@ async fn request_before_register_closes_with_failed_precondition() {
     assert_eq!(status.message(), "first message must be Register");
 }
 
-/// The hub's own request sessions use instance ids `snodra-server/<uuid>` (ADR 0027): a client may
+/// The hub's own request sessions use instance ids `snodra-server/<uuid>`: a client may
 /// not register one.
 #[tokio::test]
 async fn an_instance_id_with_the_hubs_reserved_prefix_is_refused() {

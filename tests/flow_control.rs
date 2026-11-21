@@ -1,4 +1,4 @@
-//! Flow control end to end (ADR 0014): permits, per-instance queues, priority, capacity
+//! Flow control end to end: permits, per-instance queues, priority, capacity
 //! rejections, and a Register without permits.
 
 mod common;
@@ -112,7 +112,7 @@ async fn queued_requests_leave_by_priority_then_age() {
     assert_eq!(got, ["high", "high-2", "mid", "low"]);
 }
 
-/// A multi-hub top-up (ADR 0016): `Permits{count, grant}` raises the cap first, so the hub
+/// A multi-hub top-up: `Permits{count, grant}` raises the cap first, so the hub
 /// forwards up to the grant, not just up to `initial_permits`.
 #[tokio::test]
 async fn a_permit_grant_raises_the_cap_over_the_wire() {

@@ -1,4 +1,4 @@
-//! The identity a client certificate carries (roadmap P5c, ADR 0020): exactly one URI SAN of the
+//! The identity a client certificate carries: exactly one URI SAN of the
 //! form `snodra://service/<name>` names the service the certificate authenticates.
 //!
 //! The TLS handshake has already verified the chain against the client CA and the validity

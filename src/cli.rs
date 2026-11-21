@@ -1,5 +1,5 @@
 //! Command-line modes of the binary: argument parsing and the `--topology` table renderer (with
-//! each service's event processors, ADR 0022).
+//! each service's event processors).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ pub struct Remote {
     /// `--tls-ca`: PEM file with the CA(s) to trust; turns TLS on.
     pub tls_ca: Option<PathBuf>,
     /// `--tls-client-cert` and `--tls-client-key`: the client certificate and key (PEM) to
-    /// present, for a hub that asks for one (ADR 0020). Both or neither.
+    /// present, for a hub that asks for one. Both or neither.
     pub tls_client_cert: Option<PathBuf>,
     pub tls_client_key: Option<PathBuf>,
     /// `--listen` in a probe mode: the address the hub was started on, when it is not the default.
@@ -403,7 +403,7 @@ fn one_line(text: &str) -> String {
 }
 
 /// The state of a processor as the table shows it: the state, then `replaying` while a replay
-/// range is open and `op <first 8>` of the reset holding its lock (ADR 0023).
+/// range is open and `op <first 8>` of the reset holding its lock.
 fn state_cell(p: &crate::processors::ProcessorReport) -> String {
     let mut cell = p.state.as_str().to_string();
     if p.replaying {
@@ -416,8 +416,8 @@ fn state_cell(p: &crate::processors::ProcessorReport) -> String {
     cell
 }
 
-/// One row per (processor, instance) of a service whose instances report processors (ADR
-/// 0022), sorted by processor name, then instance id.
+/// One row per (processor, instance) of a service whose instances report processors,
+/// sorted by processor name, then instance id.
 fn processor_rows(instances: &[InstanceTopology], now_ms: i64) -> Vec<Vec<String>> {
     let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
     for i in instances {
@@ -545,7 +545,7 @@ pub fn render_table(t: &Topology) -> String {
                 "  {} {} owner={} for {}\n",
                 one_line(&ty.type_name),
                 kind,
-                // Every owner of a shared query type (ADR 0017), comma-separated.
+                // Every owner of a shared query type, comma-separated.
                 one_line(&ty.owner_services.join(",")),
                 fmt_duration_ms(ty.orphaned_for_ms)
             ));

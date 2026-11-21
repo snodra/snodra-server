@@ -1,4 +1,4 @@
-//! JWT credentials over gRPC (roadmap P5b, ADR 0019): admission against a JWKS served by an
+//! JWT credentials over gRPC: admission against a JWKS served by an
 //! in-process HTTP server, the `[[service]]` ACL, expiry, refresh, reloads and the topology.
 //! Signing keys are generated here; nothing is checked in.
 

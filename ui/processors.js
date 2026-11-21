@@ -1,7 +1,7 @@
-// Event processors (ADR 0022): the merge of /api/v1/processors over the reachable hubs and the
-// per-processor aggregate, with the rules of the hub's processors.rs (since P6b, ADR 0023, also
-// whether a processor replays and the reset operation holding its lock; since ADR 0027, its event
-// store and that store's capabilities). Segments and positions are opaque strings: shown as text. The page always
+// Event processors: the merge of /api/v1/processors over the reachable hubs and the
+// per-processor aggregate, with the rules of the hub's processors.rs (also whether a
+// processor replays and the reset operation holding its lock, its event store and that store's
+// capabilities). Segments and positions are opaque strings: shown as text. The page always
 // re-aggregates from the per-instance reports, so one hub and many hubs take the same path. An
 // instance seen by several hubs counts once: its freshest report (lowest statusAgeMs) wins.
 // Everything a hub sends is data: it is checked for shape and rendered as text by the page.
@@ -40,7 +40,7 @@ export function segmentOrder(a, b) {
   return byCodePoints(a, b);
 }
 
-/** The capability that offers a reset (and so a replay) of a processor (ADR 0027). */
+/** The capability that offers a reset (and so a replay) of a processor. */
 export const REPLAY = 'replay';
 
 /** The processor's event store declares `capability`. */

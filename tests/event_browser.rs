@@ -1,6 +1,6 @@
-//! The events API over the event browser add-on (ADR 0027), against a fake browser
+//! The events API over the event browser add-on, against a fake browser
 //! (`tests/common/browser.rs`): what the hub asks for each call, the neutral answers it passes
-//! on, the payload rules and their audit lines (ADR 0025), the browser's errors as HTTP statuses,
+//! on, the payload rules and their audit lines, the browser's errors as HTTP statuses,
 //! the tail's server-sent events, and what happens without a browser or when it goes away.
 
 mod common;

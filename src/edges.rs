@@ -1,4 +1,4 @@
-//! Edge statistics for the dashboard graph (roadmap P2).
+//! Edge statistics for the dashboard graph.
 //!
 //! An edge is `(sender service, type)`: every request that reaches a terminal state adds one
 //! to its edge's count (and to its errors when the outcome is not `ok`) and, when the request

@@ -93,13 +93,13 @@ pub struct InstanceTopology {
     /// As applied (0 in `Register` reads as 100).
     pub load_factor: u32,
     pub tags: BTreeMap<String, String>,
-    /// `InstanceStatus.connected_hub_ids` as last reported (ADR 0016); empty when never reported.
+    /// `InstanceStatus.connected_hub_ids` as last reported; empty when never reported.
     pub connected_hub_ids: Vec<String>,
     /// Milliseconds since the last `InstanceStatus`; -1 when never reported.
     pub status_age_ms: i64,
-    /// The query types (of `query_types`) registered as shared (ADR 0017).
+    /// The query types (of `query_types`) registered as shared.
     pub shared_query_types: Vec<String>,
-    /// How the session authenticated (ADR 0018): `authenticated` or `unauthenticated
+    /// How the session authenticated: `authenticated` or `unauthenticated
     /// (permissive)`. Absent when access control is off. JSON only: the gRPC response has no
     /// field for it, so a topology read over gRPC never carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,7 +107,7 @@ pub struct InstanceTopology {
     /// The service the instance's token is granted in the ACL, when it authenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated_service: Option<String>,
-    /// How the credentials were presented (ADR 0019): `token`, `jwt` or `none`. Absent when
+    /// How the credentials were presented: `token`, `jwt` or `none`. Absent when
     /// access control is off; JSON only, like `auth`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_kind: Option<String>,
@@ -116,10 +116,10 @@ pub struct InstanceTopology {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     /// The first 8 hex characters of the SHA-256 of a certificate session's client certificate
-    /// (ADR 0020); absent otherwise. Never the certificate.
+    ///; absent otherwise. Never the certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_fingerprint: Option<String>,
-    /// `InstanceStatus.processors` of the latest report, bounded (ADR 0022); empty when never
+    /// `InstanceStatus.processors` of the latest report, bounded; empty when never
     /// reported.
     pub processors: Vec<ProcessorReport>,
 }
@@ -133,7 +133,7 @@ pub struct TypeOwnership {
     pub live_instances: u32,
     pub orphaned: bool,
     pub orphaned_for_ms: i64,
-    /// A shared query type: many services may own it (ADR 0017).
+    /// A shared query type: many services may own it.
     pub shared: bool,
     /// Every owning service, sorted (one for an exclusive type).
     pub owner_services: Vec<String>,
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(reported["segments"][0]["head"], "9");
         assert_eq!(reported["lastErrorAtMs"], 42);
         assert_eq!(reported["deadLetterMode"], "collection");
-        // The control plane's fields (ADR 0023) ride along.
+        // The control plane's fields ride along.
         assert_eq!(reported["replaying"], true);
         assert_eq!(reported["operationId"], "op-1");
         assert_eq!(reported["segments"][0]["replayUntil"], "8");

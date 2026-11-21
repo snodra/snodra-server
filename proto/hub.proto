@@ -35,22 +35,22 @@ message ClientMessage {
     Request request = 2;
     Reply reply = 3;
     Heartbeat heartbeat = 4;
-    // Flow control (ADR 0014): more requests this instance can take now.
+    // Flow control: more requests this instance can take now.
     Permits permits = 5;
-    // Multi-part messages (ADR 0017): a handler's streamed parts and end (a streaming query, or
+    // Multi-part messages: a handler's streamed parts and end (a streaming query, or
     // the pushed updates of a subscription), a sender's credits and its cancellation.
     ReplyPart part = 6;
     ReplyEnd end = 7;
     Flow flow = 8;
     Cancel cancel = 9;
-    // Multi-hub HA (ADR 0016): what this instance sees, every 5 s; the hub keeps the latest per
+    // Multi-hub HA: what this instance sees, every 5 s; the hub keeps the latest per
     // session.
     InstanceStatus status = 10;
-    // Credential refresh (ADR 0019): a new credential for this session, for the same service as
+    // Credential refresh: a new credential for this session, for the same service as
     // its Register. The hub validates it as it validates the Register's and, for a JWT, moves the
     // session's expiry; a refused refresh closes the stream in enforce.
     Credentials credentials = 11;
-    // Processor control (ADR 0023): the answer to a ServerMessage.control, matched by control_id.
+    // Processor control: the answer to a ServerMessage.control, matched by control_id.
     ControlReply control_reply = 12;
   }
 }
@@ -69,13 +69,13 @@ message ServerMessage {
     Heartbeat heartbeat = 4;
     // Answers every accepted Register (see RegisterAck).
     RegisterAck register_ack = 5;
-    // Multi-part messages (ADR 0017): the answers of a Request with a mode other than UNARY this
+    // Multi-part messages: the answers of a Request with a mode other than UNARY this
     // instance sent (see RequestMode), and, to a handler, a sender's credits and cancellation.
     ReplyPart part = 6;
     ReplyEnd end = 7;
     Flow flow = 8;
     Cancel cancel = 9;
-    // Processor control (ADR 0023): the hub asks this instance to act on one of its event
+    // Processor control: the hub asks this instance to act on one of its event
     // processors; exactly one ClientMessage.control_reply answers it.
     ControlRequest control = 10;
   }
@@ -87,7 +87,7 @@ message ServerMessage {
 // command_types and query_types is rejected with INVALID_ARGUMENT. A type whose kind differs from
 // the kind its current owner registered is rejected with ALREADY_EXISTS.
 //
-// Query ownership (ADR 0017): a type in query_types is exclusive, owned by one service only; a
+// Query ownership: a type in query_types is exclusive, owned by one service only; a
 // type in shared_query_types may be owned by many services. Registrants must agree: a type
 // registered exclusive by one registrant and shared by another is rejected with ALREADY_EXISTS
 // (the later Register fails). A type listed in shared_query_types and in command_types or
@@ -96,20 +96,20 @@ message ServerMessage {
 // Every accepted Register is answered with a RegisterAck, written before the echo of any
 // Heartbeat that follows it. credentials, initial_permits, load_factor, tags and client_version
 // are read from the first Register of a stream only; later Registers cannot change them. Field 11
-// is allocated to a later roadmap phase (contexts).
+// is reserved for contexts.
 message Register {
   // Logical service name, for example "orders-service"; each event-store add-on derives its
   // own names from it.
   string service_name = 1;
   // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
   string instance_id = 2;
-  // Fully qualified command type names this instance handles, for example "files.AttachFile".
+  // Fully qualified command type names this instance handles, for example "orders.PlaceOrder".
   repeated string command_types = 3;
-  // Fully qualified query type names this instance handles, for example "files.GetFileMetadata".
+  // Fully qualified query type names this instance handles, for example "orders.GetOrder".
   repeated string query_types = 4;
-  // Checked when SNODRA_SERVER_AUTH_MODE is permissive or enforce (ADR 0018). Never logged.
+  // Checked when SNODRA_SERVER_AUTH_MODE is permissive or enforce. Never logged.
   Credentials credentials = 7;
-  // Flow control (ADR 0014): requests the hub may forward before the next Permits message, and
+  // Flow control: requests the hub may forward before the next Permits message, and
   // the session's permit cap. At least 1; a Register with 0 is rejected with INVALID_ARGUMENT.
   // The hub queues further requests per instance (ordered by Request.priority, then age) until
   // Permits arrive.
@@ -123,8 +123,8 @@ message Register {
   // Free text naming the client library and its version, for example "snodra-messaging/0.1.0".
   // Shown in the topology view; never used for routing decisions.
   string client_version = 12;
-  // Fully qualified query type names this instance handles that many services may own (ADR
-  // 0017), for example a "search.FindAnything" every service answers. A point query to such a
+  // Fully qualified query type names this instance handles that many services may own,
+  // for example a "search.FindAnything" every service answers. A point query to such a
   // type goes to one live instance of any owner; a scatter-gather query to all of them.
   repeated string shared_query_types = 13;
 }
@@ -135,13 +135,13 @@ message Register {
 // session hold more than its cap, which starts at initial_permits.
 message Permits {
   uint32 count = 1;
-  // Multi-hub HA (ADR 0016): when > 0, the hub first raises this session's cap to
+  // Multi-hub HA: when > 0, the hub first raises this session's cap to
   // max(cap, grant), then adds `count` (still clamped at the cap). A grant never lowers the cap.
   // Clients send it with the top-up that moves a departed hub's share to the surviving ones.
   uint32 grant = 2;
 }
 
-// Multi-hub HA (ADR 0016): an instance connected to several hubs reports, on each of its
+// Multi-hub HA: an instance connected to several hubs reports, on each of its
 // streams, which hubs it currently holds an acknowledged stream to. Hubs never talk to each
 // other; this report is how one hub's topology (and the dashboard that merges all hubs) shows
 // that an instance is missing a hub. The hub keeps only the latest report per session, bounded
@@ -152,7 +152,7 @@ message InstanceStatus {
   repeated string connected_hub_ids = 1;
   // Handlers of this instance running now, over all its hubs.
   uint32 handlers_in_flight = 2;
-  // Event processors (ADR 0022): one entry per event processor this instance started, as of this
+  // Event processors: one entry per event processor this instance started, as of this
   // report. The hub keeps the latest list per session, bounded: at most 32 processors, 1024
   // segments, 16 capabilities and 256 event types each; longer strings are cut at a UTF-8
   // boundary (name 64 bytes, subscription and source 256, event_store 64, a capability 64,
@@ -162,7 +162,7 @@ message InstanceStatus {
   repeated ProcessorStatus processors = 3;
 }
 
-// The state of one event processor on one instance (ADR 0022). When the hub aggregates a
+// The state of one event processor on one instance. When the hub aggregates a
 // processor over its instances it shows the worst state, ranked FAILING, unknown (UNSPECIFIED or
 // a value it does not know), STARTING, PAUSED, STOPPED, RUNNING.
 enum ProcessorState {
@@ -176,15 +176,15 @@ enum ProcessorState {
   PROCESSOR_RUNNING = 2;
   // A record exhausted its attempts in the last 60 s, or the reader reports an error.
   PROCESSOR_FAILING = 3;
-  // Stopping or stopped (shutdown), or stopped for a reset (ADR 0023): out of its subscription
+  // Stopping or stopped (shutdown), or stopped for a reset: out of its subscription
   // while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
   PROCESSOR_STOPPED = 4;
-  // Paused from the hub's control plane (ADR 0023): still in its subscription,
+  // Paused from the hub's control plane: still in its subscription,
   // consuming nothing.
   PROCESSOR_PAUSED = 5;
 }
 
-// One event processor of one instance (ADR 0022): a reader with its own subscription to
+// One event processor of one instance: a reader with its own subscription to
 // the event store's source, running the handlers of one processing group. Counters are since the
 // instance started; never payloads, keys or headers.
 message ProcessorStatus {
@@ -222,10 +222,10 @@ message ProcessorStatus {
   // service's message store, the default), "event-store" (the event store's own dead-letter
   // destination) or "log" (logged and skipped).
   string dead_letter_mode = 12;
-  // A replay range is open on this instance's segments (ADR 0023): records below a
+  // A replay range is open on this instance's segments: records below a
   // segment's replay_until are handled again.
   bool replaying = 13;
-  // The reset operation holding the processor's lock (ADR 0023); empty when none.
+  // The reset operation holding the processor's lock; empty when none.
   string operation_id = 14;
   // The event store the processor reads: "kafka", "rabbitmq-streams", "memory" or the name of
   // a third-party add-on.
@@ -235,7 +235,7 @@ message ProcessorStatus {
   repeated string capabilities = 16;
 }
 
-// One segment assigned to an event processor on one instance (ADR 0022). A segment is a unit of
+// One segment assigned to an event processor on one instance. A segment is a unit of
 // the event store's order per key (a unit the add-on defines). Positions are
 // opaque strings that only the event-store add-on reads (a decimal counter for the first-wave
 // stores); an empty string means unknown or none.
@@ -251,12 +251,12 @@ message SegmentStatus {
   // The number of records between the committed position and the head (between position and
   // head when nothing is committed); -1 when unknown; never negative otherwise.
   int64 lag = 5;
-  // The end (exclusive) of the segment's open replay range (ADR 0023): its records before this
+  // The end (exclusive) of the segment's open replay range: its records before this
   // position are a replay; empty when the segment is not replaying.
   string replay_until = 6;
 }
 
-// The hub asks this instance to act on one of its event processors (ADR 0023). Exactly one
+// The hub asks this instance to act on one of its event processors. Exactly one
 // ControlReply with the same control_id answers it; the hub gives up after its control timeout
 // (10 s, reset_execute 120 s) and drops a late reply. An instance handles control requests off its
 // stream's read loop, one at a time per processor, and logs each at INFO.
@@ -436,7 +436,7 @@ message DeadLetterPage {
   uint64 total = 2;
 }
 
-// One dead letter without its payload or headers (ADR 0022).
+// One dead letter without its payload or headers.
 message DeadLetterSummary {
   string id = 1;
   string processor = 2;
@@ -475,8 +475,8 @@ message DeadLetterRetryAllOutcome {
   uint64 skipped = 4;
 }
 
-// How a client authenticates itself to the hub. Carried on Register (ADR 0018) and on
-// ClientMessage.credentials (ADR 0019). A jwt is refused with UNAUTHENTICATED by a hub that has no
+// How a client authenticates itself to the hub. Carried on Register and on
+// ClientMessage.credentials. A jwt is refused with UNAUTHENTICATED by a hub that has no
 // JWT issuer configured.
 message Credentials {
   oneof kind {
@@ -510,7 +510,7 @@ message RegisterAck {
   map<string, uint32> type_timeouts_ms = 9;
 }
 
-// How the hub delivers a Request and its answers (ADR 0017). The modes other than UNARY are for
+// How the hub delivers a Request and its answers. The modes other than UNARY are for
 // queries only: a command fails with INVALID_REQUEST, and so does a mode value this file does not
 // define. No live instance fails with an Error NO_HANDLER.
 enum RequestMode {
@@ -566,7 +566,7 @@ message Request {
   // Higher first when the hub queues requests for a flow-controlled instance; equal priorities
   // keep arrival order. 0 is the default. Queued requests keep their own deadline.
   int32 priority = 9;
-  // Field 10 is allocated to a later roadmap phase (contexts).
+  // Field 10 is reserved for contexts.
   // Streaming and subscriptions: credits the sender grants before its first Flow.
   uint32 initial_credit = 11;
   // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
@@ -629,7 +629,7 @@ message Error {
   bytes details = 4;
 }
 
-// One answer of a multi-part request (ADR 0017). For scatter-gather, one per target that answered,
+// One answer of a multi-part request. For scatter-gather, one per target that answered,
 // in arrival order, with the sender's Request.id. A target's Reply{error}, a hub-side failure of
 // one target (HANDLER_DISCONNECTED or RESOURCE_EXHAUSTED) is a part with `error` set and no
 // payload.
@@ -650,7 +650,7 @@ message ReplyPart {
   uint64 seq = 6;
 }
 
-// The last message of a multi-part request (ADR 0017): no ReplyPart for its id follows. For
+// The last message of a multi-part request: no ReplyPart for its id follows. For
 // scatter-gather: sent when every target answered, when max_results successful parts arrived, or
 // at the deadline, whichever is first.
 message ReplyEnd {
@@ -667,14 +667,14 @@ message ReplyEnd {
   uint32 timed_out = 5;
 }
 
-// Credits (ADR 0017): the receiver of a stream or a subscription may get `credits` more parts.
+// Credits: the receiver of a stream or a subscription may get `credits` more parts.
 // From the sender with its Request.id; the hub passes it on to a streaming handler ("<id>#1").
 message Flow {
   string request_id = 1;
   uint32 credits = 2;
 }
 
-// Cancels a stream or a subscription (ADR 0017): from the sender with its Request.id, no
+// Cancels a stream or a subscription: from the sender with its Request.id, no
 // ReplyEnd follows; from the hub to a handler with the target's id ("<id>#n") when the request
 // ended, the reason saying why.
 message Cancel {
@@ -746,9 +746,9 @@ message InstanceTopology {
   repeated string connected_hub_ids = 16;
   // now_ms minus the time of the last InstanceStatus; -1 when never reported.
   int64 status_age_ms = 17;
-  // Sorted; the query types of query_types this instance registered as shared (ADR 0017).
+  // Sorted; the query types of query_types this instance registered as shared.
   repeated string shared_query_types = 18;
-  // InstanceStatus.processors of the latest report, as the hub keeps them (bounded, ADR 0022);
+  // InstanceStatus.processors of the latest report, as the hub keeps them (bounded);
   // empty when never reported.
   repeated ProcessorStatus processors = 19;
 }
@@ -763,7 +763,7 @@ message TypeOwnership {
   bool orphaned = 5;
   // 0 unless orphaned.
   int64 orphaned_for_ms = 6;
-  // Registered through Register.shared_query_types: many services may own it (ADR 0017).
+  // Registered through Register.shared_query_types: many services may own it.
   bool shared = 7;
   // Every owning service, sorted (one entry for an exclusive type).
   repeated string owner_services = 8;

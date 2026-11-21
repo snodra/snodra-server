@@ -1,4 +1,4 @@
-//! The dashboard token (roadmap P5a, ADR 0018): `/api/v1/*` and the event stream
+//! The dashboard token: `/api/v1/*` and the event stream
 //! need `Authorization: Bearer <token>` when `SNODRA_SERVER_DASHBOARD_TOKEN` is set; the page and its
 //! assets stay public.
 
@@ -377,7 +377,7 @@ console.log('ok');
     );
 }
 
-/// The dashboard's control calls (`ui/api.js`, ADR 0023), run by Node against a real hub: the
+/// The dashboard's control calls (`ui/api.js`), run by Node against a real hub: the
 /// write credential is kept under its own key, goes out as a header on control calls only, never
 /// in a URL, and a refused write credential does not sign the page out. Skipped when Node is not
 /// installed.

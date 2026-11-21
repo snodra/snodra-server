@@ -1,8 +1,8 @@
-// The processor controls of the dashboard (ADR 0023): the write-token field, the confirm dialog
+// The processor controls of the dashboard: the write-token field, the confirm dialog
 // and the line that reports a control call. The write token is typed into a password field, kept
 // in sessionStorage by api.js and sent as a header to this hub only; it never goes into a URL.
 // With peer hubs a control call still goes to this hub: every instance is connected to every hub
-// (ADR 0016), so this hub reaches them all.
+//, so this hub reaches them all.
 
 import * as api from './api.js';
 import { fill, h } from './dom.js';

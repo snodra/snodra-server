@@ -1,4 +1,4 @@
-//! Processor control, hub side (ADR 0023): the HTTP API asks the instances that report a processor
+//! Processor control, hub side: the HTTP API asks the instances that report a processor
 //! to pause, resume, reset (prepare all, execute on one, finish all) and to work on their dead
 //! letters, over real gRPC to fake instances; the write credential guards every mutation.
 
@@ -411,7 +411,7 @@ async fn a_prepare_that_times_out_aborts_the_reset() {
     assert_eq!(actions(&b2.seen()), ["prepare", "finish-aborted"]);
 }
 
-/// The hub offers only what the event store declares (ADR 0027): a processor whose freshest
+/// The hub offers only what the event store declares: a processor whose freshest
 /// report lacks the `replay` capability gets 409 UNSUPPORTED, and no instance is asked.
 #[tokio::test]
 async fn a_reset_without_the_replay_capability_is_refused_before_anyone_is_asked() {

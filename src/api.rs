@@ -1,4 +1,4 @@
-//! The dashboard's JSON API (`/api/v1/`, roadmap P2): read-only views over the topology
+//! The dashboard's JSON API (`/api/v1/`): read-only views over the topology
 //! snapshot, the edge statistics and the effective configuration. Never payloads, headers or
 //! secrets. `/api/v1/topology` is the [`Topology`] snapshot itself; the other views are built
 //! here so they can be tested without a server.
@@ -92,10 +92,10 @@ pub struct Version {
     pub grafana_url: Option<String>,
     /// The edge-statistics window.
     pub window_ms: i64,
-    /// `SNODRA_SERVER_PEERS` as origins (ADR 0016): the hubs whose APIs the page merges. May list
+    /// `SNODRA_SERVER_PEERS` as origins: the hubs whose APIs the page merges. May list
     /// this hub; the page skips it by hub id. Empty: the page shows this hub only.
     pub peers: Vec<String>,
-    /// Whether the event browser add-on is connected (ADR 0027); the page hides its Events
+    /// Whether the event browser add-on is connected; the page hides its Events
     /// page while it is not.
     pub event_browser: EventBrowser,
 }
@@ -148,7 +148,7 @@ pub struct TypeView {
     #[serde(rename = "type")]
     pub type_name: String,
     pub kind: KindName,
-    /// Owning services, sorted: one, or several for a shared query type (ADR 0017).
+    /// Owning services, sorted: one, or several for a shared query type.
     pub owners: Vec<String>,
     /// A shared query type: many services may own it.
     pub shared: bool,
@@ -273,7 +273,7 @@ pub enum Node {
         name: String,
         type_kind: KindName,
         owners: Vec<String>,
-        /// A shared query type (ADR 0017).
+        /// A shared query type.
         shared: bool,
         registered: bool,
         orphaned: bool,
@@ -425,7 +425,7 @@ fn stale_instances(t: &Topology) -> u32 {
 
 /// Whether a setting's value may be shown. A `Secret` setting is listed by name only: its value
 /// and default are never serialized. No hub setting is secret today; tokens and key paths
-/// (roadmap P5) must be declared `Secret`.
+/// must be declared `Secret`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensitivity {
     Plain,
@@ -910,7 +910,7 @@ pub struct Summary {
     pub requests: u64,
     pub errors: u64,
     /// Changes when services, instances, registrations, flow-control or staleness flags, the
-    /// hubs an instance reports (ADR 0016), type ownership or the set of edges change; not with counters or ages. A page refreshes its
+    /// hubs an instance reports, type ownership or the set of edges change; not with counters or ages. A page refreshes its
     /// view at once when it changes.
     pub revision: String,
 }
@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(json["types"][1]["liveInstances"], 2);
     }
 
-    /// The fixture plus `search.Find`, a query shared by orders and catalog (ADR 0017).
+    /// The fixture plus `search.Find`, a query shared by orders and catalog.
     fn with_shared_type() -> Topology {
         let mut t = topology();
         t.types.push(TypeOwnership {
@@ -1248,7 +1248,7 @@ mod tests {
         let c = Config {
             hub_id: "hub-7".into(),
             default_timeout: Duration::from_millis(2500),
-            timeout_overrides: [("files.Upload".to_string(), Duration::from_secs(120))].into(),
+            timeout_overrides: [("orders.PlaceOrder".to_string(), Duration::from_secs(120))].into(),
             grafana_url: Some("https://admin:hunter2@grafana.example/d/hub".into()),
             otlp_endpoint: None,
             ..Config::default()
@@ -1260,7 +1260,7 @@ mod tests {
                 .find(|s| s.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"))
         };
-        // The eight settings of the event browser the hub read itself are gone (ADR 0027).
+        // The eight settings of the event browser the hub read itself are gone.
         assert_eq!(v.settings.len(), 49);
         for removed in crate::config::REMOVED_SETTINGS {
             assert!(v.settings.iter().all(|s| s.name != removed), "{removed}");
@@ -1309,7 +1309,7 @@ mod tests {
         );
         assert_eq!(
             get("SNODRA_SERVER_TIMEOUT_OVERRIDES").value.as_deref(),
-            Some("files.Upload=120000")
+            Some("orders.PlaceOrder=120000")
         );
         assert_eq!(
             get("SNODRA_SERVER_OTLP_ENDPOINT").value.as_deref(),

@@ -26,7 +26,7 @@ function renderTiles(el, t, windowMs) {
         `${fmt.int(t.errors)} errors (${fmt.errorRate(t.errors, t.requests)})`) : 'no errors'));
 }
 
-/** Totals over every reachable hub and where they disagree (ADR 0016). */
+/** Totals over every reachable hub and where they disagree. */
 function renderAllHubs(el, m) {
   const t = m.totals;
   const tiles = h('div', { class: 'tiles' },

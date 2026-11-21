@@ -1,4 +1,4 @@
-//! A fake P6b instance for the processor control tests (ADR 0023): it registers over real gRPC,
+//! A fake instance for the processor control tests: it registers over real gRPC,
 //! declares "instance-status", "processors" and (unless told otherwise) "processor-control",
 //! reports its processors, heartbeats, and answers every `ControlRequest` as its behaviour says:
 //! at once, after a delay, or never. It records every request it was sent.

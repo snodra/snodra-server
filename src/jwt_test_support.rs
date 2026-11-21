@@ -1,4 +1,4 @@
-//! Test-only support for the JWT tests (ADR 0019): signing keys generated at test time (nothing
+//! Test-only support for the JWT tests: signing keys generated at test time (nothing
 //! is checked in), token minting, forged tokens, and an in-process JWKS server.
 //!
 //! This file is compiled twice, by `#[path]`: as `jwt::test_support` into the library's own unit

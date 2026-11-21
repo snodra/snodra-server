@@ -1,4 +1,4 @@
-//! Streaming queries end to end (ADR 0017), over real gRPC with raw clients: credits, endings,
+//! Streaming queries end to end, over real gRPC with raw clients: credits, endings,
 //! cancels, a handler's permit, shared types and the refusals.
 
 mod common;

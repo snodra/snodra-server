@@ -141,7 +141,7 @@ pub fn init(config: &Config) -> anyhow::Result<TelemetryGuard> {
 
 /// The OTLP resource of every span and metric: `service.name` `snodra-server` and
 /// `service.instance.id` the hub id, which Prometheus turns into the `job` and `instance` labels
-/// dashboards select hubs by (ADR 0026); no `service.namespace`, which would change `job`.
+/// dashboards select hubs by; no `service.namespace`, which would change `job`.
 pub fn resource(config: &Config) -> Resource {
     Resource::builder()
         .with_service_name(SERVICE_NAME)
@@ -186,8 +186,8 @@ pub enum Outcome {
     /// A streaming query ended before its handler did: the sender cancelled it, or it outlived
     /// `SNODRA_SERVER_MAX_STREAM_DURATION` (CANCELLED).
     Cancelled,
-    /// The hub refused the request because the sender's token may not send its type (ADR 0018,
-    /// PERMISSION_DENIED or UNAUTHENTICATED, mode `enforce` only).
+    /// The hub refused the request because the sender's token may not send its type
+    /// (PERMISSION_DENIED or UNAUTHENTICATED, mode `enforce` only).
     Denied,
 }
 
@@ -208,7 +208,7 @@ impl Outcome {
     }
 }
 
-/// The `type` of a request metric whose type has no owner (ADR 0026): what a sender names is
+/// The `type` of a request metric whose type has no owner: what a sender names is
 /// not bounded, the registered types are.
 pub const OTHER_TYPE: &str = "other";
 
@@ -455,7 +455,7 @@ impl Metrics {
         );
     }
 
-    /// One processor control call of the HTTP API (ADR 0023).
+    /// One processor control call of the HTTP API.
     pub fn control(&self, action: &'static str, outcome: &'static str) {
         self.control.add(
             1,
@@ -466,7 +466,7 @@ impl Metrics {
         );
     }
 
-    /// One call of the events API (ADR 0027); `kind` and `outcome` are from fixed sets.
+    /// One call of the events API; `kind` and `outcome` are from fixed sets.
     pub fn event_request(&self, kind: &'static str, outcome: &'static str) {
         self.event_browser_requests.add(
             1,
@@ -528,7 +528,7 @@ impl Metrics {
         self.tls_client_ca_reload_errors.add(1, &[]);
     }
 
-    /// A client certificate judged (ADR 0020); `result` is one of a fixed set.
+    /// A client certificate judged; `result` is one of a fixed set.
     pub fn client_certificate(&self, result: &'static str) {
         self.client_certificates
             .add(1, &[KeyValue::new("result", result)]);
@@ -698,7 +698,7 @@ impl Metrics {
         );
     }
 
-    /// A subscription query (ADR 0017, P4c) got `instance` of `service` as a target.
+    /// A subscription query got `instance` of `service` as a target.
     pub fn subscription_opened(&self, service: &str, instance: &str) {
         self.subscriptions_open.add(service, instance, 1);
     }
@@ -782,7 +782,7 @@ impl Metrics {
 }
 
 /// The handler's service and instance. The instance is `instance_id`: Prometheus overwrites a
-/// data-point `instance` (and `job`) with the resource's (ADR 0026).
+/// data-point `instance` (and `job`) with the resource's.
 fn stream_attrs(service: &str, instance: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("service", service.to_string()),
@@ -886,10 +886,10 @@ fn processor_attrs(service: &str, processor: &str) -> [KeyValue; 2] {
     ]
 }
 
-/// The processor gauges (ADR 0022, 0026), per service and processor, aggregated over the
+/// The processor gauges, per service and processor, aggregated over the
 /// instances as the Processors page does, from the latest `InstanceStatus` each session holds:
 /// observed when the metrics are exported (by the exporter's thread), from memory: no I/O, no
-/// event-store read. Every instance reports to every hub (ADR 0016), so hubs export the same
+/// event-store read. Every instance reports to every hub, so hubs export the same
 /// values: dashboards take `max` over hubs. Dropping the value unregisters nothing; keep it for
 /// the life of the meter provider.
 pub struct ProcessorGauges {
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(point.value(), 1);
     }
 
-    /// The subscription instruments (ADR 0017, P4c): a gauge per handler instance and a counter
+    /// The subscription instruments: a gauge per handler instance and a counter
     /// per handler service and type.
     #[test]
     fn subscription_instruments_count_open_targets_and_relayed_updates() {
@@ -1531,7 +1531,7 @@ mod tests {
         assert_eq!(total, 0);
     }
 
-    /// Dashboards select hubs by the resource (ADR 0026 hub ruling 1): `service.name` becomes
+    /// Dashboards select hubs by the resource: `service.name` becomes
     /// `job` and `service.instance.id` becomes `instance` in Prometheus.
     #[test]
     fn the_resource_names_the_hub_and_its_id() {
@@ -1566,7 +1566,7 @@ mod tests {
 
     /// The open streams and subscription targets are gauges of the live counts per handler
     /// instance: an instance whose last one closed reads 0 once, then is no longer exported, so
-    /// the series of past instance ids (a fresh id per start) do not pile up (ADR 0026).
+    /// the series of past instance ids (a fresh id per start) do not pile up.
     #[test]
     fn an_instance_whose_last_stream_closed_reads_0_once_then_is_gone() {
         let m = test_support::test_metrics();
@@ -1683,7 +1683,7 @@ mod tests {
 
     /// The processor gauges aggregate each (service, processor) over its instances as the
     /// Processors page does: lag over distinct segments as the freshest report has them, the
-    /// worst state, the highest dead-letter count, the summed totals (ADR 0026).
+    /// worst state, the highest dead-letter count, the summed totals.
     #[test]
     fn processor_gauges_aggregate_the_latest_reports_per_service_and_processor() {
         use crate::proto::ProcessorState::{ProcessorFailing, ProcessorRunning};
@@ -1816,8 +1816,7 @@ mod tests {
     }
 
     /// A processor whose lag becomes unknown is still reported: its lag is absent, not 0 (0
-    /// means caught up), and the departure rule (0 once) is not applied to it (ADR 0026 hub
-    /// ruling 9).
+    /// means caught up), and the departure rule (0 once) is not applied to it.
     #[test]
     fn a_lag_that_becomes_unknown_is_absent_not_0() {
         use crate::proto::ProcessorState::ProcessorRunning;
