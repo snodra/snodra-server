@@ -13,7 +13,9 @@
 //! gather; each target is an ordinary [`Pending::Unary`] keyed `<id>#<n>` whose `part_of` names
 //! the gather, so flow control, queues, priority and disconnects apply per target unchanged. A
 //! target's terminal message becomes a `ReplyPart` to the sender instead; the gather's own
-//! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map.
+//! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map. A
+//! subscription type (`Register.subscription_query_types`) is never gathered: its handlers take
+//! `<id>#0` for a subscription's initial request, so the gather is refused before any target.
 //!
 //! Streaming queries: a [`Pending::Stream`] keyed by the sender's request id
 //! holds the stream; its one target is a [`Pending::Unary`] keyed `<id>#1` with `part_of` set,
@@ -1850,7 +1852,9 @@ impl Router {
 
     /// A request with a mode other than UNARY. Gates, in this order: a mode this hub
     /// does not know, or a sender whose session is gone, is INVALID_REQUEST; the modes are for
-    /// queries only (INVALID_REQUEST); no live target is NO_HANDLER; a duplicate id is
+    /// queries only (INVALID_REQUEST); no live target is NO_HANDLER; a scatter-gather of a
+    /// subscription type (`Register.subscription_query_types`) is INVALID_REQUEST, its handlers
+    /// would take target `<id>#0` for a subscription's initial request; a duplicate id is
     /// INVALID_REQUEST.
     fn route_mode(
         self: &Arc<Self>,
@@ -1916,6 +1920,17 @@ impl Router {
         };
         if kind == Kind::Command {
             let message = for_queries(&type_name);
+            return reject(
+                kind,
+                ErrorCode::InvalidRequest,
+                Outcome::InvalidRequest,
+                message,
+            );
+        }
+        if self.registry.is_subscription_type(ctx, &type_name) {
+            let message = format!(
+                "invalid request: {type_name} is a subscription type; {mode} is not for it"
+            );
             return reject(
                 kind,
                 ErrorCode::InvalidRequest,

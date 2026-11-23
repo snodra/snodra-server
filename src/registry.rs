@@ -4,6 +4,8 @@
 //! - a message type is owned by exactly one service; another service registering it is rejected;
 //!   except a shared query type (`Register.shared_query_types`), which many services may
 //!   own; registrants must agree on exclusive vs shared;
+//! - a query type may be declared a subscription type (`Register.subscription_query_types`);
+//!   registrants must agree on that too, and the router refuses a scatter-gather of one;
 //! - when the last instance of a service listing a type goes away the service keeps ownership for
 //!   `owner_grace` so a restarting service does not lose its types; `sweep` then drops it;
 //! - commands with a routing key go to one instance of the owning service chosen by consistent
@@ -91,12 +93,14 @@ pub struct StreamPool {
     pub rotation: usize,
 }
 
-/// The types one `Register` lists. `shared_query_types` are queries many services may own.
+/// The types one `Register` lists. `shared_query_types` are queries many services may own;
+/// `subscription_query_types` names, among the query types, the subscription types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
     pub command_types: Vec<String>,
     pub query_types: Vec<String>,
     pub shared_query_types: Vec<String>,
+    pub subscription_query_types: Vec<String>,
 }
 
 /// What the registry decided for a request.
@@ -145,6 +149,18 @@ pub enum RegisterError {
         owner: String,
         owner_shared: bool,
     },
+    /// The request declares a subscription type that is in neither of its query lists.
+    SubscriptionNotAQuery {
+        type_name: String,
+    },
+    /// The type is already registered as a subscription type (`owner_subscription`) and this
+    /// registrant does not declare it one, or the other way round. `owner` is its first owning
+    /// service.
+    SubscriptionConflict {
+        type_name: String,
+        owner: String,
+        owner_subscription: bool,
+    },
 }
 
 impl Kind {
@@ -189,6 +205,23 @@ impl fmt::Display for RegisterError {
                     "a shared"
                 } else {
                     "an exclusive"
+                }
+            ),
+            Self::SubscriptionNotAQuery { type_name } => write!(
+                f,
+                "type {type_name} listed as a subscription type but not as a query type"
+            ),
+            Self::SubscriptionConflict {
+                type_name,
+                owner,
+                owner_subscription,
+            } => write!(
+                f,
+                "type {type_name} is registered as {} by service {owner}",
+                if *owner_subscription {
+                    "a subscription type"
+                } else {
+                    "a query type that is not a subscription type"
                 }
             ),
         }
@@ -310,6 +343,9 @@ struct Owner {
     /// Registered through `shared_query_types`: many services may own it. Exclusive types have
     /// exactly one entry in `services`.
     shared: bool,
+    /// Declared in `subscription_query_types`: served by subscription handlers, so never
+    /// gathered. Every registrant agrees; kept as long as the type has an owner.
+    subscription: bool,
     /// Owning services, sorted. Never empty (an emptied owner is removed with its type).
     services: BTreeMap<String, Holding>,
     /// Round-robin counter of a shared type (an exclusive type uses its service's).
@@ -454,6 +490,7 @@ impl Registry {
             command_types: command_types.to_vec(),
             query_types: query_types.to_vec(),
             shared_query_types: Vec::new(),
+            subscription_query_types: Vec::new(),
         };
         self.register_types(ctx, instance_id, service, &types, placement)
     }
@@ -500,8 +537,22 @@ impl Registry {
                 Some(_) => {}
             }
         }
+        // A subscription type must be one of this Register's query types.
+        let subscriptions: BTreeSet<&String> = types.subscription_query_types.iter().collect();
+        for t in &subscriptions {
+            if !matches!(seen.get(*t), Some((Kind::Query, _))) {
+                return Err(RegisterError::SubscriptionNotAQuery {
+                    type_name: (*t).clone(),
+                });
+            }
+        }
+        // (type, kind, shared, subscription)
+        let wanted: Vec<(&String, Kind, bool, bool)> = wanted
+            .into_iter()
+            .map(|(t, kind, is_shared)| (t, kind, is_shared, subscriptions.contains(t)))
+            .collect();
 
-        for (t, kind, is_shared) in &wanted {
+        for (t, kind, is_shared, is_subscription) in &wanted {
             if let Some(owner) = inner.types.get(*t) {
                 if owner.kind != *kind {
                     return Err(RegisterError::KindConflict {
@@ -517,6 +568,13 @@ impl Registry {
                         owner_shared: owner.shared,
                     });
                 }
+                if owner.subscription != *is_subscription {
+                    return Err(RegisterError::SubscriptionConflict {
+                        type_name: (*t).clone(),
+                        owner: owner.first_service(),
+                        owner_subscription: owner.subscription,
+                    });
+                }
                 if !owner.shared && !owner.services.contains_key(service) {
                     return Err(RegisterError::TypeOwnedByOtherService {
                         type_name: (*t).clone(),
@@ -529,10 +587,11 @@ impl Registry {
         let now = Instant::now();
         inner.remove_instance(instance_id, now);
 
-        for (t, kind, is_shared) in &wanted {
+        for (t, kind, is_shared, is_subscription) in &wanted {
             let owner = inner.types.entry((*t).clone()).or_insert_with(|| Owner {
                 kind: *kind,
                 shared: *is_shared,
+                subscription: *is_subscription,
                 services: BTreeMap::new(),
                 rr: 0,
             });
@@ -554,10 +613,13 @@ impl Registry {
                 service: service.to_string(),
                 shared: wanted
                     .iter()
-                    .filter(|(_, _, sh)| *sh)
-                    .map(|(t, _, _)| (*t).clone())
+                    .filter(|(_, _, sh, _)| *sh)
+                    .map(|(t, _, _, _)| (*t).clone())
                     .collect(),
-                types: wanted.into_iter().map(|(t, k, _)| (t.clone(), k)).collect(),
+                types: wanted
+                    .into_iter()
+                    .map(|(t, k, _, _)| (t.clone(), k))
+                    .collect(),
                 placement,
             },
         );
@@ -697,6 +759,14 @@ impl Registry {
             return Err(owner.no_live_instance());
         }
         Ok((owner.kind, targets))
+    }
+
+    /// Whether `type_name` is a subscription type (`Register.subscription_query_types`) of its
+    /// owners. False for an unknown type.
+    pub fn is_subscription_type(&self, ctx: &ContextId, type_name: &str) -> bool {
+        check_context(ctx);
+        let inner = self.inner.lock().unwrap();
+        inner.types.get(type_name).is_some_and(|o| o.subscription)
     }
 
     /// The candidates of a streaming query: like the unkeyed pool of [`Registry::pick_target`]
@@ -1442,6 +1512,7 @@ mod tests {
                         command_types: commands,
                         query_types: queries,
                         shared_query_types: s(&["q.X"]),
+                        ..RegisteredTypes::default()
                     },
                     Placement::default(),
                 )
@@ -1628,6 +1699,7 @@ mod tests {
                 command_types: vec![],
                 query_types: s(&["q.Own"]),
                 shared_query_types: s(&["q.Z", "q.Find"]),
+                ..RegisteredTypes::default()
             },
             Placement::default(),
         )
@@ -1642,5 +1714,118 @@ mod tests {
             .map(|t| (t.type_name.as_str(), t.shared))
             .collect();
         assert_eq!(flags, [("q.Find", true), ("q.Own", false), ("q.Z", true)]);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Subscription types
+
+    /// Registers `id` of `service` with `exclusive` and `shared` query types, `subscriptions`
+    /// declared among them.
+    fn subs(
+        r: &Registry,
+        id: &str,
+        service: &str,
+        exclusive: &[&str],
+        shared: &[&str],
+        subscriptions: &[&str],
+    ) -> Result<(), RegisterError> {
+        r.register_types(
+            &D,
+            id,
+            service,
+            &RegisteredTypes {
+                query_types: s(exclusive),
+                shared_query_types: s(shared),
+                subscription_query_types: s(subscriptions),
+                ..RegisteredTypes::default()
+            },
+            Placement::default(),
+        )
+    }
+
+    #[test]
+    fn a_subscription_type_must_be_a_query_type_of_the_same_register() {
+        let r = reg();
+        for (commands, queries) in [(vec![], vec![]), (s(&["q.W"]), vec![])] {
+            let err = r
+                .register_types(
+                    &D,
+                    "a",
+                    "A",
+                    &RegisteredTypes {
+                        command_types: commands,
+                        query_types: queries,
+                        subscription_query_types: s(&["q.W"]),
+                        ..RegisteredTypes::default()
+                    },
+                    Placement::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                err,
+                RegisterError::SubscriptionNotAQuery {
+                    type_name: "q.W".into()
+                }
+            );
+            assert_eq!(r.service_of(&D, "a"), None, "nothing changed");
+        }
+        subs(&r, "a", "A", &["q.W"], &["q.S"], &["q.W", "q.S", "q.W"]).unwrap();
+        assert!(r.is_subscription_type(&D, "q.W"));
+        assert!(r.is_subscription_type(&D, "q.S"));
+        assert!(!r.is_subscription_type(&D, "q.Nope"));
+    }
+
+    #[test]
+    fn registrants_agree_on_a_subscription_type_as_on_sharing() {
+        let r = reg();
+        subs(&r, "a1", "A", &[], &["q.W"], &["q.W"]).unwrap();
+        shared(&r, "b1", "B", &["q.Find"]).unwrap();
+        // Another owner, or another instance of the same one, that disagrees.
+        for (id, service) in [("c1", "C"), ("a2", "A")] {
+            assert_eq!(
+                shared(&r, id, service, &["q.W"]).unwrap_err(),
+                RegisterError::SubscriptionConflict {
+                    type_name: "q.W".into(),
+                    owner: "A".into(),
+                    owner_subscription: true,
+                }
+            );
+        }
+        assert_eq!(
+            subs(&r, "c1", "C", &[], &["q.Find"], &["q.Find"]).unwrap_err(),
+            RegisterError::SubscriptionConflict {
+                type_name: "q.Find".into(),
+                owner: "B".into(),
+                owner_subscription: false,
+            }
+        );
+        assert!(!r.is_subscription_type(&D, "q.Find"));
+        // Agreeing registrants are accepted, and a re-register keeps the type.
+        subs(&r, "c1", "C", &[], &["q.W"], &["q.W"]).unwrap();
+        subs(&r, "a1", "A", &[], &["q.W"], &["q.W"]).unwrap();
+        assert!(r.is_subscription_type(&D, "q.W"));
+        assert_eq!(r.scatter_targets(&D, "q.W").unwrap().1.len(), 2);
+    }
+
+    #[test]
+    fn a_subscription_type_is_kept_while_owned_and_forgotten_with_its_last_owner() {
+        let r = reg();
+        subs(&r, "a1", "A", &["q.W"], &[], &["q.W"]).unwrap();
+        let t0 = Instant::now();
+        // An empty Register (a graceful stop) and the last instance leaving keep the owner
+        // within its grace, with its declaration: a disagreeing registrant still conflicts.
+        r.register(&D, "a1", "A", &[], &[]).unwrap();
+        assert!(r.is_subscription_type(&D, "q.W"));
+        r.unregister(&D, "a1", t0);
+        assert!(r.is_subscription_type(&D, "q.W"));
+        assert!(matches!(
+            r.register(&D, "a2", "A", &[], &s(&["q.W"])),
+            Err(RegisterError::SubscriptionConflict { .. })
+        ));
+        // Swept: the type is unknown again, and a new registrant chooses.
+        assert_eq!(r.sweep(t0 + Duration::from_secs(61)), 1);
+        assert!(!r.is_subscription_type(&D, "q.W"));
+        r.register(&D, "a2", "A", &[], &s(&["q.W"])).unwrap();
+        assert!(!r.is_subscription_type(&D, "q.W"));
     }
 }

@@ -274,6 +274,7 @@ impl StreamCtx {
                         command_types: reg.command_types.clone(),
                         query_types: reg.query_types.clone(),
                         shared_query_types: reg.shared_query_types.clone(),
+                        subscription_query_types: reg.subscription_query_types.clone(),
                     },
                     placement.clone(),
                 )
@@ -293,6 +294,7 @@ impl StreamCtx {
                     commands = reg.command_types.len(),
                     queries = reg.query_types.len(),
                     shared_queries = reg.shared_query_types.len(),
+                    subscription_queries = reg.subscription_query_types.len(),
                     client_version = %reg.client_version,
                     "register"
                 );
@@ -302,12 +304,14 @@ impl StreamCtx {
                 warn!(error = %e, service = %reg.service_name, instance = %reg.instance_id, "register rejected");
                 Err(match e {
                     RegisterError::DuplicateTypeAcrossKinds { .. }
-                    | RegisterError::SharedAndExclusive { .. } => {
+                    | RegisterError::SharedAndExclusive { .. }
+                    | RegisterError::SubscriptionNotAQuery { .. } => {
                         Status::invalid_argument(e.to_string())
                     }
                     RegisterError::TypeOwnedByOtherService { .. }
                     | RegisterError::KindConflict { .. }
-                    | RegisterError::SharingConflict { .. } => {
+                    | RegisterError::SharingConflict { .. }
+                    | RegisterError::SubscriptionConflict { .. } => {
                         Status::already_exists(e.to_string())
                     }
                 })

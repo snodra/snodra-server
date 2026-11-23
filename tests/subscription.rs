@@ -371,3 +371,46 @@ async fn a_subscription_without_owner_is_no_handler_and_unknown_parts_are_ignore
     assert!(handshake(&mut a, 2).await.is_empty());
     assert!(handshake(&mut b, 2).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_declared_subscription_type_is_subscribed_as_before() {
+    let addr = start_hub(config()).await;
+    // Both handlers declare `acct.Watch` a subscription type (Register.subscription_query_types).
+    let mut hs = Vec::new();
+    for service in ["svc-a", "svc-b"] {
+        let c = FakeClient::connect(addr).await;
+        c.send_raw_register(Register {
+            shared_query_types: vec!["acct.Watch".to_string()],
+            subscription_query_types: vec!["acct.Watch".to_string()],
+            ..c.register_message(service, &[], &[])
+        })
+        .await;
+        hs.push(c);
+    }
+    let (mut b, mut a) = (hs.pop().unwrap(), hs.pop().unwrap());
+    handshake(&mut a, 1).await;
+    handshake(&mut b, 1).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
+    handshake(&mut sender, 1).await;
+
+    let (initial_on_a, ta, tb) = open(&mut sender, &mut a, &mut b, "sub1", 0, 0).await;
+    assert_eq!((ta.as_str(), tb.as_str()), ("sub1#1", "sub1#2"));
+    let initial = if initial_on_a { &mut a } else { &mut b };
+    initial
+        .tx
+        .send(FakeClient::reply_ok("sub1#0", b"balance 10"))
+        .await
+        .unwrap();
+    let p = expect_part(&mut sender).await;
+    assert_eq!((p.request_id.as_str(), p.seq), ("sub1", 1));
+    b.tx.send(FakeClient::part_ok(&tb, 1, b"balance 11"))
+        .await
+        .unwrap();
+    let p = expect_part(&mut sender).await;
+    assert_eq!((p.seq, p.payload.as_slice()), (2, b"balance 11".as_slice()));
+    a.tx.send(FakeClient::end(&ta, None)).await.unwrap();
+    b.tx.send(FakeClient::end(&tb, None)).await.unwrap();
+    let end = expect_end(&mut sender).await;
+    assert!(end.error.is_none(), "{end:?}");
+    assert_eq!(end.parts, 2);
+}

@@ -377,3 +377,202 @@ async fn exclusive_and_shared_registrants_conflict_and_the_topology_lists_every_
     assert_eq!(b.instances[0].query_types, ["own.Get", "search.Find"]);
     assert_eq!(b.instances[0].shared_query_types, ["search.Find"]);
 }
+
+/// A client handling `exclusive` and `shared` queries, declaring `subscriptions` among them as
+/// subscription types; does not wait for the ack.
+async fn register_subscriptions(
+    addr: SocketAddr,
+    service: &str,
+    exclusive: &[&str],
+    shared: &[&str],
+    subscriptions: &[&str],
+) -> FakeClient {
+    let client = FakeClient::connect(addr).await;
+    client
+        .send_raw_register(Register {
+            shared_query_types: shared.iter().map(|s| s.to_string()).collect(),
+            subscription_query_types: subscriptions.iter().map(|s| s.to_string()).collect(),
+            ..client.register_message(service, &[], exclusive)
+        })
+        .await;
+    client
+}
+
+/// The first message of a Register the hub refused: the stream's status.
+async fn refused(c: &mut FakeClient) -> tonic::Status {
+    match c.next().await {
+        Some(Err(status)) => status,
+        other => panic!("expected the Register refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_scatter_gather_of_a_subscription_type_is_refused_and_no_target_gets_anything() {
+    let addr = start_hub(config()).await;
+    // Exclusive and shared subscription types: the handlers recognise a subscription's initial
+    // request by its `#0` id, so a gather's target `#0` would be answered as one.
+    let mut a1 = register_subscriptions(
+        addr,
+        "svc-a",
+        &["acct.Watch"],
+        &["prices.Watch"],
+        &["acct.Watch", "prices.Watch"],
+    )
+    .await;
+    let mut b1 =
+        register_subscriptions(addr, "svc-b", &[], &["prices.Watch"], &["prices.Watch"]).await;
+    handshake(&mut a1, 1).await;
+    handshake(&mut b1, 1).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
+    handshake(&mut sender, 1).await;
+
+    for (id, type_name) in [("g1", "prices.Watch"), ("g2", "acct.Watch")] {
+        sender
+            .tx
+            .send(scatter(id, type_name, 2_000, 0))
+            .await
+            .unwrap();
+    }
+    let quiet = Duration::from_millis(300);
+    for h in [&mut a1, &mut b1] {
+        let seen = drain(h, quiet).await;
+        assert!(seen.is_empty(), "no target gets anything: {seen:?}");
+    }
+    let seen = drain(&mut sender, quiet).await;
+    let errors: Vec<_> = seen
+        .iter()
+        .map(|m| match m.message.as_ref() {
+            Some(server_message::Message::Error(e)) => e,
+            other => panic!("expected only terminal errors, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "one terminal error per gather: {seen:?}");
+    for (e, id) in errors.iter().zip(["g1", "g2"]) {
+        assert_eq!(
+            (e.request_id.as_str(), e.code()),
+            (id, ErrorCode::InvalidRequest)
+        );
+        assert!(e.message.contains("subscription type"), "{e:?}");
+    }
+    // The ids are free again: nothing was entered for them.
+    sender
+        .tx
+        .send(scatter("g1", "search.Nope", 500, 0))
+        .await
+        .unwrap();
+    match message(&mut sender).await {
+        server_message::Message::Error(e) => assert_eq!(e.code(), ErrorCode::NoHandler),
+        other => panic!("expected NO_HANDLER, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_shared_query_type_is_still_gathered_next_to_a_subscription_type() {
+    let addr = start_hub(config()).await;
+    // The same instances serve a plain shared query and a subscription type.
+    let mut a1 = register_subscriptions(
+        addr,
+        "svc-a",
+        &[],
+        &["search.Find", "prices.Watch"],
+        &["prices.Watch"],
+    )
+    .await;
+    let mut b1 = register_subscriptions(
+        addr,
+        "svc-b",
+        &[],
+        &["search.Find", "prices.Watch"],
+        &["prices.Watch"],
+    )
+    .await;
+    handshake(&mut a1, 1).await;
+    handshake(&mut b1, 1).await;
+    let mut sender = register(addr, "svc-web", &[], &[]).await;
+    handshake(&mut sender, 1).await;
+
+    sender
+        .tx
+        .send(scatter("g1", "search.Find", 2_000, 0))
+        .await
+        .unwrap();
+    let mut target_ids = Vec::new();
+    for (h, name) in [(&mut a1, "a"), (&mut b1, "b")] {
+        let r = expect_request(h).await;
+        assert_eq!(r.mode, RequestMode::Unary as i32);
+        h.tx.send(FakeClient::reply_ok(&r.id, name.as_bytes()))
+            .await
+            .unwrap();
+        target_ids.push(r.id);
+    }
+    target_ids.sort();
+    assert_eq!(target_ids, ["g1#0", "g1#1"]);
+    let (parts, end) = gather(&mut sender).await;
+    assert_eq!(parts.len(), 2);
+    assert_eq!((end.parts, end.failed, end.timed_out), (2, 0, 0));
+}
+
+#[tokio::test]
+async fn registrants_must_agree_on_a_subscription_type() {
+    let addr = start_hub(config()).await;
+    let mut a1 =
+        register_subscriptions(addr, "svc-a", &[], &["prices.Watch"], &["prices.Watch"]).await;
+    let mut b1 = register(addr, "svc-b", &[], &["search.Find"]).await;
+    handshake(&mut a1, 1).await;
+    handshake(&mut b1, 1).await;
+
+    // A shared registrant that does not declare it a subscription type.
+    let mut c1 = register(addr, "svc-c", &[], &["prices.Watch"]).await;
+    let status = refused(&mut c1).await;
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    assert!(
+        status.message().contains("prices.Watch")
+            && status.message().contains("a subscription type")
+            && status.message().contains("svc-a"),
+        "{status:?}"
+    );
+
+    // A registrant declaring a subscription type the others serve as a plain query.
+    let mut d1 =
+        register_subscriptions(addr, "svc-d", &[], &["search.Find"], &["search.Find"]).await;
+    let status = refused(&mut d1).await;
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    assert!(
+        status.message().contains("not a subscription type"),
+        "{status:?}"
+    );
+
+    // Another instance of the owner, and another shared owner, that agree are accepted.
+    let mut a2 =
+        register_subscriptions(addr, "svc-a", &[], &["prices.Watch"], &["prices.Watch"]).await;
+    let mut e1 =
+        register_subscriptions(addr, "svc-e", &[], &["prices.Watch"], &["prices.Watch"]).await;
+    for h in [&mut a2, &mut e1] {
+        let before = handshake(h, 1).await;
+        assert!(
+            matches!(before.as_slice(), [server_message::Message::RegisterAck(_)]),
+            "{before:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_type_outside_the_query_lists_is_invalid_argument() {
+    let addr = start_hub(config()).await;
+    // In neither query list.
+    let mut a1 = register_subscriptions(addr, "svc-a", &["acct.Get"], &[], &["acct.Watch"]).await;
+    let status = refused(&mut a1).await;
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("acct.Watch"), "{status:?}");
+
+    // A command is never a subscription type.
+    let b1 = FakeClient::connect(addr).await;
+    b1.send_raw_register(Register {
+        subscription_query_types: vec!["acct.Do".to_string()],
+        ..b1.register_message("svc-b", &["acct.Do"], &[])
+    })
+    .await;
+    let mut b1 = b1;
+    let status = refused(&mut b1).await;
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+}

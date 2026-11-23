@@ -92,6 +92,8 @@ message ServerMessage {
 // registered exclusive by one registrant and shared by another is rejected with ALREADY_EXISTS
 // (the later Register fails). A type listed in shared_query_types and in command_types or
 // query_types of the same Register is rejected with INVALID_ARGUMENT. Commands are never shared.
+// A query type may also be declared a subscription type (subscription_query_types); registrants
+// must agree on that too.
 //
 // Every accepted Register is answered with a RegisterAck, written before the echo of any
 // Heartbeat that follows it. credentials, initial_permits, load_factor, tags and client_version
@@ -127,6 +129,13 @@ message Register {
   // for example a "search.FindAnything" every service answers. A point query to such a
   // type goes to one live instance of any owner; a scatter-gather query to all of them.
   repeated string shared_query_types = 13;
+  // Of the types in query_types and shared_query_types, the ones this instance serves with a
+  // subscription handler, for example a "prices.WatchPrices" whose handler recognises the initial
+  // request by its "<id>#0" id. A type listed here and in neither is rejected with
+  // INVALID_ARGUMENT. Registrants must agree: a type registered as a subscription type by one
+  // registrant and not by another is rejected with ALREADY_EXISTS (the later Register fails). The
+  // hub refuses a scatter-gather of a subscription type (see RequestMode.SCATTER_GATHER).
+  repeated string subscription_query_types = 14;
 }
 
 // Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
@@ -517,7 +526,8 @@ enum RequestMode {
   // One handler, one Reply or Error.
   UNARY = 0;
   // Every live instance of every owner gets an ordinary unary Request; the sender gets one
-  // ReplyPart per answer, in arrival order, then a ReplyEnd.
+  // ReplyPart per answer, in arrival order, then a ReplyEnd. A subscription type
+  // (Register.subscription_query_types) fails with INVALID_REQUEST, and no instance gets anything.
   SCATTER_GATHER = 1;
   // One live instance gets the Request (mode STREAMING, id "<id>#1", the sender's
   // initial_credit) and answers with ReplyParts and a ReplyEnd, relayed to the sender under the
