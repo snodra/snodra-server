@@ -13,9 +13,14 @@
 //! gather; each target is an ordinary [`Pending::Unary`] keyed `<id>#<n>` whose `part_of` names
 //! the gather, so flow control, queues, priority and disconnects apply per target unchanged. A
 //! target's terminal message becomes a `ReplyPart` to the sender instead; the gather's own
-//! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map. A
-//! subscription type (`Register.subscription_query_types`) is never gathered: its handlers take
-//! `<id>#0` for a subscription's initial request, so the gather is refused before any target.
+//! terminal message is its `ReplyEnd`, sent by whoever removes the gather from the map.
+//!
+//! Modes and subscription types: a subscription type (`Register.subscription_query_types`) is
+//! served in mode SUBSCRIPTION only, and mode SUBSCRIPTION serves subscription types only. A
+//! sender's unary, streaming or scatter-gather request for one, and a subscription of any other
+//! type, is refused with INVALID_REQUEST before anything is entered or written: its handlers take
+//! `<id>#0` for a subscription's initial request, and only the hub sends that one (dispatched
+//! directly, never through [`Router::route`]).
 //!
 //! Streaming queries: a [`Pending::Stream`] keyed by the sender's request id
 //! holds the stream; its one target is a [`Pending::Unary`] keyed `<id>#1` with `part_of` set,
@@ -66,7 +71,7 @@ use crate::proto::{
     RequestMode, ServerMessage, reply, server_message,
 };
 use crate::queue::{InstanceQueue, Queued, TotalBytes};
-use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, Target};
+use crate::registry::{Candidate, InstanceId, Kind, PickError, Registry, ScatterPool, Target};
 use crate::session::{SendError, SenderInfo, Sessions};
 use crate::telemetry::{
     FlowGauges, Metrics, OTHER_TYPE, Outcome, kind_label, set_parent_from_headers,
@@ -604,6 +609,12 @@ fn no_handler_message(type_name: &str, e: PickError) -> String {
             format!("owner known, no instance for service {service}")
         }
     }
+}
+
+/// A sender's request in `mode` (a label of [`mode_label`]) for a subscription type, which the
+/// hub serves in mode SUBSCRIPTION only.
+fn not_for_subscription_types(type_name: &str, mode: &str) -> String {
+    format!("invalid request: {type_name} is a subscription type; {mode} is not for it")
 }
 
 fn outcome_of(code: ErrorCode) -> Outcome {
@@ -1203,6 +1214,34 @@ impl Router {
                 return;
             }
         };
+        // A subscription type is served in mode SUBSCRIPTION only. The hub's own initial
+        // request `<id>#0` is dispatched directly and never passes here.
+        if self.registry.is_subscription_type(ctx, &type_name) {
+            self.record_rejected(
+                ctx,
+                sender_service,
+                kind,
+                &type_name,
+                Outcome::InvalidRequest,
+            );
+            record_outcome(&span, Outcome::InvalidRequest);
+            log_outcome(
+                &id,
+                &type_name,
+                Some(kind),
+                sender,
+                None,
+                Outcome::InvalidRequest,
+                false,
+            );
+            let message = not_for_subscription_types(&type_name, mode_label(req.mode));
+            self.send_to(
+                ctx,
+                sender,
+                error_message(&id, ErrorCode::InvalidRequest, message),
+            );
+            return;
+        }
 
         span.record("snodra.handler", handler.as_str());
         let sender_token = sender_info.as_ref().map(|info| info.token);
@@ -1855,7 +1894,8 @@ impl Router {
     /// queries only (INVALID_REQUEST); no live target is NO_HANDLER; a scatter-gather of a
     /// subscription type (`Register.subscription_query_types`) is INVALID_REQUEST, its handlers
     /// would take target `<id>#0` for a subscription's initial request; a duplicate id is
-    /// INVALID_REQUEST.
+    /// INVALID_REQUEST. Streams and subscriptions have the same gates in their own functions
+    /// (a stream of a subscription type, a subscription of any other type: INVALID_REQUEST).
     fn route_mode(
         self: &Arc<Self>,
         ctx: &ContextId,
@@ -1911,7 +1951,11 @@ impl Router {
                 message,
             );
         }
-        let (kind, targets) = match self.registry.scatter_targets(ctx, &type_name) {
+        let ScatterPool {
+            kind,
+            subscription,
+            targets,
+        } = match self.registry.scatter_targets(ctx, &type_name) {
             Ok(found) => found,
             Err(e) => {
                 let message = no_handler_message(&type_name, e);
@@ -1927,10 +1971,8 @@ impl Router {
                 message,
             );
         }
-        if self.registry.is_subscription_type(ctx, &type_name) {
-            let message = format!(
-                "invalid request: {type_name} is a subscription type; {mode} is not for it"
-            );
+        if subscription {
+            let message = not_for_subscription_types(&type_name, mode);
             return reject(
                 kind,
                 ErrorCode::InvalidRequest,
@@ -2299,6 +2341,10 @@ impl Router {
         let kind = pool.kind;
         if kind == Kind::Command {
             let message = for_queries(&type_name);
+            return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+        }
+        if pool.subscription {
+            let message = not_for_subscription_types(&type_name, mode);
             return self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
         }
         let mut candidates = pool.candidates;
@@ -2977,6 +3023,14 @@ impl Router {
                 self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
                 return None;
             }
+        }
+        if !pool.subscription {
+            let message = format!(
+                "invalid request: {type_name} is not a subscription type \
+                 (Register.subscription_query_types); {mode} is for subscription types only"
+            );
+            self.reject_mode(&m, kind, ErrorCode::InvalidRequest, message);
+            return None;
         }
         let candidates = pool.candidates;
         // The initial result comes from one of them, chosen as a point query is.
@@ -7059,7 +7113,18 @@ mod subscription_tests {
             }
             f.connect("x1", "X", PERMITS, 64);
             f.registry
-                .register(&D, "x1", "X", &["c.Do".into()], &["q.Own".into()])
+                .register_types(
+                    &D,
+                    "x1",
+                    "X",
+                    &RegisteredTypes {
+                        command_types: vec!["c.Do".into()],
+                        query_types: vec!["q.Own".into()],
+                        subscription_query_types: vec!["q.Own".into()],
+                        ..RegisteredTypes::default()
+                    },
+                    crate::registry::Placement::default(),
+                )
                 .unwrap();
             f
         }
@@ -7082,6 +7147,7 @@ mod subscription_tests {
             self.tokens.insert(id, token);
         }
 
+        /// Registers `id` with `types` as shared query types, declared subscription types.
         fn shared(&self, id: &str, service: &str, types: &[&str]) {
             self.registry
                 .register_types(
@@ -7090,6 +7156,7 @@ mod subscription_tests {
                     service,
                     &RegisteredTypes {
                         shared_query_types: types.iter().map(|t| t.to_string()).collect(),
+                        subscription_query_types: types.iter().map(|t| t.to_string()).collect(),
                         ..RegisteredTypes::default()
                     },
                     crate::registry::Placement::default(),
@@ -8139,7 +8206,8 @@ mod subscription_tests {
             "s1",
             Request {
                 mode: 0,
-                ..subscribe("in-flight#1", "q.Watch", 0, 0, 0)
+                kind: RequestKind::Command as i32,
+                ..subscribe("in-flight#1", "c.Do", 0, 0, 0)
             },
         );
         f.router
@@ -8407,6 +8475,58 @@ mod subscription_tests {
                 .map(|(n, _)| n),
             Some(3)
         );
+    }
+
+    /// Each refusal of a mode its type does not serve: one INVALID_REQUEST to the sender,
+    /// counted once under its own mode label with the invalid_request outcome, nothing in
+    /// flight and nothing to any handler.
+    #[tokio::test]
+    async fn a_mode_the_type_does_not_serve_is_refused_and_counted_under_its_mode() {
+        for (mode, type_name, label) in [
+            (RequestMode::Unary, "q.Watch", "unary"),
+            (RequestMode::Streaming, "q.Watch", "streaming"),
+            (RequestMode::ScatterGather, "q.Watch", "scatter_gather"),
+            (RequestMode::Unary, "q.Own", "unary"),
+            (RequestMode::Subscription, "q.Plain", "subscription"),
+        ] {
+            let m = crate::telemetry::test_support::test_metrics();
+            let mut f = Subs::with(Config::default(), Arc::clone(&m.metrics));
+            f.connect("y1", "Y", PERMITS, 64);
+            f.registry
+                .register(&D, "y1", "Y", &[], &["q.Plain".into()])
+                .unwrap();
+            f.router.route(
+                &D,
+                "s1",
+                Request {
+                    mode: mode as i32,
+                    ..subscribe("r1", type_name, 0, 0, 0)
+                },
+            );
+            let got = f.messages("s1");
+            assert_eq!(got.len(), 1, "{label}: {got:?}");
+            let (id, code, message) = error_code(&got[0]);
+            assert_eq!(
+                (id.as_str(), code),
+                ("r1", ErrorCode::InvalidRequest),
+                "{label}"
+            );
+            assert!(message.contains(type_name), "{message}");
+            for h in ["a1", "b1", "x1", "y1"] {
+                assert!(f.requests(h).is_empty(), "{label}: {h} got nothing");
+            }
+            assert_eq!(f.router.in_flight(), 0, "{label}");
+            assert_eq!(
+                m.counter("snodra_server_requests_total", "mode", label),
+                Some(1),
+                "{label}"
+            );
+            assert_eq!(
+                m.counter("snodra_server_requests_total", "outcome", "invalid_request"),
+                Some(1),
+                "{label}"
+            );
+        }
     }
 }
 

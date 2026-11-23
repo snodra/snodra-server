@@ -576,3 +576,45 @@ async fn a_subscription_type_outside_the_query_lists_is_invalid_argument() {
     let status = refused(&mut b1).await;
     assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
 }
+
+#[tokio::test]
+async fn the_only_instance_re_registering_with_another_flag_is_refused_until_the_type_is_swept() {
+    let config = Config {
+        owner_grace: Duration::from_millis(400),
+        heartbeat_timeout: Duration::from_millis(2_000),
+        ..config()
+    };
+    let addr = start_hub(config).await;
+    let mut a1 = register_subscriptions(addr, "svc-a", &["acct.Watch"], &[], &["acct.Watch"]).await;
+    handshake(&mut a1, 1).await;
+
+    // The same stream re-registers the type as a plain query: refused like a change between
+    // exclusive and shared, as the check runs against the owner entry it holds itself.
+    a1.send_raw_register(Register {
+        subscription_query_types: Vec::new(),
+        ..a1.register_message("svc-a", &[], &["acct.Watch"])
+    })
+    .await;
+    let status = refused(&mut a1).await;
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains("is registered by service svc-a as a subscription type"),
+        "{status:?}"
+    );
+
+    // Its stream closed, the type stays owned through the grace: a new instance with the
+    // new flag is still refused.
+    let mut a2 = register(addr, "svc-a", &["acct.Watch"], &[]).await;
+    assert_eq!(refused(&mut a2).await.code(), tonic::Code::AlreadyExists);
+
+    // Once the grace passed and the watchdog swept the type, the new flag is accepted.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut a3 = register(addr, "svc-a", &["acct.Watch"], &[]).await;
+    let before = handshake(&mut a3, 1).await;
+    assert!(
+        matches!(before.as_slice(), [server_message::Message::RegisterAck(_)]),
+        "{before:?}"
+    );
+}

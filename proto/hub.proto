@@ -98,8 +98,9 @@ message ServerMessage {
 // Every accepted Register is answered with a RegisterAck, written before the echo of any
 // Heartbeat that follows it. credentials, initial_permits, load_factor, tags and client_version
 // are read from the first Register of a stream only; later Registers cannot change them. Field 11
-// is reserved for contexts.
+// is reserved for contexts; fields 5 and 6 were used by an earlier version and are never reused.
 message Register {
+  reserved 5, 6;
   // Logical service name, for example "orders-service"; each event-store add-on derives its
   // own names from it.
   string service_name = 1;
@@ -133,8 +134,12 @@ message Register {
   // subscription handler, for example a "prices.WatchPrices" whose handler recognises the initial
   // request by its "<id>#0" id. A type listed here and in neither is rejected with
   // INVALID_ARGUMENT. Registrants must agree: a type registered as a subscription type by one
-  // registrant and not by another is rejected with ALREADY_EXISTS (the later Register fails). The
-  // hub refuses a scatter-gather of a subscription type (see RequestMode.SCATTER_GATHER).
+  // registrant and not by another is rejected with ALREADY_EXISTS (the later Register fails), also
+  // when the only instance re-registers it (until the hub forgets the type: owner grace, then a
+  // sweep). The hub serves a subscription type in mode SUBSCRIPTION only, and mode SUBSCRIPTION
+  // for subscription types only: anything else fails with INVALID_REQUEST before any instance gets
+  // anything (see RequestMode). The initial request "<id>#0" is the hub's own and reaches the
+  // handler as usual.
   repeated string subscription_query_types = 14;
 }
 
@@ -521,9 +526,11 @@ message RegisterAck {
 
 // How the hub delivers a Request and its answers. The modes other than UNARY are for
 // queries only: a command fails with INVALID_REQUEST, and so does a mode value this file does not
-// define. No live instance fails with an Error NO_HANDLER.
+// define. No live instance fails with an Error NO_HANDLER. A subscription type
+// (Register.subscription_query_types) is served in mode SUBSCRIPTION only: a sender's Request for
+// it in any other mode fails with INVALID_REQUEST, and no instance gets anything.
 enum RequestMode {
-  // One handler, one Reply or Error.
+  // One handler, one Reply or Error. A subscription type fails with INVALID_REQUEST.
   UNARY = 0;
   // Every live instance of every owner gets an ordinary unary Request; the sender gets one
   // ReplyPart per answer, in arrival order, then a ReplyEnd. A subscription type
@@ -531,12 +538,13 @@ enum RequestMode {
   SCATTER_GATHER = 1;
   // One live instance gets the Request (mode STREAMING, id "<id>#1", the sender's
   // initial_credit) and answers with ReplyParts and a ReplyEnd, relayed to the sender under the
-  // sender's credits (initial_credit, then Flow).
+  // sender's credits (initial_credit, then Flow). A subscription type fails with INVALID_REQUEST.
   STREAMING = 2;
   // The initial result comes from one live instance (an ordinary unary Request "<id>#0"); every
   // live instance of every owner gets the Request with mode SUBSCRIPTION ("<id>#n", n >= 1) and
   // pushes its updates as ReplyParts. The sender gets the initial result, then the updates, as
-  // ReplyParts under its credits, until a ReplyEnd or its Cancel.
+  // ReplyParts under its credits, until a ReplyEnd or its Cancel. Only for a subscription type
+  // (Register.subscription_query_types): any other type fails with INVALID_REQUEST.
   SUBSCRIPTION = 3;
 }
 

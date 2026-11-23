@@ -5,7 +5,8 @@
 //!   except a shared query type (`Register.shared_query_types`), which many services may
 //!   own; registrants must agree on exclusive vs shared;
 //! - a query type may be declared a subscription type (`Register.subscription_query_types`);
-//!   registrants must agree on that too, and the router refuses a scatter-gather of one;
+//!   registrants must agree on that too, and the router serves one in mode SUBSCRIPTION only
+//!   (and mode SUBSCRIPTION for those types only);
 //! - when the last instance of a service listing a type goes away the service keeps ownership for
 //!   `owner_grace` so a restarting service does not lose its types; `sweep` then drops it;
 //! - commands with a routing key go to one instance of the owning service chosen by consistent
@@ -84,11 +85,22 @@ pub struct ScatterTarget {
     pub service: String,
 }
 
+/// The instances a scatter-gather query goes to, with the type's kind and whether it is a
+/// subscription type (both read under the same lock as the targets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScatterPool {
+    pub kind: Kind,
+    pub subscription: bool,
+    pub targets: Vec<ScatterTarget>,
+}
+
 /// The instances a streaming query may go to: those of every owner that list
 /// the type, sorted by id, with the rotation counter of the type (shared) or of its service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamPool {
     pub kind: Kind,
+    /// Declared a subscription type by its registrants.
+    pub subscription: bool,
     pub candidates: Vec<Candidate>,
     pub rotation: usize,
 }
@@ -217,11 +229,11 @@ impl fmt::Display for RegisterError {
                 owner_subscription,
             } => write!(
                 f,
-                "type {type_name} is registered as {} by service {owner}",
+                "type {type_name} is registered by service {owner} as {}",
                 if *owner_subscription {
                     "a subscription type"
                 } else {
-                    "a query type that is not a subscription type"
+                    "a query type, not a subscription type"
                 }
             ),
         }
@@ -568,17 +580,17 @@ impl Registry {
                         owner_shared: owner.shared,
                     });
                 }
+                if !owner.shared && !owner.services.contains_key(service) {
+                    return Err(RegisterError::TypeOwnedByOtherService {
+                        type_name: (*t).clone(),
+                        owner: owner.first_service(),
+                    });
+                }
                 if owner.subscription != *is_subscription {
                     return Err(RegisterError::SubscriptionConflict {
                         type_name: (*t).clone(),
                         owner: owner.first_service(),
                         owner_subscription: owner.subscription,
-                    });
-                }
-                if !owner.shared && !owner.services.contains_key(service) {
-                    return Err(RegisterError::TypeOwnedByOtherService {
-                        type_name: (*t).clone(),
-                        owner: owner.first_service(),
                     });
                 }
             }
@@ -724,15 +736,16 @@ impl Registry {
     }
 
     /// Every live instance of every owner of `type_name` that lists the type (on an exclusive
-    /// type, those instances of its owner), sorted by service then instance id, and the type's
-    /// kind (the router rejects a scatter-gather command). Unlike unary routing, an instance of
+    /// type, those instances of its owner), sorted by service then instance id, the type's
+    /// kind (the router rejects a scatter-gather command) and whether it is a subscription type
+    /// (the router rejects that too). Unlike unary routing, an instance of
     /// an owner that did not register the type is no target: during a rolling deploy that adds
     /// a type, the old instances would only answer `NO_HANDLER`, a failed part in every gather.
     pub fn scatter_targets(
         &self,
         ctx: &ContextId,
         type_name: &str,
-    ) -> Result<(Kind, Vec<ScatterTarget>), PickError> {
+    ) -> Result<ScatterPool, PickError> {
         check_context(ctx);
         let inner = self.inner.lock().unwrap();
         let owner = inner.types.get(type_name).ok_or(PickError::UnknownType)?;
@@ -758,7 +771,11 @@ impl Registry {
         if targets.is_empty() {
             return Err(owner.no_live_instance());
         }
-        Ok((owner.kind, targets))
+        Ok(ScatterPool {
+            kind: owner.kind,
+            subscription: owner.subscription,
+            targets,
+        })
     }
 
     /// Whether `type_name` is a subscription type (`Register.subscription_query_types`) of its
@@ -788,6 +805,7 @@ impl Registry {
         } = &mut *inner;
         let owner = types.get_mut(type_name).ok_or(PickError::UnknownType)?;
         let kind = owner.kind;
+        let subscription = owner.subscription;
         if owner.holders() == 0 {
             return Err(owner.no_live_instance());
         }
@@ -820,6 +838,7 @@ impl Registry {
         };
         Ok(StreamPool {
             kind,
+            subscription,
             candidates,
             rotation,
         })
@@ -1547,7 +1566,7 @@ mod tests {
             .unwrap();
         r.register(&D, "x2", "X", &s(&["c.Do"]), &s(&["q.Own"]))
             .unwrap();
-        let (kind, targets) = r.scatter_targets(&D, "q.Find").unwrap();
+        let ScatterPool { kind, targets, .. } = r.scatter_targets(&D, "q.Find").unwrap();
         assert_eq!(kind, Kind::Query);
         let got: Vec<(&str, &str)> = targets
             .iter()
@@ -1555,17 +1574,17 @@ mod tests {
             .collect();
         assert_eq!(got, [("A", "a1"), ("B", "b1"), ("B", "b2")]);
         // An exclusive type: every instance of its owner.
-        let (_, targets) = r.scatter_targets(&D, "q.Own").unwrap();
+        let targets = r.scatter_targets(&D, "q.Own").unwrap().targets;
         assert_eq!(targets.len(), 2);
         // A command reports its kind; the router rejects the mode.
-        assert_eq!(r.scatter_targets(&D, "c.Do").unwrap().0, Kind::Command);
+        assert_eq!(r.scatter_targets(&D, "c.Do").unwrap().kind, Kind::Command);
         assert_eq!(
             r.scatter_targets(&D, "q.Nope").unwrap_err(),
             PickError::UnknownType
         );
         // An instance without types (stopping) is no target.
         r.register(&D, "b2", "B", &[], &[]).unwrap();
-        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().1.len(), 2);
+        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().targets.len(), 2);
     }
 
     /// A rolling deploy of B adds the shared "q.New": b1 (old) does not list it, b2 does. A
@@ -1576,17 +1595,17 @@ mod tests {
         let r = reg();
         shared(&r, "b1", "B", &["q.Find"]).unwrap();
         shared(&r, "b2", "B", &["q.Find", "q.New"]).unwrap();
-        let (_, targets) = r.scatter_targets(&D, "q.New").unwrap();
+        let targets = r.scatter_targets(&D, "q.New").unwrap().targets;
         let ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["b2"]);
-        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().1.len(), 2);
+        assert_eq!(r.scatter_targets(&D, "q.Find").unwrap().targets.len(), 2);
         assert_eq!(candidate_ids(&r, "q.New").0, ["b1", "b2"]);
         // An exclusive type: the same rule.
         r.register(&D, "x1", "X", &[], &s(&["q.Own"])).unwrap();
         r.register(&D, "x2", "X", &[], &s(&["q.Own", "q.Other"]))
             .unwrap();
-        assert_eq!(r.scatter_targets(&D, "q.Own").unwrap().1.len(), 2);
-        assert_eq!(r.scatter_targets(&D, "q.Other").unwrap().1.len(), 1);
+        assert_eq!(r.scatter_targets(&D, "q.Own").unwrap().targets.len(), 2);
+        assert_eq!(r.scatter_targets(&D, "q.Other").unwrap().targets.len(), 1);
     }
 
     /// A streaming query goes to one instance chosen like a point query, but only among the
@@ -1804,7 +1823,7 @@ mod tests {
         subs(&r, "c1", "C", &[], &["q.W"], &["q.W"]).unwrap();
         subs(&r, "a1", "A", &[], &["q.W"], &["q.W"]).unwrap();
         assert!(r.is_subscription_type(&D, "q.W"));
-        assert_eq!(r.scatter_targets(&D, "q.W").unwrap().1.len(), 2);
+        assert_eq!(r.scatter_targets(&D, "q.W").unwrap().targets.len(), 2);
     }
 
     #[test]
@@ -1827,5 +1846,30 @@ mod tests {
         assert!(!r.is_subscription_type(&D, "q.W"));
         r.register(&D, "a2", "A", &[], &s(&["q.W"])).unwrap();
         assert!(!r.is_subscription_type(&D, "q.W"));
+    }
+
+    #[test]
+    fn on_an_exclusive_type_of_another_service_the_ownership_is_reported_first() {
+        let r = reg();
+        subs(&r, "a1", "A", &["q.W"], &[], &["q.W"]).unwrap();
+        for subscriptions in [&[][..], &["q.W"][..]] {
+            assert_eq!(
+                subs(&r, "b1", "B", &["q.W"], &[], subscriptions).unwrap_err(),
+                RegisterError::TypeOwnedByOtherService {
+                    type_name: "q.W".into(),
+                    owner: "A".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_pools_carry_the_subscription_flag() {
+        let r = reg();
+        subs(&r, "a1", "A", &[], &["q.W", "q.Find"], &["q.W"]).unwrap();
+        assert!(r.scatter_targets(&D, "q.W").unwrap().subscription);
+        assert!(!r.scatter_targets(&D, "q.Find").unwrap().subscription);
+        assert!(r.stream_candidates(&D, "q.W").unwrap().subscription);
+        assert!(!r.stream_candidates(&D, "q.Find").unwrap().subscription);
     }
 }

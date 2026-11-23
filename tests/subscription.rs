@@ -43,8 +43,32 @@ async fn handshake(c: &mut FakeClient, n: i64) -> Vec<server_message::Message> {
     }
 }
 
-/// A client handling `queries` (exclusive) and `shared` queries; does not wait for the ack.
+/// A client handling `queries` (exclusive) and `shared` queries, all declared subscription types
+/// (Register.subscription_query_types); does not wait for the ack.
 async fn register(
+    addr: SocketAddr,
+    service: &str,
+    queries: &[&str],
+    shared: &[&str],
+) -> FakeClient {
+    let client = FakeClient::connect(addr).await;
+    client
+        .send_raw_register(Register {
+            shared_query_types: shared.iter().map(|s| s.to_string()).collect(),
+            subscription_query_types: queries
+                .iter()
+                .chain(shared)
+                .map(|s| s.to_string())
+                .collect(),
+            ..client.register_message(service, &[], queries)
+        })
+        .await;
+    client
+}
+
+/// A client handling `queries` (exclusive) and `shared` queries, none declared a subscription
+/// type; does not wait for the ack.
+async fn register_plain(
     addr: SocketAddr,
     service: &str,
     queries: &[&str],
@@ -153,6 +177,13 @@ async fn open(
     let rb = requests_of(b).await;
     let initial_id = format!("{id}#0");
     let initial_on_a = ra.iter().any(|r| r.id == initial_id);
+    for r in ra.iter().chain(&rb).filter(|r| r.id == initial_id) {
+        assert_eq!(
+            r.mode,
+            RequestMode::Unary as i32,
+            "the initial request is unary"
+        );
+    }
     assert_ne!(
         initial_on_a,
         rb.iter().any(|r| r.id == initial_id),
@@ -372,29 +403,79 @@ async fn a_subscription_without_owner_is_no_handler_and_unknown_parts_are_ignore
     assert!(handshake(&mut b, 2).await.is_empty());
 }
 
-#[tokio::test]
-async fn a_declared_subscription_type_is_subscribed_as_before() {
-    let addr = start_hub(config()).await;
-    // Both handlers declare `acct.Watch` a subscription type (Register.subscription_query_types).
-    let mut hs = Vec::new();
-    for service in ["svc-a", "svc-b"] {
-        let c = FakeClient::connect(addr).await;
-        c.send_raw_register(Register {
-            shared_query_types: vec!["acct.Watch".to_string()],
-            subscription_query_types: vec!["acct.Watch".to_string()],
-            ..c.register_message(service, &[], &[])
-        })
-        .await;
-        hs.push(c);
+fn in_mode(id: &str, type_name: &str, mode: RequestMode) -> ClientMessage {
+    let mut m = FakeClient::request(id, RequestKind::Query, type_name, "", 1_000);
+    if let Some(client_message::Message::Request(r)) = m.message.as_mut() {
+        r.mode = mode as i32;
     }
-    let (mut b, mut a) = (hs.pop().unwrap(), hs.pop().unwrap());
+    m
+}
+
+#[tokio::test]
+async fn a_subscription_type_is_refused_in_any_other_mode_and_no_handler_gets_anything() {
+    let addr = start_hub(config()).await;
+    let (mut a, mut b, mut sender) = trio(addr).await;
+    // A raw client's unary `x#0` would be answered as a subscription's initial request.
+    for (id, mode, label) in [
+        ("x#0", RequestMode::Unary, "unary"),
+        ("p1", RequestMode::Unary, "unary"),
+        ("st1", RequestMode::Streaming, "streaming"),
+        ("g1", RequestMode::ScatterGather, "scatter_gather"),
+    ] {
+        sender
+            .tx
+            .send(in_mode(id, "acct.Watch", mode))
+            .await
+            .unwrap();
+        let (got, code, message) = expect_error(&mut sender).await;
+        assert_eq!((got.as_str(), code), (id, ErrorCode::InvalidRequest));
+        assert_eq!(
+            message,
+            format!("invalid request: acct.Watch is a subscription type; {label} is not for it")
+        );
+    }
+    assert!(requests_of(&mut a).await.is_empty(), "a got nothing");
+    assert!(requests_of(&mut b).await.is_empty(), "b got nothing");
+}
+
+#[tokio::test]
+async fn a_subscription_of_an_undeclared_query_type_is_refused() {
+    let addr = start_hub(config()).await;
+    let mut a = register_plain(addr, "svc-a", &["acct.Get"], &["acct.Find"]).await;
     handshake(&mut a, 1).await;
-    handshake(&mut b, 1).await;
     let mut sender = register(addr, "svc-web", &[], &[]).await;
     handshake(&mut sender, 1).await;
+    for (id, type_name) in [("w1", "acct.Get"), ("w2", "acct.Find")] {
+        sender
+            .tx
+            .send(subscribe(id, type_name, 1_000, 0, 0))
+            .await
+            .unwrap();
+        let (got, code, message) = expect_error(&mut sender).await;
+        assert_eq!((got.as_str(), code), (id, ErrorCode::InvalidRequest));
+        assert!(
+            message.contains(type_name) && message.contains("not a subscription type"),
+            "{message}"
+        );
+    }
+    assert!(requests_of(&mut a).await.is_empty(), "a got nothing");
+    // The same types still answer point queries.
+    sender
+        .tx
+        .send(in_mode("p1", "acct.Get", RequestMode::Unary))
+        .await
+        .unwrap();
+    let r = requests_of(&mut a).await;
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].id, "p1");
+}
 
-    let (initial_on_a, ta, tb) = open(&mut sender, &mut a, &mut b, "sub1", 0, 0).await;
-    assert_eq!((ta.as_str(), tb.as_str()), ("sub1#1", "sub1#2"));
+#[tokio::test]
+async fn the_hubs_own_initial_request_reaches_the_handler_of_a_subscription_type() {
+    let addr = start_hub(config()).await;
+    let (mut a, mut b, mut sender) = trio(addr).await;
+    // The hub's own unary `<id>#0` is no sender's request: the unary refusal does not apply.
+    let (initial_on_a, _, _) = open(&mut sender, &mut a, &mut b, "sub1", 0, 0).await;
     let initial = if initial_on_a { &mut a } else { &mut b };
     initial
         .tx
@@ -403,14 +484,6 @@ async fn a_declared_subscription_type_is_subscribed_as_before() {
         .unwrap();
     let p = expect_part(&mut sender).await;
     assert_eq!((p.request_id.as_str(), p.seq), ("sub1", 1));
-    b.tx.send(FakeClient::part_ok(&tb, 1, b"balance 11"))
-        .await
-        .unwrap();
-    let p = expect_part(&mut sender).await;
-    assert_eq!((p.seq, p.payload.as_slice()), (2, b"balance 11".as_slice()));
-    a.tx.send(FakeClient::end(&ta, None)).await.unwrap();
-    b.tx.send(FakeClient::end(&tb, None)).await.unwrap();
-    let end = expect_end(&mut sender).await;
-    assert!(end.error.is_none(), "{end:?}");
-    assert_eq!(end.parts, 2);
+    assert_eq!(p.payload, b"balance 10");
+    assert!(p.error.is_none(), "{p:?}");
 }
