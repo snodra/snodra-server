@@ -8,9 +8,16 @@ on:
 permissions:
   contents: read
 
+# A branch keeps only its newest run. On main the runs queue instead: a run that is releasing must
+# finish, and the next one then starts from the tag it pushed.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# bash -eo pipefail: a failing command inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,8 +29,10 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99"
           components: rustfmt
@@ -32,28 +41,143 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99"
           components: clippy
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99"
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --all-features
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: for t in scripts/*.test.sh; do sh "$t" || exit 1; done
+
+  # Versions are cut here, from the Conventional Commit subjects since the last tag
+  # (scripts/next-version.sh): feat -> minor, fix/perf -> patch, anything else -> no release.
+  # Below 1.0.0 nothing computes a major; 1.0.0 is declared by hand.
+  version:
+    needs: [fmt, clippy, test, scripts]
+    # Pushes to main of this repository only: never a fork or a pull request, and never the
+    # release commit itself (a GITHUB_TOKEN push starts no workflow anyway).
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && github.repository_owner == 'snodra'
+      && !startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.push.outputs.tag }}
+    steps:
+      # Keeps its credentials: this job pushes. It runs no third-party action after this one.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: next version
+        id: next
+        run: |
+          main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$main" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $main, not $GITHUB_SHA: a newer push releases it, or this is a re-run of a run that released. Nothing to do. To finish a failed release, re-run its failed jobs or run the release workflow with the tag."
+            exit 0
+          fi
+          last=$(git tag --merged HEAD --list 'v*' | scripts/last-tag.sh)
+          range=${last:+$last..}HEAD
+          version=$(
+            { git log --format=%s "$range"
+              git log -E --grep='^BREAKING[ -]CHANGE:' --format='BREAKING CHANGE: %h' "$range"
+            } | scripts/next-version.sh "$last"
+          )
+          echo "last tag: ${last:-none}; next version: ${version:-none, no release}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: commit and tag
+        if: steps.next.outputs.version != ''
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          scripts/bump-version.sh "$VERSION"
+          git commit -am "release: $VERSION"
+          git tag -a "v$VERSION" -m "${GITHUB_REPOSITORY#*/} v$VERSION"
+
+      # The packaging check: the bumped tree must still package before anything is pushed. Here the
+      # manifest and the lock must agree (the release builds with --locked) and carry the version.
+      # A library runs its publish dry run here (cargo publish --dry-run, a Gradle build, go build).
+      - name: the release commit packages
+        if: steps.next.outputs.version != ''
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          jq -e --arg v "$VERSION" \
+            '[.packages[] | select(.name == "snodra-server") | .version] == [$v]' \
+            "$RUNNER_TEMP/metadata.json"
+
+      - name: push
+        id: push
+        if: steps.next.outputs.version != ''
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          # Both or neither, and only as a fast-forward of the commit this run tested.
+          if ! git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"; then
+            main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+            if [ "$main" = "$(git rev-parse HEAD)" ]; then
+              # The push landed and only the client saw an error: release it.
+              git ls-remote --exit-code origin "refs/tags/v$VERSION" >/dev/null \
+                || { echo "::error::main has the release commit but not v$VERSION"; exit 1; }
+              echo "::warning::git reported an error, but the release commit and v$VERSION are on the remote"
+            elif [ "$main" != "$GITHUB_SHA" ]; then
+              echo "::notice::main moved during the release; the run for the newer commit releases"
+              exit 0
+            else
+              echo "::error::the push to main was refused: check that github-actions may push to main"
+              exit 1
+            fi
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  # A tag pushed with GITHUB_TOKEN starts no workflow, so the release runs here.
+  release:
+    needs: version
+    if: needs.version.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

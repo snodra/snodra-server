@@ -2,14 +2,13 @@
 FROM rust:1.99-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
-# The release passes its tag; the API and the dashboard show it.
-ARG SNODRA_SERVER_VERSION
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
 COPY ui ./ui
-RUN SNODRA_SERVER_VERSION="$SNODRA_SERVER_VERSION" cargo build --release --locked
+# The version is the crate's (Cargo.toml); the API, the dashboard and --version report it.
+RUN cargo build --release --locked
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app

@@ -7,16 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // SAFETY: a build script is single-threaded until it spawns, and this runs first.
         unsafe { std::env::set_var("PROTOC", path) };
     }
-    // The release stamps its tag here; a local build keeps the crate version.
-    println!("cargo:rerun-if-env-changed=SNODRA_SERVER_VERSION");
-    let version = std::env::var("SNODRA_SERVER_VERSION")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
-    println!(
-        "cargo:rustc-env=SNODRA_SERVER_BUILD_VERSION={}",
-        version.trim()
-    );
+    // The crate version is the only source: CI writes it into Cargo.toml when it cuts a release, so
+    // every build of a tag (the image, each binary, a local `cargo build`) reports the same version.
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    println!("cargo:rustc-env=SNODRA_SERVER_BUILD_VERSION={version}");
     println!("cargo:rerun-if-changed=proto/hub.proto");
     // rust-embed reads ui/ at compile time; a new or changed asset must rebuild the crate.
     println!("cargo:rerun-if-changed=ui");

@@ -69,6 +69,26 @@ check it byte for byte.
 Branches off `main`, conventional commits, a pull request with a green workflow. Design changes that
 span repositories open on the server's tracker first.
 
+## Releases
+
+Versions are cut by CI from the commit types; nobody pushes tags. When the checks pass on a push to
+`main`, the subjects since the last `v*` tag decide: any `feat` is the next minor, otherwise any `fix` or
+`perf` the next patch, and anything else (`docs`, `test`, `chore`, `ci`, `refactor`, `build`, `style`)
+releases nothing. CI then commits `release: X.Y.Z` (the version in `Cargo.toml`, `Cargo.lock` and this
+README), tags `vX.Y.Z` and publishes the image, the GitHub release and the binaries. Pull before you
+push: `main` then carries that commit.
+
+- Below 1.0.0 any `type!:` subject and any line starting `BREAKING CHANGE:` in a message count as a
+  minor, never a major: 1.0.0 is declared by hand.
+- A revert (`Revert "feat: ..."`, `revert:`) is not a release reason: the reverted change stays in the
+  last published version until the next `feat`, `fix` or `perf`.
+- Only tags shaped `vN.N.N` count; the highest one reachable from `main` is the last release.
+- `scripts/next-version.sh` holds the rule; `for t in scripts/*.test.sh; do sh "$t"; done` tests it.
+
+If a release fails half way (the tag exists, some artifacts do not), use **Re-run failed jobs** on that
+run: every step is safe to repeat. Or run the `release` workflow by hand with the existing tag. **Re-run
+all jobs** on a run that released does nothing, because `main` has moved to its release commit.
+
 ## License
 
 [Apache-2.0](LICENSE) © 2026 Guilherme D'Amoreira.
