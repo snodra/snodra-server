@@ -37,7 +37,7 @@ state, and the server only routes.
 ## Run it
 
 ```sh
-docker run --rm -p 7000:7000 -p 7001:7001 snodra/snodra-server:0.5.0
+docker run --rm -p 7000:7000 -p 7001:7001 snodra/snodra-server:0.6.0
 ```
 
 gRPC is on `7000`, the dashboard on <http://localhost:7001>. With no configuration it accepts anonymous
