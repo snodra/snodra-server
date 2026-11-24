@@ -14,7 +14,7 @@
   <a href="https://hub.docker.com/r/snodra/snodra-server"><img alt="docker" src="https://img.shields.io/docker/v/snodra/snodra-server?label=docker"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
-  <a href="https://snodra.damoreira.com/"><img alt="docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
+  <a href="https://snodra.damoreira.com/docs/"><img alt="docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
@@ -42,7 +42,7 @@ docker run --rm -p 7000:7000 -p 7001:7001 snodra/snodra-server:0.6.0
 
 gRPC is on `7000`, the dashboard on <http://localhost:7001>. With no configuration it accepts anonymous
 clients, which is the quickest way to try it; production settings are in the
-[server configuration](https://snodra.damoreira.com/server/configuration/server/).
+[server configuration](https://snodra.damoreira.com/docs/server/configuration/server/).
 
 From the repository:
 
@@ -55,11 +55,11 @@ cargo test                # unit and in-process integration tests
 
 Everything is environment or flags, prefixed `SNODRA_SERVER_` — listen address, TLS, token file, JWT
 issuer, ACL file, dashboard write access, OTLP. The full table is in the
-[configuration reference](https://snodra.damoreira.com/server/configuration/server/).
+[configuration reference](https://snodra.damoreira.com/docs/server/configuration/server/).
 
 ## Documentation
 
-Quick start, authentication modes, deployment, the dashboard and the protocol: **<https://snodra.damoreira.com/>**.
+Quick start, authentication modes, deployment, the dashboard and the protocol: **<https://snodra.damoreira.com/docs/>**.
 
 `proto/hub.proto` in this repository is the protocol's source of truth; the client libraries vendor it and
 check it byte for byte.
