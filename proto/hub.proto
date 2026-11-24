@@ -6,11 +6,11 @@
 // connected instances and forwards each Request to one instance that registered its type.
 //
 // The hub never inspects or persists payloads. Payloads are JSON documents produced by the
-// Snodra messaging libraries; the JSON shape of each type is defined by the owning service's
-// *-api module (JVM) or documented contract (Rust).
+// Snodra messaging libraries; the JSON shape of each type is defined by the service that owns
+// the type.
 //
-// This file is the source of truth. snodra-messaging (Kotlin) and snodra-messaging-rs (Rust)
-// vendor a byte-identical copy and their CI compares it with this one.
+// This file is the source of truth. Every Snodra messaging library vendors a byte-identical
+// copy, and its CI compares the copy with this one.
 
 syntax = "proto3";
 
